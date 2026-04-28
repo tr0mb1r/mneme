@@ -172,6 +172,24 @@ pub struct RecallFilters {
     pub kind: Option<MemoryKind>,
 }
 
+/// Patch passed to [`SemanticStore::update`]. Each `Some` field is
+/// applied on top of the existing memory; `None` fields are left
+/// untouched. `created_at` is never patchable — a memory keeps the
+/// timestamp it was first stored under.
+#[derive(Debug, Clone, Default)]
+pub struct UpdatePatch {
+    pub content: Option<String>,
+    pub kind: Option<MemoryKind>,
+    pub tags: Option<Vec<String>>,
+    pub scope: Option<String>,
+}
+
+impl UpdatePatch {
+    pub fn is_empty(&self) -> bool {
+        self.content.is_none() && self.kind.is_none() && self.tags.is_none() && self.scope.is_none()
+    }
+}
+
 /// Tunables for the snapshot scheduler (Phase 3 §8).
 ///
 /// * `inserts_threshold` — number of `remember`/`forget` ops since the
@@ -591,6 +609,78 @@ impl SemanticStore {
         Ok(existed)
     }
 
+    /// Update an existing memory.
+    ///
+    /// Returns `Ok(true)` if the id existed (and the patch, if non-
+    /// empty, was applied); `Ok(false)` if no memory with this id is
+    /// stored. An empty patch on an existing id is a successful no-op.
+    ///
+    /// When `patch.content` is `Some`, the new text is re-embedded and
+    /// a single [`WalOp::VectorReplace`] is appended to the semantic
+    /// WAL. Metadata-only patches (`kind`/`tags`/`scope`) skip the
+    /// embedder entirely — they only rewrite the postcard
+    /// `MemoryItem` blob in [`Storage`].
+    ///
+    /// `created_at` is preserved across updates — it identifies when
+    /// the memory was first stored, not when it was last touched.
+    pub async fn update(&self, id: MemoryId, patch: UpdatePatch) -> Result<bool> {
+        let key = mem_key(&id);
+        let bytes = match self.storage.get(&key).await? {
+            None => return Ok(false),
+            Some(b) => b,
+        };
+        let mut item: MemoryItem = postcard::from_bytes(&bytes)
+            .map_err(|e| MnemeError::Storage(format!("decode MemoryItem {id}: {e}")))?;
+
+        if patch.is_empty() {
+            return Ok(true);
+        }
+
+        // Re-embed BEFORE acquiring write_lock so we don't block
+        // concurrent remember/forget callers on a forward pass — same
+        // pattern as `remember`.
+        let new_vector = match &patch.content {
+            Some(new_content) => {
+                let trimmed = new_content.trim();
+                if trimmed.is_empty() {
+                    return Err(MnemeError::Storage("update content is empty".into()));
+                }
+                let v = self.embedder.embed(trimmed).await?;
+                if v.len() != self.embedder.dim() {
+                    return Err(MnemeError::Embedding(format!(
+                        "embedder returned dim {} but advertised {}",
+                        v.len(),
+                        self.embedder.dim()
+                    )));
+                }
+                item.content = trimmed.to_owned();
+                Some(v)
+            }
+            None => None,
+        };
+
+        if let Some(k) = patch.kind {
+            item.kind = k;
+        }
+        if let Some(t) = patch.tags {
+            item.tags = t;
+        }
+        if let Some(s) = patch.scope {
+            item.scope = s;
+        }
+
+        let value = postcard::to_allocvec(&item)
+            .map_err(|e| MnemeError::Storage(format!("encode MemoryItem: {e}")))?;
+
+        let _g = self.write_lock.lock().await;
+        self.storage.put(&key, &value).await?;
+        if let Some(vec) = new_vector {
+            self.wal.append(WalOp::VectorReplace { id, vec }).await?;
+            self.note_mutation();
+        }
+        Ok(true)
+    }
+
     /// Lookup a single memory by id. Used by tools/inspect paths;
     /// short-circuits the HNSW entirely.
     pub async fn get(&self, id: MemoryId) -> Result<Option<MemoryItem>> {
@@ -995,6 +1085,199 @@ mod tests {
             .unwrap();
         let returned_ids: std::collections::HashSet<_> = hits.iter().map(|h| h.item.id).collect();
         assert!(returned_ids.contains(&written[0]));
+    }
+
+    // ---------- Update tests ----------
+
+    #[tokio::test]
+    async fn update_unknown_id_returns_false() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let stranger = MemoryId::new();
+        let ok = s
+            .update(
+                stranger,
+                UpdatePatch {
+                    content: Some("hi".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!ok);
+    }
+
+    #[tokio::test]
+    async fn update_empty_patch_is_noop_but_returns_true() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let id = s
+            .remember("x", MemoryKind::Fact, vec![], "personal".into())
+            .await
+            .unwrap();
+        let pre = s.get(id).await.unwrap().unwrap();
+        let ok = s.update(id, UpdatePatch::default()).await.unwrap();
+        assert!(ok);
+        let post = s.get(id).await.unwrap().unwrap();
+        assert_eq!(pre, post);
+    }
+
+    #[tokio::test]
+    async fn update_metadata_only_skips_embedder() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let id = s
+            .remember(
+                "policy on PRs",
+                MemoryKind::Fact,
+                vec!["old-tag".into()],
+                "personal".into(),
+            )
+            .await
+            .unwrap();
+        let lsn_before = s.applied_lsn();
+
+        let ok = s
+            .update(
+                id,
+                UpdatePatch {
+                    kind: Some(MemoryKind::Decision),
+                    tags: Some(vec!["new-tag".into()]),
+                    scope: Some("work".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(ok);
+
+        let item = s.get(id).await.unwrap().unwrap();
+        assert_eq!(item.kind, MemoryKind::Decision);
+        assert_eq!(item.tags, vec!["new-tag".to_string()]);
+        assert_eq!(item.scope, "work");
+        assert_eq!(item.content, "policy on PRs", "content untouched");
+        assert_eq!(
+            s.applied_lsn(),
+            lsn_before,
+            "metadata-only update must NOT append to the semantic WAL"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_content_re_embeds_and_recall_finds_new_text() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let id = s
+            .remember(
+                "stale content alpha",
+                MemoryKind::Fact,
+                vec![],
+                "personal".into(),
+            )
+            .await
+            .unwrap();
+        let pre = s.get(id).await.unwrap().unwrap();
+
+        let ok = s
+            .update(
+                id,
+                UpdatePatch {
+                    content: Some("fresh content omega".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(ok);
+
+        let post = s.get(id).await.unwrap().unwrap();
+        assert_eq!(post.content, "fresh content omega");
+        assert_eq!(post.created_at, pre.created_at, "created_at preserved");
+        // Live count must NOT have grown — replace is in-place.
+        assert_eq!(s.len(), 1);
+
+        // Querying near the new text must surface this id at distance ~0.
+        let hits = s
+            .recall("fresh content omega", 5, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert!(hits.iter().any(|h| h.item.id == id));
+        let top = hits.iter().find(|h| h.item.id == id).unwrap();
+        assert!(top.score < 0.001, "self-distance ~0, got {}", top.score);
+        assert_eq!(top.item.content, "fresh content omega");
+    }
+
+    #[tokio::test]
+    async fn update_empty_content_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let id = s
+            .remember("hi", MemoryKind::Fact, vec![], "personal".into())
+            .await
+            .unwrap();
+        let err = s
+            .update(
+                id,
+                UpdatePatch {
+                    content: Some("   ".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MnemeError::Storage(_)));
+    }
+
+    #[tokio::test]
+    async fn update_survives_restart() {
+        let tmp = TempDir::new().unwrap();
+        let storage = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+
+        let id = {
+            let s = SemanticStore::open_disabled(
+                tmp.path(),
+                Arc::clone(&storage) as _,
+                Arc::clone(&embedder),
+            )
+            .unwrap();
+            let id = s
+                .remember(
+                    "original alpha",
+                    MemoryKind::Fact,
+                    vec![],
+                    "personal".into(),
+                )
+                .await
+                .unwrap();
+            s.update(
+                id,
+                UpdatePatch {
+                    content: Some("rewritten omega".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            id
+        };
+
+        // Reopen — replay should rebuild HNSW so recall finds the new
+        // text and not the original.
+        let s2 = SemanticStore::open_disabled(
+            tmp.path(),
+            Arc::clone(&storage) as _,
+            Arc::clone(&embedder),
+        )
+        .unwrap();
+        assert_eq!(s2.len(), 1);
+        let hits = s2
+            .recall("rewritten omega", 5, &RecallFilters::default())
+            .await
+            .unwrap();
+        let hit = hits.iter().find(|h| h.item.id == id).expect("post-update");
+        assert!(hit.score < 0.001, "post-replay self-distance ~0");
+        assert_eq!(hit.item.content, "rewritten omega");
     }
 
     // ---------- Snapshot scheduler tests ----------
