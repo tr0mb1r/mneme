@@ -285,6 +285,9 @@ mod tests {
                 Arc::clone(&semantic),
                 Arc::clone(&procedural),
                 Arc::clone(&episodic),
+                Arc::clone(&storage),
+                cold.clone(),
+                1,
             )),
             Arc::new(ResourceRegistry::defaults(
                 semantic,
@@ -362,9 +365,10 @@ mod tests {
         assert_eq!(out[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(out[0]["result"]["serverInfo"]["name"], SERVER_NAME);
         let tools = out[1]["result"]["tools"].as_array().unwrap();
-        // Phase 4 surface: forget, pin, recall, recall_recent,
-        // remember, summarize_session, unpin.
-        assert_eq!(tools.len(), 7);
+        // Phase 6 surface: 10 tools across L0/L3/L4 + diagnostics
+        // (export, forget, list_scopes, pin, recall, recall_recent,
+        // remember, stats, summarize_session, unpin).
+        assert_eq!(tools.len(), 10);
     }
 
     #[tokio::test]

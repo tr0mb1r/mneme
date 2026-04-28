@@ -16,12 +16,17 @@ use std::sync::Arc;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
+use crate::storage::Storage;
+use crate::storage::archive::ColdArchive;
 
+pub mod export;
 pub mod forget;
+pub mod list_scopes;
 pub mod pin;
 pub mod recall;
 pub mod recall_recent;
 pub mod remember;
+pub mod stats;
 pub mod summarize_session;
 pub mod unpin;
 
@@ -103,25 +108,49 @@ impl ToolRegistry {
 
     /// Build the v0.1 default registry. Backed by all three memory
     /// stores so every tool the agent can call against L0/L3/L4 is
-    /// wired up at once.
+    /// wired up at once. The Phase 6 diagnostic surface (`stats`,
+    /// `list_scopes`, `export`) takes the same handles plus the
+    /// underlying [`Storage`] (for `b"mem:"` prefix scans) and the
+    /// cold-tier [`ColdArchive`].
+    #[allow(clippy::too_many_arguments)]
     pub fn defaults(
         semantic: Arc<SemanticStore>,
         procedural: Arc<ProceduralStore>,
         episodic: Arc<EpisodicStore>,
+        storage: Arc<dyn Storage>,
+        cold: ColdArchive,
+        schema_version: u32,
     ) -> Self {
         let mut r = Self::new();
         // L4 — semantic memory.
         r.register(Arc::new(remember::Remember::new(Arc::clone(&semantic))));
         r.register(Arc::new(recall::Recall::new(Arc::clone(&semantic))));
-        r.register(Arc::new(forget::Forget::new(semantic)));
+        r.register(Arc::new(forget::Forget::new(Arc::clone(&semantic))));
         // L0 — procedural memory.
         r.register(Arc::new(pin::Pin::new(Arc::clone(&procedural))));
-        r.register(Arc::new(unpin::Unpin::new(procedural)));
+        r.register(Arc::new(unpin::Unpin::new(Arc::clone(&procedural))));
         // L3 — episodic memory.
         r.register(Arc::new(recall_recent::RecallRecent::new(Arc::clone(
             &episodic,
         ))));
-        r.register(Arc::new(summarize_session::SummarizeSession::new(episodic)));
+        r.register(Arc::new(summarize_session::SummarizeSession::new(
+            Arc::clone(&episodic),
+        )));
+        // Phase 6 diagnostics + portability.
+        r.register(Arc::new(stats::Stats::new(
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+            cold,
+            schema_version,
+        )));
+        r.register(Arc::new(list_scopes::ListScopes::new(
+            semantic,
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+            Arc::clone(&storage),
+        )));
+        r.register(Arc::new(export::Export::new(procedural, episodic, storage)));
         r
     }
 
@@ -168,24 +197,30 @@ mod tests {
         let semantic =
             SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
         let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
-        let episodic = Arc::new(EpisodicStore::new(backing));
-        (ToolRegistry::defaults(semantic, procedural, episodic), tmp)
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&backing)));
+        let cold = ColdArchive::new(tmp.path());
+        (
+            ToolRegistry::defaults(semantic, procedural, episodic, backing, cold, 1),
+            tmp,
+        )
     }
 
     #[test]
-    fn defaults_register_phase_4_tools() {
+    fn defaults_register_phase_6_tools() {
         let (r, _tmp) = fresh_registry();
         let names: Vec<_> = r.list().iter().map(|d| d.name).collect();
-        // BTreeMap ordering: forget, pin, recall, recall_recent,
-        // remember, summarize_session, unpin.
+        // BTreeMap ordering across L0/L3/L4 + Phase 6 diagnostics.
         assert_eq!(
             names,
             vec![
+                "export",
                 "forget",
+                "list_scopes",
                 "pin",
                 "recall",
                 "recall_recent",
                 "remember",
+                "stats",
                 "summarize_session",
                 "unpin",
             ]

@@ -174,6 +174,9 @@ async fn async_main(
             Arc::clone(&semantic),
             Arc::clone(&procedural),
             Arc::clone(&episodic),
+            Arc::clone(&storage),
+            cold.clone(),
+            schema_version,
         )),
         Arc::new(ResourceRegistry::defaults(
             semantic,

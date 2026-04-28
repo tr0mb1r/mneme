@@ -127,8 +127,8 @@ async fn full_mcp_handshake_and_tool_calls() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    // Phase 4 surface: 7 tools across L0/L3/L4.
-    assert_eq!(tool_names.len(), 7);
+    // Phase 6 surface: 10 tools across L0/L3/L4 + diagnostics.
+    assert_eq!(tool_names.len(), 10);
     for expected in [
         "remember",
         "recall",
@@ -137,6 +137,9 @@ async fn full_mcp_handshake_and_tool_calls() {
         "unpin",
         "recall_recent",
         "summarize_session",
+        "stats",
+        "list_scopes",
+        "export",
     ] {
         assert!(tool_names.contains(&expected), "missing tool {expected:?}");
     }
