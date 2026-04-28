@@ -23,6 +23,8 @@ use crate::mcp::resources::ResourceRegistry;
 use crate::mcp::server::Server;
 use crate::mcp::tools::ToolRegistry;
 use crate::mcp::transport::stdio::StdioTransport;
+use crate::memory::episodic::EpisodicStore;
+use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::{SemanticStore, SnapshotConfig};
 use crate::storage::Storage;
 use crate::storage::layout;
@@ -97,9 +99,16 @@ pub fn execute() -> Result<()> {
     let semantic = runtime.block_on(async {
         SemanticStore::open(&root, Arc::clone(&storage_dyn), embedder, snap_cfg)
     })?;
+    let procedural = Arc::new(ProceduralStore::open(&root)?);
+    let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage_dyn)));
 
     let result = runtime
-        .block_on(async_main(storage_dyn, Arc::clone(&semantic)))
+        .block_on(async_main(
+            storage_dyn,
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+        ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
 
     // Ask the scheduler to write a final snapshot before tearing
@@ -126,7 +135,12 @@ pub fn execute() -> Result<()> {
     result
 }
 
-async fn async_main(storage: Arc<dyn Storage>, semantic: Arc<SemanticStore>) -> anyhow::Result<()> {
+async fn async_main(
+    storage: Arc<dyn Storage>,
+    semantic: Arc<SemanticStore>,
+    procedural: Arc<ProceduralStore>,
+    episodic: Arc<EpisodicStore>,
+) -> anyhow::Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         protocol = crate::mcp::PROTOCOL_VERSION,
@@ -139,8 +153,12 @@ async fn async_main(storage: Arc<dyn Storage>, semantic: Arc<SemanticStore>) -> 
     let transport = StdioTransport::new(stdin, stdout);
     let mut server = Server::new(
         transport,
-        Arc::new(ToolRegistry::defaults(semantic)),
-        Arc::new(ResourceRegistry::defaults()),
+        Arc::new(ToolRegistry::defaults(
+            semantic,
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+        )),
+        Arc::new(ResourceRegistry::defaults(procedural, episodic)),
         storage,
     );
 

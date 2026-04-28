@@ -10,6 +10,11 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::memory::episodic::EpisodicStore;
+use crate::memory::procedural::ProceduralStore;
+
+pub mod procedural;
+pub mod recent;
 pub mod stats;
 
 #[derive(Debug, thiserror::Error)]
@@ -61,9 +66,17 @@ impl ResourceRegistry {
         Self::default()
     }
 
-    pub fn defaults() -> Self {
+    /// v0.1 default resource set. Phase 5 will add `mneme://context`
+    /// and `mneme://session/{id}` once the orchestrator + session
+    /// management land.
+    pub fn defaults(
+        procedural_store: Arc<ProceduralStore>,
+        episodic_store: Arc<EpisodicStore>,
+    ) -> Self {
         let mut r = Self::new();
         r.register(Arc::new(stats::Stats));
+        r.register(Arc::new(procedural::Procedural::new(procedural_store)));
+        r.register(Arc::new(recent::Recent::new(episodic_store)));
         r
     }
 
@@ -93,11 +106,26 @@ pub fn descriptor_to_json(d: &ResourceDescriptor) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Storage;
+    use crate::storage::memory_impl::MemoryStorage;
+    use tempfile::TempDir;
+
+    fn fresh_registry() -> (ResourceRegistry, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let pstore = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let estore = Arc::new(EpisodicStore::new(backing));
+        (ResourceRegistry::defaults(pstore, estore), tmp)
+    }
 
     #[test]
-    fn defaults_register_stats() {
-        let r = ResourceRegistry::defaults();
+    fn defaults_register_phase_4_resources() {
+        let (r, _tmp) = fresh_registry();
         let uris: Vec<_> = r.list().iter().map(|d| d.uri).collect();
-        assert_eq!(uris, vec!["mneme://stats"]);
+        // BTreeMap ordering: procedural, recent, stats.
+        assert_eq!(
+            uris,
+            vec!["mneme://procedural", "mneme://recent", "mneme://stats"]
+        );
     }
 }

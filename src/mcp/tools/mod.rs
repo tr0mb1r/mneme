@@ -13,11 +13,17 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::memory::episodic::EpisodicStore;
+use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
 
 pub mod forget;
+pub mod pin;
 pub mod recall;
+pub mod recall_recent;
 pub mod remember;
+pub mod summarize_session;
+pub mod unpin;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -95,14 +101,27 @@ impl ToolRegistry {
         Self::default()
     }
 
-    /// Build the v0.1 default registry: remember, recall, forget — all
-    /// backed by `store`. Phase 4 will add `pin`, `unpin`,
-    /// `recall_recent`, etc. on top of the same surface.
-    pub fn defaults(store: Arc<SemanticStore>) -> Self {
+    /// Build the v0.1 default registry. Backed by all three memory
+    /// stores so every tool the agent can call against L0/L3/L4 is
+    /// wired up at once.
+    pub fn defaults(
+        semantic: Arc<SemanticStore>,
+        procedural: Arc<ProceduralStore>,
+        episodic: Arc<EpisodicStore>,
+    ) -> Self {
         let mut r = Self::new();
-        r.register(Arc::new(remember::Remember::new(Arc::clone(&store))));
-        r.register(Arc::new(recall::Recall::new(Arc::clone(&store))));
-        r.register(Arc::new(forget::Forget::new(store)));
+        // L4 — semantic memory.
+        r.register(Arc::new(remember::Remember::new(Arc::clone(&semantic))));
+        r.register(Arc::new(recall::Recall::new(Arc::clone(&semantic))));
+        r.register(Arc::new(forget::Forget::new(semantic)));
+        // L0 — procedural memory.
+        r.register(Arc::new(pin::Pin::new(Arc::clone(&procedural))));
+        r.register(Arc::new(unpin::Unpin::new(procedural)));
+        // L3 — episodic memory.
+        r.register(Arc::new(recall_recent::RecallRecent::new(Arc::clone(
+            &episodic,
+        ))));
+        r.register(Arc::new(summarize_session::SummarizeSession::new(episodic)));
         r
     }
 
@@ -133,26 +152,44 @@ mod tests {
     use super::*;
     use crate::embed::Embedder;
     use crate::embed::stub::StubEmbedder;
+    use crate::storage::Storage;
     use crate::storage::memory_impl::MemoryStorage;
     use tempfile::TempDir;
 
-    /// Bootstraps a `SemanticStore` over `MemoryStorage` + the stub
-    /// embedder so tests of the registry plumbing don't need a model
-    /// download. The TempDir is returned to the caller because dropping
-    /// it would yank the WAL directory out from under the writer thread.
+    /// Bootstraps the three memory stores over `MemoryStorage` + the
+    /// stub embedder so tests of the registry plumbing don't need a
+    /// model download or a real redb file. The `TempDir` is returned
+    /// to the caller because dropping it would yank the WAL +
+    /// procedural files out from under the stores.
     fn fresh_registry() -> (ToolRegistry, TempDir) {
         let tmp = TempDir::new().unwrap();
-        let storage = MemoryStorage::new();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
-        let store = SemanticStore::open_disabled(tmp.path(), storage, embedder).unwrap();
-        (ToolRegistry::defaults(store), tmp)
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(backing));
+        (ToolRegistry::defaults(semantic, procedural, episodic), tmp)
     }
 
     #[test]
-    fn defaults_register_three_tools() {
+    fn defaults_register_phase_4_tools() {
         let (r, _tmp) = fresh_registry();
         let names: Vec<_> = r.list().iter().map(|d| d.name).collect();
-        assert_eq!(names, vec!["forget", "recall", "remember"]); // BTreeMap order
+        // BTreeMap ordering: forget, pin, recall, recall_recent,
+        // remember, summarize_session, unpin.
+        assert_eq!(
+            names,
+            vec![
+                "forget",
+                "pin",
+                "recall",
+                "recall_recent",
+                "remember",
+                "summarize_session",
+                "unpin",
+            ]
+        );
     }
 
     #[tokio::test]

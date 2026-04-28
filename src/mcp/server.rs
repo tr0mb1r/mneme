@@ -258,6 +258,8 @@ mod tests {
     async fn drive(input: &[u8]) -> Vec<Value> {
         use crate::embed::Embedder;
         use crate::embed::stub::StubEmbedder;
+        use crate::memory::episodic::EpisodicStore;
+        use crate::memory::procedural::ProceduralStore;
         use crate::memory::semantic::SemanticStore;
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -265,12 +267,18 @@ mod tests {
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
         let semantic =
             SemanticStore::open_disabled(tmp.path(), Arc::clone(&storage), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage)));
 
         let transport = StdioTransport::new(input, Vec::<u8>::new());
         let mut server = Server::new(
             transport,
-            Arc::new(ToolRegistry::defaults(semantic)),
-            Arc::new(ResourceRegistry::defaults()),
+            Arc::new(ToolRegistry::defaults(
+                semantic,
+                Arc::clone(&procedural),
+                Arc::clone(&episodic),
+            )),
+            Arc::new(ResourceRegistry::defaults(procedural, episodic)),
             storage,
         );
         server.run().await.unwrap();
@@ -338,7 +346,9 @@ mod tests {
         assert_eq!(out[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(out[0]["result"]["serverInfo"]["name"], SERVER_NAME);
         let tools = out[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 3);
+        // Phase 4 surface: forget, pin, recall, recall_recent,
+        // remember, summarize_session, unpin.
+        assert_eq!(tools.len(), 7);
     }
 
     #[tokio::test]
@@ -400,7 +410,8 @@ mod tests {
         let out = drive(input.as_bytes()).await;
         assert_eq!(out.len(), 3);
         let resources = out[1]["result"]["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 1);
+        // Phase 4 surface: mneme://procedural, mneme://recent, mneme://stats.
+        assert_eq!(resources.len(), 3);
         let contents = out[2]["result"]["contents"].as_array().unwrap();
         assert_eq!(contents[0]["mimeType"], "application/json");
         let body: Value = serde_json::from_str(contents[0]["text"].as_str().unwrap()).unwrap();

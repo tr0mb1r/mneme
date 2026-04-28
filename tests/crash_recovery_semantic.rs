@@ -169,11 +169,7 @@ impl McpClient {
             .expect("recall response should have text content");
         let arr: Vec<Value> = serde_json::from_str(text).expect("recall body parses as JSON");
         arr.into_iter()
-            .filter_map(|v| {
-                v["id"]
-                    .as_str()
-                    .and_then(|s| Ulid::from_string(s).ok())
-            })
+            .filter_map(|v| v["id"].as_str().and_then(|s| Ulid::from_string(s).ok()))
             .collect()
     }
 

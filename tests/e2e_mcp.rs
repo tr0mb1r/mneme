@@ -127,10 +127,19 @@ async fn full_mcp_handshake_and_tool_calls() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tool_names.len(), 3);
-    assert!(tool_names.contains(&"remember"));
-    assert!(tool_names.contains(&"recall"));
-    assert!(tool_names.contains(&"forget"));
+    // Phase 4 surface: 7 tools across L0/L3/L4.
+    assert_eq!(tool_names.len(), 7);
+    for expected in [
+        "remember",
+        "recall",
+        "forget",
+        "pin",
+        "unpin",
+        "recall_recent",
+        "summarize_session",
+    ] {
+        assert!(tool_names.contains(&expected), "missing tool {expected:?}");
+    }
     // Every tool has a description and inputSchema.
     for tool in tools["result"]["tools"].as_array().unwrap() {
         assert!(tool["description"].as_str().is_some());
@@ -201,8 +210,15 @@ async fn full_mcp_handshake_and_tool_calls() {
         .await;
     let rl = client.recv().await;
     let resources = rl["result"]["resources"].as_array().unwrap();
-    assert_eq!(resources.len(), 1);
-    assert_eq!(resources[0]["uri"], "mneme://stats");
+    // Phase 4 surface: procedural, recent, stats.
+    assert_eq!(resources.len(), 3);
+    let uris: Vec<&str> = resources
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap())
+        .collect();
+    for expected in ["mneme://stats", "mneme://procedural", "mneme://recent"] {
+        assert!(uris.contains(&expected), "missing resource {expected:?}");
+    }
 
     // 8. resources/read
     client
