@@ -11,6 +11,7 @@
 use crate::Result;
 use async_trait::async_trait;
 
+pub mod archive;
 pub mod layout;
 pub mod lockfile;
 pub mod memory_impl;

@@ -52,6 +52,11 @@ instant-distance = { version = "0.6", features = ["with-serde"] }
 sha2 = "0.10"
 
 notify = "6"
+# Phase 4 §4 cold-tier archive. Default features keep zstd-safe (no
+# panicking C panic_unwind shim) and avoid the experimental
+# multithread codec — the bundle sizes we expect (<10 MiB) compress
+# fine on a single thread.
+zstd = { version = "0.13", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

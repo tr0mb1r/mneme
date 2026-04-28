@@ -60,10 +60,16 @@ use crate::ids::EventId;
 use crate::storage::Storage;
 use crate::{MnemeError, Result};
 
-/// Key prefix in redb. Mirrors the `mem:` prefix used by
+/// Hot-tier key prefix in redb. Mirrors the `mem:` prefix used by
 /// [`crate::memory::semantic`] so a future GC sweep can disambiguate
 /// metadata records from episodic ones in a single `scan_prefix(b"")`.
-const EPI_KEY_PREFIX: &[u8] = b"epi:";
+pub const EPI_KEY_PREFIX: &[u8] = b"epi:";
+
+/// Warm-tier key prefix. Phase 4 §3 consolidation rekeys events
+/// from `epi:` to `wepi:` once they age past the hot window. Layered
+/// in the same redb so a single `Storage` handle can serve both
+/// tiers; reads merge results from both prefixes.
+pub const WARM_KEY_PREFIX: &[u8] = b"wepi:";
 
 /// Default `retrieval_weight` when the caller doesn't specify one.
 /// Equal-weight events sort purely by recency.
@@ -277,16 +283,75 @@ impl EpisodicStore {
         Ok(out)
     }
 
-    /// Hard-delete an event. Used by the consolidation task once it
-    /// has copied an event into a colder tier.
+    /// Hard-delete an event from the hot tier. Used by the
+    /// consolidation task once it has copied an event into a colder
+    /// tier.
     pub async fn delete(&self, id: EventId) -> Result<()> {
         self.storage.delete(&epi_key(&id)).await
+    }
+
+    /// Lookup an event in either the hot or warm tier. Returns `None`
+    /// if it's not in redb (callers can fall back to the cold archive
+    /// via `storage::archive::ColdArchive::find_anywhere`).
+    pub async fn find_warm_or_hot(&self, id: EventId) -> Result<Option<EpisodicEvent>> {
+        if let Some(e) = self.get(id).await? {
+            return Ok(Some(e));
+        }
+        let warm_key = warm_key(&id);
+        match self.storage.get(&warm_key).await? {
+            None => Ok(None),
+            Some(bytes) => Ok(Some(postcard::from_bytes(&bytes).map_err(|e| {
+                MnemeError::Storage(format!("decode warm EpisodicEvent {id}: {e}"))
+            })?)),
+        }
+    }
+
+    /// All events currently in the warm tier, sorted by `created_at`
+    /// ascending. Used by the consolidation task to evaluate
+    /// warm→cold migrations.
+    pub async fn list_warm(&self) -> Result<Vec<EpisodicEvent>> {
+        let raw = self.storage.scan_prefix(WARM_KEY_PREFIX).await?;
+        let mut out: Vec<EpisodicEvent> = Vec::with_capacity(raw.len());
+        for (_k, v) in raw {
+            let event: EpisodicEvent = postcard::from_bytes(&v)
+                .map_err(|e| MnemeError::Storage(format!("decode warm EpisodicEvent: {e}")))?;
+            out.push(event);
+        }
+        out.sort_by_key(|e| e.created_at);
+        Ok(out)
+    }
+
+    /// Move an event from hot → warm. Idempotent on re-run.
+    pub async fn promote_to_warm(&self, id: EventId) -> Result<bool> {
+        let hot_key = epi_key(&id);
+        let Some(bytes) = self.storage.get(&hot_key).await? else {
+            return Ok(false);
+        };
+        // Write under the new prefix BEFORE deleting the old — if we
+        // crash between, replay leaves the row in both tiers, which
+        // re-running consolidation cleans up.
+        self.storage.put(&warm_key(&id), &bytes).await?;
+        self.storage.delete(&hot_key).await?;
+        Ok(true)
+    }
+
+    /// Drop a warm-tier row by id. Used by consolidation after the
+    /// row has been folded into the cold archive.
+    pub async fn delete_warm(&self, id: EventId) -> Result<()> {
+        self.storage.delete(&warm_key(&id)).await
     }
 }
 
 fn epi_key(id: &EventId) -> Vec<u8> {
     let mut k = Vec::with_capacity(EPI_KEY_PREFIX.len() + 16);
     k.extend_from_slice(EPI_KEY_PREFIX);
+    k.extend_from_slice(&id.0.to_bytes());
+    k
+}
+
+fn warm_key(id: &EventId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(WARM_KEY_PREFIX.len() + 16);
+    k.extend_from_slice(WARM_KEY_PREFIX);
     k.extend_from_slice(&id.0.to_bytes());
     k
 }
