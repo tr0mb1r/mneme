@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
+use crate::orchestrator::{Orchestrator, TokenBudget};
 
+pub mod context;
 pub mod procedural;
 pub mod recent;
 pub mod stats;
@@ -66,17 +68,20 @@ impl ResourceRegistry {
         Self::default()
     }
 
-    /// v0.1 default resource set. Phase 5 will add `mneme://context`
-    /// and `mneme://session/{id}` once the orchestrator + session
-    /// management land.
+    /// v0.1 default resource set. `mneme://session/{id}` is still
+    /// deferred — sessions live in `memory::working` but their
+    /// per-id resource surface is not wired yet.
     pub fn defaults(
         procedural_store: Arc<ProceduralStore>,
         episodic_store: Arc<EpisodicStore>,
+        orchestrator: Arc<Orchestrator>,
+        budget: TokenBudget,
     ) -> Self {
         let mut r = Self::new();
         r.register(Arc::new(stats::Stats));
         r.register(Arc::new(procedural::Procedural::new(procedural_store)));
         r.register(Arc::new(recent::Recent::new(episodic_store)));
+        r.register(Arc::new(context::Context::new(orchestrator, budget)));
         r
     }
 
@@ -111,21 +116,40 @@ mod tests {
     use tempfile::TempDir;
 
     fn fresh_registry() -> (ResourceRegistry, TempDir) {
+        use crate::embed::Embedder;
+        use crate::embed::stub::StubEmbedder;
+        use crate::memory::semantic::SemanticStore;
         let tmp = TempDir::new().unwrap();
         let backing: Arc<dyn Storage> = MemoryStorage::new();
         let pstore = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
-        let estore = Arc::new(EpisodicStore::new(backing));
-        (ResourceRegistry::defaults(pstore, estore), tmp)
+        let estore = Arc::new(EpisodicStore::new(Arc::clone(&backing)));
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let orch = Arc::new(Orchestrator::new(
+            semantic,
+            Arc::clone(&pstore),
+            Arc::clone(&estore),
+        ));
+        (
+            ResourceRegistry::defaults(pstore, estore, orch, TokenBudget::for_tests(2000)),
+            tmp,
+        )
     }
 
     #[test]
-    fn defaults_register_phase_4_resources() {
+    fn defaults_register_phase_5_resources() {
         let (r, _tmp) = fresh_registry();
         let uris: Vec<_> = r.list().iter().map(|d| d.uri).collect();
-        // BTreeMap ordering: procedural, recent, stats.
+        // BTreeMap ordering.
         assert_eq!(
             uris,
-            vec!["mneme://procedural", "mneme://recent", "mneme://stats"]
+            vec![
+                "mneme://context",
+                "mneme://procedural",
+                "mneme://recent",
+                "mneme://stats",
+            ]
         );
     }
 }

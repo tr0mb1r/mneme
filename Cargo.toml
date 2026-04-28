@@ -96,6 +96,11 @@ name = "cold_start"
 path = "benches/cold_start.rs"
 harness = false
 
+[[bench]]
+name = "auto_context"
+path = "benches/auto_context.rs"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

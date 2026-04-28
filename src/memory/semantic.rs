@@ -157,7 +157,7 @@ pub struct MemoryItem {
 }
 
 /// One result row from [`SemanticStore::recall`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RecallHit {
     pub item: MemoryItem,
     /// Cosine distance under the embedder's L2-normalized output:

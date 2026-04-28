@@ -210,13 +210,18 @@ async fn full_mcp_handshake_and_tool_calls() {
         .await;
     let rl = client.recv().await;
     let resources = rl["result"]["resources"].as_array().unwrap();
-    // Phase 4 surface: procedural, recent, stats.
-    assert_eq!(resources.len(), 3);
+    // Phase 5 surface: context, procedural, recent, stats.
+    assert_eq!(resources.len(), 4);
     let uris: Vec<&str> = resources
         .iter()
         .map(|r| r["uri"].as_str().unwrap())
         .collect();
-    for expected in ["mneme://stats", "mneme://procedural", "mneme://recent"] {
+    for expected in [
+        "mneme://stats",
+        "mneme://procedural",
+        "mneme://recent",
+        "mneme://context",
+    ] {
         assert!(uris.contains(&expected), "missing resource {expected:?}");
     }
 

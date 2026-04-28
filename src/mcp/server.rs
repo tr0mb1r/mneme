@@ -261,6 +261,7 @@ mod tests {
         use crate::memory::episodic::EpisodicStore;
         use crate::memory::procedural::ProceduralStore;
         use crate::memory::semantic::SemanticStore;
+        use crate::orchestrator::{Orchestrator, TokenBudget};
 
         let tmp = tempfile::TempDir::new().unwrap();
         let storage: Arc<dyn Storage> = crate::storage::memory_impl::MemoryStorage::new();
@@ -269,6 +270,11 @@ mod tests {
             SemanticStore::open_disabled(tmp.path(), Arc::clone(&storage), embedder).unwrap();
         let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
         let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage)));
+        let orchestrator = Arc::new(Orchestrator::new(
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+        ));
 
         let transport = StdioTransport::new(input, Vec::<u8>::new());
         let mut server = Server::new(
@@ -278,7 +284,12 @@ mod tests {
                 Arc::clone(&procedural),
                 Arc::clone(&episodic),
             )),
-            Arc::new(ResourceRegistry::defaults(procedural, episodic)),
+            Arc::new(ResourceRegistry::defaults(
+                procedural,
+                episodic,
+                orchestrator,
+                TokenBudget::for_tests(2000),
+            )),
             storage,
         );
         server.run().await.unwrap();
@@ -410,8 +421,8 @@ mod tests {
         let out = drive(input.as_bytes()).await;
         assert_eq!(out.len(), 3);
         let resources = out[1]["result"]["resources"].as_array().unwrap();
-        // Phase 4 surface: mneme://procedural, mneme://recent, mneme://stats.
-        assert_eq!(resources.len(), 3);
+        // Phase 5 surface: context, procedural, recent, stats.
+        assert_eq!(resources.len(), 4);
         let contents = out[2]["result"]["contents"].as_array().unwrap();
         assert_eq!(contents[0]["mimeType"], "application/json");
         let body: Value = serde_json::from_str(contents[0]["text"].as_str().unwrap()).unwrap();

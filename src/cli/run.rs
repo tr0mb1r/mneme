@@ -26,6 +26,7 @@ use crate::mcp::transport::stdio::StdioTransport;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::{SemanticStore, SnapshotConfig};
+use crate::orchestrator::{Orchestrator, TokenBudget};
 use crate::storage::Storage;
 use crate::storage::layout;
 use crate::storage::lockfile::LockGuard;
@@ -101,6 +102,12 @@ pub fn execute() -> Result<()> {
     })?;
     let procedural = Arc::new(ProceduralStore::open(&root)?);
     let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage_dyn)));
+    let orchestrator = Arc::new(Orchestrator::new(
+        Arc::clone(&semantic),
+        Arc::clone(&procedural),
+        Arc::clone(&episodic),
+    ));
+    let auto_context_budget = TokenBudget::from_config(&config.budgets);
 
     let result = runtime
         .block_on(async_main(
@@ -108,6 +115,8 @@ pub fn execute() -> Result<()> {
             Arc::clone(&semantic),
             Arc::clone(&procedural),
             Arc::clone(&episodic),
+            Arc::clone(&orchestrator),
+            auto_context_budget,
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
 
@@ -135,11 +144,14 @@ pub fn execute() -> Result<()> {
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn async_main(
     storage: Arc<dyn Storage>,
     semantic: Arc<SemanticStore>,
     procedural: Arc<ProceduralStore>,
     episodic: Arc<EpisodicStore>,
+    orchestrator: Arc<Orchestrator>,
+    auto_context_budget: TokenBudget,
 ) -> anyhow::Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -158,7 +170,12 @@ async fn async_main(
             Arc::clone(&procedural),
             Arc::clone(&episodic),
         )),
-        Arc::new(ResourceRegistry::defaults(procedural, episodic)),
+        Arc::new(ResourceRegistry::defaults(
+            procedural,
+            episodic,
+            orchestrator,
+            auto_context_budget,
+        )),
         storage,
     );
 
