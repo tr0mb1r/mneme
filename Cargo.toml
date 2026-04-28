@@ -51,6 +51,8 @@ hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustl
 instant-distance = { version = "0.6", features = ["with-serde"] }
 sha2 = "0.10"
 
+notify = "6"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
