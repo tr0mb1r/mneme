@@ -19,6 +19,19 @@ use flate2::write::GzEncoder;
 use crate::storage::layout;
 use crate::{MnemeError, Result};
 
+/// `walk_dir` classifies each entry so [`backup_at`] picks the right
+/// tar emitter. `Symlink` is split out from `File` because
+/// [`File::open`] would follow the link — a symlink-to-directory then
+/// returns `EISDIR` and crashes the backup. The symlink branch goes
+/// through `append_path_with_name`, which under `follow_symlinks(false)`
+/// emits a tar link entry without ever opening the target.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum EntryKind {
+    Dir,
+    File,
+    Symlink,
+}
+
 /// Subdirectories deliberately excluded from backups. `models/` is
 /// large and re-fetchable from upstream; `logs/` is operational
 /// chatter, not user data.
@@ -62,11 +75,18 @@ pub fn backup_at(root: &Path, output: &Path, include_models: bool) -> Result<()>
         if !include_models && is_excluded(rel) {
             continue;
         }
-        if entry.is_dir {
-            tar.append_dir(rel, &abs)?;
-        } else {
-            let mut f = File::open(&abs)?;
-            tar.append_file(rel, &mut f)?;
+        match entry.kind {
+            EntryKind::Dir => tar.append_dir(rel, &abs)?,
+            EntryKind::File => {
+                let mut f = File::open(&abs)?;
+                tar.append_file(rel, &mut f)?;
+            }
+            // Symlinks: read the target via metadata-aware path
+            // append. Under `follow_symlinks(false)` the tar crate
+            // writes a link entry pointing at the original target —
+            // it never opens the target itself, so a symlinked
+            // directory no longer triggers EISDIR.
+            EntryKind::Symlink => tar.append_path_with_name(&abs, rel)?,
         }
         included += 1;
     }
@@ -104,11 +124,14 @@ fn is_excluded(rel: &Path) -> bool {
 
 struct Entry {
     path: PathBuf,
-    is_dir: bool,
+    kind: EntryKind,
 }
 
 /// Depth-first walk. Returns directories before their contents so
-/// `tar.append_dir` lands at the right spot.
+/// `tar.append_dir` lands at the right spot. Symlinks are emitted as
+/// `EntryKind::Symlink` and never followed, even when they point at
+/// directories — that's how a `models -> ~/.mneme/models` link gets
+/// preserved without recursing into the target tree.
 fn walk_dir(root: &Path) -> Result<Vec<Entry>> {
     let mut out: Vec<Entry> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -118,7 +141,7 @@ fn walk_dir(root: &Path) -> Result<Vec<Entry>> {
         if dir != root {
             out.push(Entry {
                 path: dir.clone(),
-                is_dir: true,
+                kind: EntryKind::Dir,
             });
         }
         let mut children: Vec<PathBuf> = std::fs::read_dir(&dir)?
@@ -129,13 +152,25 @@ fn walk_dir(root: &Path) -> Result<Vec<Entry>> {
         children.sort();
         for child in children {
             let meta = std::fs::symlink_metadata(&child)?;
-            if meta.file_type().is_dir() {
-                stack.push(child);
-            } else {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                // Don't recurse: symlinks are stored as-is.
                 out.push(Entry {
                     path: child,
-                    is_dir: false,
+                    kind: EntryKind::Symlink,
                 });
+            } else if ft.is_dir() {
+                stack.push(child);
+            } else if ft.is_file() {
+                out.push(Entry {
+                    path: child,
+                    kind: EntryKind::File,
+                });
+            } else {
+                tracing::warn!(
+                    path = %child.display(),
+                    "skipping unsupported file type during backup walk"
+                );
             }
         }
     }
@@ -230,6 +265,96 @@ mod tests {
         }
         // The output archive should not exist (or be empty).
         assert!(!archive.exists() || std::fs::metadata(&archive).unwrap().len() == 0);
+    }
+
+    #[test]
+    fn backup_with_symlinked_subdir_does_not_eisdir() {
+        // Regression for the EISDIR bug surfaced by the manual test
+        // script's --reuse-models path: walk_dir used to flag a
+        // symlink-to-dir as is_dir=false, then File::open followed
+        // the link and hit EISDIR. The fix routes symlinks through
+        // tar::Builder::append_path_with_name so they're stored as
+        // tar link entries.
+        let tmp_root = TempDir::new().unwrap();
+        let root = tmp_root.path().join("mneme");
+        write(&root.join("config.toml"), "x = 1");
+
+        // Create a real dir and a symlink-to-dir inside the root.
+        let target_dir = tmp_root.path().join("real-models");
+        std::fs::create_dir_all(target_dir.join("subdir")).unwrap();
+        std::fs::write(target_dir.join("weight.bin"), b"data").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target_dir, root.join("models")).unwrap();
+        #[cfg(windows)]
+        {
+            // Windows symlinks need elevated perms; skip on that
+            // platform until we can rely on developer-mode being on.
+            return;
+        }
+
+        let out = TempDir::new().unwrap();
+        let archive = out.path().join("backup.tar.gz");
+
+        // --include-models is the case where this used to blow up.
+        backup_at(&root, &archive, true).expect("backup must not EISDIR on symlinked subdir");
+
+        // Confirm the archive holds a Symlink entry for `models` and
+        // does NOT inline the target tree (no `models/weight.bin`).
+        let f = std::fs::File::open(&archive).unwrap();
+        let gz = flate2::read::GzDecoder::new(f);
+        let mut tar = tar::Archive::new(gz);
+        let mut saw_symlink = false;
+        let mut saw_inlined_target = false;
+        for entry in tar.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().display().to_string();
+            if (path == "models" || path.trim_end_matches('/') == "models")
+                && entry.header().entry_type().is_symlink()
+            {
+                saw_symlink = true;
+            }
+            if path.starts_with("models/") {
+                saw_inlined_target = true;
+            }
+        }
+        assert!(saw_symlink, "models must appear as a Symlink tar entry");
+        assert!(
+            !saw_inlined_target,
+            "symlink target tree must not be inlined into the archive"
+        );
+    }
+
+    #[test]
+    fn backup_then_restore_preserves_symlink() {
+        let tmp_root = TempDir::new().unwrap();
+        let root = tmp_root.path().join("mneme");
+        write(&root.join("config.toml"), "x = 1");
+        let target_dir = tmp_root.path().join("link-target");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("contents.bin"), b"hi").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target_dir, root.join("models")).unwrap();
+        #[cfg(windows)]
+        {
+            return;
+        }
+
+        let archive_dir = TempDir::new().unwrap();
+        let archive = archive_dir.path().join("snap.tar.gz");
+        backup_at(&root, &archive, true).unwrap();
+
+        // Restore into a fresh root and confirm `models` came back
+        // as a symlink (not as a copied directory).
+        let restored_root = tmp_root.path().join("restored");
+        std::fs::create_dir_all(&restored_root).unwrap();
+        crate::cli::restore::restore_at(&archive, &restored_root, false).unwrap();
+        let restored_models = restored_root.join("models");
+        let meta = std::fs::symlink_metadata(&restored_models).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "restored models must still be a symlink, got {:?}",
+            meta.file_type()
+        );
     }
 
     #[test]
