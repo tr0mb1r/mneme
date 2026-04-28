@@ -29,6 +29,7 @@ pub mod remember;
 pub mod stats;
 pub mod summarize_session;
 pub mod unpin;
+pub mod update;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -126,6 +127,7 @@ impl ToolRegistry {
         r.register(Arc::new(remember::Remember::new(Arc::clone(&semantic))));
         r.register(Arc::new(recall::Recall::new(Arc::clone(&semantic))));
         r.register(Arc::new(forget::Forget::new(Arc::clone(&semantic))));
+        r.register(Arc::new(update::Update::new(Arc::clone(&semantic))));
         // L0 — procedural memory.
         r.register(Arc::new(pin::Pin::new(Arc::clone(&procedural))));
         r.register(Arc::new(unpin::Unpin::new(Arc::clone(&procedural))));
@@ -223,6 +225,7 @@ mod tests {
                 "stats",
                 "summarize_session",
                 "unpin",
+                "update",
             ]
         );
     }

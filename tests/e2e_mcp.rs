@@ -127,12 +127,13 @@ async fn full_mcp_handshake_and_tool_calls() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    // Phase 6 surface: 10 tools across L0/L3/L4 + diagnostics.
-    assert_eq!(tool_names.len(), 10);
+    // Phase 6 surface: 11 tools across L0/L3/L4 + diagnostics.
+    assert_eq!(tool_names.len(), 11);
     for expected in [
         "remember",
         "recall",
         "forget",
+        "update",
         "pin",
         "unpin",
         "recall_recent",
