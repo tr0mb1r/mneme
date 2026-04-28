@@ -76,6 +76,10 @@ pub enum WalOp {
     VectorInsert { id: MemoryId, vec: Vec<f32> },
     /// Phase 3 §6 — soft-delete `id` from the HNSW.
     VectorDelete { id: MemoryId },
+    /// Phase 6 §11 — atomic re-vector for an existing `id` after the
+    /// `update` tool re-embeds new content. Distinct from a `Delete`
+    /// + `Insert` pair so the index can keep a single live row per id.
+    VectorReplace { id: MemoryId, vec: Vec<f32> },
 }
 
 /// A record yielded by [`replay`].

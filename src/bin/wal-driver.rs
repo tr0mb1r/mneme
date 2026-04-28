@@ -63,7 +63,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // The driver only exercises the redb-WAL surface; ignore
             // vector ops if they ever land here so the harness stays
             // forward-compatible with mixed WALs.
-            WalOp::VectorInsert { .. } | WalOp::VectorDelete { .. } => {}
+            WalOp::VectorInsert { .. }
+            | WalOp::VectorDelete { .. }
+            | WalOp::VectorReplace { .. } => {}
         }
     }
 

@@ -207,7 +207,9 @@ fn apply_batch_to_redb(db: &Database, records: &[ReplayRecord]) -> Result<()> {
                 // Encountering one here means a misconfigured caller is
                 // routing through the wrong WalWriter — log and skip rather
                 // than corrupt the redb table.
-                WalOp::VectorInsert { .. } | WalOp::VectorDelete { .. } => {
+                WalOp::VectorInsert { .. }
+                | WalOp::VectorDelete { .. }
+                | WalOp::VectorReplace { .. } => {
                     tracing::error!(
                         lsn = rec.lsn,
                         "vector WalOp routed to redb applier; skipping"

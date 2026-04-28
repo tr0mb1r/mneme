@@ -50,7 +50,9 @@ fn apply_to_oracle(ops: &[WalOp], oracle: &mut BTreeMap<Vec<u8>, Vec<u8>>) {
             }
             // arb_walop only generates Put/Delete; vector variants are
             // exercised in src/index/delta.rs tests, not here.
-            WalOp::VectorInsert { .. } | WalOp::VectorDelete { .. } => {}
+            WalOp::VectorInsert { .. }
+            | WalOp::VectorDelete { .. }
+            | WalOp::VectorReplace { .. } => {}
         }
     }
 }
@@ -236,7 +238,9 @@ fn oracle_matches_replay() {
                 replayed.remove(&key);
             }
             // arb_walop never produces these; safe to ignore.
-            WalOp::VectorInsert { .. } | WalOp::VectorDelete { .. } => {}
+            WalOp::VectorInsert { .. }
+            | WalOp::VectorDelete { .. }
+            | WalOp::VectorReplace { .. } => {}
         }
     }
     assert_eq!(replayed, oracle);

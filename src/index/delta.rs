@@ -103,6 +103,7 @@ fn apply_one(index: &mut HnswIndex, op: &WalOp) -> Result<()> {
     match op {
         WalOp::VectorInsert { id, vec } => index.insert(*id, vec),
         WalOp::VectorDelete { id } => index.delete(*id),
+        WalOp::VectorReplace { id, vec } => index.replace(*id, vec),
         WalOp::Put { .. } | WalOp::Delete { .. } => {
             // Surface clearly: a redb-WAL record landed in the
             // semantic-index WAL, which means a misconfigured
@@ -149,6 +150,16 @@ mod tests {
             op: WalOp::VectorDelete { id },
         }
     }
+    fn rep(id: MemoryId, seed: f32, lsn: u64) -> ReplayRecord {
+        ReplayRecord {
+            lsn,
+            tx_id: lsn,
+            op: WalOp::VectorReplace {
+                id,
+                vec: vec_for(seed),
+            },
+        }
+    }
 
     fn fresh_applier() -> (Arc<RwLock<HnswIndex>>, Arc<AtomicU64>, HnswApplier) {
         let idx = Arc::new(RwLock::new(HnswIndex::new(4)));
@@ -167,6 +178,18 @@ mod tests {
         assert_eq!(idx.read().unwrap().len(), 2);
         applier.apply_batch(&[del(id, 3)]).unwrap();
         assert_eq!(idx.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn applier_routes_vector_replace_to_index() {
+        let (idx, _lsn, mut applier) = fresh_applier();
+        let id = MemoryId::new();
+        applier.apply_batch(&[ins(id, 1.0, 1)]).unwrap();
+        applier.apply_batch(&[rep(id, 50.0, 2)]).unwrap();
+        assert_eq!(idx.read().unwrap().len(), 1);
+        let hits = idx.read().unwrap().search(&vec_for(50.0), 1).unwrap();
+        assert_eq!(hits[0].0, id);
+        assert!(hits[0].1 < 0.001);
     }
 
     #[test]

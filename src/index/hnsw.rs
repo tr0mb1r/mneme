@@ -10,8 +10,10 @@
 //!
 //! * **Pending buffer** — vectors added since the last rebuild. Search
 //!   brute-forces these in addition to the HNSW.
-//! * **Tombstone set** — IDs deleted since the last rebuild. Search
-//!   filters these out of the HNSW's results.
+//! * **Tombstone set** — IDs whose **committed** entry should be hidden
+//!   from search until the next rebuild. Pending entries are removed
+//!   in-place by [`HnswIndex::delete`] / [`HnswIndex::replace`] so the
+//!   tombstone set never has to worry about them.
 //!
 //! [`HnswIndex::rebuild_snapshot`] consolidates: it drops tombstoned
 //! entries, builds a fresh `HnswMap` from what remains, and clears
@@ -82,8 +84,10 @@ pub struct HnswIndex {
     /// How many `corpus` entries the committed HNSW knows about.
     committed_len: usize,
 
-    /// IDs deleted since the last rebuild. Search filters them out;
-    /// `rebuild_snapshot` drops them from `corpus`.
+    /// IDs whose **committed** entry should be hidden from search.
+    /// Pending entries are removed in-place by `delete`/`replace`, so
+    /// this set only ever masks rows that live inside `committed`.
+    /// `rebuild_snapshot` drops the masked rows from `corpus`.
     tombstones: HashSet<MemoryId>,
 
     /// `None` until the first [`rebuild_snapshot`] call. While `None`,
@@ -146,11 +150,79 @@ impl HnswIndex {
         Ok(())
     }
 
-    /// Soft-delete. The vector stays in `corpus` until the next
-    /// rebuild; until then, search filters it out.
+    /// Delete a memory by id.
+    ///
+    /// If the id lives in the pending buffer, it's removed in place —
+    /// pending entries are always live, never tombstoned. Otherwise we
+    /// add the id to `tombstones` so search hides any committed entry
+    /// until the next [`rebuild_snapshot`] drops it.
+    ///
+    /// O(pending_size) — bounded by the snapshot interval (§8.2).
     pub fn delete(&mut self, id: MemoryId) -> Result<()> {
+        if self.remove_from_pending(id) {
+            // Found and removed from the pending buffer; committed is
+            // guaranteed not to also hold this id under the fresh-ULID
+            // discipline of `memory::semantic`.
+            return Ok(());
+        }
         self.tombstones.insert(id);
         Ok(())
+    }
+
+    /// Atomic re-vector for an existing id (Phase 6 `update` tool).
+    ///
+    /// Used when the caller has updated a memory's `content` and the
+    /// embedding must change. Distinct from `delete` + `insert`: that
+    /// pair leaves both vectors live in `corpus` and lets search dedup
+    /// pick the closer one, which is incorrect if the new content has
+    /// drifted away from the old query.
+    ///
+    /// Semantics:
+    /// 1. If `id` exists in the pending buffer, swap-remove the old
+    ///    pending entry (we have a fresh vector for it).
+    /// 2. Otherwise, mark the committed entry tombstoned so search
+    ///    hides it until the next rebuild.
+    /// 3. Push `(id, vec)` to the pending buffer; the new vector is
+    ///    immediately searchable.
+    ///
+    /// Caller is responsible for ensuring `id` exists at the storage
+    /// layer (else this acts as a tombstoning insert and `len()`
+    /// accounting will be off by one until the next rebuild).
+    pub fn replace(&mut self, id: MemoryId, vec: &[f32]) -> Result<()> {
+        if vec.len() != self.dim {
+            return Err(MnemeError::Index(format!(
+                "vector dim {} does not match index dim {}",
+                vec.len(),
+                self.dim
+            )));
+        }
+        let was_in_pending = self.remove_from_pending(id);
+        if !was_in_pending {
+            // Hide the committed entry (if any) until rebuild collapses
+            // the new pending row into a clean committed HnswMap.
+            self.tombstones.insert(id);
+        }
+        self.corpus.push((id, vec.to_vec()));
+        Ok(())
+    }
+
+    /// Remove every pending entry whose id matches `id`. Returns
+    /// whether any was removed. Pending duplicates shouldn't happen
+    /// under normal flow but the loop is defensive against replay
+    /// quirks.
+    fn remove_from_pending(&mut self, id: MemoryId) -> bool {
+        let mut removed = false;
+        let mut i = self.committed_len;
+        while i < self.corpus.len() {
+            if self.corpus[i].0 == id {
+                self.corpus.swap_remove(i);
+                removed = true;
+                // Don't increment i — what was at the end is now at i.
+            } else {
+                i += 1;
+            }
+        }
+        removed
     }
 
     /// Top-k cosine-nearest neighbours.
@@ -186,11 +258,10 @@ impl HnswIndex {
             }
         }
 
-        // Brute-force the pending tail.
+        // Brute-force the pending tail. Pending entries are always
+        // live — `delete`/`replace` clean them in place — so we don't
+        // consult `tombstones` here.
         for (id, vec) in self.corpus[self.committed_len..].iter() {
-            if self.tombstones.contains(id) {
-                continue;
-            }
             // distance() takes &Self, so wrap once and reuse.
             let d = q.distance(&VectorPoint(vec.clone()));
             hits.push((*id, d));
@@ -206,19 +277,27 @@ impl HnswIndex {
         Ok(hits)
     }
 
-    /// Rebuild the HNSW from the live (non-tombstoned) corpus and
-    /// reset both side-tables. Called by the snapshot scheduler in §6.
+    /// Rebuild the HNSW from the live corpus and reset both side-tables.
+    /// Called by the snapshot scheduler in §6.
+    ///
+    /// Tombstones only mask **committed** rows: an entry from the
+    /// pending range with the same id as a tombstoned committed entry
+    /// is the live successor (e.g., from `replace`) and must survive
+    /// the rebuild. We split the filter accordingly.
     ///
     /// Cost is roughly O(N · log N · ef_construction); for 100 K
     /// vectors at ef=200 this is a few hundred milliseconds on a
     /// laptop — acceptable as a periodic background task.
     pub fn rebuild_snapshot(&mut self) -> Result<()> {
-        let live: Vec<(MemoryId, Vec<f32>)> = self
-            .corpus
-            .iter()
-            .filter(|(id, _)| !self.tombstones.contains(id))
-            .cloned()
-            .collect();
+        let mut live: Vec<(MemoryId, Vec<f32>)> = Vec::with_capacity(self.corpus.len());
+        for (i, (id, vec)) in self.corpus.iter().enumerate() {
+            if i < self.committed_len && self.tombstones.contains(id) {
+                continue;
+            }
+            live.push((*id, vec.clone()));
+        }
+        // Help the borrow checker; we no longer need the original.
+        let _ = ();
 
         if live.is_empty() {
             self.corpus.clear();
@@ -361,6 +440,105 @@ mod tests {
         idx.insert(id, &vec_for(2.0)).unwrap();
         let hits = idx.search(&vec_for(2.0), 5).unwrap();
         assert!(hits.iter().any(|(hid, _)| *hid == id));
+    }
+
+    #[test]
+    fn replace_swaps_pending_vector_in_place() {
+        let mut idx = HnswIndex::new(4);
+        let id = MemoryId::new();
+        idx.insert(id, &vec_for(1.0)).unwrap();
+        // Same id, very different vector — replace should make the new
+        // one the only result for queries near the new vector.
+        idx.replace(id, &vec_for(50.0)).unwrap();
+        assert_eq!(idx.len(), 1, "len unchanged after pending replace");
+
+        let near_new = idx.search(&vec_for(50.0), 5).unwrap();
+        assert_eq!(near_new.len(), 1);
+        assert_eq!(near_new[0].0, id);
+        assert!(
+            near_new[0].1 < 0.001,
+            "post-replace vector should self-match"
+        );
+
+        // The old pending vector must NOT be returned. id may still
+        // surface (only one live row remains) but its distance from
+        // the original query reflects the NEW vector, not 0.
+        let near_old = idx.search(&vec_for(1.0), 5).unwrap();
+        if let Some(hit) = near_old.iter().find(|(hid, _)| *hid == id) {
+            assert!(
+                hit.1 > 0.05,
+                "old pending vector must be gone, got distance {}",
+                hit.1
+            );
+        }
+    }
+
+    #[test]
+    fn replace_masks_committed_with_new_pending() {
+        let mut idx = HnswIndex::new(4);
+        let target = MemoryId::new();
+        idx.insert(target, &vec_for(3.0)).unwrap();
+        for s in 0..20 {
+            idx.insert(MemoryId::new(), &vec_for(s as f32 + 100.0))
+                .unwrap();
+        }
+        idx.rebuild_snapshot().unwrap();
+        let pre = idx.len();
+
+        idx.replace(target, &vec_for(50.0)).unwrap();
+        assert_eq!(
+            idx.len(),
+            pre,
+            "len unchanged: replace masks one committed, adds one pending"
+        );
+
+        // Query near the new vector — should hit target with distance ~0.
+        let hits = idx.search(&vec_for(50.0), 3).unwrap();
+        let target_hit = hits.iter().find(|(id, _)| *id == target).expect("target");
+        assert!(
+            target_hit.1 < 0.001,
+            "post-replace self-distance, got {}",
+            target_hit.1
+        );
+
+        // Query near the OLD vector — target may still appear (the new
+        // pending vector is the only live row for `target`), but it
+        // must NOT surface at distance ~0 (which would mean the
+        // tombstoned committed `vec_for(3.0)` was returned).
+        let hits_old = idx.search(&vec_for(3.0), 5).unwrap();
+        if let Some(hit) = hits_old.iter().find(|(id, _)| *id == target) {
+            assert!(
+                hit.1 > 0.05,
+                "old committed vector must be hidden; saw distance {}",
+                hit.1
+            );
+        }
+    }
+
+    #[test]
+    fn replace_then_rebuild_drops_committed_old_vector() {
+        let mut idx = HnswIndex::new(4);
+        let target = MemoryId::new();
+        idx.insert(target, &vec_for(3.0)).unwrap();
+        idx.rebuild_snapshot().unwrap();
+
+        idx.replace(target, &vec_for(50.0)).unwrap();
+        idx.rebuild_snapshot().unwrap();
+
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.tombstones.len(), 0);
+        let hits = idx.search(&vec_for(50.0), 1).unwrap();
+        assert_eq!(hits[0].0, target);
+        assert!(hits[0].1 < 0.001);
+    }
+
+    #[test]
+    fn replace_dim_mismatch_errors() {
+        let mut idx = HnswIndex::new(4);
+        let id = MemoryId::new();
+        idx.insert(id, &vec_for(1.0)).unwrap();
+        let err = idx.replace(id, &[0.0; 3]).unwrap_err();
+        assert!(matches!(err, MnemeError::Index(_)));
     }
 
     #[test]
