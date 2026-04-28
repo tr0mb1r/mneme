@@ -84,10 +84,7 @@ impl BgeM3 {
             }))
             .map_err(|e| MnemeError::Embedding(format!("set truncation: {e}")))?;
 
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device)
-                .map_err(|e| MnemeError::Embedding(format!("mmap weights: {e}")))?
-        };
+        let vb = build_var_builder(weights_path, &device)?;
         let model = XLMRobertaModel::new(&config, vb)
             .map_err(|e| MnemeError::Embedding(format!("XLMRobertaModel::new: {e}")))?;
 
@@ -214,6 +211,29 @@ fn l2_normalize(v: &Tensor) -> Result<Tensor> {
         .map_err(|e| MnemeError::Embedding(format!("norm: {e}")))?;
     v.broadcast_div(&norm)
         .map_err(|e| MnemeError::Embedding(format!("normalize: {e}")))
+}
+
+/// Build a `VarBuilder` from whatever weight format the loader
+/// resolved. BAAI/bge-m3 ships `pytorch_model.bin` only — no
+/// safetensors at the pinned revision — so we branch on extension.
+fn build_var_builder<'a>(weights_path: &Path, device: &Device) -> Result<VarBuilder<'a>> {
+    let ext = weights_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    match ext {
+        "safetensors" => unsafe {
+            VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device).map_err(|e| {
+                MnemeError::Embedding(format!("mmap safetensors {weights_path:?}: {e}"))
+            })
+        },
+        "bin" => VarBuilder::from_pth(weights_path, DType::F32, device)
+            .map_err(|e| MnemeError::Embedding(format!("load pth {weights_path:?}: {e}"))),
+        other => Err(MnemeError::Embedding(format!(
+            "unsupported weights extension `.{other}` at {weights_path:?}; \
+             expected `.safetensors` or `.bin`"
+        ))),
+    }
 }
 
 #[cfg(test)]

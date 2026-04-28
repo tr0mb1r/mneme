@@ -66,6 +66,11 @@ pub struct ModelEntry {
     /// Approximate on-disk size after download — used for the user-
     /// facing prompt in `mneme init`.
     pub approx_size_mb: u32,
+    /// Candidate weight filenames in priority order. The fetch path
+    /// tries each in turn and accepts the first that resolves. Some
+    /// repos (e.g. BAAI/bge-m3) only ship `pytorch_model.bin`; the
+    /// loader picks the right `VarBuilder` constructor by extension.
+    pub weight_candidates: &'static [&'static str],
 }
 
 /// Hugging Face revision used for the v0.1 MiniLM pin.
@@ -101,6 +106,9 @@ pub fn models() -> &'static BTreeMap<&'static str, ModelEntry> {
                 revision: MINILM_REVISION,
                 dim: 384,
                 approx_size_mb: 90,
+                // refs/pr/21 is the PR that adds model.safetensors to
+                // the canonical MiniLM repo — same pin candle uses.
+                weight_candidates: &["model.safetensors"],
             },
         );
         m.insert(
@@ -112,6 +120,11 @@ pub fn models() -> &'static BTreeMap<&'static str, ModelEntry> {
                 revision: BGE_M3_REVISION,
                 dim: 1024,
                 approx_size_mb: 2300,
+                // BAAI/bge-m3 only publishes pytorch_model.bin — there
+                // is no model.safetensors at this revision. We still
+                // ask for safetensors first so a future repo update
+                // gets picked up automatically.
+                weight_candidates: &["model.safetensors", "pytorch_model.bin"],
             },
         );
         m
@@ -158,29 +171,68 @@ fn fetch_with_verify(entry: &ModelEntry, cache_root: &Path) -> Result<ModelFiles
         entry.revision.to_string(),
     ));
 
-    let files = ModelFiles {
-        config: repo.get("config.json").map_err(|e| {
-            MnemeError::Embedding(format!("download config.json for {}: {e}", entry.repo_id))
-        })?,
-        tokenizer: repo.get("tokenizer.json").map_err(|e| {
-            MnemeError::Embedding(format!(
-                "download tokenizer.json for {}: {e}",
-                entry.repo_id
-            ))
-        })?,
-        weights: repo.get("model.safetensors").map_err(|e| {
-            MnemeError::Embedding(format!(
-                "download model.safetensors for {}: {e}",
-                entry.repo_id
-            ))
-        })?,
-    };
+    let config = repo.get("config.json").map_err(|e| {
+        MnemeError::Embedding(format!("download config.json for {}: {e}", entry.repo_id))
+    })?;
+    let tokenizer = repo.get("tokenizer.json").map_err(|e| {
+        MnemeError::Embedding(format!(
+            "download tokenizer.json for {}: {e}",
+            entry.repo_id
+        ))
+    })?;
+    let weights = fetch_first_available(&repo, entry)?;
 
-    verify_or_record(&files.config)?;
-    verify_or_record(&files.tokenizer)?;
-    verify_or_record(&files.weights)?;
+    verify_or_record(&config)?;
+    verify_or_record(&tokenizer)?;
+    verify_or_record(&weights)?;
 
-    Ok(files)
+    Ok(ModelFiles {
+        config,
+        tokenizer,
+        weights,
+    })
+}
+
+/// Walk `entry.weight_candidates` in order; return the first that
+/// downloads successfully. We log other failures at debug rather than
+/// surfacing them — they're expected ("safetensors is missing, fall
+/// back to .bin"). If every candidate fails, the final error wins.
+fn fetch_first_available(repo: &hf_hub::api::sync::ApiRepo, entry: &ModelEntry) -> Result<PathBuf> {
+    if entry.weight_candidates.is_empty() {
+        return Err(MnemeError::Embedding(format!(
+            "no weight candidates declared for {}",
+            entry.short_name
+        )));
+    }
+    let mut last_err: Option<String> = None;
+    for filename in entry.weight_candidates {
+        match repo.get(filename) {
+            Ok(path) => {
+                tracing::debug!(
+                    repo = entry.repo_id,
+                    file = filename,
+                    "resolved weight file"
+                );
+                return Ok(path);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    repo = entry.repo_id,
+                    file = filename,
+                    error = %e,
+                    "weight candidate unavailable, trying next"
+                );
+                last_err = Some(format!("{filename}: {e}"));
+            }
+        }
+    }
+    Err(MnemeError::Embedding(format!(
+        "no weight file available for {} at revision {}; tried {:?} (last error: {})",
+        entry.repo_id,
+        entry.revision,
+        entry.weight_candidates,
+        last_err.unwrap_or_else(|| "no candidates".into())
+    )))
 }
 
 /// If a `<file>.sha256` sidecar exists, recompute and compare. If not,
@@ -264,6 +316,29 @@ mod tests {
         assert!(m.contains_key(BGE_M3));
         assert_eq!(m[MINILM_L6].dim, 384);
         assert_eq!(m[BGE_M3].dim, 1024);
+    }
+
+    #[test]
+    fn bge_m3_lists_pytorch_bin_fallback() {
+        // BAAI/bge-m3 doesn't ship model.safetensors at the pinned
+        // revision — without this fallback the loader 404s on first
+        // run. Pin the catalog so the regression is loud.
+        let entry = lookup(BGE_M3).expect("bge-m3 entry");
+        assert!(
+            entry.weight_candidates.contains(&"pytorch_model.bin"),
+            "bge-m3 must accept pytorch_model.bin; got {:?}",
+            entry.weight_candidates
+        );
+    }
+
+    #[test]
+    fn every_catalog_entry_declares_at_least_one_weight_file() {
+        for (name, entry) in models() {
+            assert!(
+                !entry.weight_candidates.is_empty(),
+                "{name} declared no weight_candidates"
+            );
+        }
     }
 
     #[test]
