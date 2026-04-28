@@ -1,0 +1,103 @@
+name: cross-build
+
+# Phase 3 §3 day-1 risk gate (mneme-implementation-plan.md §1 risk #3):
+# "Cross-compile a hello-world candle + BGE-M3 binary to all 5 release
+#  targets. If any target can't produce a single-file binary <100MB
+#  that loads the model, stop and reconsider candle vs ort vs llama.cpp."
+#
+# This workflow only builds — it does NOT execute the binary or
+# download BGE-M3 weights. The spike's purpose is to prove candle
+# links cleanly on every release platform; the actual model-load
+# smoke is a separate manual pre-release step that has to run on the
+# native hardware.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-build:
+    name: ${{ matrix.target }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cross: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cross: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Report binary size (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/mneme"
+          if [ ! -f "$bin" ]; then
+            echo "expected $bin to exist after build" >&2
+            exit 1
+          fi
+          size=$(stat -c '%s' "$bin" 2>/dev/null || stat -f '%z' "$bin")
+          mb=$(awk -v s="$size" 'BEGIN { printf "%.2f", s/1024/1024 }')
+          echo "::notice title=binary size::${{ matrix.target }} -> ${mb} MiB"
+          # Gate from plan §1 risk #3.
+          if [ "$size" -gt $((100 * 1024 * 1024)) ]; then
+            echo "binary exceeds 100 MiB cap (was ${mb} MiB)" >&2
+            exit 1
+          fi
+
+      - name: Report binary size (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/mneme.exe"
+          if (-not (Test-Path $bin)) {
+            Write-Error "expected $bin to exist after build"
+            exit 1
+          }
+          $size = (Get-Item $bin).Length
+          $mb = [math]::Round($size / 1MB, 2)
+          Write-Output "::notice title=binary size::${{ matrix.target }} -> $mb MiB"
+          if ($size -gt (100 * 1024 * 1024)) {
+            Write-Error "binary exceeds 100 MiB cap (was $mb MiB)"
+            exit 1
+          }

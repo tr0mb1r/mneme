@@ -1,0 +1,95 @@
+[package]
+name = "mneme"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "MCP-native persistent memory tool for AI agents"
+repository = "https://github.com/vserkin/mneme"
+readme = "README.md"
+keywords = ["mcp", "memory", "ai", "agent", "embeddings"]
+categories = ["command-line-utilities", "database"]
+# Each `benches/<name>.rs` would otherwise auto-register as a bench
+# target. We share helpers through `benches/common.rs`, which is
+# included via `mod common;` in the actual benches — disabling
+# auto-discovery keeps Cargo from treating the helper as a bench.
+autobenches = false
+
+[features]
+default = []
+test-driver = []
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ulid = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "signal", "fs", "time"] }
+async-trait = "0.1"
+redb = "2"
+postcard = { version = "1", features = ["alloc"] }
+crc32c = "0.6"
+fs2 = "0.4"
+dirs = "5"
+toml = "0.8"
+
+# Phase 3 — semantic layer (embedding model + HNSW vector index).
+# `candle-*` is the pure-Rust ML runtime (ADR-0002). MSRV-wise these are 1.83+,
+# so the workspace's pinned stable toolchain (rust-toolchain.toml) covers them.
+# `hf-hub` uses the blocking `ureq` path — model downloads are one-shot
+# operations, no need to drag a second runtime in. `instant-distance` provides
+# the HNSW we serialize via its `with-serde` feature.
+candle-core = { version = "0.10" }
+candle-nn = { version = "0.10" }
+candle-transformers = { version = "0.10" }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
+instant-distance = { version = "0.6", features = ["with-serde"] }
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "process", "time", "sync", "fs"] }
+# Phase 3 §13 latency benches. Plain (non-async) criterion — bench
+# bodies wrap a single tokio::Runtime created once per bench; we
+# `block_on` per iteration. That avoids pulling the `async_tokio`
+# feature flag and keeps bench compile times predictable.
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+
+[[bin]]
+name = "wal-driver"
+path = "src/bin/wal-driver.rs"
+required-features = ["test-driver"]
+
+# Phase 3 latency budgets (spec §13): recall p95 < 50ms, remember p95
+# < 150ms, cold start < 5s on 100K memories. These benches use the
+# StubEmbedder so we measure storage + index + WAL only — running
+# against the real BGE-M3 model is a pre-release manual exercise,
+# tracked separately.
+[[bench]]
+name = "recall"
+path = "benches/recall.rs"
+harness = false
+
+[[bench]]
+name = "remember"
+path = "benches/remember.rs"
+harness = false
+
+[[bench]]
+name = "cold_start"
+path = "benches/cold_start.rs"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
