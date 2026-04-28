@@ -107,4 +107,57 @@ mod tests {
             other => panic!("expected Migration error, got {other:?}"),
         }
     }
+
+    /// Plan §3 Phase 6 deliverable: "schema migration framework
+    /// with one successful round-trip from a 'v0' fixture."
+    ///
+    /// A "v0" install is one created before the schema_version
+    /// sentinel was introduced — `~/.mneme/` exists with config +
+    /// data, but no `schema_version` file. After `migrate_to(1)` the
+    /// existing data must be untouched and the sentinel must be
+    /// written with the right version.
+    #[test]
+    fn migrates_realistic_v0_install_to_v1() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Hand-build a v0-shaped tree.
+        let config_body = b"[storage]\nmax_size_gb = 5\n";
+        let pinned_body = b"{\"id\":\"01H0000000000000000000000Z\",\
+                            \"content\":\"prefer rust\",\
+                            \"tags\":[],\
+                            \"scope\":\"personal\",\
+                            \"created_at\":\"2026-04-28T16:48:00Z\"}\n";
+        let wal_body = b"\xff\xff\xff\xfffake-wal-tail";
+        std::fs::write(root.join("config.toml"), config_body).unwrap();
+        std::fs::create_dir_all(root.join("procedural")).unwrap();
+        std::fs::write(root.join("procedural").join("pinned.jsonl"), pinned_body).unwrap();
+        std::fs::create_dir_all(root.join("episodic/wal")).unwrap();
+        std::fs::write(root.join("episodic/wal/wal-0000.log"), wal_body).unwrap();
+        // Sanity: no schema_version file present.
+        assert!(!root.join(SCHEMA_VERSION_FILE).exists());
+        assert_eq!(current_version(root).unwrap(), 0);
+
+        // Run the migration.
+        migrate_to(root, 1).unwrap();
+
+        // Sentinel is now at v1.
+        assert_eq!(current_version(root).unwrap(), 1);
+        // Existing data was untouched byte-for-byte.
+        assert_eq!(std::fs::read(root.join("config.toml")).unwrap(), config_body);
+        assert_eq!(
+            std::fs::read(root.join("procedural").join("pinned.jsonl")).unwrap(),
+            pinned_body
+        );
+        assert_eq!(
+            std::fs::read(root.join("episodic/wal/wal-0000.log")).unwrap(),
+            wal_body
+        );
+
+        // Re-running the migration is a no-op (idempotent at the
+        // exit gate).
+        migrate_to(root, 1).unwrap();
+        assert_eq!(current_version(root).unwrap(), 1);
+        assert_eq!(std::fs::read(root.join("config.toml")).unwrap(), config_body);
+    }
 }
