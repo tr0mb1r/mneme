@@ -1,0 +1,245 @@
+//! `mneme backup <path>` — Phase 6 §11.2 deliverable.
+//!
+//! Tar+gzip the entire `<root>/` tree to `<path>`. Excludes the
+//! embedding-model cache (`<root>/models/`, can be re-downloaded)
+//! and rotating log files (`<root>/logs/`) so the backup stays
+//! small and focused on irreplaceable data.
+//!
+//! Refuses to run while a `mneme run` instance holds the lockfile —
+//! taking a snapshot of an in-flight WAL/HNSW state could capture
+//! a torn write. The user gets a clear error and can stop the
+//! server first.
+
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+use flate2::Compression;
+use flate2::write::GzEncoder;
+
+use crate::storage::layout;
+use crate::{MnemeError, Result};
+
+/// Subdirectories deliberately excluded from backups. `models/` is
+/// large and re-fetchable from upstream; `logs/` is operational
+/// chatter, not user data.
+const EXCLUDED_SUBDIRS: &[&str] = &["models", "logs"];
+
+pub fn execute(output: PathBuf, include_models: bool) -> Result<()> {
+    let root = layout::default_root()
+        .ok_or_else(|| MnemeError::Config("could not resolve ~/.mneme".into()))?;
+    backup_at(&root, &output, include_models)
+}
+
+/// Library entry point. Tests call this directly with a tempdir
+/// root; the CLI wraps it with the default home-dir lookup.
+pub fn backup_at(root: &Path, output: &Path, include_models: bool) -> Result<()> {
+    if !root.exists() {
+        return Err(MnemeError::Config(format!(
+            "data directory {} does not exist; nothing to back up",
+            root.display()
+        )));
+    }
+    refuse_if_locked(root)?;
+
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = File::create(output)?;
+    let gz = GzEncoder::new(file, Compression::default());
+    let mut tar = tar::Builder::new(gz);
+    // Don't follow symlinks — store them as links. Avoids accidental
+    // duplication if the user has symlinked anything inside ~/.mneme.
+    tar.follow_symlinks(false);
+
+    let mut included = 0usize;
+    for entry in walk_dir(root)? {
+        let abs = entry.path;
+        let rel = abs
+            .strip_prefix(root)
+            .map_err(|e| MnemeError::Config(format!("path {abs:?} not under {root:?}: {e}")))?;
+        if !include_models && is_excluded(rel) {
+            continue;
+        }
+        if entry.is_dir {
+            tar.append_dir(rel, &abs)?;
+        } else {
+            let mut f = File::open(&abs)?;
+            tar.append_file(rel, &mut f)?;
+        }
+        included += 1;
+    }
+    let gz = tar
+        .into_inner()
+        .map_err(|e| MnemeError::Storage(format!("close tar: {e}")))?;
+    gz.finish()
+        .map_err(|e| MnemeError::Storage(format!("close gzip: {e}")))?;
+    eprintln!(
+        "wrote {included} entries to {} ({} bytes)",
+        output.display(),
+        std::fs::metadata(output).map(|m| m.len()).unwrap_or(0)
+    );
+    Ok(())
+}
+
+fn refuse_if_locked(root: &Path) -> Result<()> {
+    let lock_path = root.join(".lock");
+    if lock_path.exists() {
+        return Err(MnemeError::Lock(format!(
+            "{} is held — stop the running mneme instance before backing up",
+            lock_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn is_excluded(rel: &Path) -> bool {
+    rel.components().next().is_some_and(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| EXCLUDED_SUBDIRS.contains(&s))
+    })
+}
+
+struct Entry {
+    path: PathBuf,
+    is_dir: bool,
+}
+
+/// Depth-first walk. Returns directories before their contents so
+/// `tar.append_dir` lands at the right spot.
+fn walk_dir(root: &Path) -> Result<Vec<Entry>> {
+    let mut out: Vec<Entry> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        // Only emit subdirectories — skip the root itself so the
+        // archive paths are relative.
+        if dir != root {
+            out.push(Entry {
+                path: dir.clone(),
+                is_dir: true,
+            });
+        }
+        let mut children: Vec<PathBuf> = std::fs::read_dir(&dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        // Stable order — sorted ascending — so backups are
+        // reproducible across runs at the same DB state.
+        children.sort();
+        for child in children {
+            let meta = std::fs::symlink_metadata(&child)?;
+            if meta.file_type().is_dir() {
+                stack.push(child);
+            } else {
+                out.push(Entry {
+                    path: child,
+                    is_dir: false,
+                });
+            }
+        }
+    }
+    // Pop order gives us depth-first reverse; reverse so directories
+    // come before their children inside the archive.
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write(path: &Path, body: &str) {
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn backup_excludes_models_and_logs_by_default() {
+        let tmp_root = TempDir::new().unwrap();
+        let root = tmp_root.path().join("mneme");
+        write(&root.join("config.toml"), "x = 1");
+        write(&root.join("episodic/wal/wal-0000.log"), "wal");
+        write(&root.join("models/big-blob.bin"), "ignore me");
+        write(&root.join("logs/mneme.log"), "ignore me too");
+
+        let out = TempDir::new().unwrap();
+        let archive = out.path().join("backup.tar.gz");
+        backup_at(&root, &archive, false).unwrap();
+
+        // Read back the archive and confirm contents.
+        let f = std::fs::File::open(&archive).unwrap();
+        let gz = flate2::read::GzDecoder::new(f);
+        let mut tar = tar::Archive::new(gz);
+        let entries: Vec<String> = tar
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().unwrap().display().to_string())
+            .collect();
+        assert!(entries.iter().any(|p| p.ends_with("config.toml")));
+        assert!(entries.iter().any(|p| p.contains("episodic/wal")));
+        assert!(
+            !entries.iter().any(|p| p.starts_with("models")),
+            "models/ must be excluded"
+        );
+        assert!(
+            !entries.iter().any(|p| p.starts_with("logs")),
+            "logs/ must be excluded"
+        );
+    }
+
+    #[test]
+    fn backup_with_include_models_packs_them() {
+        let tmp_root = TempDir::new().unwrap();
+        let root = tmp_root.path().join("mneme");
+        write(&root.join("models/big.bin"), "weights");
+        let out = TempDir::new().unwrap();
+        let archive = out.path().join("backup.tar.gz");
+        backup_at(&root, &archive, true).unwrap();
+
+        let f = std::fs::File::open(&archive).unwrap();
+        let gz = flate2::read::GzDecoder::new(f);
+        let mut tar = tar::Archive::new(gz);
+        assert!(
+            tar.entries().unwrap().filter_map(|e| e.ok()).any(|e| e
+                .path()
+                .unwrap()
+                .display()
+                .to_string()
+                .contains("models"))
+        );
+    }
+
+    #[test]
+    fn backup_refuses_when_lockfile_present() {
+        let tmp_root = TempDir::new().unwrap();
+        let root = tmp_root.path().join("mneme");
+        write(&root.join("config.toml"), "x = 1");
+        write(&root.join(".lock"), "12345");
+        let out = TempDir::new().unwrap();
+        let archive = out.path().join("backup.tar.gz");
+        match backup_at(&root, &archive, false) {
+            Err(MnemeError::Lock(msg)) => {
+                assert!(msg.contains("running mneme"));
+            }
+            other => panic!("expected Lock error, got {other:?}"),
+        }
+        // The output archive should not exist (or be empty).
+        assert!(!archive.exists() || std::fs::metadata(&archive).unwrap().len() == 0);
+    }
+
+    #[test]
+    fn backup_missing_root_is_clear_error() {
+        let out = TempDir::new().unwrap();
+        let nope = std::path::PathBuf::from("/does/not/exist/mneme-root");
+        let archive = out.path().join("backup.tar.gz");
+        match backup_at(&nope, &archive, false) {
+            Err(MnemeError::Config(msg)) => assert!(msg.contains("does not exist")),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+}

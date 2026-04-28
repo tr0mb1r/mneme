@@ -1824,6 +1824,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "dirs 5.0.1",
+ "flate2",
  "fs2",
  "hf-hub",
  "instant-distance",
@@ -1835,6 +1836,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
@@ -2892,6 +2894,16 @@ dependencies = [
  "libc",
  "thiserror 1.0.69",
  "walkdir",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22692a6476a21fa75fdfc11d452fda482af402c008cdbaf3476414e122040973"
+dependencies = [
+ "filetime",
+ "libc",
 ]
 
 [[package]]

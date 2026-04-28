@@ -57,6 +57,12 @@ notify = "6"
 # multithread codec — the bundle sizes we expect (<10 MiB) compress
 # fine on a single thread.
 zstd = { version = "0.13", default-features = false }
+# Phase 6 §11.2 backup/restore. `tar` + `flate2` is the boring,
+# universally-available combo; on Windows we rely on tar 0.4's
+# fallback path that ignores xattrs. Default features only — we
+# don't pull the extended-format / pax bits.
+tar = { version = "0.4", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
