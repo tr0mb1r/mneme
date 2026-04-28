@@ -48,6 +48,7 @@ impl Resource for Recent {
                     "kind": e.kind,
                     "scope": e.scope,
                     "payload": e.payload,
+                    "tags": e.tags,
                     "last_accessed": e.last_accessed.to_rfc3339(),
                     "created_at": e.created_at.to_rfc3339(),
                 })

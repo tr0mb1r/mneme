@@ -129,6 +129,7 @@ mod tests {
             kind: "k".into(),
             scope: "personal".into(),
             payload: "\"x\"".into(),
+            tags: vec![],
             retrieval_weight: weight,
             last_accessed: ts,
             created_at: ts,

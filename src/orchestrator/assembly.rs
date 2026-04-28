@@ -264,6 +264,7 @@ mod tests {
             kind: "k".into(),
             scope: "personal".into(),
             payload: payload.into(),
+            tags: vec![],
             retrieval_weight: DEFAULT_RETRIEVAL_WEIGHT,
             last_accessed: Utc::now(),
             created_at: Utc::now(),

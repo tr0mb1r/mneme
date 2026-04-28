@@ -136,6 +136,7 @@ pub async fn _record_backdated_for_tests(
         kind: kind.to_owned(),
         scope: scope.to_owned(),
         payload: payload.to_owned(),
+        tags: vec![],
         retrieval_weight: DEFAULT_RETRIEVAL_WEIGHT,
         last_accessed: created_at,
         created_at,

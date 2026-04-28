@@ -88,6 +88,7 @@ impl Tool for RecallRecent {
                     "kind": e.kind,
                     "scope": e.scope,
                     "payload": e.payload,
+                    "tags": e.tags,
                     "retrieval_weight": e.retrieval_weight,
                     "last_accessed": e.last_accessed.to_rfc3339(),
                     "created_at": e.created_at.to_rfc3339(),

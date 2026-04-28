@@ -80,6 +80,14 @@ pub const DEFAULT_RETRIEVAL_WEIGHT: f32 = 1.0;
 /// `kind` is a free-form string (e.g. `"tool_call"`, `"user_message"`,
 /// `"checkpoint"`) — keeping it un-enumerated avoids forcing a schema
 /// migration every time an agent invents a new event class.
+/// `MemoryKind` (the enum) is reserved for `MemoryItem` and
+/// `PinnedItem` where the four canonical types make sense.
+///
+/// `tags` mirrors the same field on
+/// [`crate::memory::semantic::MemoryItem`] and
+/// [`crate::memory::procedural::PinnedItem`] — every memory layer
+/// can be tagged uniformly. Loaded with `#[serde(default)]` so old
+/// postcard rows written before this field existed still decode.
 ///
 /// `payload` is opaque to this module — typically a JSON string the
 /// caller encoded itself. We deliberately don't serialise
@@ -92,6 +100,8 @@ pub struct EpisodicEvent {
     pub kind: String,
     pub scope: String,
     pub payload: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// Per-event constant in `[0.0, 1.0]`. Higher values rank above
     /// lower ones at the same `last_accessed`. Default
     /// [`DEFAULT_RETRIEVAL_WEIGHT`] (1.0).
@@ -133,11 +143,12 @@ impl EpisodicStore {
         Self { storage }
     }
 
-    /// Append a new episodic event with the default retrieval weight.
-    /// `payload` is stored verbatim (no encoding/escaping); typically
-    /// a JSON string the caller produced via `serde_json::to_string`.
+    /// Append a new episodic event with the default retrieval weight
+    /// and no tags. `payload` is stored verbatim (no encoding/escaping);
+    /// typically a JSON string the caller produced via
+    /// `serde_json::to_string`.
     pub async fn record(&self, kind: &str, scope: &str, payload: &str) -> Result<EventId> {
-        self.record_weighted(kind, scope, payload, DEFAULT_RETRIEVAL_WEIGHT)
+        self.record_full(kind, scope, payload, vec![], DEFAULT_RETRIEVAL_WEIGHT)
             .await
     }
 
@@ -154,14 +165,31 @@ impl EpisodicStore {
         self.record(kind, scope, &s).await
     }
 
-    /// Append a new event with an explicit retrieval weight. Use this
-    /// for events that should rank above or below their peers — for
-    /// instance, agent reflections vs. raw tool outputs.
+    /// Append a new event with an explicit retrieval weight (no
+    /// tags). Use this for events that should rank above or below
+    /// their peers — for instance, agent reflections vs. raw tool
+    /// outputs. Equivalent to
+    /// `record_full(kind, scope, payload, vec![], retrieval_weight)`.
     pub async fn record_weighted(
         &self,
         kind: &str,
         scope: &str,
         payload: &str,
+        retrieval_weight: f32,
+    ) -> Result<EventId> {
+        self.record_full(kind, scope, payload, vec![], retrieval_weight)
+            .await
+    }
+
+    /// Most general append. Takes every populated field; the simpler
+    /// `record` / `record_weighted` wrappers exist so the common
+    /// cases stay readable.
+    pub async fn record_full(
+        &self,
+        kind: &str,
+        scope: &str,
+        payload: &str,
+        tags: Vec<String>,
         retrieval_weight: f32,
     ) -> Result<EventId> {
         if !(0.0..=1.0).contains(&retrieval_weight) {
@@ -175,6 +203,7 @@ impl EpisodicStore {
             kind: kind.to_owned(),
             scope: scope.to_owned(),
             payload: payload.to_owned(),
+            tags,
             retrieval_weight,
             last_accessed: now,
             created_at: now,

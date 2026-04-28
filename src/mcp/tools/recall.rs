@@ -117,7 +117,11 @@ impl Tool for Recall {
                 json!({
                     "id": h.item.id.to_string(),
                     "content": h.item.content,
-                    "type": h.item.kind.as_str(),
+                    // `kind` matches the field name used by every
+                    // other tool/resource (recall_recent, recent
+                    // resource, context resource). Avoids the
+                    // earlier `type` vs `kind` split.
+                    "kind": h.item.kind.as_str(),
                     "tags": h.item.tags,
                     "scope": h.item.scope,
                     "created_at": h.item.created_at.to_rfc3339(),
@@ -202,7 +206,7 @@ mod tests {
         assert!(!arr.is_empty());
         assert_eq!(arr[0]["id"], id.to_string());
         assert_eq!(arr[0]["content"], "hello world");
-        assert_eq!(arr[0]["type"], "fact");
+        assert_eq!(arr[0]["kind"], "fact");
     }
 
     #[tokio::test]
@@ -229,8 +233,29 @@ mod tests {
         let arr = v.as_array().unwrap();
         assert!(!arr.is_empty());
         for hit in arr {
-            assert_eq!(hit["type"], "decision");
+            // Output uses `kind` (canonical field name); `type` is
+            // accepted on the input side for client compatibility.
+            assert_eq!(hit["kind"], "decision");
+            assert!(hit.get("type").is_none(), "output must not emit `type`");
         }
         assert!(arr.iter().any(|h| h["id"] == dec.to_string()));
+    }
+
+    #[tokio::test]
+    async fn returns_kind_field_not_type_in_output() {
+        let tmp = TempDir::new().unwrap();
+        let s = fresh_store(&tmp);
+        s.remember("hello", MemoryKind::Fact, vec![], "personal".into())
+            .await
+            .unwrap();
+        let r = Recall::new(s);
+        let res = r.invoke(json!({ "query": "hello" })).await.unwrap();
+        let text = match &res.content[0] {
+            crate::mcp::tools::ContentBlock::Text(t) => t.clone(),
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let arr = v.as_array().unwrap();
+        assert!(!arr.is_empty());
+        assert_eq!(arr[0]["kind"], "fact");
     }
 }
