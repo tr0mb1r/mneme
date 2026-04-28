@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
+use crate::memory::semantic::SemanticStore;
 use crate::orchestrator::{Orchestrator, TokenBudget};
+use crate::storage::archive::ColdArchive;
 
 pub mod context;
 pub mod procedural;
@@ -72,15 +74,26 @@ impl ResourceRegistry {
     /// deferred — sessions live in `memory::working` but their
     /// per-id resource surface is not wired yet.
     pub fn defaults(
+        semantic_store: Arc<SemanticStore>,
         procedural_store: Arc<ProceduralStore>,
         episodic_store: Arc<EpisodicStore>,
         orchestrator: Arc<Orchestrator>,
+        cold: ColdArchive,
+        schema_version: u32,
         budget: TokenBudget,
     ) -> Self {
         let mut r = Self::new();
-        r.register(Arc::new(stats::Stats));
-        r.register(Arc::new(procedural::Procedural::new(procedural_store)));
-        r.register(Arc::new(recent::Recent::new(episodic_store)));
+        r.register(Arc::new(stats::Stats::new(
+            semantic_store,
+            Arc::clone(&procedural_store),
+            Arc::clone(&episodic_store),
+            cold,
+            schema_version,
+        )));
+        r.register(Arc::new(procedural::Procedural::new(Arc::clone(
+            &procedural_store,
+        ))));
+        r.register(Arc::new(recent::Recent::new(Arc::clone(&episodic_store))));
         r.register(Arc::new(context::Context::new(orchestrator, budget)));
         r
     }
@@ -118,7 +131,6 @@ mod tests {
     fn fresh_registry() -> (ResourceRegistry, TempDir) {
         use crate::embed::Embedder;
         use crate::embed::stub::StubEmbedder;
-        use crate::memory::semantic::SemanticStore;
         let tmp = TempDir::new().unwrap();
         let backing: Arc<dyn Storage> = MemoryStorage::new();
         let pstore = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
@@ -127,12 +139,21 @@ mod tests {
         let semantic =
             SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
         let orch = Arc::new(Orchestrator::new(
-            semantic,
+            Arc::clone(&semantic),
             Arc::clone(&pstore),
             Arc::clone(&estore),
         ));
+        let cold = ColdArchive::new(tmp.path());
         (
-            ResourceRegistry::defaults(pstore, estore, orch, TokenBudget::for_tests(2000)),
+            ResourceRegistry::defaults(
+                semantic,
+                pstore,
+                estore,
+                orch,
+                cold,
+                1,
+                TokenBudget::for_tests(2000),
+            ),
             tmp,
         )
     }

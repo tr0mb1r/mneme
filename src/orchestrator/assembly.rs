@@ -14,7 +14,7 @@
 //! 4. Pool the remaining budget and continue greedy-filling across
 //!    every layer combined, again biggest score first.
 //! 5. Sort each kept-set by descending score for stable, deterministic
-//!    output. Procedural is sub-sorted by `added_at` ascending so
+//!    output. Procedural is sub-sorted by `created_at` ascending so
 //!    older anchors lead — agents often expect "rules" before
 //!    "details".
 //!
@@ -136,9 +136,10 @@ pub fn assemble(
 
     // Step 4: deterministic per-layer ordering.
     proc_final.sort_by(|a, b| match (a, b) {
-        (ScoredItem::Procedural { item: ai, .. }, ScoredItem::Procedural { item: bi, .. }) => {
-            ai.added_at.cmp(&bi.added_at).then(ai.id.0.cmp(&bi.id.0))
-        }
+        (ScoredItem::Procedural { item: ai, .. }, ScoredItem::Procedural { item: bi, .. }) => ai
+            .created_at
+            .cmp(&bi.created_at)
+            .then(ai.id.0.cmp(&bi.id.0)),
         _ => std::cmp::Ordering::Equal,
     });
     sem_final.sort_by(order_scored);
@@ -239,7 +240,7 @@ mod tests {
             content: content.into(),
             tags: vec![],
             scope: "personal".into(),
-            added_at: Utc::now(),
+            created_at: Utc::now(),
         }
     }
 

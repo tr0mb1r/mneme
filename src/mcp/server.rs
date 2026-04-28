@@ -262,6 +262,7 @@ mod tests {
         use crate::memory::procedural::ProceduralStore;
         use crate::memory::semantic::SemanticStore;
         use crate::orchestrator::{Orchestrator, TokenBudget};
+        use crate::storage::archive::ColdArchive;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let storage: Arc<dyn Storage> = crate::storage::memory_impl::MemoryStorage::new();
@@ -275,19 +276,23 @@ mod tests {
             Arc::clone(&procedural),
             Arc::clone(&episodic),
         ));
+        let cold = ColdArchive::new(tmp.path());
 
         let transport = StdioTransport::new(input, Vec::<u8>::new());
         let mut server = Server::new(
             transport,
             Arc::new(ToolRegistry::defaults(
-                semantic,
+                Arc::clone(&semantic),
                 Arc::clone(&procedural),
                 Arc::clone(&episodic),
             )),
             Arc::new(ResourceRegistry::defaults(
+                semantic,
                 procedural,
                 episodic,
                 orchestrator,
+                cold,
+                1,
                 TokenBudget::for_tests(2000),
             )),
             storage,
@@ -426,7 +431,9 @@ mod tests {
         let contents = out[2]["result"]["contents"].as_array().unwrap();
         assert_eq!(contents[0]["mimeType"], "application/json");
         let body: Value = serde_json::from_str(contents[0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(body["phase"], 1);
+        // Phase 6 stats reports real counts; just assert shape here.
+        assert!(body["schema_version"].is_number());
+        assert!(body["memories"]["semantic"].is_number());
     }
 
     #[tokio::test]

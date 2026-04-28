@@ -108,6 +108,7 @@ pub fn execute() -> Result<()> {
         Arc::clone(&episodic),
     ));
     let auto_context_budget = TokenBudget::from_config(&config.budgets);
+    let cold = crate::storage::archive::ColdArchive::new(&root);
 
     let result = runtime
         .block_on(async_main(
@@ -116,6 +117,8 @@ pub fn execute() -> Result<()> {
             Arc::clone(&procedural),
             Arc::clone(&episodic),
             Arc::clone(&orchestrator),
+            cold,
+            on_disk_version.max(migrate::CURRENT_SCHEMA_VERSION),
             auto_context_budget,
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
@@ -151,6 +154,8 @@ async fn async_main(
     procedural: Arc<ProceduralStore>,
     episodic: Arc<EpisodicStore>,
     orchestrator: Arc<Orchestrator>,
+    cold: crate::storage::archive::ColdArchive,
+    schema_version: u32,
     auto_context_budget: TokenBudget,
 ) -> anyhow::Result<()> {
     tracing::info!(
@@ -166,14 +171,17 @@ async fn async_main(
     let mut server = Server::new(
         transport,
         Arc::new(ToolRegistry::defaults(
-            semantic,
+            Arc::clone(&semantic),
             Arc::clone(&procedural),
             Arc::clone(&episodic),
         )),
         Arc::new(ResourceRegistry::defaults(
+            semantic,
             procedural,
             episodic,
             orchestrator,
+            cold,
+            schema_version,
             auto_context_budget,
         )),
         storage,

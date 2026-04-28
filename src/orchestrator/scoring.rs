@@ -104,7 +104,7 @@ mod tests {
             content: content.into(),
             tags: vec![],
             scope: "personal".into(),
-            added_at: Utc::now(),
+            created_at: Utc::now(),
         }
     }
 

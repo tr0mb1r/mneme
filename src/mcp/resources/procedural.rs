@@ -45,7 +45,7 @@ impl Resource for Procedural {
                     "content": p.content,
                     "tags": p.tags,
                     "scope": p.scope,
-                    "added_at": p.added_at.to_rfc3339(),
+                    "created_at": p.created_at.to_rfc3339(),
                 })
             })
             .collect();

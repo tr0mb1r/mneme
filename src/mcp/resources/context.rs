@@ -55,7 +55,7 @@ impl Resource for Context {
                 "content": p.content,
                 "tags": p.tags,
                 "scope": p.scope,
-                "added_at": p.added_at.to_rfc3339(),
+                "created_at": p.created_at.to_rfc3339(),
             })).collect::<Vec<_>>(),
             "episodic": ctx.episodic.iter().map(|e| json!({
                 "id": e.id.to_string(),

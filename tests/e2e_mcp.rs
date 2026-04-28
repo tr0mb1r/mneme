@@ -238,7 +238,13 @@ async fn full_mcp_handshake_and_tool_calls() {
     let contents = rr["result"]["contents"].as_array().unwrap();
     assert_eq!(contents[0]["mimeType"], "application/json");
     let body: Value = serde_json::from_str(contents[0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(body["phase"], 1);
+    // Phase 6: stats now reports real counts. Just assert the
+    // shape; the values depend on whatever this test session wrote.
+    assert!(body["schema_version"].is_number());
+    assert!(body["memories"]["semantic"].is_number());
+    assert!(body["memories"]["procedural"].is_number());
+    assert!(body["memories"]["episodic"]["hot"].is_number());
+    assert!(body["semantic_index"]["embed_dim"].is_number());
 
     // 9. close stdin → server exits cleanly within 2s
     drop(client.stdin);

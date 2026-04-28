@@ -14,8 +14,15 @@
 //! Each line is a self-contained JSON object:
 //!
 //! ```json
-//! {"id":"01HK...","content":"prefer rust over python","tags":["pref"],"scope":"personal","added_at":"2026-04-28T16:48:00Z"}
+//! {"id":"01HK...","content":"prefer rust over python","tags":["pref"],"scope":"personal","created_at":"2026-04-28T16:48:00Z"}
 //! ```
+//!
+//! `created_at` matches the timestamp field on
+//! [`crate::memory::semantic::MemoryItem`] and
+//! [`crate::memory::episodic::EpisodicEvent`] so a generic
+//! "memory metadata" pass over any of the three stores can rely on a
+//! consistent field name. Older files that wrote `added_at` (the
+//! pre-normalization name) keep loading via `#[serde(alias)]`.
 //!
 //! Lines are written by `pin` and consumed by `list` / `unpin`. We
 //! deliberately don't gate on schema strictness for unknown lines —
@@ -63,6 +70,10 @@ pub const PINNED_FILE: &str = "pinned.jsonl";
 
 /// One pinned item. Designed for `serde_json` round-trips so the
 /// on-disk JSONL stays human-readable.
+///
+/// `created_at` is the canonical timestamp field across every memory
+/// store; old JSONL written with `added_at` still loads via
+/// `#[serde(alias = "added_at")]` for one release cycle.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PinnedItem {
     pub id: MemoryId,
@@ -70,7 +81,8 @@ pub struct PinnedItem {
     #[serde(default)]
     pub tags: Vec<String>,
     pub scope: String,
-    pub added_at: DateTime<Utc>,
+    #[serde(alias = "added_at")]
+    pub created_at: DateTime<Utc>,
 }
 
 /// Reader/writer for the procedural pinned-list.
@@ -154,7 +166,7 @@ impl ProceduralStore {
             content,
             tags,
             scope,
-            added_at: Utc::now(),
+            created_at: Utc::now(),
         };
         let id = item.id;
 
@@ -462,7 +474,7 @@ mod tests {
             content: "kept".into(),
             tags: vec![],
             scope: "personal".into(),
-            added_at: Utc::now(),
+            created_at: Utc::now(),
         })
         .unwrap();
         let body = format!("# user comment\n{good}\n{{not json\nplain garbage\n");
@@ -490,7 +502,7 @@ mod tests {
             content: "added by user editor".into(),
             tags: vec!["external".into()],
             scope: "personal".into(),
-            added_at: Utc::now(),
+            created_at: Utc::now(),
         };
         let mut body = serde_json::to_string(&new_item).unwrap();
         body.push('\n');

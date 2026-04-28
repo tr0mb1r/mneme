@@ -428,10 +428,11 @@ impl SemanticStore {
         self.len() == 0
     }
 
-    /// Current `applied_lsn`. Tests use this to assert that a
+    /// Current `applied_lsn` — the highest semantic-WAL LSN whose
+    /// effect is folded into the in-memory HNSW. Surfaced for the
+    /// `mneme://stats` resource and for tests asserting that a
     /// snapshot covered as much WAL ground as we expected.
-    #[cfg(test)]
-    pub(crate) fn applied_lsn(&self) -> u64 {
+    pub fn applied_lsn(&self) -> u64 {
         self.applied_lsn.load(Ordering::SeqCst)
     }
 

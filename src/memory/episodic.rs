@@ -306,6 +306,19 @@ impl EpisodicStore {
         }
     }
 
+    /// Hot-tier event count — cheap scan of the `epi:` prefix range.
+    /// Surfaced via the `mneme://stats` resource. The redb prefix
+    /// scan is O(n) over the rows in the prefix, but for hot-tier
+    /// cardinalities (≤thousands) that's microseconds.
+    pub async fn count_hot(&self) -> Result<usize> {
+        Ok(self.storage.scan_prefix(EPI_KEY_PREFIX).await?.len())
+    }
+
+    /// Warm-tier event count.
+    pub async fn count_warm(&self) -> Result<usize> {
+        Ok(self.storage.scan_prefix(WARM_KEY_PREFIX).await?.len())
+    }
+
     /// All events currently in the warm tier, sorted by `created_at`
     /// ascending. Used by the consolidation task to evaluate
     /// warm→cold migrations.
