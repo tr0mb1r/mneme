@@ -101,9 +101,13 @@ where
 
 fn apply_one(index: &mut HnswIndex, op: &WalOp) -> Result<()> {
     match op {
-        WalOp::VectorInsert { id, vec } => index.insert(*id, vec),
+        WalOp::VectorInsert { id, vec } => apply_vector_op(index, *id, vec, |idx, id, v| {
+            idx.insert(id, v)
+        }),
         WalOp::VectorDelete { id } => index.delete(*id),
-        WalOp::VectorReplace { id, vec } => index.replace(*id, vec),
+        WalOp::VectorReplace { id, vec } => apply_vector_op(index, *id, vec, |idx, id, v| {
+            idx.replace(id, v)
+        }),
         WalOp::Put { .. } | WalOp::Delete { .. } => {
             // Surface clearly: a redb-WAL record landed in the
             // semantic-index WAL, which means a misconfigured
@@ -114,6 +118,30 @@ fn apply_one(index: &mut HnswIndex, op: &WalOp) -> Result<()> {
             ))
         }
     }
+}
+
+/// Apply a vector op, skipping (with a loud warn) records whose dim
+/// doesn't match the in-memory index. Mirrors `SemanticStore::open`'s
+/// snapshot-skip behaviour: when the user changes
+/// `config.embeddings.model`, the old WAL is still on disk at the
+/// previous dim, and we'd rather start cold than fail to boot.
+fn apply_vector_op(
+    index: &mut HnswIndex,
+    id: crate::ids::MemoryId,
+    vec: &[f32],
+    apply: impl FnOnce(&mut HnswIndex, crate::ids::MemoryId, &[f32]) -> Result<()>,
+) -> Result<()> {
+    if vec.len() != index.dim() {
+        tracing::warn!(
+            memory_id = %id,
+            wal_vec_len = vec.len(),
+            index_dim = index.dim(),
+            "skipping WAL vector op: dim mismatch (likely embedder model change). \
+             Memory metadata remains in KV but is not searchable until re-embed migration."
+        );
+        return Ok(());
+    }
+    apply(index, id, vec)
 }
 
 #[cfg(test)]
@@ -178,6 +206,42 @@ mod tests {
         assert_eq!(idx.read().unwrap().len(), 2);
         applier.apply_batch(&[del(id, 3)]).unwrap();
         assert_eq!(idx.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn applier_skips_dim_mismatched_records_with_warn() {
+        // Mirrors the embedder-swap recovery path: WAL contains a
+        // vector at the old dim; the index is freshly opened at the
+        // new dim. The applier must not propagate the error.
+        let idx = Arc::new(RwLock::new(HnswIndex::new(8))); // new dim
+        let lsn = Arc::new(AtomicU64::new(0));
+        let mut applier = HnswApplier::new(Arc::clone(&idx), Arc::clone(&lsn));
+
+        let stale = ReplayRecord {
+            lsn: 1,
+            tx_id: 1,
+            op: WalOp::VectorInsert {
+                id: MemoryId::new(),
+                vec: vec_for(1.0), // 4-dim, mismatched against 8
+            },
+        };
+        applier.apply_batch(&[stale]).unwrap();
+        assert_eq!(idx.read().unwrap().len(), 0, "stale insert must be skipped");
+        // applied_lsn must still advance — replay is making progress
+        // even if records are no-ops.
+        assert_eq!(lsn.load(Ordering::SeqCst), 1);
+
+        // VectorReplace at wrong dim is also skipped.
+        let stale_replace = ReplayRecord {
+            lsn: 2,
+            tx_id: 2,
+            op: WalOp::VectorReplace {
+                id: MemoryId::new(),
+                vec: vec_for(2.0),
+            },
+        };
+        applier.apply_batch(&[stale_replace]).unwrap();
+        assert_eq!(lsn.load(Ordering::SeqCst), 2);
     }
 
     #[test]
