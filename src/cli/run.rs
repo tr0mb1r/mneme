@@ -81,11 +81,32 @@ pub fn execute() -> Result<()> {
     let storage_dyn: Arc<dyn Storage> = Arc::clone(&storage) as Arc<dyn Storage>;
 
     let embedder = build_embedder(&config, &root)?;
+    let active_model_name = active_embedder_model_name(&config);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(MnemeError::Io)?;
+    // If the active embedder differs from the one that produced the
+    // on-disk vectors, re-embed every stored memory before opening the
+    // semantic store. This both replaces the stale snapshot/WAL and
+    // makes the existing memories searchable under the new model.
+    match runtime.block_on(crate::embed::migrate::migrate_if_needed(
+        &root,
+        Arc::clone(&storage_dyn),
+        Arc::clone(&embedder),
+        &active_model_name,
+    ))? {
+        crate::embed::migrate::Outcome::NoChange => {}
+        crate::embed::migrate::Outcome::Migrated { count } => {
+            tracing::info!(
+                count,
+                model = %active_model_name,
+                dim = embedder.dim(),
+                "re-embedded memories under new embedder identity"
+            );
+        }
+    }
     // SemanticStore::open spawns a tokio task for the snapshot
     // scheduler, so it has to be constructed inside the runtime
     // context. Build the SnapshotConfig from `config.checkpoints` and
@@ -228,6 +249,18 @@ fn build_embedder(config: &Config, root: &std::path::Path) -> Result<Arc<dyn Emb
             config.embeddings.model
         ))
     })
+}
+
+/// Identifying name for the active embedder. Stored in the embedder
+/// sidecar so we can detect "user swapped models" between boots.
+/// `MNEME_EMBEDDER=stub` overrides the config-named model, so the name
+/// has to come from the same control flow as `build_embedder`.
+fn active_embedder_model_name(config: &Config) -> String {
+    if matches!(std::env::var(EMBEDDER_OVERRIDE_ENV).as_deref(), Ok("stub")) {
+        "stub".to_owned()
+    } else {
+        config.embeddings.model.clone()
+    }
 }
 
 async fn shutdown_signal() {

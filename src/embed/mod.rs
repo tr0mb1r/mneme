@@ -18,6 +18,7 @@ use std::sync::Arc;
 pub mod batch;
 pub mod candle_bge;
 pub mod candle_minilm;
+pub mod migrate;
 pub mod model_loader;
 pub mod stub;
 
