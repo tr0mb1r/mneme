@@ -78,56 +78,51 @@ for the per-hook opt-out patterns.
 
 ### `permissions`
 
-A starting-point allow / deny list that cuts permission prompts
-during normal mneme + Rust development without opening the door to
-destructive operations.
+Mneme-specific entries only. The template allows two patterns so
+the agent doesn't get prompted on every routine mneme call:
 
-**Allowed** without prompting:
+- `mcp__mneme__*` — every mneme MCP tool (`recall`, `remember`,
+  `pin`, `recall_recent`, `summarize_session`, …). The `forget`
+  confirmation rule lives in `CLAUDE.md` (see template above),
+  not here.
+- `Bash(mneme:*)` — the `mneme` CLI subcommands (`mneme run`,
+  `mneme stats`, `mneme inspect`, `mneme backup`, etc.).
 
-- `mcp__mneme__*` — every mneme MCP tool. The `forget` confirmation
-  rule lives in `CLAUDE.md` (see template above), not here.
-- `Bash(mneme:*)` — the `mneme` CLI subcommands.
-- Read-only `cargo` (`build`, `check`, `test`, `fmt`, `clippy`, `doc`).
-- Read-only `git` (`status`, `diff`, `log`, `show`, `branch`, `fetch`).
-- Read-only `gh` (`pr view/checks/list`, `run view/list`,
-  `issue view/list`, `repo view`).
-- Read-only Unix (`ls`, `cat`, `head`, `tail`, `grep`, `rg`, `find`,
-  `wc`, `which`).
-
-**Denied outright** — these prompt even if a wider allow pattern
-gets pasted in later:
-
-- `Bash(git push:*)` — `git push` should always be a deliberate act.
-- `Bash(git reset --hard:*)` — destroys uncommitted work silently.
-- `Bash(rm -rf:*)` — destroys directory trees silently.
-- `Bash(cargo publish:*)` / `Bash(cargo yank:*)` — public-registry
-  side effects.
-
-Anything not listed in `allow` or `deny` falls back to Claude Code's
-default behaviour (prompt the user). That's the right shape for an
-allowlist: tight on what's pre-approved, narrow on what's outright
-forbidden, prompt on everything else.
+Anything not listed falls back to Claude Code's default
+behaviour (prompt the user). The template intentionally
+*does not* prescribe what other tools (`cargo`, `git`, `gh`,
+shell utilities, …) should be pre-allowed — those are personal
+choices that depend on the projects you work in. See the next
+section for how to grow the list from your real usage.
 
 ## 3. Refining over time
 
-The list above is a starting point, not a finished set. After a few
-sessions, run the `/fewer-permission-prompts` skill — it scans your
-recent transcripts for read-only Bash and MCP tool calls that
-prompted, and proposes additions to the allow list. Iterate from
-your real usage rather than guessing patterns up-front.
+The mneme-only allow list above is the floor. To grow it without
+guessing, run the `/fewer-permission-prompts` skill after a few
+sessions — it scans your recent transcripts for read-only Bash
+and MCP tool calls that prompted, and proposes additions to your
+allow list. Iterate from your real usage rather than guessing
+patterns up front.
+
+If you want a deny list too, scope it to operations that should
+*always* require explicit confirmation (`git push`, `rm -rf`,
+`cargo publish`, etc.) and merge it into the same `permissions`
+block. Anything denied prompts even if a wider allow pattern
+gets added later.
 
 ## 4. Verifying the setup
 
 After dropping in the files and restarting Claude Code:
 
-1. **MCP listing** — type `/mcp`. You should see `mneme` with 12
-   tools and 5 resources.
-2. **Hook smoke** — pin a sentinel rule and confirm the agent reads
-   it on session start. Walkthrough in
+1. **MCP listing** — type `/mcp`. You should see `mneme` with
+   12 tools and 5 resources.
+2. **Tool smoke** — ask the agent to call `mneme.stats`. The
+   call should run without a permission prompt (the
+   `mcp__mneme__*` allow pattern covers it) and return the
+   per-layer counts.
+3. **Hook smoke** — pin a sentinel rule and confirm the agent
+   reads it on session start. Walkthrough in
    [the setup guide §7.4](./claude-code-setup.md#74-verifying).
-3. **Permission smoke** — try a read-only `git status`. It should
-   run without a permission prompt. Try a `git push`. It should
-   prompt.
 
 If `/mcp` doesn't list mneme, see
 [the setup guide's troubleshooting section](./claude-code-setup.md#8-troubleshooting).

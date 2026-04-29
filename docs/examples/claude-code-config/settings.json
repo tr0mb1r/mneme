@@ -31,43 +31,7 @@
   "permissions": {
     "allow": [
       "mcp__mneme__*",
-      "Bash(mneme:*)",
-      "Bash(cargo build:*)",
-      "Bash(cargo check:*)",
-      "Bash(cargo test:*)",
-      "Bash(cargo fmt:*)",
-      "Bash(cargo clippy:*)",
-      "Bash(cargo doc:*)",
-      "Bash(git status:*)",
-      "Bash(git diff:*)",
-      "Bash(git log:*)",
-      "Bash(git show:*)",
-      "Bash(git branch:*)",
-      "Bash(git fetch:*)",
-      "Bash(gh pr view:*)",
-      "Bash(gh pr checks:*)",
-      "Bash(gh pr list:*)",
-      "Bash(gh run view:*)",
-      "Bash(gh run list:*)",
-      "Bash(gh issue view:*)",
-      "Bash(gh issue list:*)",
-      "Bash(gh repo view:*)",
-      "Bash(ls:*)",
-      "Bash(cat:*)",
-      "Bash(head:*)",
-      "Bash(tail:*)",
-      "Bash(grep:*)",
-      "Bash(rg:*)",
-      "Bash(find:*)",
-      "Bash(wc:*)",
-      "Bash(which:*)"
-    ],
-    "deny": [
-      "Bash(git push:*)",
-      "Bash(git reset --hard:*)",
-      "Bash(rm -rf:*)",
-      "Bash(cargo publish:*)",
-      "Bash(cargo yank:*)"
+      "Bash(mneme:*)"
     ]
   }
 }
