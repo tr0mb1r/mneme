@@ -80,7 +80,7 @@ There is no `brew install mneme` yet. Until the release pipeline lands, build
 from source:
 
 ```sh
-git clone https://github.com/vserkin/mneme && cd mneme
+git clone https://github.com/tr0mb1r/mneme && cd mneme
 cargo build --release
 cp target/release/mneme ~/.local/bin/   # or anywhere on $PATH
 mneme init                               # scaffolds ~/.mneme and pulls the embedding model

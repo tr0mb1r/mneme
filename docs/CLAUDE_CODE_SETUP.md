@@ -21,7 +21,7 @@ You need:
 - **Mneme built locally**:
 
   ```sh
-  git clone https://github.com/vserkin/mneme && cd mneme
+  git clone https://github.com/tr0mb1r/mneme && cd mneme
   cargo build --release
   ```
 
