@@ -193,11 +193,10 @@ mod tests {
                 .build()
                 .unwrap();
             rt.block_on(async {
-                let storage: Arc<dyn Storage> =
-                    RedbStorage::open(&root.join("episodic")).unwrap();
+                let storage: Arc<dyn Storage> = RedbStorage::open(&root.join("episodic")).unwrap();
                 let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
-                let s = SemanticStore::open_disabled(&root, Arc::clone(&storage), embedder)
-                    .unwrap();
+                let s =
+                    SemanticStore::open_disabled(&root, Arc::clone(&storage), embedder).unwrap();
                 let id = s
                     .remember(&content, kind, vec!["t1".into()], "personal".into())
                     .await

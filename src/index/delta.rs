@@ -101,13 +101,13 @@ where
 
 fn apply_one(index: &mut HnswIndex, op: &WalOp) -> Result<()> {
     match op {
-        WalOp::VectorInsert { id, vec } => apply_vector_op(index, *id, vec, |idx, id, v| {
-            idx.insert(id, v)
-        }),
+        WalOp::VectorInsert { id, vec } => {
+            apply_vector_op(index, *id, vec, |idx, id, v| idx.insert(id, v))
+        }
         WalOp::VectorDelete { id } => index.delete(*id),
-        WalOp::VectorReplace { id, vec } => apply_vector_op(index, *id, vec, |idx, id, v| {
-            idx.replace(id, v)
-        }),
+        WalOp::VectorReplace { id, vec } => {
+            apply_vector_op(index, *id, vec, |idx, id, v| idx.replace(id, v))
+        }
         WalOp::Put { .. } | WalOp::Delete { .. } => {
             // Surface clearly: a redb-WAL record landed in the
             // semantic-index WAL, which means a misconfigured

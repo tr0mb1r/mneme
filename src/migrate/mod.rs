@@ -144,7 +144,10 @@ mod tests {
         // Sentinel is now at v1.
         assert_eq!(current_version(root).unwrap(), 1);
         // Existing data was untouched byte-for-byte.
-        assert_eq!(std::fs::read(root.join("config.toml")).unwrap(), config_body);
+        assert_eq!(
+            std::fs::read(root.join("config.toml")).unwrap(),
+            config_body
+        );
         assert_eq!(
             std::fs::read(root.join("procedural").join("pinned.jsonl")).unwrap(),
             pinned_body
@@ -158,6 +161,9 @@ mod tests {
         // exit gate).
         migrate_to(root, 1).unwrap();
         assert_eq!(current_version(root).unwrap(), 1);
-        assert_eq!(std::fs::read(root.join("config.toml")).unwrap(), config_body);
+        assert_eq!(
+            std::fs::read(root.join("config.toml")).unwrap(),
+            config_body
+        );
     }
 }

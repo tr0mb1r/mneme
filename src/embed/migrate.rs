@@ -318,9 +318,8 @@ mod tests {
         // Boot 1 — 4-dim, two memories, sidecar gets written.
         {
             let e: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
-            let s =
-                SemanticStore::open_disabled(tmp.path(), Arc::clone(&storage), Arc::clone(&e))
-                    .unwrap();
+            let s = SemanticStore::open_disabled(tmp.path(), Arc::clone(&storage), Arc::clone(&e))
+                .unwrap();
             s.remember("alpha", MemoryKind::Fact, vec![], "personal".into())
                 .await
                 .unwrap();
