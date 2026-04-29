@@ -1,0 +1,62 @@
+name: release-plz
+
+# Auto-bump release PR pipeline.
+#
+# On every push to `main`, release-plz inspects the commits since the
+# previous release tag and — if any are bump-worthy under Conventional
+# Commits — opens (or updates) a "release PR" that:
+#
+#   - bumps `Cargo.toml` `package.version` to the next version, and
+#   - regenerates `CHANGELOG.md` with one section per bump.
+#
+# We deliberately scope this workflow to PR generation only. The
+# tag-and-publish step is intentionally manual until v1.0 (see
+# `release-plz.toml` for the gates):
+#
+#   - `git_tag_enable = false` — no auto-tag from the tool.
+#   - `git_release_enable = false` — no auto-GitHub-Release; that's
+#     `release.yml`'s job, triggered explicitly by a tag push.
+#   - `publish = false` — no crates.io publish until 1.0.
+#
+# Release flow:
+#   1. Merge feature work to `main`.
+#   2. release-plz opens / updates the release PR.
+#   3. Review and merge the release PR (it bumps Cargo.toml + CHANGELOG).
+#   4. On main:
+#        v="$(awk -F'"' '/^version/{print $2; exit}' Cargo.toml)"
+#        git tag "v${v}" && git push origin "v${v}"
+#   5. `release.yml` runs on the tag push and ships the binaries.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write          # create/update the release PR branch
+  pull-requests: write     # open the release PR
+
+# Avoid concurrent release-plz runs racing on the same release PR.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    name: open / update release PR
+    # Only the canonical repo opens release PRs; forks would otherwise
+    # try to push branches they don't have rights for.
+    if: ${{ github.repository_owner == 'tr0mb1r' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz (release-pr mode)
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
