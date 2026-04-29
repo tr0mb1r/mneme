@@ -29,6 +29,9 @@ Thanks for your interest. This document is short on purpose.
 - All public APIs return `Result<T, MnemeError>`.
 - No `unwrap()` in non-test code.
 - Tests are mandatory for non-trivial changes.
+- Changes that touch the durability path (WAL, redb, HNSW snapshot/delta,
+  backup/restore) must pass `scripts/manual_test.sh --stub` end-to-end
+  before review.
 
 ## Commits
 
@@ -43,4 +46,6 @@ its own sake.
 ## What needs review
 
 Anything that touches the durability path (WAL, redb integration, HNSW
-snapshot+delta) needs a second pair of eyes. Crash tests are mandatory.
+snapshot+delta, backup/restore, schema migration) needs a second pair
+of eyes. Crash tests are mandatory; the `scripts/manual_test.sh`
+end-to-end run is the floor, not the ceiling.
