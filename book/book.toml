@@ -1,0 +1,26 @@
+[book]
+title = "Mneme"
+authors = ["Valeriy Serkin"]
+description = "MCP-native persistent memory tool for AI agents."
+language = "en"
+multilingual = false
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/tr0mb1r/mneme"
+edit-url-template = "https://github.com/tr0mb1r/mneme/edit/main/book/{path}"
+site-url = "/mneme/"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-boolean-and = true
+
+[preprocessor.links]
+# Pulls content from sibling files outside book/src via {{#include}}.

@@ -1,0 +1,62 @@
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One in-flight Pages deploy at a time; new pushes cancel the previous.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build mdBook
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo + mdbook
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/mdbook
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: mdbook-${{ runner.os }}-v0.4
+
+      - name: Install mdbook
+        run: |
+          if ! command -v mdbook >/dev/null 2>&1; then
+            cargo install --locked --version 0.4.40 mdbook
+          fi
+          mdbook --version
+
+      - name: Build the book
+        working-directory: book
+        run: mdbook build
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: book/book
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
