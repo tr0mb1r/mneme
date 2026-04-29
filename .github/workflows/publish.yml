@@ -1,0 +1,92 @@
+name: publish
+
+# Manual-trigger workflow that publishes a tagged version to crates.io.
+#
+# Pre-1.0 we deliberately don't auto-publish on every tag — accidental
+# tags shouldn't accidentally publish to crates.io. Trigger explicitly:
+#
+#   gh workflow run publish.yml --field tag=v0.2.1
+#
+# Long-term plan: replace `CARGO_REGISTRY_TOKEN` with OIDC trusted
+# publishing once the crate exists on crates.io. The Trusted Publisher
+# config is set up on the crates.io side after the first publish; once
+# enabled, this workflow's `Publish to crates.io` step swaps the
+# `CARGO_REGISTRY_TOKEN` env for an OIDC-issued short-lived token and
+# the secret can be deleted from the repo. See follow-up PR.
+#
+# Security notes:
+# - `if: github.repository_owner == 'tr0mb1r'` blocks forks from
+#   running this workflow (they wouldn't have the secret anyway, but
+#   defense-in-depth).
+# - `concurrency` prevents accidental double-publish.
+# - `--dry-run` runs first to catch packaging issues before contacting
+#   crates.io. A failed dry-run aborts before the real publish step
+#   touches the secret.
+# - The `Verify Cargo.toml version matches tag` step blocks the case
+#   where someone runs the workflow against a tag that points at code
+#   with a mismatched Cargo.toml version (e.g., publishing 0.3.0 from
+#   a tag created on a 0.2.x commit).
+# - Future hardening (in the OIDC migration PR): pin all action refs
+#   to commit SHAs. Currently consistent with the rest of the repo's
+#   workflows that use tag refs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish to crates.io (e.g., v0.2.1)'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-crates-io
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: cargo publish
+    if: ${{ github.repository_owner == 'tr0mb1r' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/mneme-mcp
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag }}
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish
+
+      - name: Verify Cargo.toml version matches tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag }}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "::error::Tag '$tag' does not match v*.*.* pattern."
+            exit 1
+          fi
+          version="${tag#v}"
+          cargo_ver="$(awk -F'"' '/^version[[:space:]]*=/{print $2; exit}' Cargo.toml)"
+          if [ "$cargo_ver" != "$version" ]; then
+            echo "::error::Cargo.toml version '$cargo_ver' does not match tag '$tag' (expected '$version')."
+            exit 1
+          fi
+          echo "::notice::Publishing mneme-mcp $version from tag $tag"
+
+      - name: Dry-run publish
+        run: cargo publish --dry-run --locked
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
