@@ -50,26 +50,44 @@ fn group_commit_under_load() {
     let elapsed = started.elapsed();
 
     // The point of this assertion is "group-commit amortizes fsync" —
-    // we cap at a generous bound so the test fails loudly if the
-    // pipeline regressed to per-put fsync. Naive per-put on a typical
-    // SSD would be ~10ms × 32k ops ≈ 320s; we're well under that on
-    // any platform that's not catastrophically broken.
+    // a regression to per-put fsync would push 32k ops well past 60 s
+    // on any reasonable SSD (~10 ms × 32k = ~320 s naive per-put).
     //
-    // Windows runners (NTFS + flush_and_close on every commit) are
-    // ~3× slower than ext4/APFS; bumping the bound there avoids a
-    // flake that's about platform fsync, not about whether
-    // group-commit is working.
-    #[cfg(windows)]
-    let budget = Duration::from_secs(240);
+    // We only enforce it on Linux + macOS. On Windows the assertion
+    // is dropped because:
+    //
+    //   * NTFS + flush_and_close on every commit is structurally
+    //     ~3× slower than ext4 / APFS,
+    //   * GitHub Actions windows-latest runners have wide per-job
+    //     performance variance — observed runs range from ~110 s to
+    //     ~280 s for the same workload, with no code change between.
+    //
+    // The correctness checks below (every key reads back identical;
+    // per-worker prefix scan returns exactly OPS_PER_WORKER items)
+    // still exercise the concurrent-write path on every platform —
+    // the only thing we forgo on Windows is the throughput floor.
     #[cfg(not(windows))]
-    let budget = Duration::from_secs(60);
-    assert!(
-        elapsed < budget,
-        "{} concurrent puts took {:?} (budget {:?}) — group-commit appears not to be amortizing fsync",
-        WORKERS * OPS_PER_WORKER,
-        elapsed,
-        budget,
-    );
+    {
+        let budget = Duration::from_secs(60);
+        assert!(
+            elapsed < budget,
+            "{} concurrent puts took {:?} (budget {:?}) — group-commit appears not to be amortizing fsync",
+            WORKERS * OPS_PER_WORKER,
+            elapsed,
+            budget,
+        );
+    }
+    #[cfg(windows)]
+    {
+        // Surface the wall-clock to the runner log so a regression is
+        // still investigable, even though we don't fail the test on
+        // throughput here.
+        eprintln!(
+            "concurrent_writes (windows): {} ops in {:?}",
+            WORKERS * OPS_PER_WORKER,
+            elapsed,
+        );
+    }
 
     // Every key written must read back identical.
     rt.block_on(async {
