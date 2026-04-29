@@ -22,6 +22,19 @@ name: release
 #
 # Crate publication to crates.io is intentionally NOT done here —
 # release-plz.toml sets `publish = false` until the v1.0 gate clears.
+#
+# The Homebrew tap (`tr0mb1r/homebrew-mneme`) is bumped from this
+# workflow's `tap-bump` job: after the GitHub Release is up, that
+# job rewrites `Formula/mneme.rb` against the new sha256 sidecars
+# and opens a PR. The PR has to be merged manually so the user
+# stays in the loop on what brew users see — this is the explicit
+# "publish to brew" gate.
+#
+# Setup (one-time): create a fine-grained PAT scoped to
+# `tr0mb1r/homebrew-mneme` with `Contents: R/W` and
+# `Pull requests: R/W`, store it in this repo as the
+# `HOMEBREW_TAP_TOKEN` secret. A GitHub App token with the same
+# scopes works equally well.
 
 on:
   push:
@@ -211,3 +224,134 @@ jobs:
             dist/mneme-*.tar.gz.sha256
             dist/mneme-*.zip
             dist/mneme-*.zip.sha256
+
+  tap-bump:
+    name: Bump Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify token is set
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "${TOKEN}" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN secret is not set. See release.yml header for setup."
+            exit 1
+          fi
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${ref#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: tr0mb1r/homebrew-mneme
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Fetch sha256 sidecars
+        id: sha
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          VER: ${{ steps.ver.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://github.com/tr0mb1r/mneme/releases/download/${TAG}"
+          for arch in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-musl x86_64-unknown-linux-musl; do
+            file="mneme-${VER}-${arch}.tar.gz.sha256"
+            sha=$(curl -fsSL "${base}/${file}" | awk '{print $1}')
+            if ! [[ "${sha}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::invalid sha256 for ${arch}: '${sha}'"
+              exit 1
+            fi
+            slug="${arch//-/_}"
+            echo "${slug}=${sha}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Rewrite formula
+        env:
+          VER: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          SHA_AARCH64_APPLE_DARWIN: ${{ steps.sha.outputs.aarch64_apple_darwin }}
+          SHA_X86_64_APPLE_DARWIN: ${{ steps.sha.outputs.x86_64_apple_darwin }}
+          SHA_AARCH64_UNKNOWN_LINUX_MUSL: ${{ steps.sha.outputs.aarch64_unknown_linux_musl }}
+          SHA_X86_64_UNKNOWN_LINUX_MUSL: ${{ steps.sha.outputs.x86_64_unknown_linux_musl }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, pathlib, sys
+
+          ver = os.environ["VER"]
+          tag = os.environ["TAG"]
+          shas = {
+              "aarch64-apple-darwin":       os.environ["SHA_AARCH64_APPLE_DARWIN"],
+              "x86_64-apple-darwin":        os.environ["SHA_X86_64_APPLE_DARWIN"],
+              "aarch64-unknown-linux-musl": os.environ["SHA_AARCH64_UNKNOWN_LINUX_MUSL"],
+              "x86_64-unknown-linux-musl":  os.environ["SHA_X86_64_UNKNOWN_LINUX_MUSL"],
+          }
+          path = pathlib.Path("tap/Formula/mneme.rb")
+          src = path.read_text()
+          for arch, sha in shas.items():
+              pat = re.compile(
+                  r'url "https://github\.com/tr0mb1r/mneme/releases/download/v[^/"]+/'
+                  r'mneme-[^"]+-' + re.escape(arch) + r'\.tar\.gz"\n'
+                  r'(\s+)sha256 "[0-9a-f]{64}"',
+                  re.MULTILINE,
+              )
+              repl = (
+                  f'url "https://github.com/tr0mb1r/mneme/releases/download/{tag}/'
+                  f'mneme-{ver}-{arch}.tar.gz"\n'
+                  f'\\g<1>sha256 "{sha}"'
+              )
+              src, n = pat.subn(repl, src)
+              if n != 1:
+                  sys.exit(f"expected exactly 1 match for {arch}, got {n}")
+          path.write_text(src)
+          PY
+
+          if git -C tap diff --quiet Formula/mneme.rb; then
+            echo "::error::formula already at ${TAG} (no changes after rewrite); refusing to open empty PR"
+            exit 1
+          fi
+          git -C tap diff Formula/mneme.rb
+
+      - name: Open PR
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          VER: ${{ steps.ver.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tap
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="bump/${TAG}"
+          # If a previous run left the branch around, replace it.
+          git push origin --delete "${branch}" 2>/dev/null || true
+          git checkout -b "${branch}"
+          git add Formula/mneme.rb
+          git commit -m "chore(formula): bump mneme to ${TAG}"
+          git push -u origin "${branch}"
+          gh pr create \
+            --repo tr0mb1r/homebrew-mneme \
+            --base main \
+            --head "${branch}" \
+            --title "chore(formula): bump mneme to ${TAG}" \
+            --body "Auto-bump from the mneme release pipeline ([run](${RUN_URL})).
+
+          Tracks https://github.com/tr0mb1r/mneme/releases/tag/${TAG}.
+          sha256s pulled from the .sha256 sidecars on that GitHub Release.
+
+          Merge to publish ${VER} to brew users."
