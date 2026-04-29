@@ -5,7 +5,18 @@ no-default-features = false
 [advisories]
 db-urls = ["https://github.com/RustSec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    # `atomic-polyfill` is upstream-archived (deprecated in favour of
+    # `portable-atomic`). Pulled transitively via the candle / heapless
+    # graph; no known security vulnerability, just unmaintained.
+    # Revisit when an upstream we depend on cuts a release that drops
+    # the dep.
+    "RUSTSEC-2023-0089",
+    # `paste` is upstream-archived. Pulled transitively via candle's
+    # macro graph; no known security vulnerability. Same revisit
+    # criterion as above.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 allow = [
@@ -21,6 +32,10 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "0BSD",
+    # CDLA-Permissive-2.0: webpki-roots ships Mozilla's CA bundle
+    # under this license. Permissive (no copyleft), explicitly
+    # OSI-recognised category. Acceptable for this project.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 

@@ -49,11 +49,26 @@ fn group_commit_under_load() {
     });
     let elapsed = started.elapsed();
 
+    // The point of this assertion is "group-commit amortizes fsync" —
+    // we cap at a generous bound so the test fails loudly if the
+    // pipeline regressed to per-put fsync. Naive per-put on a typical
+    // SSD would be ~10ms × 32k ops ≈ 320s; we're well under that on
+    // any platform that's not catastrophically broken.
+    //
+    // Windows runners (NTFS + flush_and_close on every commit) are
+    // ~3× slower than ext4/APFS; bumping the bound there avoids a
+    // flake that's about platform fsync, not about whether
+    // group-commit is working.
+    #[cfg(windows)]
+    let budget = Duration::from_secs(240);
+    #[cfg(not(windows))]
+    let budget = Duration::from_secs(60);
     assert!(
-        elapsed < Duration::from_secs(60),
-        "{} concurrent puts took {:?} — group-commit appears not to be amortizing fsync",
+        elapsed < budget,
+        "{} concurrent puts took {:?} (budget {:?}) — group-commit appears not to be amortizing fsync",
         WORKERS * OPS_PER_WORKER,
-        elapsed
+        elapsed,
+        budget,
     );
 
     // Every key written must read back identical.
