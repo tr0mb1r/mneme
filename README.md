@@ -1,5 +1,9 @@
 # Mneme
 
+[![CI](https://github.com/tr0mb1r/mneme/actions/workflows/ci.yml/badge.svg)](https://github.com/tr0mb1r/mneme/actions/workflows/ci.yml)
+[![cross-build](https://github.com/tr0mb1r/mneme/actions/workflows/cross-build.yml/badge.svg)](https://github.com/tr0mb1r/mneme/actions/workflows/cross-build.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 > A standalone, MCP-native memory tool for any LLM or agent.
 > Single binary. Local-first. Rust. Built to last.
 
