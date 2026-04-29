@@ -271,7 +271,7 @@ async fn async_main(
         Arc::new(ResourceRegistry::defaults_with_schedulers(
             semantic,
             procedural,
-            episodic,
+            Arc::clone(&episodic),
             orchestrator,
             cold,
             schema_version,
@@ -280,11 +280,11 @@ async fn async_main(
             Some(Arc::clone(&checkpoint_scheduler)),
             Some(Arc::clone(&active_session)),
             Some(sessions_dir),
-            Some(scope_state),
+            Some(Arc::clone(&scope_state)),
         )),
         storage,
     )
-    .with_session(active_session, checkpoint_scheduler);
+    .with_session(active_session, checkpoint_scheduler, episodic, scope_state);
 
     tokio::select! {
         result = server.run() => result?,

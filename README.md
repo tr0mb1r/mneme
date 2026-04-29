@@ -7,7 +7,7 @@
 > A standalone, MCP-native memory tool for any LLM or agent.
 > Single binary. Local-first. Rust. Built to last.
 
-**Status:** Pre-1.0 — `0.2.x` line, latest `0.2.2` published as
+**Status:** Pre-1.0 — `0.2.x` line, latest `0.2.3` published as
 [`mneme-mcp`](https://crates.io/crates/mneme-mcp) on crates.io and as
 [`tr0mb1r/mneme`](https://github.com/tr0mb1r/homebrew-mneme) on Homebrew.
 Phases 0–5 complete; Phase 6 (portability + diagnostics + release

@@ -26,7 +26,9 @@ use super::tools::{ToolError, ToolRegistry, descriptor_to_json as tool_to_json};
 use super::transport::stdio::{FrameError, StdioTransport};
 use super::{PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
 use crate::memory::checkpoint_scheduler::CheckpointScheduler;
+use crate::memory::episodic::EpisodicStore;
 use crate::memory::working::ActiveSession;
+use crate::scope::ScopeState;
 use crate::storage::Storage;
 
 // Tools consume the SemanticStore directly (Phase 3); the `Storage`
@@ -56,6 +58,15 @@ pub struct Server<R, W> {
     /// can re-evaluate the turn-count threshold without waiting for
     /// the next wall-clock tick. `None` when `session` is `None`.
     checkpoint_scheduler: Option<Arc<CheckpointScheduler>>,
+    /// `Some(_)` in production. Each successful `tools/call` is
+    /// recorded as an `EpisodicEvent { kind: "tool_call" }` in L3
+    /// hot tier. Closes the producer gap that left the L3 layer
+    /// permanently empty pre-v0.2.3.
+    episodic: Option<Arc<EpisodicStore>>,
+    /// Tags the auto-emitted L3 event with the active default scope,
+    /// matching `remember`/`pin` behaviour when the caller omits an
+    /// explicit `scope` argument.
+    scope_state: Option<Arc<ScopeState>>,
     initialized: AtomicBool,
 }
 
@@ -77,21 +88,29 @@ where
             storage,
             session: None,
             checkpoint_scheduler: None,
+            episodic: None,
+            scope_state: None,
             initialized: AtomicBool::new(false),
         }
     }
 
-    /// Builder hook: attach an active session + its checkpoint
-    /// scheduler so each successful `tools/call` records a turn and
-    /// pokes the scheduler. `cli::run` calls this in production;
-    /// tests may skip it for stateless fixtures.
+    /// Builder hook: attach the production runtime wiring so each
+    /// successful `tools/call` (1) records a turn on the active
+    /// session, (2) pokes the checkpoint scheduler, and (3) appends
+    /// an L3 episodic event tagged with the current scope. `cli::run`
+    /// calls this in production; stateless test fixtures skip it
+    /// entirely (Server has `None` for all four slots).
     pub fn with_session(
         mut self,
         session: Arc<ActiveSession>,
         scheduler: Arc<CheckpointScheduler>,
+        episodic: Arc<EpisodicStore>,
+        scope_state: Arc<ScopeState>,
     ) -> Self {
         self.session = Some(session);
         self.checkpoint_scheduler = Some(scheduler);
+        self.episodic = Some(episodic);
+        self.scope_state = Some(scope_state);
         self
     }
 
@@ -235,6 +254,22 @@ where
                 {
                     session.push_turn("tool", &name);
                     sched.poke();
+                }
+                if let (Some(episodic), Some(scope_state)) =
+                    (self.episodic.as_ref(), self.scope_state.as_ref())
+                {
+                    let scope = scope_state.current();
+                    let payload = json!({ "tool": &name });
+                    if let Err(e) = episodic.record_json("tool_call", &scope, &payload).await {
+                        // Non-fatal: the user already got their tool result;
+                        // a missed L3 event is a degraded-mode signal, not a
+                        // reason to fail the request.
+                        tracing::warn!(
+                            error = %e,
+                            tool = %name,
+                            "failed to record episodic tool_call event"
+                        );
+                    }
                 }
                 Response::success(id, result.to_json())
             }
@@ -531,5 +566,189 @@ mod tests {
     #[allow(dead_code)]
     fn _ensure_id_used() {
         let _ = Id::Number(0);
+    }
+
+    /// Closes the L3 producer gap. Until v0.2.3 the episodic hot
+    /// tier had no production writer — every `EpisodicStore::record*`
+    /// call lived in `#[cfg(test)]`. This test pins the auto-emit
+    /// contract: every successful `tools/call` MUST land one
+    /// `EpisodicEvent { kind: "tool_call" }` in the hot tier, tagged
+    /// with the active scope and the called tool's name.
+    #[tokio::test]
+    async fn successful_tools_call_emits_episodic_event() {
+        use crate::embed::Embedder;
+        use crate::embed::stub::StubEmbedder;
+        use crate::memory::checkpoint_scheduler::{CheckpointScheduler, CheckpointSchedulerConfig};
+        use crate::memory::episodic::{EpisodicStore, RecentFilters};
+        use crate::memory::procedural::ProceduralStore;
+        use crate::memory::semantic::SemanticStore;
+        use crate::memory::working::ActiveSession;
+        use crate::orchestrator::{Orchestrator, TokenBudget};
+        use crate::scope::ScopeState;
+        use crate::storage::archive::ColdArchive;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = crate::storage::memory_impl::MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&storage), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage)));
+        let orchestrator = Arc::new(Orchestrator::new(
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+        ));
+        let cold = ColdArchive::new(tmp.path());
+        let active_session = ActiveSession::open(tmp.path().join("sessions")).unwrap();
+        let checkpoint_scheduler = CheckpointScheduler::start(
+            Arc::clone(&active_session),
+            CheckpointSchedulerConfig::disabled(),
+        );
+        let scope_state = ScopeState::new("work");
+
+        let mut input = String::new();
+        input.push_str(&req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18"}),
+        ));
+        input.push_str(&notif("notifications/initialized"));
+        input.push_str(&req(
+            2,
+            "tools/call",
+            json!({"name": "remember", "arguments": {"content": "hi"}}),
+        ));
+
+        let transport = StdioTransport::new(input.as_bytes(), Vec::<u8>::new());
+        let mut server = Server::new(
+            transport,
+            Arc::new(ToolRegistry::defaults(
+                Arc::clone(&semantic),
+                Arc::clone(&procedural),
+                Arc::clone(&episodic),
+                Arc::clone(&storage),
+                cold.clone(),
+                1,
+            )),
+            Arc::new(ResourceRegistry::defaults(
+                semantic,
+                procedural,
+                Arc::clone(&episodic),
+                orchestrator,
+                cold,
+                1,
+                TokenBudget::for_tests(2000),
+            )),
+            storage,
+        )
+        .with_session(
+            active_session,
+            checkpoint_scheduler,
+            Arc::clone(&episodic),
+            Arc::clone(&scope_state),
+        );
+        server.run().await.unwrap();
+
+        let events = episodic
+            .recall_recent(&RecentFilters::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "expected one tool_call event");
+        let evt = &events[0];
+        assert_eq!(evt.kind, "tool_call");
+        assert_eq!(evt.scope, "work");
+        let payload = evt.payload_json().unwrap();
+        assert_eq!(payload["tool"], "remember");
+    }
+
+    /// Failed tool calls must NOT emit an episodic event — same
+    /// reasoning as the existing turn-counter behaviour: we don't
+    /// want the hot tier to fill up with noise from invalid calls.
+    #[tokio::test]
+    async fn failed_tools_call_does_not_emit_episodic_event() {
+        use crate::embed::Embedder;
+        use crate::embed::stub::StubEmbedder;
+        use crate::memory::checkpoint_scheduler::{CheckpointScheduler, CheckpointSchedulerConfig};
+        use crate::memory::episodic::{EpisodicStore, RecentFilters};
+        use crate::memory::procedural::ProceduralStore;
+        use crate::memory::semantic::SemanticStore;
+        use crate::memory::working::ActiveSession;
+        use crate::orchestrator::{Orchestrator, TokenBudget};
+        use crate::scope::ScopeState;
+        use crate::storage::archive::ColdArchive;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = crate::storage::memory_impl::MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&storage), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage)));
+        let orchestrator = Arc::new(Orchestrator::new(
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+        ));
+        let cold = ColdArchive::new(tmp.path());
+        let active_session = ActiveSession::open(tmp.path().join("sessions")).unwrap();
+        let checkpoint_scheduler = CheckpointScheduler::start(
+            Arc::clone(&active_session),
+            CheckpointSchedulerConfig::disabled(),
+        );
+        let scope_state = ScopeState::new("personal");
+
+        let mut input = String::new();
+        input.push_str(&req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18"}),
+        ));
+        input.push_str(&notif("notifications/initialized"));
+        input.push_str(&req(
+            2,
+            "tools/call",
+            json!({"name": "no_such_tool", "arguments": {}}),
+        ));
+
+        let transport = StdioTransport::new(input.as_bytes(), Vec::<u8>::new());
+        let mut server = Server::new(
+            transport,
+            Arc::new(ToolRegistry::defaults(
+                Arc::clone(&semantic),
+                Arc::clone(&procedural),
+                Arc::clone(&episodic),
+                Arc::clone(&storage),
+                cold.clone(),
+                1,
+            )),
+            Arc::new(ResourceRegistry::defaults(
+                semantic,
+                procedural,
+                Arc::clone(&episodic),
+                orchestrator,
+                cold,
+                1,
+                TokenBudget::for_tests(2000),
+            )),
+            storage,
+        )
+        .with_session(
+            active_session,
+            checkpoint_scheduler,
+            Arc::clone(&episodic),
+            scope_state,
+        );
+        server.run().await.unwrap();
+
+        let events = episodic
+            .recall_recent(&RecentFilters::default(), 10)
+            .await
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "failed tools/call should not emit, got {} event(s)",
+            events.len()
+        );
     }
 }
