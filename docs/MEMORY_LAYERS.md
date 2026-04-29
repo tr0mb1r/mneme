@@ -29,7 +29,7 @@ The rest of the doc is layer-by-layer detail.
 |---|---|---|---|---|---|
 | **L0 Procedural** | Always-on pinned rules (`pin` / `unpin`) | No | `~/.mneme/procedural/pinned.jsonl` | Live: file watched every 500 ms; external edits picked up in <1 s | Same |
 | **L1 Working session** | The current session's turns, scratch state | No | `~/.mneme/sessions/<session_id>.snapshot` (atomic temp+rename per flush) | **Wired (v0.13)** — `CheckpointScheduler` flushes every 30 s OR every 5 tool calls | Same |
-| **L3 Episodic** | Time-ordered events, tool calls, summaries | No (lexical only) | `~/.mneme/episodic/` (redb), three prefixes: `epi:` hot, `wepi:` warm, `cold/` zstd | Hot tier writes are live. **Tier promotion is wired (v0.12)** — `ConsolidationScheduler` fires every 5 min when idle | Idle-time pass: hot → warm at age ≥ 28 d, warm → cold at age ≥ 180 d |
+| **L3 Episodic** | Time-ordered events, tool calls, summaries | No (lexical only) | `~/.mneme/episodic/` (redb), three prefixes: `epi:` hot, `wepi:` warm, `cold/` zstd | **Producer wired (v0.2.3)** — every successful `tools/call` auto-emits a `kind="tool_call"` event tagged with the active scope. **Tier promotion wired (v0.12)** — `ConsolidationScheduler` fires every 5 min when idle | Idle-time pass: hot → warm at age ≥ 28 d, warm → cold at age ≥ 180 d |
 | **L4 Semantic** | Long-term facts, decisions, preferences | **Yes** — every `remember` / `update` re-embeds | `~/.mneme/episodic/` (redb), prefix `mem:` + `~/.mneme/index/hnsw.idx` snapshot + `~/.mneme/wal/` deltas | Live writes; **HNSW snapshot scheduler runs**: every 1000 inserts OR every 60 min, whichever first | Same |
 | **Auto-context resource** | Pinned + recent, packed to a token budget | Reads only | (assembled on demand) | On read of `mneme://context` | Same |
 | **Cold archive** | Quarter-bundled JSON, zstd-compressed | No | `~/.mneme/cold/<YYYY-Q>.zst` | Written only when L3 consolidation runs | Same as L3 |
@@ -153,9 +153,18 @@ fires a pass and refreshes its idle gate. Future modes
 (`every_<n>m`, cron, `on_demand`) belong to v1.1.
 
 **What runs today:**
-> Hot-tier writes happen live every time the agent emits an
-> episodic event. **Tier promotion is wired and runs in the
-> background** (`memory::consolidation_scheduler::ConsolidationScheduler`,
+> **Producer is wired (v0.2.3).** Every successful `tools/call`
+> dispatched by `mcp::server::Server::handle_tools_call` appends one
+> `EpisodicEvent { kind: "tool_call", payload: {"tool": <name>} }`
+> to the hot tier, scoped to whatever `ScopeState::current()` returns
+> at emit time. Failed calls do not emit (same logic that protects
+> the L1 turn counter). Pre-v0.2.3 the layer had no production
+> writer despite the rest of the pipeline shipping — see the v0.19
+> note in `proj_docs/mneme-implementation-plan.md` for the
+> backstory.
+>
+> **Tier promotion is wired and runs in the background**
+> (`memory::consolidation_scheduler::ConsolidationScheduler`,
 > spawned by `cli::run`). Per-pass observability (`runs_total`,
 > `errors_total`, `last_consolidation_at`, `last_promoted_to_warm`,
 > `last_archived_to_cold`) lands on the `mneme://stats` resource and

@@ -225,9 +225,9 @@ step "tools/list"
 send_request "tools/list" >/dev/null
 LIST_RESP=$(read_response)
 TOOL_NAMES=$(jq -r '.result.tools[].name' <<<"$LIST_RESP" | sort | paste -sd, -)
-EXPECTED="export,forget,list_scopes,pin,recall,recall_recent,remember,stats,summarize_session,unpin,update"
+EXPECTED="export,forget,list_scopes,pin,recall,recall_recent,remember,stats,summarize_session,switch_scope,unpin,update"
 [[ "$TOOL_NAMES" == "$EXPECTED" ]] \
-    && ok "11 tools registered: $TOOL_NAMES" \
+    && ok "12 tools registered: $TOOL_NAMES" \
     || fail "tool list mismatch: got=$TOOL_NAMES expected=$EXPECTED"
 
 # ---------- L4 semantic ----------
@@ -309,13 +309,19 @@ TEXT=$(jq -r '.result.content[0].text' <<<"$RESP")
 # ---------- L3 episodic ----------
 
 step "L3 episodic — recall_recent / summarize_session"
-RESP=$(call_tool recall_recent '{"limit":10}')
+RESP=$(call_tool recall_recent '{"limit":20}')
 RECENT_TEXT=$(jq -r '.result.content[0].text' <<<"$RESP")
-# recall_recent returns a JSON array (possibly empty on a fresh tree) —
-# just check it parses.
+# Since v0.2.3 every successful tools/call auto-emits a `tool_call`
+# event, so by this point in the script the hot tier MUST contain
+# at least one entry. n=0 means the producer regressed.
 if echo "$RECENT_TEXT" | jq -e 'type == "array"' >/dev/null 2>&1; then
     COUNT=$(echo "$RECENT_TEXT" | jq 'length')
-    ok "recall_recent returned a JSON array (n=$COUNT)"
+    KINDS=$(echo "$RECENT_TEXT" | jq -r '[.[].kind] | unique | join(",")')
+    if [[ "$COUNT" -ge 1 ]]; then
+        ok "recall_recent returned $COUNT event(s); kinds=[$KINDS]"
+    else
+        fail "recall_recent returned empty array; auto-emit on tools/call appears broken"
+    fi
 else
     fail "recall_recent did not return a JSON array: $RECENT_TEXT"
 fi
