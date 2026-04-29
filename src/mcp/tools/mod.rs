@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::memory::checkpoint_scheduler::CheckpointScheduler;
 use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
@@ -123,7 +124,7 @@ impl ToolRegistry {
         cold: ColdArchive,
         schema_version: u32,
     ) -> Self {
-        Self::defaults_with_consolidation(
+        Self::defaults_with_schedulers(
             semantic,
             procedural,
             episodic,
@@ -131,14 +132,15 @@ impl ToolRegistry {
             cold,
             schema_version,
             None,
+            None,
         )
     }
 
     /// Like [`defaults`](Self::defaults) but also attaches the L3
-    /// consolidation scheduler so the `stats` tool reports its
-    /// observability counters.
+    /// consolidation scheduler and the L1 checkpoint scheduler so
+    /// the `stats` tool reports their observability counters.
     #[allow(clippy::too_many_arguments)]
-    pub fn defaults_with_consolidation(
+    pub fn defaults_with_schedulers(
         semantic: Arc<SemanticStore>,
         procedural: Arc<ProceduralStore>,
         episodic: Arc<EpisodicStore>,
@@ -146,6 +148,7 @@ impl ToolRegistry {
         cold: ColdArchive,
         schema_version: u32,
         consolidation: Option<Arc<ConsolidationScheduler>>,
+        checkpoints: Option<Arc<CheckpointScheduler>>,
     ) -> Self {
         let mut r = Self::new();
         // L4 — semantic memory.
@@ -173,6 +176,9 @@ impl ToolRegistry {
         );
         if let Some(sched) = consolidation {
             stats_tool = stats_tool.with_consolidation(sched);
+        }
+        if let Some(sched) = checkpoints {
+            stats_tool = stats_tool.with_checkpoints(sched);
         }
         r.register(Arc::new(stats_tool));
         r.register(Arc::new(list_scopes::ListScopes::new(

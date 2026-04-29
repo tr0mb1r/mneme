@@ -9,12 +9,13 @@ about to do disk I/O while you're typing.
 If you only want the one-page version, read [§1 Quick reference](#1-quick-reference).
 The rest of the doc is layer-by-layer detail.
 
-> **Honesty note on schedules.** As of v0.12, the L3 consolidation
-> pass (hot → warm → cold) **is** wired and runs on a 5-minute idle
-> tick. The HNSW snapshot scheduler is also wired. The L1
-> working-session checkpoint loop remains tested but unwired —
-> `Session::checkpoint(...)` exists, no caller in `cli/run.rs`. See
-> each layer's "What runs today" note.
+> **Honesty note on schedules.** As of v0.13, all three background
+> schedulers are wired: HNSW snapshots, L3 consolidation
+> (5-minute idle tick), and L1 session checkpoints (30 s OR 5
+> tools/call invocations, whichever first). The L1 read-side
+> fold-in into `mneme://context` is still outstanding — the
+> session is *persisted* but isn't yet pulled into auto-context
+> assembly.
 
 ---
 
@@ -23,7 +24,7 @@ The rest of the doc is layer-by-layer detail.
 | Layer | What it holds | Embedded? | Where on disk | Auto-schedule (today) | Auto-schedule (v1 design) |
 |---|---|---|---|---|---|
 | **L0 Procedural** | Always-on pinned rules (`pin` / `unpin`) | No | `~/.mneme/procedural/pinned.jsonl` | Live: file watched every 500 ms; external edits picked up in <1 s | Same |
-| **L1 Working session** | The current session's turns, scratch state | No | `~/.mneme/sessions/<session_id>.json` (when checkpointed) | **Not wired in v0.11** — `Session::checkpoint(...)` exists, no autoschedule yet | Every 30 s OR every 5 turns, whichever first |
+| **L1 Working session** | The current session's turns, scratch state | No | `~/.mneme/sessions/<session_id>.snapshot` (atomic temp+rename per flush) | **Wired (v0.13)** — `CheckpointScheduler` flushes every 30 s OR every 5 tool calls | Same |
 | **L3 Episodic** | Time-ordered events, tool calls, summaries | No (lexical only) | `~/.mneme/episodic/` (redb), three prefixes: `epi:` hot, `wepi:` warm, `cold/` zstd | Hot tier writes are live. **Tier promotion is wired (v0.12)** — `ConsolidationScheduler` fires every 5 min when idle | Idle-time pass: hot → warm at age ≥ 28 d, warm → cold at age ≥ 180 d |
 | **L4 Semantic** | Long-term facts, decisions, preferences | **Yes** — every `remember` / `update` re-embeds | `~/.mneme/episodic/` (redb), prefix `mem:` + `~/.mneme/index/hnsw.idx` snapshot + `~/.mneme/wal/` deltas | Live writes; **HNSW snapshot scheduler runs**: every 1000 inserts OR every 60 min, whichever first | Same |
 | **Auto-context resource** | Pinned + recent, packed to a token budget | Reads only | (assembled on demand) | On read of `mneme://context` | Same |
@@ -84,16 +85,24 @@ temp+rename per checkpoint). Single file per session.
 - Whichever fires first.
 
 **What runs today:**
-> The `Session::checkpoint(...)` API is implemented and tested
-> (`memory/working.rs`), but the running server in `cli/run.rs` does
-> not currently spawn a checkpoint loop. Working state is held in
-> memory only; restart loses it. This is tracked under "L1
-> working-session fold-in" in the implementation plan's Phase 6
-> outstanding work.
+> **Wired (v0.13).** `cli::run` spawns a `CheckpointScheduler` that
+> writes the active session to `~/.mneme/sessions/<session_id>.snapshot`
+> on the first of two triggers: every `session_interval_secs` (30 s
+> default) when there are pending turns, OR every
+> `session_interval_turns` (5 default) tools/call invocations,
+> whichever first. A clean shutdown writes a final snapshot with
+> `clean_shutdown = true`. Per-session counters land on
+> `mneme://stats` and the `stats` tool under the `working` key:
+> `session_id`, `started_at`, `last_checkpoint_at`, `turns_total`,
+> `checkpoints_total`.
 
-**Practical implication.** Until L1 is wired, treat working-session
-state as ephemeral. The L3 episodic store is the one that survives
-restart for "what did we just do?" queries.
+**Practical implication.** Working-session state now survives
+restart; the most recent snapshot for any prior session can be
+loaded via `Session::load(...)` (today exposed only in tests; a
+`mneme://session/{id}` resource is still outstanding). The L3
+episodic store remains the structured "what did we just do?"
+surface — it ranks by recency and embeddings; L1 is a turn log,
+not a search index.
 
 ---
 

@@ -23,11 +23,13 @@ use crate::mcp::resources::ResourceRegistry;
 use crate::mcp::server::Server;
 use crate::mcp::tools::ToolRegistry;
 use crate::mcp::transport::stdio::StdioTransport;
+use crate::memory::checkpoint_scheduler::{CheckpointScheduler, CheckpointSchedulerConfig};
 use crate::memory::consolidation::ConsolidationParams;
 use crate::memory::consolidation_scheduler::{ConsolidationScheduler, SchedulerConfig};
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::{SemanticStore, SnapshotConfig};
+use crate::memory::working::ActiveSession;
 use crate::orchestrator::{Orchestrator, TokenBudget};
 use crate::storage::Storage;
 use crate::storage::layout;
@@ -149,6 +151,17 @@ pub fn execute() -> Result<()> {
         )
     });
 
+    // L1 working session + its checkpoint scheduler. One ActiveSession
+    // per `mneme run` lifetime; the scheduler flushes on the configured
+    // cadence + on shutdown.
+    let active_session = ActiveSession::open(root.join("sessions"))?;
+    let checkpoint_scheduler = runtime.block_on(async {
+        CheckpointScheduler::start(
+            Arc::clone(&active_session),
+            CheckpointSchedulerConfig::from_config(&config.checkpoints),
+        )
+    });
+
     let result = runtime
         .block_on(async_main(
             Arc::clone(&storage_dyn),
@@ -160,8 +173,17 @@ pub fn execute() -> Result<()> {
             on_disk_version.max(migrate::CURRENT_SCHEMA_VERSION),
             auto_context_budget,
             Arc::clone(&consolidation_scheduler),
+            Arc::clone(&active_session),
+            Arc::clone(&checkpoint_scheduler),
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
+
+    // Stop the checkpoint scheduler before the consolidation +
+    // semantic shutdowns so its final flush lands first. shutdown()
+    // also writes the clean-shutdown marker.
+    if let Err(e) = runtime.block_on(checkpoint_scheduler.shutdown()) {
+        tracing::warn!(error = %e, "checkpoint scheduler shutdown reported error");
+    }
 
     // Stop the consolidation scheduler before the semantic shutdown so
     // it can't fire one more pass mid-tear-down. Its current pass (if
@@ -204,6 +226,8 @@ async fn async_main(
     schema_version: u32,
     auto_context_budget: TokenBudget,
     consolidation: Arc<ConsolidationScheduler>,
+    active_session: Arc<ActiveSession>,
+    checkpoint_scheduler: Arc<CheckpointScheduler>,
 ) -> anyhow::Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -217,7 +241,7 @@ async fn async_main(
     let transport = StdioTransport::new(stdin, stdout);
     let mut server = Server::new(
         transport,
-        Arc::new(ToolRegistry::defaults_with_consolidation(
+        Arc::new(ToolRegistry::defaults_with_schedulers(
             Arc::clone(&semantic),
             Arc::clone(&procedural),
             Arc::clone(&episodic),
@@ -225,8 +249,9 @@ async fn async_main(
             cold.clone(),
             schema_version,
             Some(Arc::clone(&consolidation)),
+            Some(Arc::clone(&checkpoint_scheduler)),
         )),
-        Arc::new(ResourceRegistry::defaults_with_consolidation(
+        Arc::new(ResourceRegistry::defaults_with_schedulers(
             semantic,
             procedural,
             episodic,
@@ -235,9 +260,11 @@ async fn async_main(
             schema_version,
             auto_context_budget,
             Some(consolidation),
+            Some(Arc::clone(&checkpoint_scheduler)),
         )),
         storage,
-    );
+    )
+    .with_session(active_session, checkpoint_scheduler);
 
     tokio::select! {
         result = server.run() => result?,

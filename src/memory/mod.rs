@@ -2,6 +2,7 @@
 //! procedural pinned items.
 
 pub mod activity;
+pub mod checkpoint_scheduler;
 pub mod consolidation;
 pub mod consolidation_scheduler;
 pub mod episodic;

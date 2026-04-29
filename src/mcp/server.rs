@@ -25,6 +25,8 @@ use super::resources::{ResourceError, ResourceRegistry, descriptor_to_json as re
 use super::tools::{ToolError, ToolRegistry, descriptor_to_json as tool_to_json};
 use super::transport::stdio::{FrameError, StdioTransport};
 use super::{PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
+use crate::memory::checkpoint_scheduler::CheckpointScheduler;
+use crate::memory::working::ActiveSession;
 use crate::storage::Storage;
 
 // Tools consume the SemanticStore directly (Phase 3); the `Storage`
@@ -45,6 +47,15 @@ pub struct Server<R, W> {
     /// locked decision — wiring lands in Phase 3 with embeddings + HNSW).
     #[allow(dead_code)]
     storage: Arc<dyn Storage>,
+    /// `Some(_)` in production (`cli::run` wires it); `None` in
+    /// test fixtures that don't care about session checkpointing.
+    /// Each successful `tools/call` pushes a turn here and pokes
+    /// the checkpoint scheduler so the turn-count trigger sees it.
+    session: Option<Arc<ActiveSession>>,
+    /// Wakes after every successful `tools/call` so the scheduler
+    /// can re-evaluate the turn-count threshold without waiting for
+    /// the next wall-clock tick. `None` when `session` is `None`.
+    checkpoint_scheduler: Option<Arc<CheckpointScheduler>>,
     initialized: AtomicBool,
 }
 
@@ -64,8 +75,24 @@ where
             tools,
             resources,
             storage,
+            session: None,
+            checkpoint_scheduler: None,
             initialized: AtomicBool::new(false),
         }
+    }
+
+    /// Builder hook: attach an active session + its checkpoint
+    /// scheduler so each successful `tools/call` records a turn and
+    /// pokes the scheduler. `cli::run` calls this in production;
+    /// tests may skip it for stateless fixtures.
+    pub fn with_session(
+        mut self,
+        session: Arc<ActiveSession>,
+        scheduler: Arc<CheckpointScheduler>,
+    ) -> Self {
+        self.session = Some(session);
+        self.checkpoint_scheduler = Some(scheduler);
+        self
     }
 
     /// Run until the peer closes stdin (EOF) or sends `shutdown`.
@@ -194,7 +221,23 @@ where
         };
 
         match tool.invoke(args).await {
-            Ok(result) => Response::success(id, result.to_json()),
+            Ok(result) => {
+                // Record the turn on the active session and poke the
+                // checkpoint scheduler. Two reasons to do it here, not
+                // before the invoke: (1) we don't want failed calls to
+                // count as turns; (2) we don't want to poke the
+                // scheduler if the call ultimately errors out and
+                // produces no observable effect. The recorded content
+                // is just the tool name — full args are typically
+                // sensitive and don't belong in the session log.
+                if let (Some(session), Some(sched)) =
+                    (self.session.as_ref(), self.checkpoint_scheduler.as_ref())
+                {
+                    session.push_turn("tool", &name);
+                    sched.poke();
+                }
+                Response::success(id, result.to_json())
+            }
             Err(ToolError::InvalidArguments(msg)) => {
                 Response::error(id, error_codes::INVALID_PARAMS, msg)
             }

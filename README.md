@@ -70,7 +70,7 @@ ready-to-copy scripts in
 - mdBook-rendered user docs site
 - 30-day soak on real workloads
 - `switch_scope` tool and `mneme://session/{id}` resource
-- L1 working-session checkpoint scheduler wiring
+- L1 working-session **read-side** fold-in into `mneme://context`
 
 See [`proj_docs/mneme-implementation-plan.md`](proj_docs/mneme-implementation-plan.md)
 for the canonical roadmap.

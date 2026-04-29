@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::memory::checkpoint_scheduler::CheckpointScheduler;
 use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
@@ -83,7 +84,7 @@ impl ResourceRegistry {
         schema_version: u32,
         budget: TokenBudget,
     ) -> Self {
-        Self::defaults_with_consolidation(
+        Self::defaults_with_schedulers(
             semantic_store,
             procedural_store,
             episodic_store,
@@ -92,15 +93,17 @@ impl ResourceRegistry {
             schema_version,
             budget,
             None,
+            None,
         )
     }
 
     /// Like [`defaults`](Self::defaults) but also attaches the L3
-    /// consolidation scheduler so its observability counters
-    /// surface on `mneme://stats`. Callers that don't run the
-    /// scheduler (tests, CLI helpers) keep using `defaults`.
+    /// consolidation scheduler and the L1 checkpoint scheduler so
+    /// their observability counters surface on `mneme://stats`.
+    /// Callers that don't run the schedulers (tests, CLI helpers)
+    /// keep using `defaults`.
     #[allow(clippy::too_many_arguments)]
-    pub fn defaults_with_consolidation(
+    pub fn defaults_with_schedulers(
         semantic_store: Arc<SemanticStore>,
         procedural_store: Arc<ProceduralStore>,
         episodic_store: Arc<EpisodicStore>,
@@ -109,6 +112,7 @@ impl ResourceRegistry {
         schema_version: u32,
         budget: TokenBudget,
         consolidation: Option<Arc<ConsolidationScheduler>>,
+        checkpoints: Option<Arc<CheckpointScheduler>>,
     ) -> Self {
         let mut r = Self::new();
         let mut stats_resource = stats::Stats::new(
@@ -120,6 +124,9 @@ impl ResourceRegistry {
         );
         if let Some(sched) = consolidation {
             stats_resource = stats_resource.with_consolidation(sched);
+        }
+        if let Some(sched) = checkpoints {
+            stats_resource = stats_resource.with_checkpoints(sched);
         }
         r.register(Arc::new(stats_resource));
         r.register(Arc::new(procedural::Procedural::new(Arc::clone(

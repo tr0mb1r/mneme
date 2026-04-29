@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::{Resource, ResourceContent, ResourceDescriptor, ResourceError};
+use crate::memory::checkpoint_scheduler::CheckpointScheduler;
 use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
@@ -30,6 +31,9 @@ pub struct Stats {
     /// in fixtures that don't spawn one. The resource emits the
     /// scheduler block iff this is populated.
     consolidation: Option<Arc<ConsolidationScheduler>>,
+    /// `Some(_)` once the L1 checkpoint scheduler is wired
+    /// (production); `None` in fixtures.
+    checkpoints: Option<Arc<CheckpointScheduler>>,
 }
 
 impl Stats {
@@ -47,6 +51,7 @@ impl Stats {
             cold,
             schema_version,
             consolidation: None,
+            checkpoints: None,
         }
     }
 
@@ -55,6 +60,13 @@ impl Stats {
     /// constructors (and tests) don't need to change.
     pub fn with_consolidation(mut self, sched: Arc<ConsolidationScheduler>) -> Self {
         self.consolidation = Some(sched);
+        self
+    }
+
+    /// Attach the L1 checkpoint scheduler so the active session's
+    /// counters land in the `working` block.
+    pub fn with_checkpoints(mut self, sched: Arc<CheckpointScheduler>) -> Self {
+        self.checkpoints = Some(sched);
         self
     }
 }
@@ -105,6 +117,19 @@ impl Resource for Stats {
             })
         });
 
+        let working = self.checkpoints.as_ref().map(|s| {
+            let m = s.metrics();
+            json!({
+                "session_id": m.session_id.to_string(),
+                "started_at": m.started_at.to_rfc3339(),
+                "last_checkpoint_at": m.last_checkpoint_at
+                    .map(|d| d.to_rfc3339()),
+                "turns_total": m.turns_total,
+                "checkpoints_total": m.checkpoints_total,
+                "errors_total": m.errors_total,
+            })
+        });
+
         let body = json!({
             "schema_version": self.schema_version,
             "memories": {
@@ -122,6 +147,7 @@ impl Resource for Stats {
                 "embed_dim": self.semantic.dim(),
             },
             "consolidation": consolidation,
+            "working": working,
         });
         let text = serde_json::to_string(&body)
             .map_err(|e| ResourceError::Internal(format!("serialise stats: {e}")))?;
@@ -217,6 +243,47 @@ mod tests {
         assert!(v["consolidation"].is_null());
     }
 
+    /// Without a checkpoint scheduler attached, the resource emits
+    /// `working: null`. Same pattern as the consolidation null test.
+    #[tokio::test]
+    async fn working_field_is_null_without_scheduler() {
+        let (s, _tmp) = fixture().await;
+        let c = s.read().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
+        assert!(v.get("working").is_some());
+        assert!(v["working"].is_null());
+    }
+
+    /// With a checkpoint scheduler attached, the resource emits the
+    /// working block with session_id, started_at, and zero
+    /// checkpoint counters until the first flush.
+    #[tokio::test]
+    async fn working_block_surfaces_when_scheduler_attached() {
+        use crate::memory::checkpoint_scheduler::{
+            CheckpointScheduler, CheckpointSchedulerConfig,
+        };
+        use crate::memory::working::ActiveSession;
+
+        let (s, _tmp) = fixture().await;
+        let active = ActiveSession::open(_tmp.path().to_path_buf()).unwrap();
+        let sched =
+            CheckpointScheduler::start(Arc::clone(&active), CheckpointSchedulerConfig::disabled());
+        let s = s.with_checkpoints(Arc::clone(&sched));
+
+        let c = s.read().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
+        let w = &v["working"];
+        assert!(w.is_object(), "working should be an object: {w}");
+        assert!(w["session_id"].is_string());
+        assert!(w["started_at"].is_string());
+        assert!(w["last_checkpoint_at"].is_null());
+        assert_eq!(w["turns_total"], 0);
+        assert_eq!(w["checkpoints_total"], 0);
+        assert_eq!(w["errors_total"], 0);
+
+        sched.shutdown().await.unwrap();
+    }
+
     /// With a scheduler attached but no pass yet, the resource emits
     /// the metrics block with `last_consolidation_at = null` and
     /// zero counters — proves the wiring without forcing a timed
@@ -224,9 +291,7 @@ mod tests {
     #[tokio::test]
     async fn consolidation_block_surfaces_when_scheduler_attached() {
         use crate::memory::consolidation::ConsolidationParams;
-        use crate::memory::consolidation_scheduler::{
-            ConsolidationScheduler, SchedulerConfig,
-        };
+        use crate::memory::consolidation_scheduler::{ConsolidationScheduler, SchedulerConfig};
 
         let (s, _tmp) = fixture().await;
         // Build a disabled scheduler — no timing flakiness.
@@ -247,7 +312,10 @@ mod tests {
         let c = s.read().await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
         let cons = &v["consolidation"];
-        assert!(cons.is_object(), "consolidation should be an object: {cons}");
+        assert!(
+            cons.is_object(),
+            "consolidation should be an object: {cons}"
+        );
         assert!(cons["last_consolidation_at"].is_null());
         assert_eq!(cons["runs_total"], 0);
         assert_eq!(cons["errors_total"], 0);

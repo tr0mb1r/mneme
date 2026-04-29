@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{Tool, ToolDescriptor, ToolError, ToolResult};
+use crate::memory::checkpoint_scheduler::CheckpointScheduler;
 use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
@@ -29,6 +30,7 @@ pub struct Stats {
     cold: ColdArchive,
     schema_version: u32,
     consolidation: Option<Arc<ConsolidationScheduler>>,
+    checkpoints: Option<Arc<CheckpointScheduler>>,
 }
 
 impl Stats {
@@ -46,6 +48,7 @@ impl Stats {
             cold,
             schema_version,
             consolidation: None,
+            checkpoints: None,
         }
     }
 
@@ -54,6 +57,13 @@ impl Stats {
     /// existing constructor stays a drop-in for tests.
     pub fn with_consolidation(mut self, sched: Arc<ConsolidationScheduler>) -> Self {
         self.consolidation = Some(sched);
+        self
+    }
+
+    /// Attach the L1 checkpoint scheduler so the active session's
+    /// counters land in the `working` block.
+    pub fn with_checkpoints(mut self, sched: Arc<CheckpointScheduler>) -> Self {
+        self.checkpoints = Some(sched);
         self
     }
 }
@@ -106,6 +116,19 @@ impl Tool for Stats {
             })
         });
 
+        let working = self.checkpoints.as_ref().map(|s| {
+            let m = s.metrics();
+            json!({
+                "session_id": m.session_id.to_string(),
+                "started_at": m.started_at.to_rfc3339(),
+                "last_checkpoint_at": m.last_checkpoint_at
+                    .map(|d| d.to_rfc3339()),
+                "turns_total": m.turns_total,
+                "checkpoints_total": m.checkpoints_total,
+                "errors_total": m.errors_total,
+            })
+        });
+
         let body = json!({
             "schema_version": self.schema_version,
             "memories": {
@@ -123,6 +146,7 @@ impl Tool for Stats {
                 "embed_dim": self.semantic.dim(),
             },
             "consolidation": consolidation,
+            "working": working,
         });
         let text = serde_json::to_string(&body)
             .map_err(|e| ToolError::Internal(format!("serialise stats: {e}")))?;
