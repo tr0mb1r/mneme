@@ -1,0 +1,115 @@
+name: Bug report
+description: Mneme is doing something it clearly shouldn't (panic, data loss, wrong output, hang, ...)
+title: "bug: <one-line summary>"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file. The fastest path to a fix is a
+        reproduction we can run locally — even a partial one helps.
+
+        **Before filing**, please confirm the issue isn't a known
+        configuration question (the docs site at
+        https://tr0mb1r.github.io/mneme/ covers most of those).
+
+  - type: input
+    id: version
+    attributes:
+      label: Mneme version
+      description: Output of `mneme --version`. If you built from source, use the short git SHA — `git -C <repo> rev-parse --short HEAD`.
+      placeholder: "0.1.0 (or 'main @ abc1234')"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      multiple: true
+      options:
+        - macOS (arm64 / Apple Silicon)
+        - macOS (x86_64 / Intel)
+        - Linux (x86_64)
+        - Linux (aarch64)
+        - Windows
+    validations:
+      required: true
+
+  - type: dropdown
+    id: embedder
+    attributes:
+      label: Embedder
+      description: Value of `[embeddings] model` in `~/.mneme/config.toml`, or `stub` if `MNEME_EMBEDDER=stub` is set.
+      options:
+        - bge-m3 (default)
+        - minilm-l6
+        - stub
+        - other / custom
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host
+    attributes:
+      label: MCP host
+      description: Where you're calling mneme from.
+      options:
+        - Claude Code
+        - Claude Desktop
+        - Cursor
+        - Cline
+        - Aider
+        - manual stdio (no MCP host)
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you do, what did you expect, what did mneme do instead. Be specific.
+      placeholder: |
+        I called `recall("foo")` after `remember("foo bar baz", scope="work")`. Expected
+        the memory back; got an empty result.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Even a rough sequence helps. If you can capture the failing tool calls
+        from your MCP host's transcript, paste them as JSON-RPC frames.
+      placeholder: |
+        1. `mneme init`
+        2. Edit `~/.mneme/config.toml` to set `[embeddings] model = "minilm-l6"`
+        3. `mneme run` and connect with `claude mcp add ...`
+        4. Inside the agent: ...
+
+  - type: textarea
+    id: stats
+    attributes:
+      label: Output of mneme stats
+      description: Cheap diagnostic; surfaces schema version, scheduler state, current scope. Run `mneme stats > /tmp/mneme-stats.json && cat /tmp/mneme-stats.json` and paste the JSON.
+      render: json
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: |
+        From `~/.mneme/logs/mneme.log`. Filter to the time window of the bug if the file is large.
+      render: text
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Confirmations
+      options:
+        - label: I've read the docs site for this layer / feature.
+          required: true
+        - label: I checked the existing issues for duplicates.
+          required: true

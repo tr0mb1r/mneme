@@ -1,0 +1,31 @@
+name: Docs issue
+description: A page is wrong, missing, or misleading
+title: "docs: <one-line summary>"
+labels: ["docs"]
+body:
+  - type: input
+    id: page
+    attributes:
+      label: Which page
+      description: URL or repo path. If a paragraph is wrong, quote the exact text.
+      placeholder: "https://tr0mb1r.github.io/mneme/configuration.html — section on `[embeddings] model`"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's wrong
+      description: |
+        Wrong / missing / contradictory / out of date / unclear. Be specific —
+        "the install section is confusing" is hard to act on; "step 3 says
+        `mneme init` but the binary on PATH was built without `--release`"
+        gives a fix path.
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested fix (optional)
+      description: A sentence, a paragraph, or a PR link.

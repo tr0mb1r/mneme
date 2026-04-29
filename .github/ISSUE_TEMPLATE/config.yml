@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Setup walkthrough
+    url: https://tr0mb1r.github.io/mneme/claude-code-setup.html
+    about: Step-by-step guide for getting mneme wired into Claude Code or Claude Desktop. Most "it doesn't work" reports turn out to be configuration questions answered there.
+  - name: Memory layers reference
+    url: https://tr0mb1r.github.io/mneme/memory-layers.html
+    about: What L0/L1/L3/L4 hold, where they live on disk, what's wired vs. deferred. Read this before reporting "memory X disappeared" or "memory Y didn't surface in recall".
+  - name: Configuration reference
+    url: https://tr0mb1r.github.io/mneme/configuration.html
+    about: Per-parameter docs for ~/.mneme/config.toml — model selection, schedulers, budgets. If you're unsure whether a knob exists, check here before opening an issue.
+  - name: Discussions
+    url: https://github.com/tr0mb1r/mneme/discussions
+    about: Open-ended questions, design feedback, and "is this in scope for mneme?" go in Discussions, not Issues.

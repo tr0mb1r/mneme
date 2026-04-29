@@ -1,0 +1,79 @@
+name: Feature request
+description: A capability mneme doesn't have today and should
+title: "feat: <one-line summary>"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Mneme is intentionally narrow — see
+        https://github.com/tr0mb1r/mneme#what-it-isnt for the explicit
+        non-goals. Common rejections: code embedding, knowledge graphs,
+        SaaS hosting, multi-user concurrency. If your request lands in
+        any of those, consider a [Discussion](https://github.com/tr0mb1r/mneme/discussions)
+        instead.
+
+        Good feature requests describe a workflow problem, not a
+        solution. ("I can't tell which session a memory came from"
+        > "add a session_id field to MemoryItem".)
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Workflow problem
+      description: What are you trying to do, and where does mneme fall short today? Include the agent / host / scope / scale where relevant.
+      placeholder: |
+        I run mneme inside Claude Code with two scopes (work and personal).
+        After three months of use, recall on the work scope returns mostly
+        old conversational chatter that I don't care about, drowning out
+        the few high-signal facts and decisions. There's no way to
+        prioritise certain memory types over others at recall time.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal (optional)
+      description: |
+        If you have a concrete shape in mind, describe it. Don't worry
+        about implementation detail; a sketch of the user-facing
+        behaviour is enough. Marked optional because the workflow problem
+        is what matters most.
+      placeholder: |
+        Give `recall` an optional `prefer_kinds: ["fact", "decision"]`
+        parameter that boosts those types in the score.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: What workarounds have you tried, and why don't they cover the case?
+
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Which layer / surface
+      description: Helps with triage; pick the closest fit.
+      options:
+        - L0 procedural (pin / unpin)
+        - L1 working session
+        - L3 episodic (recall_recent / consolidation)
+        - L4 semantic (remember / recall / update / forget)
+        - Auto-context (mneme://context)
+        - MCP protocol surface (tools / resources)
+        - CLI (mneme run / init / stats / inspect / backup / ...)
+        - Configuration / scopes
+        - Cross-cutting / unsure
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Confirmations
+      options:
+        - label: I've read the project's "What it isn't" list and don't think this falls into a non-goal.
+          required: true
+        - label: I checked the existing issues + Discussions for similar requests.
+          required: true
