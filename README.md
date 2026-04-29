@@ -7,15 +7,17 @@
 > A standalone, MCP-native memory tool for any LLM or agent.
 > Single binary. Local-first. Rust. Built to last.
 
-**Status:** Pre-1.0 — `0.2.0` baseline (Phase 6 polish + release). Phases 0–5
-complete; Phase 6 (portability + diagnostics + release infrastructure)
-substantially complete. Code-side feature work for 1.0 is done; remaining gates
-are operational: 30-day soak (clock started 2026-04-29), Homebrew formula, and
-public release pipeline (tag-driven via `release.yml`). The on-disk format is
-stable behind a versioned schema with a migration path. Treat as
-production-capable for personal use, not yet 1.0. See
-[`book/src/versioning.md`](book/src/versioning.md) for the versioning policy
-and 1.0 gates.
+**Status:** Pre-1.0 — `0.2.x` line, latest `0.2.1` published as
+[`mneme-mcp`](https://crates.io/crates/mneme-mcp) on crates.io and as
+[`tr0mb1r/mneme`](https://github.com/tr0mb1r/homebrew-mneme) on Homebrew.
+Phases 0–5 complete; Phase 6 (portability + diagnostics + release
+infrastructure) substantially complete. Code-side feature work and release
+infrastructure are done; the remaining gates are calendar-bound: 30-day soak
+on real workloads (Day 0 = 2026-04-29) and one full release cycle without
+bumping `schema_version`. The on-disk format is stable behind a versioned
+schema with a migration path. Treat as production-capable for personal use,
+not yet 1.0. See [`book/src/versioning.md`](book/src/versioning.md) for the
+versioning policy and the five 1.0 gates.
 
 ## What it is
 
@@ -70,17 +72,42 @@ ready-to-copy scripts in
 
 ## Roadmap to 1.0
 
-- Homebrew formula and a release pipeline that ships prebuilt binaries
-- mdBook-rendered user docs site
-- 30-day soak on real workloads
+- 30-day soak on real workloads (Day 0 = 2026-04-29)
+- One full release cycle without bumping `schema_version`
 
-Feature work for v1.0 is complete; the remaining items are release
-infrastructure.
+Code-side feature work, release infrastructure (Homebrew tap,
+crates.io publish, tag-driven cross-build pipeline, mdBook-rendered
+user docs at <https://tr0mb1r.github.io/mneme/>), and the
+12-tool MCP-surface freeze are complete. The remaining items are
+calendar-bound rather than work-bound.
 
 ## Installing
 
-There is no `brew install mneme` yet. Until the release pipeline lands, build
-from source. The fastest path is the bundled installer:
+Three install paths, each producing the same `mneme` binary on your
+`$PATH`. See the [installation page](https://tr0mb1r.github.io/mneme/installation.html)
+in the user docs for the full walkthrough.
+
+### Homebrew (macOS, Linux) — recommended
+
+```sh
+brew tap tr0mb1r/mneme
+brew install mneme
+```
+
+Pre-built static binary; no Rust toolchain. Apple Silicon, Intel macOS, and
+aarch64 / x86_64 Linux (musl-static).
+
+### `cargo install`
+
+```sh
+cargo install mneme-mcp
+```
+
+The crate is `mneme-mcp` on crates.io (the bare `mneme` name is held by an
+unrelated event-sourcing library); the installed binary is `mneme`. Requires
+Rust stable.
+
+### From source
 
 ```sh
 git clone https://github.com/tr0mb1r/mneme && cd mneme
@@ -90,17 +117,17 @@ scripts/install.sh --minilm    # same, but default to MiniLM (~80 MB) instead of
 
 `scripts/install.sh` picks `~/.local/bin` (or `/usr/local/bin` if writable),
 runs `cargo build --release`, copies the binary, runs `mneme init`, and
-prints the exact `claude mcp add` line for the next step. It's idempotent —
-safe to re-run when you pull. Pass `--prefix <dir>` to install elsewhere or
+prints the exact `claude mcp add` line for the next step. Idempotent — safe
+to re-run when you pull. Pass `--prefix <dir>` to install elsewhere or
 `--no-init` to skip the data-directory scaffold.
 
-If you'd rather drive each step yourself:
+### After install
+
+Both Homebrew and `cargo install` skip `mneme init` by design (a formula
+and `cargo install` should not modify `$HOME`). Run it once manually:
 
 ```sh
-git clone https://github.com/tr0mb1r/mneme && cd mneme
-cargo build --release
-cp target/release/mneme ~/.local/bin/   # or anywhere on $PATH
-mneme init                               # scaffolds ~/.mneme and pulls the embedding model
+mneme init
 ```
 
 `mneme init` writes `~/.mneme/config.toml` with all defaults made explicit;
@@ -116,7 +143,7 @@ model:
 Switching models later re-embeds every stored memory automatically; no
 manual reindex.
 
-Requires Rust stable, pinned via `rust-toolchain.toml`.
+Building from source requires Rust stable, pinned via `rust-toolchain.toml`.
 
 ## Smoke-testing the MCP server
 
