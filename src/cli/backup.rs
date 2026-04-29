@@ -267,6 +267,10 @@ mod tests {
         assert!(!archive.exists() || std::fs::metadata(&archive).unwrap().len() == 0);
     }
 
+    // Symlink tests are gated to Unix because creating directory
+    // symlinks on Windows requires elevated privileges or
+    // developer-mode being on, neither of which is the default in CI.
+    #[cfg(unix)]
     #[test]
     fn backup_with_symlinked_subdir_does_not_eisdir() {
         // Regression for the EISDIR bug surfaced by the manual test
@@ -283,14 +287,7 @@ mod tests {
         let target_dir = tmp_root.path().join("real-models");
         std::fs::create_dir_all(target_dir.join("subdir")).unwrap();
         std::fs::write(target_dir.join("weight.bin"), b"data").unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&target_dir, root.join("models")).unwrap();
-        #[cfg(windows)]
-        {
-            // Windows symlinks need elevated perms; skip on that
-            // platform until we can rely on developer-mode being on.
-            return;
-        }
 
         let out = TempDir::new().unwrap();
         let archive = out.path().join("backup.tar.gz");
@@ -324,6 +321,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn backup_then_restore_preserves_symlink() {
         let tmp_root = TempDir::new().unwrap();
@@ -332,12 +330,7 @@ mod tests {
         let target_dir = tmp_root.path().join("link-target");
         std::fs::create_dir_all(&target_dir).unwrap();
         std::fs::write(target_dir.join("contents.bin"), b"hi").unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&target_dir, root.join("models")).unwrap();
-        #[cfg(windows)]
-        {
-            return;
-        }
 
         let archive_dir = TempDir::new().unwrap();
         let archive = archive_dir.path().join("snap.tar.gz");
