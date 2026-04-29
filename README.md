@@ -77,7 +77,21 @@ for the canonical roadmap.
 ## Installing
 
 There is no `brew install mneme` yet. Until the release pipeline lands, build
-from source:
+from source. The fastest path is the bundled installer:
+
+```sh
+git clone https://github.com/tr0mb1r/mneme && cd mneme
+scripts/install.sh             # build, install on $PATH, scaffold ~/.mneme
+scripts/install.sh --minilm    # same, but default to MiniLM (~80 MB) instead of BGE-M3 (~1.5 GB)
+```
+
+`scripts/install.sh` picks `~/.local/bin` (or `/usr/local/bin` if writable),
+runs `cargo build --release`, copies the binary, runs `mneme init`, and
+prints the exact `claude mcp add` line for the next step. It's idempotent —
+safe to re-run when you pull. Pass `--prefix <dir>` to install elsewhere or
+`--no-init` to skip the data-directory scaffold.
+
+If you'd rather drive each step yourself:
 
 ```sh
 git clone https://github.com/tr0mb1r/mneme && cd mneme
@@ -89,8 +103,15 @@ mneme init                               # scaffolds ~/.mneme and pulls the embe
 `mneme init` writes `~/.mneme/config.toml` with all defaults made explicit;
 edit it before first run if you want to override the embedding model, data
 directory, or storage budget. The first `mneme run` downloads the embedding
-model (~1.5 GB for the default `bge-m3`; switch to `minilm-l6` in
-`config.toml` for a ~80 MB / faster-startup option).
+model:
+
+| Model | Size | Speed | Recall | When to pick |
+|-------|------|-------|--------|--------------|
+| `bge-m3` (default) | ~1.5 GB | slower cold start | top-tier, multilingual | You want the best recall and don't mind the disk + first-boot wait. |
+| `minilm-l6` | ~80 MB | sub-second cold start | good for English | You want fast onboarding, English-only is fine, or you're testing before committing to BGE-M3. |
+
+Switching models later re-embeds every stored memory automatically; no
+manual reindex.
 
 Requires Rust stable, pinned via `rust-toolchain.toml`.
 
