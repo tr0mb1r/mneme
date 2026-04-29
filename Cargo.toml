@@ -1,5 +1,10 @@
 [package]
-name = "mneme"
+# The bare `mneme` crate name on crates.io is held by jwilger's
+# event-sourcing library (last published 2025-03-14, real project,
+# not a squat). To avoid contention and keep `cargo install` viable
+# post-1.0, we publish under `mneme-mcp` while keeping the user-
+# facing binary, library, and project names as `mneme`.
+name = "mneme-mcp"
 version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -13,6 +18,22 @@ categories = ["command-line-utilities", "database"]
 # included via `mod common;` in the actual benches — disabling
 # auto-discovery keeps Cargo from treating the helper as a bench.
 autobenches = false
+
+# Pin the library name to `mneme` so internal consumers (tests, benches)
+# keep using `use mneme::...` paths. Without this, Cargo would derive
+# the lib name from the package name (`mneme_mcp`) and break every
+# import in tests/ and benches/.
+[lib]
+name = "mneme"
+path = "src/lib.rs"
+
+# Pin the main binary name to `mneme` so `cargo install mneme-mcp`
+# still produces a binary called `mneme` and `mneme run`, `mneme stats`,
+# etc. continue to work as documented. Without this explicit block,
+# Cargo would name the binary after the package (`mneme-mcp`).
+[[bin]]
+name = "mneme"
+path = "src/main.rs"
 
 [features]
 default = []

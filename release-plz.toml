@@ -63,7 +63,7 @@ protect_breaking_commits = true
 sort_commits = "newest"
 
 [[package]]
-name = "mneme"
+name = "mneme-mcp"
 changelog_update = true
 # The semver bump-level rules below mirror book/src/versioning.md.
 # Pre-1.0 release-plz interprets `feat!` / `BREAKING CHANGE` as a
