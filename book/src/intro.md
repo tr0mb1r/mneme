@@ -23,13 +23,16 @@ work that the agent would otherwise forget.**
 
 ## Status
 
-Pre-1.0 — `0.2.0` baseline. Phases 0–5 complete; Phase 6 (portability +
-diagnostics + release infrastructure) substantially complete. Code-side
-feature work for 1.0 is done; the remaining gates are operational:
-30-day soak (clock started 2026-04-29), Homebrew formula, and public
-release pipeline. The on-disk format is stable behind a versioned schema
-with a migration path. Treat as production-capable for personal use, not
-yet 1.0. See [Versioning](./versioning.md) for the policy and 1.0 gates.
+Pre-1.0 — `0.2.x` line, latest `0.2.2` published as
+[`mneme-mcp`](https://crates.io/crates/mneme-mcp) on crates.io and via
+[Homebrew](https://github.com/tr0mb1r/homebrew-mneme). Phases 0–5
+complete; Phase 6 (portability + diagnostics + release infrastructure)
+substantially complete. Code-side feature work for 1.0 is done; the
+remaining gates are calendar-bound: 30-day soak (clock started
+2026-04-29) and one full release cycle without a `schema_version` bump.
+The on-disk format is stable behind a versioned schema with a migration
+path. Treat as production-capable for personal use, not yet 1.0. See
+[Versioning](./versioning.md) for the policy and 1.0 gates.
 
 ## What works today
 

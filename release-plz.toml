@@ -12,9 +12,13 @@
 #      The tag triggers `.github/workflows/release.yml`, which cross-
 #      builds the five release targets and creates the GitHub Release
 #      with binaries + sha256 sums.
-#   3. We do NOT publish to crates.io until the v1.0 release pipeline
-#      has settled. Flip `publish` back on alongside the Homebrew
-#      formula decision, post-1.0.
+#   3. After the tag is verified, publish to crates.io manually via the
+#      `publish.yml` workflow:
+#        gh workflow run publish.yml --field tag=v${v}
+#      That workflow uses OIDC trusted publishing (no long-lived token).
+#      `publish = false` below keeps release-plz from publishing
+#      automatically on PR merge — the explicit workflow_dispatch is the
+#      only trigger for crates.io.
 #
 # Disabling `git_tag_enable` and `git_release_enable` here keeps the
 # release-PR-merge step from racing the cross-build pipeline. Only the

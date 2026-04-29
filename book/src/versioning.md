@@ -76,6 +76,8 @@ Strict SemVer with project-specific definitions:
   bumps `Cargo.toml` and updates `CHANGELOG.md` from Conventional
   Commits since the last release. Configured at `release-plz.toml`.
 - **release.yml** — tag-triggered cross-build + GitHub Release.
-
-`crates.io` publishing is disabled until v1.0+
-(`workspace.publish = false` in `release-plz.toml`).
+- **publish.yml** — manual `workflow_dispatch` that publishes a tagged
+  version to crates.io as [`mneme-mcp`](https://crates.io/crates/mneme-mcp)
+  via OIDC trusted publishing. Trigger after merging a release PR and
+  pushing the tag:
+  `gh workflow run publish.yml --field tag=vX.Y.Z`
