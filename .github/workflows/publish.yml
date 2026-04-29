@@ -1,44 +1,55 @@
 name: publish
 
-# Manual-trigger workflow that publishes a tagged version to crates.io.
+# Manual-trigger workflow that publishes a tagged version to crates.io
+# via OIDC trusted publishing (no long-lived token).
 #
 # Pre-1.0 we deliberately don't auto-publish on every tag — accidental
 # tags shouldn't accidentally publish to crates.io. Trigger explicitly:
 #
-#   gh workflow run publish.yml --field tag=v0.2.1
+#   gh workflow run publish.yml --field tag=v0.2.2
 #
-# Long-term plan: replace `CARGO_REGISTRY_TOKEN` with OIDC trusted
-# publishing once the crate exists on crates.io. The Trusted Publisher
-# config is set up on the crates.io side after the first publish; once
-# enabled, this workflow's `Publish to crates.io` step swaps the
-# `CARGO_REGISTRY_TOKEN` env for an OIDC-issued short-lived token and
-# the secret can be deleted from the repo. See follow-up PR.
+# Authentication uses crates.io's OIDC trusted-publishing flow. The
+# Trusted Publisher config on the registry side
+# (https://crates.io/crates/mneme-mcp/settings → Trusted Publishers)
+# binds this exact identity:
+#
+#   owner    = tr0mb1r
+#   repo     = mneme
+#   workflow = publish.yml
+#   env      = crates-io
+#
+# The `rust-lang/crates-io-auth-action` step requests a JWT from
+# GitHub's OIDC provider and exchanges it for a short-lived
+# crates.io access token. The `Publish to crates.io` step uses that
+# token via $CARGO_REGISTRY_TOKEN. There is no long-lived secret —
+# `CARGO_REGISTRY_TOKEN` was rotated out of repo secrets when this
+# workflow landed.
 #
 # Security notes:
-# - `if: github.repository_owner == 'tr0mb1r'` blocks forks from
-#   running this workflow (they wouldn't have the secret anyway, but
-#   defense-in-depth).
-# - `concurrency` prevents accidental double-publish.
-# - `--dry-run` runs first to catch packaging issues before contacting
-#   crates.io. A failed dry-run aborts before the real publish step
-#   touches the secret.
-# - The `Verify Cargo.toml version matches tag` step blocks the case
-#   where someone runs the workflow against a tag that points at code
-#   with a mismatched Cargo.toml version (e.g., publishing 0.3.0 from
-#   a tag created on a 0.2.x commit).
-# - Future hardening (in the OIDC migration PR): pin all action refs
-#   to commit SHAs. Currently consistent with the rest of the repo's
-#   workflows that use tag refs.
+# - All third-party action refs are pinned to commit SHAs (with the
+#   tag in a trailing comment for readability). Pinning to tags would
+#   leave the workflow vulnerable to a tag-repointing supply-chain
+#   attack on the secret-touching publish step.
+# - `if: github.repository_owner == 'tr0mb1r'` blocks fork runs.
+# - `concurrency: publish-crates-io` prevents double-publish races.
+# - `--dry-run` runs first; failed packaging aborts before the token
+#   exchange happens.
+# - The `Verify Cargo.toml version matches tag` step blocks publishing
+#   from a tag whose code carries a mismatched Cargo.toml version.
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to publish to crates.io (e.g., v0.2.1)'
+        description: 'Tag to publish to crates.io (e.g., v0.2.2)'
         required: true
 
 permissions:
+  # OIDC: GitHub's id-token endpoint is what the auth action exchanges
+  # for a crates.io publish token. Without `id-token: write` the
+  # auth-action step fails with a 401.
   contents: read
+  id-token: write
 
 concurrency:
   group: publish-crates-io
@@ -55,14 +66,14 @@ jobs:
 
     steps:
       - name: Checkout tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           ref: ${{ github.event.inputs.tag }}
           fetch-depth: 1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable (March 2026)
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
         with:
           key: publish
 
@@ -86,7 +97,16 @@ jobs:
       - name: Dry-run publish
         run: cargo publish --dry-run --locked
 
+      # OIDC token exchange — produces a short-lived crates.io token
+      # bound to this workflow run. The action's `token` output is
+      # plumbed straight into `cargo publish` via the env block below;
+      # nothing else in the run can read it (GitHub auto-masks
+      # `outputs.token` in logs).
+      - name: Get short-lived crates.io token via OIDC
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe  # v1.0.4
+        id: cargo-auth
+
       - name: Publish to crates.io
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.cargo-auth.outputs.token }}
         run: cargo publish --locked
