@@ -31,6 +31,7 @@ use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::{SemanticStore, SnapshotConfig};
 use crate::memory::working::ActiveSession;
 use crate::orchestrator::{Orchestrator, TokenBudget};
+use crate::scope::ScopeState;
 use crate::storage::Storage;
 use crate::storage::layout;
 use crate::storage::lockfile::LockGuard;
@@ -130,6 +131,10 @@ pub fn execute() -> Result<()> {
     let auto_context_budget = TokenBudget::from_config(&config.budgets);
     let cold = crate::storage::archive::ColdArchive::new(&root);
 
+    // Process-lifetime "current scope" cell. Initialised from
+    // `[scopes] default`; mutated by the `switch_scope` tool.
+    let scope_state = ScopeState::new(&config.scopes.default);
+
     // Spawn the L3 consolidation scheduler. Watches the semantic +
     // episodic activity counters for idle windows; fires
     // `consolidation::run` on the configured cadence so hot-tier
@@ -183,6 +188,7 @@ pub fn execute() -> Result<()> {
             Arc::clone(&active_session),
             Arc::clone(&checkpoint_scheduler),
             sessions_dir,
+            scope_state,
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
 
@@ -237,6 +243,7 @@ async fn async_main(
     active_session: Arc<ActiveSession>,
     checkpoint_scheduler: Arc<CheckpointScheduler>,
     sessions_dir: std::path::PathBuf,
+    scope_state: Arc<ScopeState>,
 ) -> anyhow::Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -259,6 +266,7 @@ async fn async_main(
             schema_version,
             Some(Arc::clone(&consolidation)),
             Some(Arc::clone(&checkpoint_scheduler)),
+            Arc::clone(&scope_state),
         )),
         Arc::new(ResourceRegistry::defaults_with_schedulers(
             semantic,
@@ -272,6 +280,7 @@ async fn async_main(
             Some(Arc::clone(&checkpoint_scheduler)),
             Some(Arc::clone(&active_session)),
             Some(sessions_dir),
+            Some(scope_state),
         )),
         storage,
     )

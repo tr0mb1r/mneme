@@ -19,6 +19,7 @@ use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
 use crate::memory::working::ActiveSession;
 use crate::orchestrator::{Orchestrator, TokenBudget};
+use crate::scope::ScopeState;
 use crate::storage::archive::ColdArchive;
 
 pub mod context;
@@ -114,15 +115,18 @@ impl ResourceRegistry {
             None,
             None,
             None,
+            None,
         )
     }
 
     /// Like [`defaults`](Self::defaults) but also attaches the L3
     /// consolidation scheduler, the L1 checkpoint scheduler, the
-    /// active session, and the sessions directory so the per-session
-    /// resource (`mneme://session/{id}`) and the observability
-    /// counters on `mneme://stats` are wired. Callers that don't run
-    /// the schedulers (tests, CLI helpers) keep using `defaults`.
+    /// active session, the sessions directory, and the scope state
+    /// so the per-session resource (`mneme://session/{id}`) and the
+    /// observability counters on `mneme://stats` (including the
+    /// `working.current_scope` field) are wired. Callers that don't
+    /// run the schedulers (tests, CLI helpers) keep using
+    /// `defaults`.
     #[allow(clippy::too_many_arguments)]
     pub fn defaults_with_schedulers(
         semantic_store: Arc<SemanticStore>,
@@ -136,6 +140,7 @@ impl ResourceRegistry {
         checkpoints: Option<Arc<CheckpointScheduler>>,
         active_session: Option<Arc<ActiveSession>>,
         sessions_dir: Option<PathBuf>,
+        scope_state: Option<Arc<ScopeState>>,
     ) -> Self {
         let mut r = Self::new();
         let mut stats_resource = stats::Stats::new(
@@ -150,6 +155,9 @@ impl ResourceRegistry {
         }
         if let Some(sched) = checkpoints {
             stats_resource = stats_resource.with_checkpoints(sched);
+        }
+        if let Some(s) = scope_state.as_ref() {
+            stats_resource = stats_resource.with_scope_state(Arc::clone(s));
         }
         r.register(Arc::new(stats_resource));
         r.register(Arc::new(procedural::Procedural::new(Arc::clone(

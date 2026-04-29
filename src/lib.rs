@@ -60,6 +60,7 @@ pub mod mcp;
 pub mod memory;
 pub mod migrate;
 pub mod orchestrator;
+pub mod scope;
 pub mod storage;
 
 pub use error::{MnemeError, Result};

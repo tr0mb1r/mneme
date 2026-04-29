@@ -18,6 +18,7 @@ use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
+use crate::scope::ScopeState;
 use crate::storage::Storage;
 use crate::storage::archive::ColdArchive;
 
@@ -30,6 +31,7 @@ pub mod recall_recent;
 pub mod remember;
 pub mod stats;
 pub mod summarize_session;
+pub mod switch_scope;
 pub mod unpin;
 pub mod update;
 
@@ -133,12 +135,16 @@ impl ToolRegistry {
             schema_version,
             None,
             None,
+            ScopeState::new("personal"),
         )
     }
 
     /// Like [`defaults`](Self::defaults) but also attaches the L3
     /// consolidation scheduler and the L1 checkpoint scheduler so
     /// the `stats` tool reports their observability counters.
+    /// `scope_state` is the per-process default-scope cell that
+    /// `switch_scope` mutates and `remember` / `pin` consult on
+    /// argument fall-back.
     #[allow(clippy::too_many_arguments)]
     pub fn defaults_with_schedulers(
         semantic: Arc<SemanticStore>,
@@ -149,15 +155,22 @@ impl ToolRegistry {
         schema_version: u32,
         consolidation: Option<Arc<ConsolidationScheduler>>,
         checkpoints: Option<Arc<CheckpointScheduler>>,
+        scope_state: Arc<ScopeState>,
     ) -> Self {
         let mut r = Self::new();
         // L4 — semantic memory.
-        r.register(Arc::new(remember::Remember::new(Arc::clone(&semantic))));
+        r.register(Arc::new(remember::Remember::new(
+            Arc::clone(&semantic),
+            Arc::clone(&scope_state),
+        )));
         r.register(Arc::new(recall::Recall::new(Arc::clone(&semantic))));
         r.register(Arc::new(forget::Forget::new(Arc::clone(&semantic))));
         r.register(Arc::new(update::Update::new(Arc::clone(&semantic))));
         // L0 — procedural memory.
-        r.register(Arc::new(pin::Pin::new(Arc::clone(&procedural))));
+        r.register(Arc::new(pin::Pin::new(
+            Arc::clone(&procedural),
+            Arc::clone(&scope_state),
+        )));
         r.register(Arc::new(unpin::Unpin::new(Arc::clone(&procedural))));
         // L3 — episodic memory.
         r.register(Arc::new(recall_recent::RecallRecent::new(Arc::clone(
@@ -166,6 +179,10 @@ impl ToolRegistry {
         r.register(Arc::new(summarize_session::SummarizeSession::new(
             Arc::clone(&episodic),
         )));
+        // Session state: switch_scope tool.
+        r.register(Arc::new(switch_scope::SwitchScope::new(Arc::clone(
+            &scope_state,
+        ))));
         // Phase 6 diagnostics + portability.
         let mut stats_tool = stats::Stats::new(
             Arc::clone(&semantic),
@@ -180,6 +197,7 @@ impl ToolRegistry {
         if let Some(sched) = checkpoints {
             stats_tool = stats_tool.with_checkpoints(sched);
         }
+        stats_tool = stats_tool.with_scope_state(Arc::clone(&scope_state));
         r.register(Arc::new(stats_tool));
         r.register(Arc::new(list_scopes::ListScopes::new(
             semantic,
@@ -246,7 +264,8 @@ mod tests {
     fn defaults_register_phase_6_tools() {
         let (r, _tmp) = fresh_registry();
         let names: Vec<_> = r.list().iter().map(|d| d.name).collect();
-        // BTreeMap ordering across L0/L3/L4 + Phase 6 diagnostics.
+        // BTreeMap ordering across L0/L3/L4 + Phase 6 diagnostics
+        // + switch_scope (v0.15).
         assert_eq!(
             names,
             vec![
@@ -259,6 +278,7 @@ mod tests {
                 "remember",
                 "stats",
                 "summarize_session",
+                "switch_scope",
                 "unpin",
                 "update",
             ]

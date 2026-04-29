@@ -9,14 +9,17 @@ about to do disk I/O while you're typing.
 If you only want the one-page version, read [§1 Quick reference](#1-quick-reference).
 The rest of the doc is layer-by-layer detail.
 
-> **Honesty note on schedules.** As of v0.14, all three background
+> **Honesty note on schedules.** As of v0.14 all three background
 > schedulers are wired (HNSW snapshots, L3 consolidation on a
 > 5-min idle tick, L1 session checkpoints on 30 s / 5 turns) AND
 > the L1 read-side fold-in into `mneme://context` ships. Working
 > turns now appear in auto-context with `WORKING_WEIGHT = 0.9`,
 > sorted newest-first. The per-session resource
 > `mneme://session/{id}` exposes the full session JSON for active
-> or past sessions.
+> or past sessions. v0.15 adds `switch_scope` so write tools
+> (`remember`, `pin`) without an explicit `scope` arg land in the
+> session's current scope; current value surfaces on
+> `mneme://stats` as `working.current_scope`.
 
 ---
 

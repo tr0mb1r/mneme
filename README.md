@@ -54,7 +54,7 @@ work that the agent would otherwise forget.**
 | Diagnostics | `stats`, `list_scopes`, `export` | `mneme://stats` | — |
 
 `mneme run` speaks JSON-RPC over stdio against MCP protocol `2025-06-18`,
-advertises 11 tools and 4 resources, and survives malformed JSON, oversize
+advertises 12 tools and 5 resources, and survives malformed JSON, oversize
 frames, and EOF cleanly. Real BGE-M3 / MiniLM embeddings via `candle`,
 HNSW recall via `instant-distance`, atomic snapshots, WAL crash-recovery,
 schema migration from v0, and `mneme backup` / `mneme restore` round-trips
@@ -69,7 +69,7 @@ ready-to-copy scripts in
 - Homebrew formula and a release pipeline that ships prebuilt binaries
 - mdBook-rendered user docs site
 - 30-day soak on real workloads
-- `switch_scope` tool
+- (release pipeline only — feature work for v1.0 is complete)
 
 See [`proj_docs/mneme-implementation-plan.md`](proj_docs/mneme-implementation-plan.md)
 for the canonical roadmap.
@@ -113,7 +113,7 @@ manually with Claude Desktop on macOS:
    }
    ```
 
-3. Restart Claude Desktop. The tools panel should show 11 tools and 4 MCP
+3. Restart Claude Desktop. The tools panel should show 12 tools and 5 MCP
    resources. The first call may take a few seconds while the embedding
    model loads.
 
@@ -128,7 +128,7 @@ To smoke from the shell without an MCP host:
 ```
 
 You should see two JSON lines: an `initialize` response advertising the
-server's capabilities, then a `tools/list` response with all 11 tools.
+server's capabilities, then a `tools/list` response with all 12 tools.
 
 For the comprehensive end-to-end check (every tool, backup/restore
 round-trip, post-restore recall) run:

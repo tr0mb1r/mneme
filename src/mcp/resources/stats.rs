@@ -16,6 +16,7 @@ use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
+use crate::scope::ScopeState;
 use crate::storage::archive::ColdArchive;
 
 pub struct Stats {
@@ -34,6 +35,9 @@ pub struct Stats {
     /// `Some(_)` once the L1 checkpoint scheduler is wired
     /// (production); `None` in fixtures.
     checkpoints: Option<Arc<CheckpointScheduler>>,
+    /// `Some(_)` in production. Surfaces the active default scope
+    /// (mutated by the `switch_scope` tool) on the `working` block.
+    scope_state: Option<Arc<ScopeState>>,
 }
 
 impl Stats {
@@ -52,6 +56,7 @@ impl Stats {
             schema_version,
             consolidation: None,
             checkpoints: None,
+            scope_state: None,
         }
     }
 
@@ -67,6 +72,13 @@ impl Stats {
     /// counters land in the `working` block.
     pub fn with_checkpoints(mut self, sched: Arc<CheckpointScheduler>) -> Self {
         self.checkpoints = Some(sched);
+        self
+    }
+
+    /// Attach the scope-state cell so the active default scope
+    /// surfaces on the `working` block as `current_scope`.
+    pub fn with_scope_state(mut self, state: Arc<ScopeState>) -> Self {
+        self.scope_state = Some(state);
         self
     }
 }
@@ -127,6 +139,7 @@ impl Resource for Stats {
                 "turns_total": m.turns_total,
                 "checkpoints_total": m.checkpoints_total,
                 "errors_total": m.errors_total,
+                "current_scope": self.scope_state.as_ref().map(|s| s.current()),
             })
         });
 

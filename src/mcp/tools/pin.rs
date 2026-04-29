@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use super::{Tool, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::procedural::ProceduralStore;
+use crate::scope::ScopeState;
 
 const DESCRIPTION: &str = "Promote a piece of information to procedural \
 memory. Pinned items appear at the top of every recall context until \
@@ -17,16 +18,14 @@ explicitly unpinned. Use sparingly: this is the right place for \
 hard preferences ('use Rust over Python'), persistent identity \
 facts, and binding decisions; not for transient state.";
 
-/// Default scope, mirrors `remember`.
-const DEFAULT_SCOPE: &str = "personal";
-
 pub struct Pin {
     store: Arc<ProceduralStore>,
+    scope_state: Arc<ScopeState>,
 }
 
 impl Pin {
-    pub fn new(store: Arc<ProceduralStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<ProceduralStore>, scope_state: Arc<ScopeState>) -> Self {
+        Self { store, scope_state }
     }
 }
 
@@ -45,7 +44,7 @@ impl Tool for Pin {
                         "items": { "type": "string" },
                         "description": "Optional tags."
                     },
-                    "scope": { "type": "string", "description": "Optional scope override." }
+                    "scope": { "type": "string", "description": "Optional scope override. Defaults to the session's current scope (set by `switch_scope`)." }
                 },
                 "required": ["content"]
             }),
@@ -83,8 +82,8 @@ impl Tool for Pin {
         let scope = args
             .get("scope")
             .and_then(Value::as_str)
-            .unwrap_or(DEFAULT_SCOPE)
-            .to_owned();
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| self.scope_state.current());
 
         let id = self
             .store

@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use super::{Tool, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::semantic::{MemoryKind, SemanticStore};
+use crate::scope::ScopeState;
 
 const DESCRIPTION: &str = "Store a piece of information for future recall. \
 Use this when the user shares a fact, makes a decision, or expresses a \
@@ -16,18 +17,18 @@ information from tool outputs (those are handled automatically). Do NOT \
 use to store the contents of source code files (those are read live from \
 disk).";
 
-/// Default scope when the caller omits one. Mirrors
-/// [`crate::config::ScopesConfig::default`] (`"personal"`); kept here as
-/// well so the tool stays self-contained for tests.
-const DEFAULT_SCOPE: &str = "personal";
-
 pub struct Remember {
     store: Arc<SemanticStore>,
+    /// Active default scope. Tools fall back to
+    /// `scope_state.current()` when the caller omits the `scope`
+    /// argument; `switch_scope` mutates this. Initialised from
+    /// `[scopes] default` in `config.toml` at boot.
+    scope_state: Arc<ScopeState>,
 }
 
 impl Remember {
-    pub fn new(store: Arc<SemanticStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<SemanticStore>, scope_state: Arc<ScopeState>) -> Self {
+        Self { store, scope_state }
     }
 }
 
@@ -51,7 +52,7 @@ impl Tool for Remember {
                         "items": { "type": "string" },
                         "description": "Optional tags for retrieval."
                     },
-                    "scope": { "type": "string", "description": "Optional scope override." },
+                    "scope": { "type": "string", "description": "Optional scope override. Defaults to the session's current scope (set by `switch_scope`)." },
                     "pinned": { "type": "boolean", "description": "Promote to procedural memory." }
                 },
                 "required": ["content"]
@@ -99,8 +100,8 @@ impl Tool for Remember {
         let scope = args
             .get("scope")
             .and_then(Value::as_str)
-            .unwrap_or(DEFAULT_SCOPE)
-            .to_owned();
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| self.scope_state.current());
 
         // `pinned` is recognised by the schema but not yet wired to the
         // procedural layer (Phase 4). Surface that explicitly so callers
@@ -134,10 +135,14 @@ mod tests {
         SemanticStore::open_disabled(tmp.path(), storage, embedder).unwrap()
     }
 
+    fn make_scope() -> Arc<ScopeState> {
+        ScopeState::new("personal")
+    }
+
     #[tokio::test]
     async fn returns_parseable_ulid() {
         let tmp = TempDir::new().unwrap();
-        let r = Remember::new(store(&tmp));
+        let r = Remember::new(store(&tmp), make_scope());
         let res = r.invoke(json!({ "content": "hello" })).await.unwrap();
         let text = match &res.content[0] {
             crate::mcp::tools::ContentBlock::Text(t) => t.clone(),
@@ -152,7 +157,7 @@ mod tests {
     #[tokio::test]
     async fn missing_content_is_invalid() {
         let tmp = TempDir::new().unwrap();
-        let r = Remember::new(store(&tmp));
+        let r = Remember::new(store(&tmp), make_scope());
         let err = r.invoke(json!({})).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
@@ -160,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn empty_content_is_invalid() {
         let tmp = TempDir::new().unwrap();
-        let r = Remember::new(store(&tmp));
+        let r = Remember::new(store(&tmp), make_scope());
         let err = r.invoke(json!({ "content": "   " })).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
@@ -168,7 +173,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_type_is_invalid() {
         let tmp = TempDir::new().unwrap();
-        let r = Remember::new(store(&tmp));
+        let r = Remember::new(store(&tmp), make_scope());
         let err = r
             .invoke(json!({ "content": "x", "type": "weird" }))
             .await
@@ -179,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn tags_must_be_strings() {
         let tmp = TempDir::new().unwrap();
-        let r = Remember::new(store(&tmp));
+        let r = Remember::new(store(&tmp), make_scope());
         let err = r
             .invoke(json!({ "content": "x", "tags": [1, 2] }))
             .await
@@ -188,10 +193,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn falls_back_to_current_scope_when_arg_omitted() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let scope = ScopeState::new("personal");
+        scope.set("work").unwrap();
+        let r = Remember::new(Arc::clone(&s), Arc::clone(&scope));
+        r.invoke(json!({ "content": "no scope passed" }))
+            .await
+            .unwrap();
+        let hits = s
+            .recall(
+                "no scope passed",
+                5,
+                &crate::memory::semantic::RecallFilters::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].item.scope, "work");
+    }
+
+    #[tokio::test]
     async fn round_trip_through_recall() {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
-        let r = Remember::new(Arc::clone(&s));
+        let r = Remember::new(Arc::clone(&s), make_scope());
         r.invoke(json!({
             "content": "the build is green",
             "type": "fact",

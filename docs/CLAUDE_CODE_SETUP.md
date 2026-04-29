@@ -1,7 +1,7 @@
 # Setting up Mneme with Claude Code
 
 This guide walks you from a stock Claude Code install to a session where
-the agent can call `remember`, `recall`, and the rest of mneme's 11 tools
+the agent can call `remember`, `recall`, and the rest of mneme's 12 tools
 — including verification, project-vs-personal scoping, and troubleshooting.
 
 If you only want the three lines: build the binary, run `mneme init`, then
@@ -140,12 +140,13 @@ Inside the session, run the slash command:
 /mcp
 ```
 
-You should see mneme listed with **11 tools** and **4 resources**:
+You should see mneme listed with **12 tools** and **5 resources**:
 
 - Tools: `remember`, `recall`, `update`, `forget`, `pin`, `unpin`,
-  `recall_recent`, `summarize_session`, `stats`, `list_scopes`, `export`.
+  `recall_recent`, `summarize_session`, `stats`, `list_scopes`, `export`,
+  `switch_scope`.
 - Resources: `mneme://stats`, `mneme://procedural`, `mneme://recent`,
-  `mneme://context`.
+  `mneme://context`, `mneme://session/{id}`.
 
 Quick functional check inside the session:
 
