@@ -1,0 +1,62 @@
+name: ci-skipped
+
+# Sibling to ci.yml. Runs on docs-only changes that ci.yml's
+# paths-ignore filters out, and emits success on the same job names
+# the `main protection` ruleset requires:
+#   test (ubuntu-latest)
+#   test (macos-latest)
+#   test (windows-latest)
+#   cargo-deny
+#   cargo-audit
+#
+# That lets docs-only PRs clear the required-status-checks gate
+# without burning the real build matrix.
+#
+# IMPORTANT: keep the job names + matrix shape in lockstep with
+# ci.yml. If ci.yml's required check names change, this file MUST
+# follow or docs-only PRs will hang on missing required checks.
+# The `paths` block here is the inverse of ci.yml's `paths-ignore`
+# — they must stay in sync as a pair.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.md'
+      - 'book/**'
+      - 'proj_docs/**'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.github/workflows/pages.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.md'
+      - 'book/**'
+      - 'proj_docs/**'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.github/workflows/pages.yml'
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - run: echo "docs-only change; ci.yml skipped for ${{ matrix.os }}"
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "docs-only change; cargo-deny skipped"
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "docs-only change; cargo-audit skipped"

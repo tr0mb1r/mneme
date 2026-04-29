@@ -14,8 +14,22 @@ name: cross-build
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'book/**'
+      - 'proj_docs/**'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.github/workflows/pages.yml'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'book/**'
+      - 'proj_docs/**'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 env:

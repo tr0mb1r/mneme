@@ -3,6 +3,12 @@ name: pages
 on:
   push:
     branches: [main]
+    paths:
+      - 'book/**'
+      - 'docs/**'
+      - 'CONTRIBUTING.md'
+      - 'LICENSE'
+      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 permissions:
