@@ -49,8 +49,19 @@ jobs:
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    # rustsec/audit-check posts findings as a GitHub check-run annotation,
+    # which requires `checks: write`. Without it the action errors out at
+    # the end even when the advisories list is acceptable.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Same two transitive deps cargo-deny already ignores in
+          # deny.toml — `atomic-polyfill` and `paste` are upstream-
+          # archived but carry no security vulnerability. Keep the two
+          # tools in sync so they don't disagree.
+          ignore: RUSTSEC-2023-0089,RUSTSEC-2024-0436
