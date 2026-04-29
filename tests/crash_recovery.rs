@@ -10,7 +10,7 @@
 //!
 //! By default the test runs **64 iterations**, which is fast enough for
 //! routine CI. Set `MNEME_CRASH_TEST_ITERATIONS=1000` for the formal
-//! Phase 2 exit-gate run from `proj_docs/mneme-implementation-plan.md` §3.
+//! Phase 2 exit-gate run.
 //!
 //! The driver binary is gated behind `--features test-driver`. The test
 //! locates it via `CARGO_BIN_EXE_wal-driver` (cargo sets this for any

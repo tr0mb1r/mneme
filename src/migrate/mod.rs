@@ -1,7 +1,6 @@
 //! Schema migration framework.
 //!
-//! `schema_version` is independent of the binary's `Cargo.toml` version
-//! (per locked decision in `proj_docs/mneme-implementation-plan.md` §0).
+//! `schema_version` is independent of the binary's `Cargo.toml` version.
 //! Patches that don't change disk format don't bump the schema; format
 //! changes do.
 //!

@@ -4,23 +4,24 @@ Thanks for your interest. This document is short on purpose.
 
 ## Before you start
 
-1. Read [`proj_docs/mneme-project-specification-v2.md`](proj_docs/mneme-project-specification-v2.md). It is the canonical
-   project context and resolves most ambiguity.
-2. Read [`proj_docs/mneme-implementation-plan.md`](proj_docs/mneme-implementation-plan.md) to see the current phase and
-   exit gates.
-3. Skim the ADRs in `proj_docs/decisions/` — they explain non-obvious calls.
+1. Read [`docs/MEMORY_LAYERS.md`](docs/MEMORY_LAYERS.md) for a per-layer
+   walkthrough — what each layer holds, where it lives on disk, and what
+   runs vs. what's deferred.
+2. Skim [`docs/CLAUDE_CODE_SETUP.md`](docs/CLAUDE_CODE_SETUP.md) for the
+   end-user setup flow; understanding the install/configure path keeps
+   reviewer-focused changes from breaking it.
 
 ## Working on Mneme
 
-- Match the design principles in spec §3. When two principles conflict,
-  the higher-numbered one loses.
 - **Respect the seams.** `src/storage/mod.rs`, `src/embed/mod.rs`, and
-  `src/index/mod.rs` define traits that protect spec principle #10
-  ("build for ten years"). Don't bypass them.
-- **Layer boundaries are not advisory.** L1 never persists. L4 has one
-  home. See spec §5.2.
+  `src/index/mod.rs` define traits that protect long-term portability —
+  swapping redb / candle / instant-distance stays local to those modules.
+  Don't bypass the seams from elsewhere in the tree.
+- **Layer boundaries are not advisory.** L1 (working session) never
+  outlives a process beyond its checkpoint. L4 (semantic) has exactly one
+  home (`mem:` prefix in redb + HNSW). Don't blur layers.
 - **Stay in Mneme's lane.** No code embedding, no knowledge graph, no
-  SaaS. See spec §11.4.
+  SaaS. The README's "What it isn't" section is the source of truth.
 
 ## Style
 
@@ -36,12 +37,6 @@ Thanks for your interest. This document is short on purpose.
 ## Commits
 
 Follow Conventional Commits (`feat:`, `fix:`, `chore:`, `docs:`, `sec:`).
-
-## When the spec is wrong
-
-Update the spec in the same commit as the code change, with a short
-explanation of why. The spec exists to be useful, not authoritative for
-its own sake.
 
 ## What needs review
 

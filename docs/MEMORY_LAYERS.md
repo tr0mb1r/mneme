@@ -430,11 +430,6 @@ just stopped.
 
 - [`docs/CLAUDE_CODE_SETUP.md`](CLAUDE_CODE_SETUP.md) — getting mneme
   wired into Claude Code, plus the patterns that make it pay off.
-- [`proj_docs/mneme-project-specification-v2.md`](../proj_docs/mneme-project-specification-v2.md)
-  §5–§8 — the canonical spec for layers, persistence, and HNSW
-  snapshot strategy.
-- [`proj_docs/mneme-implementation-plan.md`](../proj_docs/mneme-implementation-plan.md) —
-  current build status; the source of truth for which features are
-  wired vs. deferred.
-- [`proj_docs/decisions/`](../proj_docs/decisions/) — ADRs explaining
-  redb vs sled, candle vs ort, the WAL design, etc.
+- The crate-level rustdoc (`cargo doc --open`) — `MnemeError`, the
+  three trait seams (`Storage` / `Embedder` / `VectorIndex`), and
+  per-module documentation cover the implementation in detail.

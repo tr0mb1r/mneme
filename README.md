@@ -9,10 +9,6 @@ with a migration path, but the project hasn't yet cleared its 30-day soak,
 shipped a Homebrew formula, or published a release pipeline. Treat as
 production-capable for personal use, not yet 1.0.
 
-See [`proj_docs/mneme-project-specification-v2.md`](proj_docs/mneme-project-specification-v2.md)
-for the canonical spec and [`proj_docs/mneme-implementation-plan.md`](proj_docs/mneme-implementation-plan.md)
-for the build plan.
-
 ## What it is
 
 Mneme is a persistent memory tool for AI agents. It runs as a long-lived
@@ -69,10 +65,9 @@ ready-to-copy scripts in
 - Homebrew formula and a release pipeline that ships prebuilt binaries
 - mdBook-rendered user docs site
 - 30-day soak on real workloads
-- (release pipeline only — feature work for v1.0 is complete)
 
-See [`proj_docs/mneme-implementation-plan.md`](proj_docs/mneme-implementation-plan.md)
-for the canonical roadmap.
+Feature work for v1.0 is complete; the remaining items are release
+infrastructure.
 
 ## Installing
 

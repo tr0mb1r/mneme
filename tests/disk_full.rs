@@ -1,5 +1,5 @@
-//! Phase 2 exit gate (per `proj_docs/mneme-implementation-plan.md` §3):
-//! "Disk-full test: writes return clear errors, reads continue."
+//! Phase 2 exit gate: writes return clear errors when the
+//! filesystem is full, and reads continue working unaffected.
 //!
 //! Strategy
 //! --------

@@ -1,5 +1,5 @@
-//! Phase 2 exit gate (per `proj_docs/mneme-implementation-plan.md` §3):
-//! "10K random put/get/delete operations survive restart byte-identical (proptest)."
+//! Phase 2 exit gate: 10K random put/get/delete operations
+//! survive restart byte-identical (proptest).
 //!
 //! This is the in-process companion to `tests/crash_recovery.rs` (which
 //! exercises subprocess kill -9). Here we drive the real `RedbStorage` for

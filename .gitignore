@@ -16,3 +16,6 @@ Thumbs.db
 
 # Local data dirs (in case someone runs mneme inside the repo)
 /.mneme/
+
+# Working notes and design docs are author-local; not shipped publicly.
+/proj_docs/
