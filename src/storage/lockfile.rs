@@ -154,9 +154,21 @@ mod tests {
         let path = tmp.path().join(".lock");
         let guard = LockGuard::acquire(&path).unwrap();
         assert!(path.exists());
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let pid: u32 = contents.trim().parse().unwrap();
-        assert_eq!(pid, std::process::id());
+
+        // On Unix, file locks are advisory — the PID written by
+        // `acquire` is readable through the path while the lock is
+        // still held. On Windows, fs2's exclusive lock prevents
+        // even the holding process from opening the file by path
+        // (the kernel returns ERROR_LOCK_VIOLATION). The PID is
+        // still written; we just can't read it back without
+        // releasing the lock first.
+        #[cfg(unix)]
+        {
+            let contents = std::fs::read_to_string(&path).unwrap();
+            let pid: u32 = contents.trim().parse().unwrap();
+            assert_eq!(pid, std::process::id());
+        }
+
         drop(guard);
         // After drop, file is removed.
         assert!(!path.exists());
