@@ -5,7 +5,7 @@
 # post-1.0, we publish under `mneme-mcp` while keeping the user-
 # facing binary, library, and project names as `mneme`.
 name = "mneme-mcp"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "MCP-native persistent memory tool for AI agents"
