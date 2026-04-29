@@ -82,7 +82,7 @@ impl Resource for Stats {
         }
     }
 
-    async fn read(&self) -> Result<ResourceContent, ResourceError> {
+    async fn read(&self, _uri: &str) -> Result<ResourceContent, ResourceError> {
         let semantic_count = self.semantic.len();
         let procedural_count = self
             .procedural
@@ -200,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn read_returns_real_counts() {
         let (s, _tmp) = fixture().await;
-        let c = s.read().await.unwrap();
+        let c = s.read("mneme://stats").await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
         assert_eq!(v["schema_version"], 1);
         assert_eq!(v["memories"]["semantic"], 2);
@@ -224,7 +224,7 @@ mod tests {
         let cold = ColdArchive::new(tmp.path());
 
         let s = Stats::new(semantic, procedural, episodic, cold, 1);
-        let c = s.read().await.unwrap();
+        let c = s.read("mneme://stats").await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
         assert_eq!(v["memories"]["semantic"], 0);
         assert_eq!(v["memories"]["procedural"], 0);
@@ -237,7 +237,7 @@ mod tests {
     #[tokio::test]
     async fn consolidation_field_is_null_without_scheduler() {
         let (s, _tmp) = fixture().await;
-        let c = s.read().await.unwrap();
+        let c = s.read("mneme://stats").await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
         assert!(v.get("consolidation").is_some());
         assert!(v["consolidation"].is_null());
@@ -248,7 +248,7 @@ mod tests {
     #[tokio::test]
     async fn working_field_is_null_without_scheduler() {
         let (s, _tmp) = fixture().await;
-        let c = s.read().await.unwrap();
+        let c = s.read("mneme://stats").await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
         assert!(v.get("working").is_some());
         assert!(v["working"].is_null());
@@ -259,9 +259,7 @@ mod tests {
     /// checkpoint counters until the first flush.
     #[tokio::test]
     async fn working_block_surfaces_when_scheduler_attached() {
-        use crate::memory::checkpoint_scheduler::{
-            CheckpointScheduler, CheckpointSchedulerConfig,
-        };
+        use crate::memory::checkpoint_scheduler::{CheckpointScheduler, CheckpointSchedulerConfig};
         use crate::memory::working::ActiveSession;
 
         let (s, _tmp) = fixture().await;
@@ -270,7 +268,7 @@ mod tests {
             CheckpointScheduler::start(Arc::clone(&active), CheckpointSchedulerConfig::disabled());
         let s = s.with_checkpoints(Arc::clone(&sched));
 
-        let c = s.read().await.unwrap();
+        let c = s.read("mneme://stats").await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
         let w = &v["working"];
         assert!(w.is_object(), "working should be an object: {w}");
@@ -309,7 +307,7 @@ mod tests {
         );
         let s = s.with_consolidation(Arc::clone(&sched));
 
-        let c = s.read().await.unwrap();
+        let c = s.read("mneme://stats").await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
         let cons = &v["consolidation"];
         assert!(

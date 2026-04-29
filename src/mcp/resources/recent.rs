@@ -34,7 +34,7 @@ impl Resource for Recent {
         }
     }
 
-    async fn read(&self) -> Result<ResourceContent, ResourceError> {
+    async fn read(&self, _uri: &str) -> Result<ResourceContent, ResourceError> {
         let events = self
             .store
             .recall_recent(&RecentFilters::default(), RECENT_LIMIT)

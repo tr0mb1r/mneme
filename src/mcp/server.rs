@@ -276,7 +276,7 @@ where
             }
         };
 
-        match resource.read().await {
+        match resource.read(&uri).await {
             Ok(content) => Response::success(id, json!({ "contents": [content.to_json()] })),
             Err(ResourceError::NotFound(msg)) => {
                 Response::error(id, error_codes::METHOD_NOT_FOUND, msg)

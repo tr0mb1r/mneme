@@ -21,11 +21,17 @@ use chrono::{DateTime, Utc};
 use crate::memory::episodic::EpisodicEvent;
 use crate::memory::procedural::PinnedItem;
 use crate::memory::semantic::RecallHit;
+use crate::memory::working::Turn;
 
 /// Layer weights. Higher = ranks higher at equal semantic + recency
 /// score. Sum doesn't have to equal 1; only relative magnitudes
 /// matter for ranking.
 pub const PROCEDURAL_WEIGHT: f32 = 1.0;
+/// Working turns are the active session's most recent context.
+/// Below procedural (anchors) but above episodic (history) and
+/// semantic (long-term recall) — they're the immediate
+/// conversation, freshest available.
+pub const WORKING_WEIGHT: f32 = 0.9;
 pub const EPISODIC_WEIGHT: f32 = 0.8;
 pub const SEMANTIC_WEIGHT: f32 = 0.7;
 
@@ -42,6 +48,7 @@ pub enum ScoredItem {
     Procedural { item: PinnedItem, score: f32 },
     Semantic { hit: RecallHit, score: f32 },
     Episodic { event: EpisodicEvent, score: f32 },
+    Working { turn: Turn, score: f32 },
 }
 
 impl ScoredItem {
@@ -50,6 +57,7 @@ impl ScoredItem {
             ScoredItem::Procedural { score, .. } => *score,
             ScoredItem::Semantic { score, .. } => *score,
             ScoredItem::Episodic { score, .. } => *score,
+            ScoredItem::Working { score, .. } => *score,
         }
     }
 }
@@ -79,6 +87,16 @@ pub fn score_episodic(event: EpisodicEvent, now: DateTime<Utc>) -> ScoredItem {
     let weight = (event.retrieval_weight as f64) * (EPISODIC_WEIGHT as f64);
     let score = (weight * recency) as f32;
     ScoredItem::Episodic { event, score }
+}
+
+/// Score a working-session turn. Turns have no semantic match (they
+/// aren't embedded) and no per-row weight; the score collapses to
+/// `WORKING_WEIGHT * recency_factor(at)`. Recent turns dominate aged
+/// ones with the same half-life as everything else.
+pub fn score_working(turn: Turn, now: DateTime<Utc>) -> ScoredItem {
+    let recency = recency_factor(turn.at, now);
+    let score = (WORKING_WEIGHT as f64 * recency) as f32;
+    ScoredItem::Working { turn, score }
 }
 
 /// `(1/2)^(elapsed / half_life)` — a true half-life curve (factor =
@@ -188,6 +206,60 @@ mod tests {
         assert!((fresh - 1.0).abs() < 1e-6);
         assert!((one_half_life - 0.5).abs() < 1e-3);
         assert!((two_half_lives - 0.25).abs() < 1e-3);
+    }
+
+    #[test]
+    fn working_fresh_collapses_to_layer_weight() {
+        let now = Utc::now();
+        let turn = Turn {
+            role: "user".into(),
+            content: "hi".into(),
+            at: now,
+        };
+        let s = score_working(turn, now);
+        assert!((s.score() - WORKING_WEIGHT).abs() < 1e-3);
+    }
+
+    #[test]
+    fn working_recent_outranks_aged() {
+        let now = Utc::now();
+        let recent = score_working(
+            Turn {
+                role: "user".into(),
+                content: "x".into(),
+                at: now,
+            },
+            now,
+        );
+        let aged = score_working(
+            Turn {
+                role: "user".into(),
+                content: "x".into(),
+                at: now - Duration::days(60),
+            },
+            now,
+        );
+        assert!(recent.score() > aged.score());
+    }
+
+    #[test]
+    fn working_outranks_episodic_at_equal_recency() {
+        let now = Utc::now();
+        let w = score_working(
+            Turn {
+                role: "user".into(),
+                content: "x".into(),
+                at: now,
+            },
+            now,
+        );
+        let e = score_episodic(event(DEFAULT_RETRIEVAL_WEIGHT, 0), now);
+        assert!(
+            w.score() > e.score(),
+            "working {} should outrank episodic {} at equal recency",
+            w.score(),
+            e.score()
+        );
     }
 
     #[test]

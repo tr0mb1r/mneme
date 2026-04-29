@@ -42,7 +42,7 @@ impl Resource for Context {
         }
     }
 
-    async fn read(&self) -> Result<ResourceContent, ResourceError> {
+    async fn read(&self, _uri: &str) -> Result<ResourceContent, ResourceError> {
         let ctx = self
             .orchestrator
             .build_context(None, None, self.budget)

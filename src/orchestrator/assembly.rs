@@ -26,8 +26,11 @@ use chrono::Utc;
 use crate::memory::episodic::EpisodicEvent;
 use crate::memory::procedural::PinnedItem;
 use crate::memory::semantic::RecallHit;
+use crate::memory::working::Turn;
 use crate::orchestrator::budget::{TokenBudget, estimate_tokens};
-use crate::orchestrator::scoring::{ScoredItem, score_episodic, score_procedural, score_semantic};
+use crate::orchestrator::scoring::{
+    ScoredItem, score_episodic, score_procedural, score_semantic, score_working,
+};
 
 /// One assembled context, ready to render into a prompt.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -35,17 +38,23 @@ pub struct AssembledContext {
     pub procedural: Vec<PinnedItem>,
     pub semantic: Vec<RecallHit>,
     pub episodic: Vec<EpisodicEvent>,
+    /// Working-session turns from the active session (if any). Empty
+    /// when the orchestrator has no `ActiveSession` attached, e.g.
+    /// in tests that exercise only L0/L3/L4. Sorted newest-first
+    /// (by `Turn.at`).
+    pub working: Vec<Turn>,
     /// Sum of `chars/4` token estimates across every retained item.
     /// Guaranteed `<= TokenBudget::max_tokens`.
     pub total_tokens: usize,
 }
 
-const N_LAYERS: usize = 3;
+const N_LAYERS: usize = 4;
 
 pub fn assemble(
     procedural: Vec<PinnedItem>,
     semantic: Vec<RecallHit>,
     episodic: Vec<EpisodicEvent>,
+    working: Vec<Turn>,
     budget: &TokenBudget,
 ) -> AssembledContext {
     let now = Utc::now();
@@ -62,6 +71,10 @@ pub fn assemble(
     let scored_epi: Vec<(usize, ScoredItem)> = episodic
         .into_iter()
         .map(|e| (estimate_tokens(&e.payload), score_episodic(e, now)))
+        .collect();
+    let scored_work: Vec<(usize, ScoredItem)> = working
+        .into_iter()
+        .map(|t| (estimate_tokens(&t.content), score_working(t, now)))
         .collect();
 
     // Step 2: per-layer reservation. Empty layers don't reserve.
@@ -90,16 +103,20 @@ pub fn assemble(
         pack_within(scored_sem.clone(), layer_reserve.min(budget.max_tokens));
     let (epi_kept, epi_used) =
         pack_within(scored_epi.clone(), layer_reserve.min(budget.max_tokens));
+    let (work_kept, work_used) =
+        pack_within(scored_work.clone(), layer_reserve.min(budget.max_tokens));
 
-    let mut total_used = proc_used + sem_used + epi_used;
+    let mut total_used = proc_used + sem_used + epi_used + work_used;
     let mut chosen_ids = ChosenSet::default();
     chosen_ids.extend_proc(&proc_kept);
     chosen_ids.extend_sem(&sem_kept);
     chosen_ids.extend_epi(&epi_kept);
+    chosen_ids.extend_work(&work_kept);
 
     let mut proc_final = proc_kept;
     let mut sem_final = sem_kept;
     let mut epi_final = epi_kept;
+    let mut work_final = work_kept;
 
     // Step 3: pool the remainder, fill across layers by score.
     if total_used < budget.max_tokens {
@@ -119,6 +136,11 @@ pub fn assemble(
                 remainder.push((cost, item));
             }
         }
+        for (cost, item) in scored_work {
+            if !chosen_ids.contains(&item) {
+                remainder.push((cost, item));
+            }
+        }
         remainder.sort_by(|a, b| order_scored(&a.1, &b.1));
 
         for (cost, item) in remainder {
@@ -130,6 +152,7 @@ pub fn assemble(
                 ScoredItem::Procedural { .. } => proc_final.push(item),
                 ScoredItem::Semantic { .. } => sem_final.push(item),
                 ScoredItem::Episodic { .. } => epi_final.push(item),
+                ScoredItem::Working { .. } => work_final.push(item),
             }
         }
     }
@@ -144,6 +167,16 @@ pub fn assemble(
     });
     sem_final.sort_by(order_scored);
     epi_final.sort_by(order_scored);
+    // Working sorted newest-first by `Turn.at` (and content as a
+    // last-resort tie-break — turns lack stable ids). The agent
+    // reads working as "what just happened", so chronological
+    // descending matches that intuition better than score order.
+    work_final.sort_by(|a, b| match (a, b) {
+        (ScoredItem::Working { turn: at, .. }, ScoredItem::Working { turn: bt, .. }) => {
+            bt.at.cmp(&at.at).then(bt.content.cmp(&at.content))
+        }
+        _ => std::cmp::Ordering::Equal,
+    });
 
     AssembledContext {
         procedural: proc_final
@@ -167,6 +200,13 @@ pub fn assemble(
                 _ => unreachable!("scored_epi only holds Episodic"),
             })
             .collect(),
+        working: work_final
+            .into_iter()
+            .map(|s| match s {
+                ScoredItem::Working { turn, .. } => turn,
+                _ => unreachable!("scored_work only holds Working"),
+            })
+            .collect(),
         total_tokens: total_used,
     }
 }
@@ -185,7 +225,23 @@ fn id_bytes(item: &ScoredItem) -> [u8; 16] {
         ScoredItem::Procedural { item, .. } => item.id.0.to_bytes(),
         ScoredItem::Semantic { hit, .. } => hit.item.id.0.to_bytes(),
         ScoredItem::Episodic { event, .. } => event.id.0.to_bytes(),
+        ScoredItem::Working { turn, .. } => turn_pseudo_id(turn),
     }
+}
+
+/// Working turns lack ULIDs, so we synthesise a 16-byte tiebreaker
+/// from the turn's timestamp + a hash of role+content. Sufficient for
+/// the score-tie ordering invariant; not used as a real identifier.
+fn turn_pseudo_id(turn: &Turn) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let ts_nanos = turn.at.timestamp_nanos_opt().unwrap_or(0).to_be_bytes();
+    out[..8].copy_from_slice(&ts_nanos);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    turn.role.hash(&mut hasher);
+    turn.content.hash(&mut hasher);
+    out[8..].copy_from_slice(&hasher.finish().to_be_bytes());
+    out
 }
 
 #[derive(Default)]
@@ -193,6 +249,7 @@ struct ChosenSet {
     proc_ids: std::collections::HashSet<[u8; 16]>,
     sem_ids: std::collections::HashSet<[u8; 16]>,
     epi_ids: std::collections::HashSet<[u8; 16]>,
+    work_ids: std::collections::HashSet<[u8; 16]>,
 }
 
 impl ChosenSet {
@@ -217,11 +274,19 @@ impl ChosenSet {
             }
         }
     }
+    fn extend_work(&mut self, kept: &[ScoredItem]) {
+        for it in kept {
+            if let ScoredItem::Working { turn, .. } = it {
+                self.work_ids.insert(turn_pseudo_id(turn));
+            }
+        }
+    }
     fn contains(&self, item: &ScoredItem) -> bool {
         match item {
             ScoredItem::Procedural { item, .. } => self.proc_ids.contains(&item.id.0.to_bytes()),
             ScoredItem::Semantic { hit, .. } => self.sem_ids.contains(&hit.item.id.0.to_bytes()),
             ScoredItem::Episodic { event, .. } => self.epi_ids.contains(&event.id.0.to_bytes()),
+            ScoredItem::Working { turn, .. } => self.work_ids.contains(&turn_pseudo_id(turn)),
         }
     }
 }
@@ -271,9 +336,23 @@ mod tests {
         }
     }
 
+    fn turn(content: &str) -> Turn {
+        Turn {
+            role: "user".into(),
+            content: content.into(),
+            at: Utc::now(),
+        }
+    }
+
     #[test]
     fn assemble_empty_returns_zero_tokens() {
-        let ctx = assemble(vec![], vec![], vec![], &TokenBudget::for_tests(1000));
+        let ctx = assemble(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            &TokenBudget::for_tests(1000),
+        );
         assert_eq!(ctx, AssembledContext::default());
     }
 
@@ -281,7 +360,7 @@ mod tests {
     fn assemble_respects_max_tokens() {
         let big = "x".repeat(500); // 125 tokens
         let proc: Vec<_> = (0..10).map(|_| pin(&big)).collect();
-        let ctx = assemble(proc, vec![], vec![], &TokenBudget::for_tests(300));
+        let ctx = assemble(proc, vec![], vec![], vec![], &TokenBudget::for_tests(300));
         assert!(ctx.total_tokens <= 300);
         // Should fit ~2 of the 125-token items.
         assert!(ctx.procedural.len() <= 2);
@@ -298,6 +377,7 @@ mod tests {
         let ctx = assemble(
             proc,
             semantic,
+            vec![],
             vec![],
             &TokenBudget {
                 max_tokens: 600,
@@ -321,6 +401,7 @@ mod tests {
             vec![],
             vec![mid, far, near],
             vec![],
+            vec![],
             &TokenBudget::for_tests(1000),
         );
         let ids: Vec<_> = ctx.semantic.iter().map(|h| h.item.id).collect();
@@ -332,10 +413,17 @@ mod tests {
         let p = pin("aaaa"); // 1 token
         let s = hit("bbbbbbbb", 0.0); // 2 tokens
         let e = event("\"cc\""); // 1 token
-        let ctx = assemble(vec![p], vec![s], vec![e], &TokenBudget::for_tests(1000));
+        let w = turn("dddd"); // 1 token
+        let ctx = assemble(
+            vec![p],
+            vec![s],
+            vec![e],
+            vec![w],
+            &TokenBudget::for_tests(1000),
+        );
         // Allow ±1 for token-rounding boundaries.
         assert!(
-            (ctx.total_tokens as i64 - 4).abs() <= 1,
+            (ctx.total_tokens as i64 - 5).abs() <= 1,
             "got {}",
             ctx.total_tokens
         );
@@ -346,15 +434,27 @@ mod tests {
         let proc = vec![pin("p1"), pin("p2"), pin("p3")];
         let sem = vec![hit("s1", 0.1), hit("s2", 0.2), hit("s3", 0.3)];
         let epi = vec![event("\"e1\""), event("\"e2\"")];
+        let work = vec![turn("w1"), turn("w2")];
         let budget = TokenBudget::for_tests(1000);
-        let a = assemble(proc.clone(), sem.clone(), epi.clone(), &budget);
-        let b = assemble(proc, sem, epi, &budget);
+        let a = assemble(
+            proc.clone(),
+            sem.clone(),
+            epi.clone(),
+            work.clone(),
+            &budget,
+        );
+        let b = assemble(proc, sem, epi, work, &budget);
         let to_ids = |c: &AssembledContext| -> Vec<String> {
             c.procedural
                 .iter()
                 .map(|p| p.id.to_string())
                 .chain(c.semantic.iter().map(|s| s.item.id.to_string()))
                 .chain(c.episodic.iter().map(|e| e.id.to_string()))
+                .chain(
+                    c.working
+                        .iter()
+                        .map(|t| format!("{}|{}", t.role, t.content)),
+                )
                 .collect()
         };
         assert_eq!(to_ids(&a), to_ids(&b));
@@ -366,6 +466,7 @@ mod tests {
             vec![pin("anything")],
             vec![hit("anything", 0.0)],
             vec![event("\"x\"")],
+            vec![turn("anything")],
             &TokenBudget {
                 max_tokens: 0,
                 per_layer_min: 0,
@@ -374,6 +475,7 @@ mod tests {
         assert!(ctx.procedural.is_empty());
         assert!(ctx.semantic.is_empty());
         assert!(ctx.episodic.is_empty());
+        assert!(ctx.working.is_empty());
         assert_eq!(ctx.total_tokens, 0);
     }
 
@@ -392,9 +494,83 @@ mod tests {
             vec![],
             vec![],
             vec![aged, fresh],
+            vec![],
             &TokenBudget::for_tests(1000),
         );
         assert!(ctx.episodic.len() >= 2);
         assert_eq!(ctx.episodic[0].id, fresh_id);
+    }
+
+    #[test]
+    fn assemble_passes_working_through() {
+        // Simple smoke: working turns survive the assemble pass with
+        // ample budget.
+        let ws = vec![turn("first"), turn("second"), turn("third")];
+        let ctx = assemble(
+            vec![],
+            vec![],
+            vec![],
+            ws.clone(),
+            &TokenBudget::for_tests(1000),
+        );
+        assert_eq!(ctx.working.len(), 3);
+        assert_eq!(
+            ctx.total_tokens,
+            ws.iter()
+                .map(|t| estimate_tokens(&t.content))
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn assemble_working_orders_newest_first() {
+        let now = Utc::now();
+        let old = Turn {
+            role: "user".into(),
+            content: "old".into(),
+            at: now - Duration::minutes(5),
+        };
+        let mid = Turn {
+            role: "user".into(),
+            content: "mid".into(),
+            at: now - Duration::minutes(2),
+        };
+        let new = Turn {
+            role: "user".into(),
+            content: "new".into(),
+            at: now,
+        };
+        let ctx = assemble(
+            vec![],
+            vec![],
+            vec![],
+            vec![old, mid, new],
+            &TokenBudget::for_tests(1000),
+        );
+        let order: Vec<_> = ctx.working.iter().map(|t| t.content.as_str()).collect();
+        assert_eq!(order, vec!["new", "mid", "old"]);
+    }
+
+    #[test]
+    fn assemble_working_respects_per_layer_minimum() {
+        // Working turns alongside a wall of large procedural items —
+        // the per-layer floor should keep at least one working turn.
+        let big_pin = "p".repeat(800); // 200 tokens
+        let proc: Vec<_> = (0..10).map(|_| pin(&big_pin)).collect();
+        let ws = vec![turn("session note A"), turn("session note B")];
+        let ctx = assemble(
+            proc,
+            vec![],
+            vec![],
+            ws,
+            &TokenBudget {
+                max_tokens: 1000,
+                per_layer_min: 200,
+            },
+        );
+        assert!(
+            !ctx.working.is_empty(),
+            "working layer was starved by procedural"
+        );
     }
 }

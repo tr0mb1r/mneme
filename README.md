@@ -69,8 +69,7 @@ ready-to-copy scripts in
 - Homebrew formula and a release pipeline that ships prebuilt binaries
 - mdBook-rendered user docs site
 - 30-day soak on real workloads
-- `switch_scope` tool and `mneme://session/{id}` resource
-- L1 working-session **read-side** fold-in into `mneme://context`
+- `switch_scope` tool
 
 See [`proj_docs/mneme-implementation-plan.md`](proj_docs/mneme-implementation-plan.md)
 for the canonical roadmap.

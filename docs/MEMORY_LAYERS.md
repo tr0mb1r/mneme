@@ -9,13 +9,14 @@ about to do disk I/O while you're typing.
 If you only want the one-page version, read [§1 Quick reference](#1-quick-reference).
 The rest of the doc is layer-by-layer detail.
 
-> **Honesty note on schedules.** As of v0.13, all three background
-> schedulers are wired: HNSW snapshots, L3 consolidation
-> (5-minute idle tick), and L1 session checkpoints (30 s OR 5
-> tools/call invocations, whichever first). The L1 read-side
-> fold-in into `mneme://context` is still outstanding — the
-> session is *persisted* but isn't yet pulled into auto-context
-> assembly.
+> **Honesty note on schedules.** As of v0.14, all three background
+> schedulers are wired (HNSW snapshots, L3 consolidation on a
+> 5-min idle tick, L1 session checkpoints on 30 s / 5 turns) AND
+> the L1 read-side fold-in into `mneme://context` ships. Working
+> turns now appear in auto-context with `WORKING_WEIGHT = 0.9`,
+> sorted newest-first. The per-session resource
+> `mneme://session/{id}` exposes the full session JSON for active
+> or past sessions.
 
 ---
 

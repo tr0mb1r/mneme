@@ -127,11 +127,6 @@ pub fn execute() -> Result<()> {
     })?;
     let procedural = Arc::new(ProceduralStore::open(&root)?);
     let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage_dyn)));
-    let orchestrator = Arc::new(Orchestrator::new(
-        Arc::clone(&semantic),
-        Arc::clone(&procedural),
-        Arc::clone(&episodic),
-    ));
     let auto_context_budget = TokenBudget::from_config(&config.budgets);
     let cold = crate::storage::archive::ColdArchive::new(&root);
 
@@ -162,6 +157,18 @@ pub fn execute() -> Result<()> {
         )
     });
 
+    // The orchestrator is built AFTER the active session so it can
+    // pull the L1 working layer into auto-context (`mneme://context`).
+    let orchestrator = Arc::new(
+        Orchestrator::new(
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+        )
+        .with_active_session(Arc::clone(&active_session)),
+    );
+
+    let sessions_dir = root.join("sessions");
     let result = runtime
         .block_on(async_main(
             Arc::clone(&storage_dyn),
@@ -175,6 +182,7 @@ pub fn execute() -> Result<()> {
             Arc::clone(&consolidation_scheduler),
             Arc::clone(&active_session),
             Arc::clone(&checkpoint_scheduler),
+            sessions_dir,
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
 
@@ -228,6 +236,7 @@ async fn async_main(
     consolidation: Arc<ConsolidationScheduler>,
     active_session: Arc<ActiveSession>,
     checkpoint_scheduler: Arc<CheckpointScheduler>,
+    sessions_dir: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -261,6 +270,8 @@ async fn async_main(
             auto_context_budget,
             Some(consolidation),
             Some(Arc::clone(&checkpoint_scheduler)),
+            Some(Arc::clone(&active_session)),
+            Some(sessions_dir),
         )),
         storage,
     )

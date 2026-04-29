@@ -32,7 +32,7 @@ impl Resource for Procedural {
         }
     }
 
-    async fn read(&self) -> Result<ResourceContent, ResourceError> {
+    async fn read(&self, _uri: &str) -> Result<ResourceContent, ResourceError> {
         let items = self
             .store
             .list(None)
