@@ -1,0 +1,213 @@
+name: release
+
+# Tag-triggered release pipeline.
+#
+# When a `v*.*.*` tag is pushed, cross-build the five release targets
+# (same matrix as cross-build.yml), package the binary + README + LICENSE
+# into per-target archives with sha256 sums, and attach them to a GitHub
+# Release for the tag.
+#
+# This workflow is the public-facing artefact pipeline; the
+# Conventional-Commits → version-bump path is owned by `release-plz.yml`.
+# A typical release flow:
+#
+#   1. Land work on `main` via PR.
+#   2. release-plz.yml opens a "release PR" that bumps Cargo.toml +
+#      updates CHANGELOG.md from the commits since the previous release.
+#   3. Review and merge the release PR.
+#   4. Tag the merge commit:
+#        v="$(awk -F'"' '/^version/{print $2; exit}' Cargo.toml)"
+#        git tag "v${v}" && git push origin "v${v}"
+#   5. This workflow runs on the tag push and ships the binaries.
+#
+# Crate publication to crates.io is intentionally NOT done here —
+# release-plz.toml sets `publish = false` until the v1.0 gate clears.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build the release for, e.g. v0.2.0'
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write   # creating the GitHub Release and uploading assets
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cross: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cross: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            cross: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${ref#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="mneme-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/${stage}"
+          cp "target/${{ matrix.target }}/release/mneme" "dist/${stage}/"
+          cp README.md LICENSE "dist/${stage}/"
+          cp CHANGELOG.md "dist/${stage}/" 2>/dev/null || true
+          (cd dist && tar -czf "${stage}.tar.gz" "${stage}")
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
+          fi
+          rm -rf "dist/${stage}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = "mneme-${{ steps.ver.outputs.version }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$stage" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/mneme.exe" "dist/$stage/"
+          Copy-Item README.md, LICENSE "dist/$stage/"
+          if (Test-Path CHANGELOG.md) { Copy-Item CHANGELOG.md "dist/$stage/" }
+          Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
+          $hash = (Get-FileHash "dist/$stage.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $stage.zip" | Out-File "dist/$stage.zip.sha256" -Encoding ascii -NoNewline
+          Remove-Item -Recurse -Force "dist/$stage"
+
+      - name: Upload artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mneme-${{ matrix.target }}
+          path: |
+            dist/mneme-*.tar.gz
+            dist/mneme-*.tar.gz.sha256
+            dist/mneme-*.zip
+            dist/mneme-*.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${ref#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Download artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artefacts
+        run: ls -la dist
+
+      - name: Extract changelog section for this version
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.version }}"
+          if [ -f CHANGELOG.md ]; then
+            awk -v v="$ver" '
+              /^## \[/ {
+                if (in_section) exit
+                if (index($0, "[" v "]")) { in_section = 1; print; next }
+              }
+              in_section { print }
+            ' CHANGELOG.md > .release-notes.md || true
+          fi
+          if [ -s .release-notes.md ]; then
+            echo "have_notes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_notes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          draft: false
+          # Pre-1.0 tags (v0.x.y) are tagged as prereleases on GitHub
+          # so installers and homebrew formulae can opt out by default.
+          # Flip to `false` once 1.0 ships.
+          prerelease: ${{ startsWith(steps.ver.outputs.tag, 'v0.') }}
+          generate_release_notes: ${{ steps.notes.outputs.have_notes != 'true' }}
+          body_path: ${{ steps.notes.outputs.have_notes == 'true' && '.release-notes.md' || '' }}
+          files: |
+            dist/mneme-*.tar.gz
+            dist/mneme-*.tar.gz.sha256
+            dist/mneme-*.zip
+            dist/mneme-*.zip.sha256

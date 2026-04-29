@@ -16,6 +16,7 @@
 
 - [Configuration](./configuration.md)
 - [Troubleshooting](./troubleshooting.md)
+- [Versioning](./versioning.md)
 
 # Contributing
 

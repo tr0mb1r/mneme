@@ -23,11 +23,13 @@ work that the agent would otherwise forget.**
 
 ## Status
 
-Pre-1.0. Phases 0–5 complete; Phase 6 (portability + diagnostics)
-substantially complete. The on-disk format is stable behind a versioned
-schema with a migration path, but the project hasn't yet cleared its
-30-day soak, shipped a Homebrew formula, or published a release pipeline.
-Treat as production-capable for personal use, not yet 1.0.
+Pre-1.0 — `0.2.0` baseline. Phases 0–5 complete; Phase 6 (portability +
+diagnostics + release infrastructure) substantially complete. Code-side
+feature work for 1.0 is done; the remaining gates are operational:
+30-day soak (clock started 2026-04-29), Homebrew formula, and public
+release pipeline. The on-disk format is stable behind a versioned schema
+with a migration path. Treat as production-capable for personal use, not
+yet 1.0. See [Versioning](./versioning.md) for the policy and 1.0 gates.
 
 ## What works today
 

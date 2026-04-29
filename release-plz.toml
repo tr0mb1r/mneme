@@ -1,0 +1,72 @@
+# release-plz config — see https://release-plz.dev/docs/config
+#
+# Pre-1.0 strategy:
+#
+#   1. release-plz opens a release PR on every push to `main` whose
+#      commits include a `feat:` / `fix:` / `BREAKING CHANGE` since the
+#      last release. The PR bumps `Cargo.toml` `package.version` and
+#      regenerates `CHANGELOG.md`.
+#   2. After merging the release PR, push a tag manually:
+#        v="$(awk -F'"' '/^version/{print $2; exit}' Cargo.toml)"
+#        git tag "v${v}" && git push origin "v${v}"
+#      The tag triggers `.github/workflows/release.yml`, which cross-
+#      builds the five release targets and creates the GitHub Release
+#      with binaries + sha256 sums.
+#   3. We do NOT publish to crates.io until the v1.0 release pipeline
+#      has settled. Flip `publish` back on alongside the Homebrew
+#      formula decision, post-1.0.
+#
+# Disabling `git_tag_enable` and `git_release_enable` here keeps the
+# release-PR-merge step from racing the cross-build pipeline. Only the
+# explicit `git push origin v*.*.*` should trigger `release.yml`.
+
+[workspace]
+publish = false
+git_tag_enable = false
+git_release_enable = false
+# Don't run `cargo publish --dry-run` either — it tries to network out
+# to crates.io and adds nothing pre-1.0.
+publish_no_verify = true
+
+[changelog]
+header = """# Changelog
+
+All notable changes to mneme are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
+project adheres to [Semantic Versioning](https://semver.org/) — see
+[`book/src/versioning.md`](book/src/versioning.md) for the project's
+pre-1.0 cadence and 1.0 gates.
+
+"""
+
+# Conventional Commits → CHANGELOG sections. Keep this stable: changing
+# group names mid-release-cycle reflows existing CHANGELOG entries on
+# the next regeneration and creates noisy diffs.
+commit_parsers = [
+    { message = "^feat", group = "Added" },
+    { message = "^fix", group = "Fixed" },
+    { message = "^perf", group = "Changed" },
+    { message = "^refactor", group = "Changed" },
+    { message = "^sec", group = "Security" },
+    { message = "^docs", group = "Documentation" },
+    { message = "^chore", skip = true },
+    { message = "^style", skip = true },
+    { message = "^test", skip = true },
+    { message = "^ci", skip = true },
+    { message = "^build", skip = true },
+]
+
+# Surface BREAKING CHANGE footers prominently. Pre-1.0 these become a
+# `0.MINOR.0` bump per book/src/versioning.md; post-1.0 they become a
+# MAJOR bump.
+protect_breaking_commits = true
+sort_commits = "newest"
+
+[[package]]
+name = "mneme"
+changelog_update = true
+# The semver bump-level rules below mirror book/src/versioning.md.
+# Pre-1.0 release-plz interprets `feat!` / `BREAKING CHANGE` as a
+# 0.MINOR bump (Cargo's pre-1.0 SemVer convention); post-1.0 the same
+# triggers MAJOR.
+semver_check = true
