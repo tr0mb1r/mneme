@@ -6,6 +6,7 @@
 
 - [Installation](./installation.md)
 - [Setting up with Claude Code](./claude-code-setup.md)
+- [Recommended Claude Code config](./claude-code-config.md)
 
 # Concepts
 
