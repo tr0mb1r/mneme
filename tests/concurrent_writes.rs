@@ -12,7 +12,9 @@
 
 use mneme::storage::{Storage, redb_impl::RedbStorage};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+#[cfg(not(windows))]
+use std::time::Duration;
 use tempfile::TempDir;
 
 const WORKERS: usize = 32;
