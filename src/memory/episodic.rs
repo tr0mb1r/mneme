@@ -57,6 +57,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::EventId;
+use crate::memory::activity::ActivityCounter;
 use crate::storage::Storage;
 use crate::{MnemeError, Result};
 
@@ -136,11 +137,24 @@ pub struct RecentFilters {
 #[derive(Clone)]
 pub struct EpisodicStore {
     storage: Arc<dyn Storage>,
+    /// Bumped on every user-driven append (`record_*`). Read by the
+    /// L3 consolidation scheduler to gate its passes; consolidation's
+    /// own `promote_to_warm` / `delete_warm` paths don't bump this so
+    /// the scheduler can't mistake itself for fresh user activity.
+    activity: Arc<ActivityCounter>,
 }
 
 impl EpisodicStore {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            activity: ActivityCounter::new(),
+        }
+    }
+
+    /// Hand out the shared activity counter (see field docs).
+    pub fn activity_counter(&self) -> Arc<ActivityCounter> {
+        Arc::clone(&self.activity)
     }
 
     /// Append a new episodic event with the default retrieval weight
@@ -212,6 +226,7 @@ impl EpisodicStore {
         let value = postcard::to_allocvec(&event)
             .map_err(|e| MnemeError::Storage(format!("encode EpisodicEvent: {e}")))?;
         self.storage.put(&key, &value).await?;
+        self.activity.bump();
         Ok(event.id)
     }
 

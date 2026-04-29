@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use super::{Resource, ResourceContent, ResourceDescriptor, ResourceError};
+use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
@@ -25,6 +26,10 @@ pub struct Stats {
     /// change at runtime; we read it in `cli::run` and hand it in
     /// rather than re-reading from disk on every resource fetch.
     schema_version: u32,
+    /// `Some(_)` once the L3 scheduler is wired (production); `None`
+    /// in fixtures that don't spawn one. The resource emits the
+    /// scheduler block iff this is populated.
+    consolidation: Option<Arc<ConsolidationScheduler>>,
 }
 
 impl Stats {
@@ -41,7 +46,16 @@ impl Stats {
             episodic,
             cold,
             schema_version,
+            consolidation: None,
         }
+    }
+
+    /// Attach the L3 consolidation scheduler so its observability
+    /// counters surface on `mneme://stats`. Builder-style so existing
+    /// constructors (and tests) don't need to change.
+    pub fn with_consolidation(mut self, sched: Arc<ConsolidationScheduler>) -> Self {
+        self.consolidation = Some(sched);
+        self
     }
 }
 
@@ -79,6 +93,18 @@ impl Resource for Stats {
             .map_err(|e| ResourceError::Internal(format!("cold list_quarters: {e}")))?
             .len();
 
+        let consolidation = self.consolidation.as_ref().map(|s| {
+            let m = s.metrics();
+            json!({
+                "last_consolidation_at": m.last_consolidation_at
+                    .map(|d| d.to_rfc3339()),
+                "runs_total": m.runs_total,
+                "errors_total": m.errors_total,
+                "last_promoted_to_warm": m.last_promoted_to_warm,
+                "last_archived_to_cold": m.last_archived_to_cold,
+            })
+        });
+
         let body = json!({
             "schema_version": self.schema_version,
             "memories": {
@@ -94,7 +120,8 @@ impl Resource for Stats {
             "semantic_index": {
                 "applied_lsn": self.semantic.applied_lsn(),
                 "embed_dim": self.semantic.dim(),
-            }
+            },
+            "consolidation": consolidation,
         });
         let text = serde_json::to_string(&body)
             .map_err(|e| ResourceError::Internal(format!("serialise stats: {e}")))?;
@@ -176,5 +203,57 @@ mod tests {
         assert_eq!(v["memories"]["semantic"], 0);
         assert_eq!(v["memories"]["procedural"], 0);
         assert_eq!(v["memories"]["episodic"]["hot"], 0);
+    }
+
+    /// Without a scheduler attached, the resource emits
+    /// `consolidation: null` so clients can disambiguate "not wired"
+    /// from "wired but never run".
+    #[tokio::test]
+    async fn consolidation_field_is_null_without_scheduler() {
+        let (s, _tmp) = fixture().await;
+        let c = s.read().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
+        assert!(v.get("consolidation").is_some());
+        assert!(v["consolidation"].is_null());
+    }
+
+    /// With a scheduler attached but no pass yet, the resource emits
+    /// the metrics block with `last_consolidation_at = null` and
+    /// zero counters — proves the wiring without forcing a timed
+    /// pass.
+    #[tokio::test]
+    async fn consolidation_block_surfaces_when_scheduler_attached() {
+        use crate::memory::consolidation::ConsolidationParams;
+        use crate::memory::consolidation_scheduler::{
+            ConsolidationScheduler, SchedulerConfig,
+        };
+
+        let (s, _tmp) = fixture().await;
+        // Build a disabled scheduler — no timing flakiness.
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let cold = ColdArchive::new(_tmp.path());
+        let sched = ConsolidationScheduler::start(
+            backing,
+            cold,
+            ConsolidationParams {
+                hot_to_warm_days: 28,
+                warm_to_cold_days: 180,
+            },
+            SchedulerConfig::disabled(),
+            vec![],
+        );
+        let s = s.with_consolidation(Arc::clone(&sched));
+
+        let c = s.read().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
+        let cons = &v["consolidation"];
+        assert!(cons.is_object(), "consolidation should be an object: {cons}");
+        assert!(cons["last_consolidation_at"].is_null());
+        assert_eq!(cons["runs_total"], 0);
+        assert_eq!(cons["errors_total"], 0);
+        assert_eq!(cons["last_promoted_to_warm"], 0);
+        assert_eq!(cons["last_archived_to_cold"], 0);
+
+        sched.shutdown().await;
     }
 }

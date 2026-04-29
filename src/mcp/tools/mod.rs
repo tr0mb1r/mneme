@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
@@ -122,6 +123,30 @@ impl ToolRegistry {
         cold: ColdArchive,
         schema_version: u32,
     ) -> Self {
+        Self::defaults_with_consolidation(
+            semantic,
+            procedural,
+            episodic,
+            storage,
+            cold,
+            schema_version,
+            None,
+        )
+    }
+
+    /// Like [`defaults`](Self::defaults) but also attaches the L3
+    /// consolidation scheduler so the `stats` tool reports its
+    /// observability counters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn defaults_with_consolidation(
+        semantic: Arc<SemanticStore>,
+        procedural: Arc<ProceduralStore>,
+        episodic: Arc<EpisodicStore>,
+        storage: Arc<dyn Storage>,
+        cold: ColdArchive,
+        schema_version: u32,
+        consolidation: Option<Arc<ConsolidationScheduler>>,
+    ) -> Self {
         let mut r = Self::new();
         // L4 — semantic memory.
         r.register(Arc::new(remember::Remember::new(Arc::clone(&semantic))));
@@ -139,13 +164,17 @@ impl ToolRegistry {
             Arc::clone(&episodic),
         )));
         // Phase 6 diagnostics + portability.
-        r.register(Arc::new(stats::Stats::new(
+        let mut stats_tool = stats::Stats::new(
             Arc::clone(&semantic),
             Arc::clone(&procedural),
             Arc::clone(&episodic),
             cold,
             schema_version,
-        )));
+        );
+        if let Some(sched) = consolidation {
+            stats_tool = stats_tool.with_consolidation(sched);
+        }
+        r.register(Arc::new(stats_tool));
         r.register(Arc::new(list_scopes::ListScopes::new(
             semantic,
             Arc::clone(&procedural),

@@ -9,13 +9,12 @@ about to do disk I/O while you're typing.
 If you only want the one-page version, read [§1 Quick reference](#1-quick-reference).
 The rest of the doc is layer-by-layer detail.
 
-> **Honesty note on schedules.** Two backgrounded schedulers are
-> *implemented and tested* but not yet *wired* into the running server
-> as of v0.11: the consolidation pass (hot → warm → cold) and the
-> working-session checkpoint loop. Their cadences are documented here
-> as designed; until they're wired, those transitions only happen on
-> explicit invocation. The HNSW snapshot scheduler **is** wired and
-> running. See each layer's "What runs today" note.
+> **Honesty note on schedules.** As of v0.12, the L3 consolidation
+> pass (hot → warm → cold) **is** wired and runs on a 5-minute idle
+> tick. The HNSW snapshot scheduler is also wired. The L1
+> working-session checkpoint loop remains tested but unwired —
+> `Session::checkpoint(...)` exists, no caller in `cli/run.rs`. See
+> each layer's "What runs today" note.
 
 ---
 
@@ -25,7 +24,7 @@ The rest of the doc is layer-by-layer detail.
 |---|---|---|---|---|---|
 | **L0 Procedural** | Always-on pinned rules (`pin` / `unpin`) | No | `~/.mneme/procedural/pinned.jsonl` | Live: file watched every 500 ms; external edits picked up in <1 s | Same |
 | **L1 Working session** | The current session's turns, scratch state | No | `~/.mneme/sessions/<session_id>.json` (when checkpointed) | **Not wired in v0.11** — `Session::checkpoint(...)` exists, no autoschedule yet | Every 30 s OR every 5 turns, whichever first |
-| **L3 Episodic** | Time-ordered events, tool calls, summaries | No (lexical only) | `~/.mneme/episodic/` (redb), three prefixes: `epi:` hot, `wepi:` warm, `cold/` zstd | Hot tier writes are live. **Tier promotion is not scheduled in v0.11** — `consolidation::run(...)` exists, no autoschedule yet | Idle-time pass: hot → warm at age ≥ 28 d, warm → cold at age ≥ 180 d |
+| **L3 Episodic** | Time-ordered events, tool calls, summaries | No (lexical only) | `~/.mneme/episodic/` (redb), three prefixes: `epi:` hot, `wepi:` warm, `cold/` zstd | Hot tier writes are live. **Tier promotion is wired (v0.12)** — `ConsolidationScheduler` fires every 5 min when idle | Idle-time pass: hot → warm at age ≥ 28 d, warm → cold at age ≥ 180 d |
 | **L4 Semantic** | Long-term facts, decisions, preferences | **Yes** — every `remember` / `update` re-embeds | `~/.mneme/episodic/` (redb), prefix `mem:` + `~/.mneme/index/hnsw.idx` snapshot + `~/.mneme/wal/` deltas | Live writes; **HNSW snapshot scheduler runs**: every 1000 inserts OR every 60 min, whichever first | Same |
 | **Auto-context resource** | Pinned + recent, packed to a token budget | Reads only | (assembled on demand) | On read of `mneme://context` | Same |
 | **Cold archive** | Quarter-bundled JSON, zstd-compressed | No | `~/.mneme/cold/<YYYY-Q>.zst` | Written only when L3 consolidation runs | Same as L3 |
@@ -134,26 +133,22 @@ temp+rename) before deleting warm rows. A `kill -9` mid-pass leaves
 duplicates that the next run cleans up.
 
 **Designed schedule.** `[consolidation] schedule = "idle"` in the
-default config — meant to run when the server is idle. Triggered
-once per "idle window" (TBD heuristic).
+default config — meant to run when the server is idle. v1.0 honours
+the `"idle"` mode only: the scheduler wakes every 5 min; if no
+`remember` / `forget` / `record` happened in the prior tick, it
+fires a pass and refreshes its idle gate. Future modes
+(`every_<n>m`, cron, `on_demand`) belong to v1.1.
 
 **What runs today:**
-> Hot-tier writes happen live every time the agent emits an episodic
-> event. **Tier promotion is not currently scheduled in v0.11** —
-> `consolidation::run(...)` is fully implemented and tested but no
-> background task in `cli/run.rs` calls it. In practice this means
-> events accumulate in the hot tier indefinitely until either a
-> future server release wires the schedule, or you trigger
-> consolidation manually (no public CLI surface today; tests use
-> the function directly).
-
-**Practical implication.** A running mneme deployment will have an
-ever-growing hot tier. This is fine for normal interactive use —
-hot-tier scans are O(N) but N is small per session. If you've been
-running for months and `mneme stats` shows 100K+ episodic events,
-expect `recall_recent` to slow down and watch for a future release
-that wires the schedule. Until then, `mneme backup` + selective
-prune via `mneme inspect` is the manual workaround.
+> Hot-tier writes happen live every time the agent emits an
+> episodic event. **Tier promotion is wired and runs in the
+> background** (`memory::consolidation_scheduler::ConsolidationScheduler`,
+> spawned by `cli::run`). Per-pass observability (`runs_total`,
+> `errors_total`, `last_consolidation_at`, `last_promoted_to_warm`,
+> `last_archived_to_cold`) lands on the `mneme://stats` resource and
+> the `stats` tool under the `consolidation` key. A burst of
+> writes still inside its idle window suppresses the next pass —
+> consolidation only fires after the system goes quiet.
 
 **Surfaced via:**
 - Tools: `recall_recent`, `summarize_session`.
@@ -379,10 +374,14 @@ just slower without the snapshot.
 
 **Q: Why isn't my old episodic event being archived to cold tier
 even though it's two years old?**
-Because the consolidation schedule isn't wired in v0.11 (see §4).
-The promotion logic exists and works correctly when invoked; the
-cron-style trigger that calls it doesn't exist yet. Tracked under
-implementation plan Phase 6 outstanding work.
+Two reasons it can stall: (1) the system never went idle long
+enough for the scheduler's idle gate to close — every `remember` /
+`forget` / `record` resets the window, so a constantly-active mneme
+delays consolidation; (2) the event hasn't yet aged past
+`hot_to_warm_days` / `warm_to_cold_days`. Inspect `mneme://stats`
+under the `consolidation` key: `last_consolidation_at` is the
+wall-clock of the last pass, and `runs_total` confirms the
+scheduler is actually firing.
 
 **Q: Does mneme embed my pinned items so they show up in semantic
 recall?**

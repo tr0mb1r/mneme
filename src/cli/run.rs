@@ -23,6 +23,8 @@ use crate::mcp::resources::ResourceRegistry;
 use crate::mcp::server::Server;
 use crate::mcp::tools::ToolRegistry;
 use crate::mcp::transport::stdio::StdioTransport;
+use crate::memory::consolidation::ConsolidationParams;
+use crate::memory::consolidation_scheduler::{ConsolidationScheduler, SchedulerConfig};
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::{SemanticStore, SnapshotConfig};
@@ -131,9 +133,25 @@ pub fn execute() -> Result<()> {
     let auto_context_budget = TokenBudget::from_config(&config.budgets);
     let cold = crate::storage::archive::ColdArchive::new(&root);
 
+    // Spawn the L3 consolidation scheduler. Watches the semantic +
+    // episodic activity counters for idle windows; fires
+    // `consolidation::run` on the configured cadence so hot-tier
+    // growth is bounded without the agent having to ask for it.
+    // Construction must happen inside the runtime context (it
+    // `tokio::spawn`s).
+    let consolidation_scheduler = runtime.block_on(async {
+        ConsolidationScheduler::start(
+            Arc::clone(&storage_dyn),
+            cold.clone(),
+            ConsolidationParams::from_config(&config.consolidation),
+            SchedulerConfig::from_config(&config.consolidation),
+            vec![semantic.activity_counter(), episodic.activity_counter()],
+        )
+    });
+
     let result = runtime
         .block_on(async_main(
-            storage_dyn,
+            Arc::clone(&storage_dyn),
             Arc::clone(&semantic),
             Arc::clone(&procedural),
             Arc::clone(&episodic),
@@ -141,11 +159,18 @@ pub fn execute() -> Result<()> {
             cold,
             on_disk_version.max(migrate::CURRENT_SCHEMA_VERSION),
             auto_context_budget,
+            Arc::clone(&consolidation_scheduler),
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
 
-    // Ask the scheduler to write a final snapshot before tearing
-    // down the runtime — saves the next boot a full WAL replay.
+    // Stop the consolidation scheduler before the semantic shutdown so
+    // it can't fire one more pass mid-tear-down. Its current pass (if
+    // any) is awaited inside `shutdown`.
+    runtime.block_on(consolidation_scheduler.shutdown());
+
+    // Ask the snapshot scheduler to write a final HNSW snapshot
+    // before tearing down the runtime — saves the next boot a full
+    // WAL replay.
     if let Err(e) = runtime.block_on(semantic.shutdown()) {
         tracing::warn!(error = %e, "semantic store shutdown reported error");
     }
@@ -178,6 +203,7 @@ async fn async_main(
     cold: crate::storage::archive::ColdArchive,
     schema_version: u32,
     auto_context_budget: TokenBudget,
+    consolidation: Arc<ConsolidationScheduler>,
 ) -> anyhow::Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -191,15 +217,16 @@ async fn async_main(
     let transport = StdioTransport::new(stdin, stdout);
     let mut server = Server::new(
         transport,
-        Arc::new(ToolRegistry::defaults(
+        Arc::new(ToolRegistry::defaults_with_consolidation(
             Arc::clone(&semantic),
             Arc::clone(&procedural),
             Arc::clone(&episodic),
             Arc::clone(&storage),
             cold.clone(),
             schema_version,
+            Some(Arc::clone(&consolidation)),
         )),
-        Arc::new(ResourceRegistry::defaults(
+        Arc::new(ResourceRegistry::defaults_with_consolidation(
             semantic,
             procedural,
             episodic,
@@ -207,6 +234,7 @@ async fn async_main(
             cold,
             schema_version,
             auto_context_budget,
+            Some(consolidation),
         )),
         storage,
     );

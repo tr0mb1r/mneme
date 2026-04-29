@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{Tool, ToolDescriptor, ToolError, ToolResult};
+use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
@@ -27,6 +28,7 @@ pub struct Stats {
     episodic: Arc<EpisodicStore>,
     cold: ColdArchive,
     schema_version: u32,
+    consolidation: Option<Arc<ConsolidationScheduler>>,
 }
 
 impl Stats {
@@ -43,7 +45,16 @@ impl Stats {
             episodic,
             cold,
             schema_version,
+            consolidation: None,
         }
+    }
+
+    /// Attach the L3 consolidation scheduler so its observability
+    /// counters surface on the tool output. Builder-style so the
+    /// existing constructor stays a drop-in for tests.
+    pub fn with_consolidation(mut self, sched: Arc<ConsolidationScheduler>) -> Self {
+        self.consolidation = Some(sched);
+        self
     }
 }
 
@@ -83,6 +94,18 @@ impl Tool for Stats {
             .map_err(|e| ToolError::Internal(format!("cold list_quarters: {e}")))?
             .len();
 
+        let consolidation = self.consolidation.as_ref().map(|s| {
+            let m = s.metrics();
+            json!({
+                "last_consolidation_at": m.last_consolidation_at
+                    .map(|d| d.to_rfc3339()),
+                "runs_total": m.runs_total,
+                "errors_total": m.errors_total,
+                "last_promoted_to_warm": m.last_promoted_to_warm,
+                "last_archived_to_cold": m.last_archived_to_cold,
+            })
+        });
+
         let body = json!({
             "schema_version": self.schema_version,
             "memories": {
@@ -98,7 +121,8 @@ impl Tool for Stats {
             "semantic_index": {
                 "applied_lsn": self.semantic.applied_lsn(),
                 "embed_dim": self.semantic.dim(),
-            }
+            },
+            "consolidation": consolidation,
         });
         let text = serde_json::to_string(&body)
             .map_err(|e| ToolError::Internal(format!("serialise stats: {e}")))?;

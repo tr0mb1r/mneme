@@ -90,6 +90,7 @@ use crate::ids::MemoryId;
 use crate::index::delta::{HnswApplier, replay_into};
 use crate::index::hnsw::HnswIndex;
 use crate::index::snapshot;
+use crate::memory::activity::ActivityCounter;
 use crate::storage::Storage;
 use crate::storage::wal::{self, WalOp, WalWriter};
 use crate::{MnemeError, Result};
@@ -298,6 +299,13 @@ pub struct SemanticStore {
     // `None` when `SnapshotConfig::disabled` was passed in.
     snapshot: Option<Arc<SnapshotState>>,
     scheduler_join: std::sync::Mutex<Option<JoinHandle<()>>>,
+
+    /// Bumped on every user-facing mutation (`remember`, `forget`,
+    /// `update`). The L3 consolidation scheduler reads this to gate
+    /// its passes — a steady stream of writes suppresses
+    /// consolidation until the system goes idle. Internal-only;
+    /// callers consume it via [`Self::activity_counter`].
+    activity: Arc<ActivityCounter>,
 }
 
 impl SemanticStore {
@@ -418,7 +426,15 @@ impl SemanticStore {
             write_lock,
             snapshot: snapshot_state,
             scheduler_join,
+            activity: ActivityCounter::new(),
         }))
+    }
+
+    /// Hand out the shared activity counter. The L3 consolidation
+    /// scheduler clones this `Arc` so it can see every `remember` /
+    /// `forget` / `update` without re-reading store state.
+    pub fn activity_counter(&self) -> Arc<ActivityCounter> {
+        Arc::clone(&self.activity)
     }
 
     /// Convenience for tests: open with the scheduler disabled.
@@ -755,12 +771,15 @@ impl SemanticStore {
     }
 
     fn note_mutation(&self) {
+        // Tell the snapshot scheduler we wrote.
         if let Some(state) = &self.snapshot {
             let new = state.inserts_since.fetch_add(1, Ordering::SeqCst) + 1;
             if new >= state.inserts_threshold {
                 state.notify.notify_one();
             }
         }
+        // Tell the consolidation scheduler the system is busy.
+        self.activity.bump();
     }
 }
 

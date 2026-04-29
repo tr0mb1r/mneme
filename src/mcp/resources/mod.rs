@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
@@ -82,14 +83,45 @@ impl ResourceRegistry {
         schema_version: u32,
         budget: TokenBudget,
     ) -> Self {
+        Self::defaults_with_consolidation(
+            semantic_store,
+            procedural_store,
+            episodic_store,
+            orchestrator,
+            cold,
+            schema_version,
+            budget,
+            None,
+        )
+    }
+
+    /// Like [`defaults`](Self::defaults) but also attaches the L3
+    /// consolidation scheduler so its observability counters
+    /// surface on `mneme://stats`. Callers that don't run the
+    /// scheduler (tests, CLI helpers) keep using `defaults`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn defaults_with_consolidation(
+        semantic_store: Arc<SemanticStore>,
+        procedural_store: Arc<ProceduralStore>,
+        episodic_store: Arc<EpisodicStore>,
+        orchestrator: Arc<Orchestrator>,
+        cold: ColdArchive,
+        schema_version: u32,
+        budget: TokenBudget,
+        consolidation: Option<Arc<ConsolidationScheduler>>,
+    ) -> Self {
         let mut r = Self::new();
-        r.register(Arc::new(stats::Stats::new(
+        let mut stats_resource = stats::Stats::new(
             semantic_store,
             Arc::clone(&procedural_store),
             Arc::clone(&episodic_store),
             cold,
             schema_version,
-        )));
+        );
+        if let Some(sched) = consolidation {
+            stats_resource = stats_resource.with_consolidation(sched);
+        }
+        r.register(Arc::new(stats_resource));
         r.register(Arc::new(procedural::Procedural::new(Arc::clone(
             &procedural_store,
         ))));

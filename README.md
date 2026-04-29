@@ -70,7 +70,7 @@ ready-to-copy scripts in
 - mdBook-rendered user docs site
 - 30-day soak on real workloads
 - `switch_scope` tool and `mneme://session/{id}` resource
-- Symlink-to-directory `EISDIR` fix in `mneme backup --include-models`
+- L1 working-session checkpoint scheduler wiring
 
 See [`proj_docs/mneme-implementation-plan.md`](proj_docs/mneme-implementation-plan.md)
 for the canonical roadmap.
