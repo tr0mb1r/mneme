@@ -38,6 +38,35 @@ Thanks for your interest. This document is short on purpose.
 
 Follow Conventional Commits (`feat:`, `fix:`, `chore:`, `docs:`, `sec:`).
 
+Write a multi-paragraph commit body for substantive changes. The body
+is what gives a reviewer (and a future archaeologist) the *why*; the
+subject just says *what*.
+
+## Changelog
+
+`CHANGELOG.md` follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+`release-plz` auto-generates a thin entry from each commit's *subject*
+line — that's a floor, not a target.
+
+For substantive changes, **hand-edit `CHANGELOG.md` as part of the same
+PR** that introduces the change. Use the v0.2.0 / v0.2.4 entries as the
+shape:
+
+- A short paragraph at the top of the version section that says what
+  the release is *for* and what bump-level it is per
+  [`book/src/versioning.md`](book/src/versioning.md).
+- Sections grouped by Keep-a-Changelog convention (`Added`, `Changed`,
+  `Deprecated`, `Removed`, `Fixed`, `Security`) plus optional
+  `Architecture decisions`, `Documentation`, `Tests`.
+- Multi-line bullets where the *what* + *why* + *how to verify* don't
+  fit on one line.
+- Cross-link to ADRs in `proj_docs/decisions/` when the change is one.
+
+If the change is genuinely small (a typo fix, a CI tweak, a single
+docs update), the auto-generated entry is fine — release-plz will
+handle it. Use judgement; default to writing the entry by hand when
+in doubt.
+
 ## What needs review
 
 Anything that touches the durability path (WAL, redb integration, HNSW
