@@ -1,9 +1,9 @@
 //! Resource registry. A `Resource` is a noun the agent can read.
 //!
-//! Phase 1 ships only `mneme://stats`. The full v1 surface (`mneme://context`,
-//! `mneme://procedural`, `mneme://session/{id}`, `mneme://recent`,
-//! `mneme://scopes`) lands in later phases as the underlying memory tiers
-//! come online.
+//! v1 surface (all shipping): `mneme://stats`, `mneme://procedural`,
+//! `mneme://recent`, `mneme://context`, and the template resource
+//! `mneme://session/{id}`. See `book/src/mcp-surface.md` for the
+//! authoritative inventory.
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
