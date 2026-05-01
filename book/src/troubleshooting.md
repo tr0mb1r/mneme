@@ -62,9 +62,11 @@ returns a partial response — a clean re-download usually resolves it.
 
 ## Backup says EISDIR with `--include-models`
 
-Fixed since v0.10. If you see this on a current build, the symlink
-chain in `~/.mneme/models/` is unusual; report with the full path
-listing (`ls -la ~/.mneme/models/`).
+Fixed in current builds (the walker now uses `symlink_metadata` so
+symlink-to-dir entries land in the archive as symlinks). If you see
+this on a current build, the symlink chain in `~/.mneme/models/` is
+unusual; report with the full path listing
+(`ls -la ~/.mneme/models/`).
 
 ## Diagnosing scheduler health
 

@@ -9,17 +9,17 @@ about to do disk I/O while you're typing.
 If you only want the one-page version, read [§1 Quick reference](#1-quick-reference).
 The rest of the doc is layer-by-layer detail.
 
-> **Honesty note on schedules.** As of v0.14 all three background
-> schedulers are wired (HNSW snapshots, L3 consolidation on a
-> 5-min idle tick, L1 session checkpoints on 30 s / 5 turns) AND
-> the L1 read-side fold-in into `mneme://context` ships. Working
-> turns now appear in auto-context with `WORKING_WEIGHT = 0.9`,
-> sorted newest-first. The per-session resource
-> `mneme://session/{id}` exposes the full session JSON for active
-> or past sessions. v0.15 adds `switch_scope` so write tools
-> (`remember`, `pin`) without an explicit `scope` arg land in the
-> session's current scope; current value surfaces on
-> `mneme://stats` as `working.current_scope`.
+> **What's wired today.** All three background schedulers run (HNSW
+> snapshots, L3 consolidation on a 5-min idle tick, L1 session
+> checkpoints on 30 s / 5 turns). The L1 read-side fold-in into
+> `mneme://context` ships — working turns appear in auto-context
+> with `WORKING_WEIGHT = 0.9`, sorted newest-first. The per-session
+> resource `mneme://session/{id}` exposes the full session JSON for
+> active or past sessions. The `switch_scope` tool sets the live
+> default scope so write tools (`remember`, `pin`, `record_event`)
+> without an explicit `scope` arg land in the session's current
+> scope; the current value surfaces on `mneme://stats` as
+> `working.current_scope`.
 
 ---
 
@@ -28,8 +28,8 @@ The rest of the doc is layer-by-layer detail.
 | Layer | What it holds | Embedded? | Where on disk | Auto-schedule (today) | Auto-schedule (v1 design) |
 |---|---|---|---|---|---|
 | **L0 Procedural** | Always-on pinned rules (`pin` / `unpin`) | No | `~/.mneme/procedural/pinned.jsonl` | Live: file watched every 500 ms; external edits picked up in <1 s | Same |
-| **L1 Working session** | The current session's turns (tool, user, assistant), scratch state | No | `~/.mneme/sessions/<session_id>.snapshot` (atomic temp+rename per flush) | **Checkpoint scheduler wired (v0.13)**; **conversation mirror wired (v0.2.4)** — `record_event(kind="user_message"/"assistant_message")` pushes a matching turn to L1 | Same |
-| **L3 Episodic** | Time-ordered events: tool calls, lifecycle events, conversation turns, curated semantic events | No (lexical only) | `~/.mneme/episodic/` (redb), three prefixes: `epi:` hot, `wepi:` warm, `cold/` zstd | **Auto-emit shipping (v0.2.3 + v0.2.4)** — `tool_call` (per-tool enriched payload), `tool_call_failed`, `session_start`, `session_end`. **Agent-driven (v0.2.4)** — `record_event` writes any kind. **Tier promotion wired (v0.12)** — `ConsolidationScheduler` fires every 5 min when idle | Idle-time pass: hot → warm at age ≥ 28 d, warm → cold at age ≥ 180 d |
+| **L1 Working session** | The current session's turns (tool, user, assistant), scratch state | No | `~/.mneme/sessions/<session_id>.snapshot` (atomic temp+rename per flush) | Checkpoint scheduler running; conversation mirror wired — `record_event(kind="user_message"/"assistant_message")` pushes a matching turn to L1 | Same |
+| **L3 Episodic** | Time-ordered events: tool calls, lifecycle events, conversation turns, curated semantic events | No (lexical only) | `~/.mneme/episodic/` (redb), three prefixes: `epi:` hot, `wepi:` warm, `cold/` zstd | Auto-emit running — `tool_call` (per-tool enriched payload), `tool_call_failed`, `session_start`, `session_end`. Agent-driven — `record_event` writes any kind. `ConsolidationScheduler` fires every 5 min when idle | Idle-time pass: hot → warm at age ≥ 28 d, warm → cold at age ≥ 180 d |
 | **L4 Semantic** | Long-term facts, decisions, preferences, conversations | **Yes** — every `remember` / `update` re-embeds | `~/.mneme/episodic/` (redb), prefix `mem:` + `~/.mneme/index/hnsw.idx` snapshot + `~/.mneme/wal/` deltas | Live writes; **HNSW snapshot scheduler runs**: every 1000 inserts OR every 60 min, whichever first | Same |
 | **Auto-context resource** | Pinned + recent, packed to a token budget | Reads only | (assembled on demand) | On read of `mneme://context` | Same |
 | **Cold archive** | Quarter-bundled JSON, zstd-compressed | No | `~/.mneme/cold/<YYYY-Q>.zst` | Written only when L3 consolidation runs | Same as L3 |
@@ -89,16 +89,15 @@ temp+rename per checkpoint). Single file per session.
 - Whichever fires first.
 
 **What runs today:**
-> **Wired (v0.13).** `cli::run` spawns a `CheckpointScheduler` that
-> writes the active session to `~/.mneme/sessions/<session_id>.snapshot`
-> on the first of two triggers: every `session_interval_secs` (30 s
-> default) when there are pending turns, OR every
-> `session_interval_turns` (5 default) tools/call invocations,
-> whichever first. A clean shutdown writes a final snapshot with
-> `clean_shutdown = true`. Per-session counters land on
-> `mneme://stats` and the `stats` tool under the `working` key:
-> `session_id`, `started_at`, `last_checkpoint_at`, `turns_total`,
-> `checkpoints_total`.
+> `cli::run` spawns a `CheckpointScheduler` that writes the active
+> session to `~/.mneme/sessions/<session_id>.snapshot` on the first
+> of two triggers: every `session_interval_secs` (30 s default) when
+> there are pending turns, OR every `session_interval_turns` (5
+> default) tools/call invocations, whichever fires first. A clean
+> shutdown writes a final snapshot with `clean_shutdown = true`.
+> Per-session counters land on `mneme://stats` and the `stats` tool
+> under the `working` key: `session_id`, `started_at`,
+> `last_checkpoint_at`, `turns_total`, `checkpoints_total`.
 
 **Practical implication.** Working-session state survives restart;
 the active session and any prior snapshot are reachable via the
@@ -156,8 +155,8 @@ fires a pass and refreshes its idle gate. Future modes
 (`every_<n>m`, cron, `on_demand`) belong to v1.1.
 
 **What runs today:**
-> **Auto-emit shipped through v0.2.4** (ADR-0009). Server-side
-> `Server::handle_tools_call` and `cli::run::async_main` emit:
+> **Server-side auto-emit** (ADR-0009). `Server::handle_tools_call`
+> and `cli::run::async_main` emit:
 >
 > - `tool_call` after every successful dispatch — payload is enriched
 >   per-tool with the value-bearing arg (e.g. `remember.content`,
@@ -169,25 +168,25 @@ fires a pass and refreshes its idle gate. Future modes
 > - `session_start` on `mneme run` boot.
 > - `session_end` on graceful shutdown (`clean_shutdown=true`).
 >
-> **Agent-driven via `record_event` (v0.2.4, ADR-0008).** The agent
-> calls `mneme.record_event(kind, payload, ...)` for any kind beyond
-> the auto-emits. Canonical kinds: `user_message`, `assistant_message`
+> **Agent-driven via `record_event`** (ADR-0008). The agent calls
+> `mneme.record_event(kind, payload, ...)` for any kind beyond the
+> auto-emits. Canonical kinds: `user_message`, `assistant_message`
 > (server also pushes a matching turn to L1), `decision`, `problem`,
 > `resolution`, `milestone`, `preference`, `pivot`, `observation`,
 > `summary`. Free-form: agents can invent new kinds without a schema
 > migration.
 >
-> **Tier promotion is wired and runs in the background**
+> **Tier promotion** runs in the background
 > (`memory::consolidation_scheduler::ConsolidationScheduler`,
 > spawned by `cli::run`). Per-pass observability (`runs_total`,
 > `errors_total`, `last_consolidation_at`, `last_promoted_to_warm`,
 > `last_archived_to_cold`) lands on the `mneme://stats` resource and
-> the `stats` tool under the `consolidation` key. A burst of
-> writes still inside its idle window suppresses the next pass —
-> consolidation only fires after the system goes quiet.
+> the `stats` tool under the `consolidation` key. A burst of writes
+> still inside its idle window suppresses the next pass — consolidation
+> only fires after the system goes quiet.
 
 **Surfaced via:**
-- Tools: `recall_recent`, `summarize_session`, `record_event` (v0.2.4+).
+- Tools: `recall_recent`, `summarize_session`, `record_event`.
 - Resource: `mneme://recent`.
 
 ---

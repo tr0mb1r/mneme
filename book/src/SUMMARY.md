@@ -15,6 +15,7 @@
 
 # Reference
 
+- [CLI surface](./cli.md)
 - [Configuration](./configuration.md)
 - [Troubleshooting](./troubleshooting.md)
 - [Versioning](./versioning.md)
