@@ -20,9 +20,9 @@ you want a different default for write tools (`remember`, `pin`,
 ### Tools
 
 - `mneme.recall(query, limit?, scope?, kind?)` — semantic search across
-  **L4 only**. L3 events are not embedded (ADR-0010); to search them by
-  similarity, also `remember` the distilled fact to L4. Use `recall`
-  before answering questions about past work.
+  **L4 only** (ADR-0010). L3 events are not embedded (ADR-0007); to
+  search them by similarity, also `remember` the distilled fact to L4.
+  Use `recall` before answering questions about past work.
 - `mneme.recall_recent(limit?, scope?, kind?)` — last-N L3 events. No
   embedding; fast. Use for "what was the last thing on this branch?"
   Pass `kind` to filter by event kind (e.g. `decision`, `milestone`).

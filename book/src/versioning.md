@@ -39,10 +39,11 @@ are five gates, not three.
 4. **No `schema_version` bump for one full release cycle.** Proves
    the on-disk format has stabilized.
 5. **MCP tool surface frozen** with no pending renames, removals, or
-   signature changes. Twelve tools as of `0.2.0`: `pin`, `unpin`,
-   `remember`, `recall`, `recall_recent`, `update`, `forget`,
-   `summarize_session`, `stats`, `list_scopes`, `export`,
-   `switch_scope`.
+   signature changes. The authoritative inventory is
+   [MCP surface](./mcp-surface.md); the freeze condition is that no
+   tool on that page is renamed, removed, or signature-changed before
+   1.0. Additive new tools are still allowed (each is a 0.MINOR bump
+   pre-1.0) and don't restart this gate.
 
 1.0 means *"I will not break your install for 12+ months without a
 major bump."* The promise has to be keepable.

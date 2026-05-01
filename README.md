@@ -7,7 +7,7 @@
 > A standalone, MCP-native memory tool for any LLM or agent.
 > Single binary. Local-first. Rust. Built to last.
 
-**Status:** Pre-1.0 — `0.2.x` line, latest `0.2.3` published as
+**Status:** Pre-1.0 — `0.2.x` line, latest `0.2.4` published as
 [`mneme-mcp`](https://crates.io/crates/mneme-mcp) on crates.io and as
 [`tr0mb1r/mneme`](https://github.com/tr0mb1r/homebrew-mneme) on Homebrew.
 Phases 0–5 complete; Phase 6 (portability + diagnostics + release
@@ -54,10 +54,11 @@ work that the agent would otherwise forget.**
 | Layer | Tools | Resource | Storage |
 |-------|-------|----------|---------|
 | L0 procedural (always-on) | `pin`, `unpin` | `mneme://procedural` | JSONL on disk, hot-reloaded |
+| L1 working session | (live state) | `mneme://session/{id}` | `~/.mneme/sessions/<id>.snapshot` |
 | L3 episodic (recent events) | `recall_recent`, `summarize_session`, `record_event` | `mneme://recent` | redb hot tier + zstd cold quarters |
 | L4 semantic (long-term facts) | `remember`, `recall`, `update`, `forget` | — | redb + WAL + HNSW vector index |
-| Auto-context | — | `mneme://context` | Pinned + recent, packed to a token budget |
-| Diagnostics | `stats`, `list_scopes`, `export` | `mneme://stats` | — |
+| Auto-context | — | `mneme://context` | All four layers, packed to a token budget |
+| Diagnostics | `stats`, `list_scopes`, `export`, `switch_scope` | `mneme://stats` | — |
 
 `mneme run` speaks JSON-RPC over stdio against MCP protocol `2025-06-18`,
 advertises a focused MCP tool and resource surface (see
@@ -79,8 +80,10 @@ ready-to-copy scripts in
 
 Code-side feature work, release infrastructure (Homebrew tap,
 crates.io publish, tag-driven cross-build pipeline, mdBook-rendered
-user docs at <https://tr0mb1r.github.io/mneme/>), and the
-12-tool MCP-surface freeze are complete. The remaining items are
+user docs at <https://tr0mb1r.github.io/mneme/>), and the MCP-surface
+freeze (see
+[`book/src/mcp-surface.md`](book/src/mcp-surface.md) for the
+authoritative inventory) are complete. The remaining items are
 calendar-bound rather than work-bound.
 
 ## Installing

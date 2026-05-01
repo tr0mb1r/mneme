@@ -200,7 +200,7 @@ The string is free-form. Common conventions:
 - `"client-x"`, `"client-y"` — confidentiality boundaries
 
 `list_scopes` shows every distinct scope across the three layers.
-Cross-process semantics: see [switch_scope](./mcp-surface.md#tools-12).
+Cross-process semantics: see [switch_scope](./mcp-surface.md#session-helpers).
 
 ---
 

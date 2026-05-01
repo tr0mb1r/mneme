@@ -23,7 +23,7 @@ work that the agent would otherwise forget.**
 
 ## Status
 
-Pre-1.0 — `0.2.x` line, latest `0.2.3` published as
+Pre-1.0 — `0.2.x` line, latest `0.2.4` published as
 [`mneme-mcp`](https://crates.io/crates/mneme-mcp) on crates.io and via
 [Homebrew](https://github.com/tr0mb1r/homebrew-mneme). Phases 0–5
 complete; Phase 6 (portability + diagnostics + release infrastructure)
