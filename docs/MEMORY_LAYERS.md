@@ -100,13 +100,12 @@ temp+rename per checkpoint). Single file per session.
 > `session_id`, `started_at`, `last_checkpoint_at`, `turns_total`,
 > `checkpoints_total`.
 
-**Practical implication.** Working-session state now survives
-restart; the most recent snapshot for any prior session can be
-loaded via `Session::load(...)` (today exposed only in tests; a
-`mneme://session/{id}` resource is still outstanding). The L3
-episodic store remains the structured "what did we just do?"
-surface — it ranks by recency and embeddings; L1 is a turn log,
-not a search index.
+**Practical implication.** Working-session state survives restart;
+the active session and any prior snapshot are reachable via the
+`mneme://session/{id}` template resource (in-memory for the active
+session, on-disk for past sessions). The L3 episodic store remains
+the structured "what did we just do?" surface — it ranks by recency;
+L1 is a turn log, not a search index.
 
 ---
 
@@ -209,8 +208,10 @@ The active embedder is set in `[embeddings] model` in `config.toml`:
 - **`minilm-l6`** — ~80 MB, 384-dim, English. Faster startup, smaller
   footprint, lower recall on edge cases.
 - **`stub`** (via `MNEME_EMBEDDER=stub` env var, not config) —
-  deterministic 768-dim dummy. Tests + offline boots only; **stored
-  vectors aren't portable to real models**.
+  deterministic 32-dim dummy (see `STUB_DIM` in `src/embed/stub.rs`).
+  Tests + offline boots only; **stored vectors aren't portable to real
+  models** — the 32-dim choice is deliberate to force a loud
+  dim-mismatch the moment you switch back to a real model.
 
 **Model swap behavior.** Changing `[embeddings] model` in `config.toml`
 between runs triggers an automatic re-embed of every stored memory on
