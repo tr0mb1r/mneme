@@ -161,28 +161,7 @@ impl Tool for RecordEvent {
             .unwrap_or_else(|| self.scope_state.current());
 
         // ---------- tags ----------
-        let tags: Vec<String> = match args.get("tags") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::Array(arr)) => {
-                let mut out = Vec::with_capacity(arr.len());
-                for v in arr {
-                    match v {
-                        Value::String(s) => out.push(s.clone()),
-                        _ => {
-                            return Err(ToolError::InvalidArguments(
-                                "`tags` must be an array of strings".into(),
-                            ));
-                        }
-                    }
-                }
-                out
-            }
-            Some(_) => {
-                return Err(ToolError::InvalidArguments(
-                    "`tags` must be an array of strings".into(),
-                ));
-            }
-        };
+        let tags = super::parse_tags_arg(args.get("tags"))?;
 
         // ---------- retrieval_weight ----------
         let retrieval_weight = match args.get("retrieval_weight") {
@@ -361,6 +340,38 @@ mod tests {
         assert_eq!(e.scope, "work");
         assert_eq!(e.tags, vec!["release".to_string(), "v0.2.4".to_string()]);
         assert!((e.retrieval_weight - 0.9).abs() < 1e-4);
+    }
+
+    /// Some MCP clients double-encode array tool args before
+    /// forwarding the `tools/call` frame, so `tags` arrives as a
+    /// JSON-encoded string. The shared `parse_tags_arg` helper
+    /// tolerates that shape; this test pins the `record_event` call
+    /// site to delegate to the helper rather than hard-rejecting
+    /// non-array values.
+    #[tokio::test]
+    async fn harness_double_encoded_tags_are_accepted() {
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage)));
+        let scope = ScopeState::new("personal");
+        let t = RecordEvent::new(Arc::clone(&episodic), scope);
+
+        t.invoke(json!({
+            "kind": "observation",
+            "payload": {"content": "double-encoded tags"},
+            "tags": "[\"workaround\",\"harness\"]",
+        }))
+        .await
+        .unwrap();
+
+        let events = episodic
+            .recall_recent(&RecentFilters::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].tags,
+            vec!["workaround".to_string(), "harness".to_string()]
+        );
     }
 
     #[tokio::test]

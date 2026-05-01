@@ -62,22 +62,7 @@ impl Tool for Pin {
             ));
         }
 
-        let tags: Vec<String> = match args.get("tags") {
-            None => Vec::new(),
-            Some(Value::Array(arr)) => arr
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(|s| s.to_owned())
-                        .ok_or_else(|| ToolError::InvalidArguments("`tags` must be strings".into()))
-                })
-                .collect::<Result<_, _>>()?,
-            Some(_) => {
-                return Err(ToolError::InvalidArguments(
-                    "`tags` must be an array of strings".into(),
-                ));
-            }
-        };
+        let tags = super::parse_tags_arg(args.get("tags"))?;
 
         let scope = args
             .get("scope")
@@ -91,5 +76,48 @@ impl Tool for Pin {
             .await
             .map_err(|e| ToolError::Internal(format!("pin failed: {e}")))?;
         Ok(ToolResult::text(format!("pinned {id}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn fresh_pin() -> (Pin, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let scope = ScopeState::new("personal");
+        (Pin::new(store, scope), tmp)
+    }
+
+    /// Workaround for MCP clients that double-encode array tool args
+    /// before forwarding the `tools/call` frame (observed: certain
+    /// Claude Code releases). The shared `parse_tags_arg` helper
+    /// accepts both real arrays and JSON-encoded array strings; this
+    /// test pins the `pin` call site to use that helper rather than
+    /// bypassing it.
+    #[tokio::test]
+    async fn harness_double_encoded_tags_are_accepted() {
+        let (p, _tmp) = fresh_pin();
+        let res = p
+            .invoke(json!({
+                "content": "always run cargo fmt before commit",
+                "tags": "[\"binding\",\"workflow\"]"
+            }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+    }
+
+    #[tokio::test]
+    async fn array_of_strings_still_works() {
+        let (p, _tmp) = fresh_pin();
+        p.invoke(json!({
+            "content": "real array path still works",
+            "tags": ["binding", "workflow"]
+        }))
+        .await
+        .unwrap();
     }
 }

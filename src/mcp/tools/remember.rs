@@ -80,22 +80,7 @@ impl Tool for Remember {
             })?,
         };
 
-        let tags: Vec<String> = match args.get("tags") {
-            None => Vec::new(),
-            Some(Value::Array(arr)) => arr
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(|s| s.to_owned())
-                        .ok_or_else(|| ToolError::InvalidArguments("`tags` must be strings".into()))
-                })
-                .collect::<Result<_, _>>()?,
-            Some(_) => {
-                return Err(ToolError::InvalidArguments(
-                    "`tags` must be an array of strings".into(),
-                ));
-            }
-        };
+        let tags = super::parse_tags_arg(args.get("tags"))?;
 
         let scope = args
             .get("scope")
@@ -212,6 +197,37 @@ mod tests {
             .unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].item.scope, "work");
+    }
+
+    /// Some MCP clients (observed: certain Claude Code releases)
+    /// double-encode array tool arguments before forwarding the
+    /// `tools/call` frame, so `tags` arrives as a JSON-encoded string
+    /// rather than a real array. The shared `parse_tags_arg` helper
+    /// tolerates that shape; this test pins the call site to use it.
+    #[tokio::test]
+    async fn harness_double_encoded_tags_are_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let r = Remember::new(Arc::clone(&s), make_scope());
+        r.invoke(json!({
+            "content": "double-encoded tags should still land",
+            "tags": "[\"workaround\",\"harness\"]"
+        }))
+        .await
+        .unwrap();
+        let hits = s
+            .recall(
+                "double-encoded tags should still land",
+                5,
+                &crate::memory::semantic::RecallFilters::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(
+            hits[0].item.tags,
+            vec!["workaround".to_string(), "harness".to_string()]
+        );
     }
 
     #[tokio::test]

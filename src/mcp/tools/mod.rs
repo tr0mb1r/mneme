@@ -248,6 +248,47 @@ pub fn descriptor_to_json(d: &ToolDescriptor) -> Value {
     })
 }
 
+/// Parse a `tags` argument shared by `remember`, `pin`, and `record_event`.
+///
+/// Accepts three shapes:
+/// 1. Absent or `null` — empty list.
+/// 2. JSON array of strings — taken as-is.
+/// 3. JSON-encoded string whose contents parse to an array of strings —
+///    tolerated as a workaround for MCP clients that double-encode
+///    array-typed tool arguments before forwarding the `tools/call`
+///    frame. Observed in some Claude Code releases against the
+///    `tags` parameter; without this fallback every tagged write
+///    from those clients fails with `-32602` even though the JSON
+///    Schema is correct. The strict JSON-array path remains the
+///    documented contract — the schema is unchanged — but a
+///    stringified array is accepted with no behavioural difference.
+///
+/// Anything else (number, object, array of non-strings, malformed
+/// JSON-encoded string) returns `InvalidArguments`. Callers report
+/// the same `tags` error message regardless of source so existing
+/// regression tests keep matching.
+pub(crate) fn parse_tags_arg(arg: Option<&Value>) -> Result<Vec<String>, ToolError> {
+    match arg {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(|s| s.to_owned())
+                    .ok_or_else(|| ToolError::InvalidArguments("`tags` must be strings".into()))
+            })
+            .collect(),
+        Some(Value::String(s)) => serde_json::from_str::<Vec<String>>(s).map_err(|_| {
+            ToolError::InvalidArguments(
+                "`tags` must be an array of strings (got a string that did not parse as a JSON array of strings; some MCP clients double-encode array args)".into(),
+            )
+        }),
+        Some(_) => Err(ToolError::InvalidArguments(
+            "`tags` must be an array of strings".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +348,61 @@ mod tests {
     async fn unknown_tool_returns_none() {
         let (r, _tmp) = fresh_registry();
         assert!(r.get("nope").is_none());
+    }
+
+    #[test]
+    fn parse_tags_accepts_missing_or_null() {
+        assert_eq!(parse_tags_arg(None).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            parse_tags_arg(Some(&Value::Null)).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn parse_tags_accepts_array_of_strings() {
+        let v = json!(["a", "b"]);
+        assert_eq!(parse_tags_arg(Some(&v)).unwrap(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parse_tags_rejects_array_of_numbers() {
+        let v = json!([1, 2]);
+        let err = parse_tags_arg(Some(&v)).unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    /// Workaround test: some MCP clients double-encode array tool
+    /// arguments before forwarding the `tools/call` frame. We accept
+    /// the stringified-array form when it parses back to a `Vec<String>`,
+    /// so a buggy client doesn't lock the user out of `tags` writes.
+    #[test]
+    fn parse_tags_accepts_stringified_array_workaround() {
+        let v = json!("[\"a\",\"b\"]");
+        assert_eq!(parse_tags_arg(Some(&v)).unwrap(), vec!["a", "b"]);
+        // Empty stringified array also accepted.
+        let empty = json!("[]");
+        assert_eq!(parse_tags_arg(Some(&empty)).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_tags_rejects_unparseable_string() {
+        let v = json!("not an array");
+        let err = parse_tags_arg(Some(&v)).unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn parse_tags_rejects_stringified_non_string_array() {
+        let v = json!("[1, 2]");
+        let err = parse_tags_arg(Some(&v)).unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[test]
+    fn parse_tags_rejects_non_array_non_string() {
+        let v = json!(42);
+        let err = parse_tags_arg(Some(&v)).unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
 }
