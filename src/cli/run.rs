@@ -189,6 +189,7 @@ pub fn execute() -> Result<()> {
             Arc::clone(&checkpoint_scheduler),
             sessions_dir,
             scope_state,
+            active_model_name.clone(),
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
 
@@ -244,6 +245,7 @@ async fn async_main(
     checkpoint_scheduler: Arc<CheckpointScheduler>,
     sessions_dir: std::path::PathBuf,
     scope_state: Arc<ScopeState>,
+    active_model_name: String,
 ) -> anyhow::Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -251,6 +253,32 @@ async fn async_main(
         embed_dim = semantic.dim(),
         "mneme MCP server starting on stdio"
     );
+
+    // ADR-0009 — emit `session_start` to L3 before serving traffic so
+    // the brackets around a session are explicit in the activity log.
+    // Best-effort: a failed emit logs a warning and proceeds (the
+    // server still serves; missing one boundary event is degraded
+    // mode, not a fatal condition).
+    let session_id = active_session.id().to_string();
+    let started_at = active_session.started_at().to_rfc3339();
+    let session_start_payload = serde_json::json!({
+        "session_id": session_id,
+        "started_at": started_at,
+        "embedder": &active_model_name,
+        "embed_dim": semantic.dim(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol": crate::mcp::PROTOCOL_VERSION,
+    });
+    if let Err(e) = episodic
+        .record_json(
+            "session_start",
+            &scope_state.current(),
+            &session_start_payload,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "failed to record session_start event");
+    }
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -267,6 +295,7 @@ async fn async_main(
             Some(Arc::clone(&consolidation)),
             Some(Arc::clone(&checkpoint_scheduler)),
             Arc::clone(&scope_state),
+            Some(Arc::clone(&active_session)),
         )),
         Arc::new(ResourceRegistry::defaults_with_schedulers(
             semantic,
@@ -284,13 +313,37 @@ async fn async_main(
         )),
         storage,
     )
-    .with_session(active_session, checkpoint_scheduler, episodic, scope_state);
+    .with_session(
+        Arc::clone(&active_session),
+        checkpoint_scheduler,
+        Arc::clone(&episodic),
+        Arc::clone(&scope_state),
+    );
 
     tokio::select! {
         result = server.run() => result?,
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received");
         }
+    }
+
+    // ADR-0009 — emit `session_end` after the run loop returns, before
+    // the storage drop unwinds. Same best-effort contract as
+    // `session_start`. `clean_shutdown=true` here because we exited
+    // via the loop or the shutdown signal — kill -9 wouldn't reach
+    // this branch.
+    let session_end_payload = serde_json::json!({
+        "session_id": session_id,
+        "ended_at": chrono::Utc::now().to_rfc3339(),
+        "clean_shutdown": true,
+        "turns_total": active_session.turns_total(),
+        "checkpoints_total": active_session.checkpoints_total(),
+    });
+    if let Err(e) = episodic
+        .record_json("session_end", &scope_state.current(), &session_end_payload)
+        .await
+    {
+        tracing::warn!(error = %e, "failed to record session_end event");
     }
 
     tracing::info!("mneme MCP server stopped");
