@@ -115,7 +115,7 @@ gets added later.
 After dropping in the files and restarting Claude Code:
 
 1. **MCP listing** — type `/mcp`. You should see `mneme` with
-   12 tools and 5 resources.
+   13 tools and 5 resources.
 2. **Tool smoke** — ask the agent to call `mneme.stats`. The
    call should run without a permission prompt (the
    `mcp__mneme__*` allow pattern covers it) and return the

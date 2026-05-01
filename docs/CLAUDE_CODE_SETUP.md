@@ -1,7 +1,7 @@
 # Setting up Mneme with Claude Code
 
 This guide walks you from a stock Claude Code install to a session where
-the agent can call `remember`, `recall`, and the rest of mneme's 12 tools
+the agent can call `remember`, `recall`, and the rest of mneme's 13 tools
 — including verification, project-vs-personal scoping, and troubleshooting.
 
 If you only want the three lines: build the binary, run `mneme init`, then
@@ -140,11 +140,11 @@ Inside the session, run the slash command:
 /mcp
 ```
 
-You should see mneme listed with **12 tools** and **5 resources**:
+You should see mneme listed with **13 tools** and **5 resources**:
 
 - Tools: `remember`, `recall`, `update`, `forget`, `pin`, `unpin`,
-  `recall_recent`, `summarize_session`, `stats`, `list_scopes`, `export`,
-  `switch_scope`.
+  `recall_recent`, `summarize_session`, `record_event`, `stats`,
+  `list_scopes`, `export`, `switch_scope`.
 - Resources: `mneme://stats`, `mneme://procedural`, `mneme://recent`,
   `mneme://context`, `mneme://session/{id}`.
 
@@ -219,19 +219,37 @@ proactively rather than only when you ask:
 ```markdown
 ## Memory (mneme)
 
-- On session start, read `mneme://context` to see pinned procedural
-  rules and recent events. Do this before answering anything that
-  references "earlier" or "last time".
+- On session start, read `mneme://procedural` and `mneme://context`
+  before answering anything that references "earlier" or "last time".
+  The SessionStart hook (§7) nudges this; do it even if the nudge
+  didn't fire.
+- `recall` searches L4 only (long-term semantic memory).
+  `recall_recent` returns L3 events without embedding — use it for
+  "what did we just do on this branch?". They do not cross-pollinate.
 - When the user shares a fact, decision, or preference that should
-  outlive the session, call `remember` with an appropriate `type`
+  outlive the session, call `remember` with the matching `kind`
   (`fact`, `decision`, `preference`, `conversation`) and a `scope`
   if the project has its own.
 - When the user states a hard rule ("always use uv", "we never
   commit to main"), call `pin` instead of `remember` — pins surface
   on every subsequent context assembly.
-- At the end of a long working session, call `summarize_session`
-  with the session id and feed the prompt template into your own
-  completion path.
+- For each substantive turn, capture the exchange with
+  `record_event(kind="user_message", payload={"content": …})` and
+  `record_event(kind="assistant_message", payload={"content": …})`.
+  Skip pure-ack turns. Use additional kinds (`decision`,
+  `milestone`, `problem`, `resolution`, `pivot`, `observation`)
+  when the turn produces them.
+- Do NOT call `record_event` for `tool_call`, `tool_call_failed`,
+  `session_start`, or `session_end` — the server emits these
+  automatically; double-recording creates duplicates.
+- Privacy: `record_event` and `remember` payloads are opaque to
+  mneme. Never include credentials, secrets, or API tokens — the
+  L3 cold archive retains them for 180+ days.
+- At the end of a long working session, call `summarize_session`,
+  feed the returned prompt template into your own completion path,
+  then land the digest with `record_event(kind="summary",
+  payload={"text": …, "covers": [event_ids]})` and `remember` /
+  `pin` the durable bits the digest surfaces.
 - Never invoke `forget` without confirming with the user first;
   deletion is permanent.
 ```
@@ -242,11 +260,20 @@ Concrete moments to use each tool:
   preference. Default for "remember this".
 - **`pin`** — hard rule that should surface every session. Use sparingly;
   the procedural feed is small on purpose.
-- **`recall`** — semantic search. The right tool when you need context
-  the user previously shared but isn't in the current conversation.
+- **`recall`** — semantic search across L4. The right tool when you need
+  context the user previously shared but isn't in the current
+  conversation.
 - **`recall_recent`** — "what did we just do?" / "what was the last
-  thing on this branch?" Episodic, time-ordered, not semantic.
+  thing on this branch?" L3, time-ordered, not semantic. Pass `kind`
+  to filter (e.g. `kind: "decision"`).
+- **`record_event`** — agent-driven L3 producer (v0.2.4+, ADR-0008).
+  Use for conversation turns and curated semantic events; the server
+  pushes a matching L1 turn for `user_message` / `assistant_message`
+  kinds.
 - **`update`** — user revises a fact. Re-embeds if `content` changes.
+- **`summarize_session`** — returns a prompt template populated with
+  recent L3 events; fill it via your completion path, land via
+  `record_event(kind="summary")` + `remember` / `pin` durable bits.
 - **`stats`** / **`list_scopes`** — diagnose / orient. Cheap.
 - **`export`** — read-only dump for grepping or piping to `jq`.
 

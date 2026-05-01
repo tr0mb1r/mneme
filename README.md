@@ -54,13 +54,15 @@ work that the agent would otherwise forget.**
 | Layer | Tools | Resource | Storage |
 |-------|-------|----------|---------|
 | L0 procedural (always-on) | `pin`, `unpin` | `mneme://procedural` | JSONL on disk, hot-reloaded |
-| L3 episodic (recent events) | `recall_recent`, `summarize_session` | `mneme://recent` | redb hot tier + zstd cold quarters |
+| L3 episodic (recent events) | `recall_recent`, `summarize_session`, `record_event` | `mneme://recent` | redb hot tier + zstd cold quarters |
 | L4 semantic (long-term facts) | `remember`, `recall`, `update`, `forget` | — | redb + WAL + HNSW vector index |
 | Auto-context | — | `mneme://context` | Pinned + recent, packed to a token budget |
 | Diagnostics | `stats`, `list_scopes`, `export` | `mneme://stats` | — |
 
 `mneme run` speaks JSON-RPC over stdio against MCP protocol `2025-06-18`,
-advertises 12 tools and 5 resources, and survives malformed JSON, oversize
+advertises a focused MCP tool and resource surface (see
+[`book/src/mcp-surface.md`](book/src/mcp-surface.md) for the
+authoritative inventory), and survives malformed JSON, oversize
 frames, and EOF cleanly. Real BGE-M3 / MiniLM embeddings via `candle`,
 HNSW recall via `instant-distance`, atomic snapshots, WAL crash-recovery,
 schema migration from v0, and `mneme backup` / `mneme restore` round-trips
@@ -164,8 +166,10 @@ manually with Claude Desktop on macOS:
    }
    ```
 
-3. Restart Claude Desktop. The tools panel should show 12 tools and 5 MCP
-   resources. The first call may take a few seconds while the embedding
+3. Restart Claude Desktop. The tools panel should list `mneme` with its
+   full tool inventory (see
+   [`book/src/mcp-surface.md`](book/src/mcp-surface.md)) and resource
+   set. The first call may take a few seconds while the embedding
    model loads.
 
 To smoke from the shell without an MCP host:
@@ -179,7 +183,10 @@ To smoke from the shell without an MCP host:
 ```
 
 You should see two JSON lines: an `initialize` response advertising the
-server's capabilities, then a `tools/list` response with all 12 tools.
+server's capabilities, then a `tools/list` response enumerating every
+registered tool (see
+[`book/src/mcp-surface.md`](book/src/mcp-surface.md) for the canonical
+list).
 
 For the comprehensive end-to-end check (every tool, backup/restore
 round-trip, post-restore recall) run:

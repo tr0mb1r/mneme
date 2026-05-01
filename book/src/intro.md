@@ -40,14 +40,15 @@ path. Treat as production-capable for personal use, not yet 1.0. See
 |-------|-------|----------|---------|
 | L0 procedural (always-on) | `pin`, `unpin` | `mneme://procedural` | JSONL on disk, hot-reloaded |
 | L1 working session | (live state) | `mneme://session/{id}` | `~/.mneme/sessions/<id>.snapshot` |
-| L3 episodic (recent events) | `recall_recent`, `summarize_session` | `mneme://recent` | redb hot tier + zstd cold quarters |
+| L3 episodic (recent events) | `recall_recent`, `summarize_session`, `record_event` | `mneme://recent` | redb hot tier + zstd cold quarters |
 | L4 semantic (long-term facts) | `remember`, `recall`, `update`, `forget` | — | redb + WAL + HNSW vector index |
 | Auto-context | — | `mneme://context` | All four layers, packed to a token budget |
 | Diagnostics | `stats`, `list_scopes`, `export`, `switch_scope` | `mneme://stats` | — |
 
 `mneme run` speaks JSON-RPC over stdio against MCP protocol `2025-06-18`,
-advertises **12 tools** and **5 resources**, and survives malformed JSON,
-oversize frames, and EOF cleanly.
+advertises a focused MCP tool and resource surface (see
+[MCP surface](./mcp-surface.md) for the authoritative inventory),
+and survives malformed JSON, oversize frames, and EOF cleanly.
 
 ## Where to next
 

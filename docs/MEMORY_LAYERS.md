@@ -30,7 +30,7 @@ The rest of the doc is layer-by-layer detail.
 | **L0 Procedural** | Always-on pinned rules (`pin` / `unpin`) | No | `~/.mneme/procedural/pinned.jsonl` | Live: file watched every 500 ms; external edits picked up in <1 s | Same |
 | **L1 Working session** | The current session's turns (tool, user, assistant), scratch state | No | `~/.mneme/sessions/<session_id>.snapshot` (atomic temp+rename per flush) | **Checkpoint scheduler wired (v0.13)**; **conversation mirror wired (v0.2.4)** — `record_event(kind="user_message"/"assistant_message")` pushes a matching turn to L1 | Same |
 | **L3 Episodic** | Time-ordered events: tool calls, lifecycle events, conversation turns, curated semantic events | No (lexical only) | `~/.mneme/episodic/` (redb), three prefixes: `epi:` hot, `wepi:` warm, `cold/` zstd | **Auto-emit shipping (v0.2.3 + v0.2.4)** — `tool_call` (per-tool enriched payload), `tool_call_failed`, `session_start`, `session_end`. **Agent-driven (v0.2.4)** — `record_event` writes any kind. **Tier promotion wired (v0.12)** — `ConsolidationScheduler` fires every 5 min when idle | Idle-time pass: hot → warm at age ≥ 28 d, warm → cold at age ≥ 180 d |
-| **L4 Semantic** | Long-term facts, decisions, preferences | **Yes** — every `remember` / `update` re-embeds | `~/.mneme/episodic/` (redb), prefix `mem:` + `~/.mneme/index/hnsw.idx` snapshot + `~/.mneme/wal/` deltas | Live writes; **HNSW snapshot scheduler runs**: every 1000 inserts OR every 60 min, whichever first | Same |
+| **L4 Semantic** | Long-term facts, decisions, preferences, conversations | **Yes** — every `remember` / `update` re-embeds | `~/.mneme/episodic/` (redb), prefix `mem:` + `~/.mneme/index/hnsw.idx` snapshot + `~/.mneme/wal/` deltas | Live writes; **HNSW snapshot scheduler runs**: every 1000 inserts OR every 60 min, whichever first | Same |
 | **Auto-context resource** | Pinned + recent, packed to a token budget | Reads only | (assembled on demand) | On read of `mneme://context` | Same |
 | **Cold archive** | Quarter-bundled JSON, zstd-compressed | No | `~/.mneme/cold/<YYYY-Q>.zst` | Written only when L3 consolidation runs | Same as L3 |
 
@@ -118,10 +118,14 @@ not a search corpus — `recall_recent` returns events ordered by
 `(last_accessed, retrieval_weight, created_at)`, not by semantic
 similarity.
 
-**Embedding.** None. Episodic recall is lexical/temporal. If you
-want semantic search over what happened, the agent should call
-`summarize_session` (which produces a prompt template you feed to
-your own LLM) and then `remember` the resulting summary into L4.
+**Embedding.** None (ADR-0007). Episodic recall is lexical/temporal —
+`recall_recent` returns L3 hits only, never L4. If you want semantic
+search over what happened, the close-of-loop is: `summarize_session`
+(returns a prompt template populated with recent L3 events) → fill it
+via the host LLM → `record_event(kind="summary", payload={text, covers})`
+to land the digest as a single L3 event → `remember` durable facts into
+L4 for similarity retrieval. Mneme itself never calls an LLM (cardinal
+rule #3); the agent owns the host completion path.
 
 **Storage.** All in `~/.mneme/episodic/` (redb), distinguished by
 key prefix:
@@ -184,7 +188,7 @@ fires a pass and refreshes its idle gate. Future modes
 > consolidation only fires after the system goes quiet.
 
 **Surfaced via:**
-- Tools: `recall_recent`, `summarize_session`.
+- Tools: `recall_recent`, `summarize_session`, `record_event` (v0.2.4+).
 - Resource: `mneme://recent`.
 
 ---
@@ -340,7 +344,7 @@ write workloads where snapshots are starting to dominate I/O.
 | `update` (only `tags`/`scope`/`kind`) | No | Metadata-only path skips the embedder. |
 | `forget` | No | Tombstone the vector; no new embedding. |
 | `pin` / `unpin` | No | L0 is exact-match. |
-| `recall_recent` / `summarize_session` | No | L3 is lexical/temporal. |
+| `recall_recent` / `summarize_session` / `record_event` | No | L3 is lexical/temporal (ADR-0007). |
 | `recall` | **Yes (query side)** | Embeds the query string before the HNSW search. |
 | Reading `mneme://context` | Sometimes | Only if you pass a `query` parameter. |
 | Reading `mneme://stats` / `mneme://procedural` / `mneme://recent` | No | Direct lookups. |
