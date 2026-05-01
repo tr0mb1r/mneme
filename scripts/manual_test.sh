@@ -225,9 +225,9 @@ step "tools/list"
 send_request "tools/list" >/dev/null
 LIST_RESP=$(read_response)
 TOOL_NAMES=$(jq -r '.result.tools[].name' <<<"$LIST_RESP" | sort | paste -sd, -)
-EXPECTED="export,forget,list_scopes,pin,recall,recall_recent,remember,stats,summarize_session,switch_scope,unpin,update"
+EXPECTED="export,forget,list_scopes,pin,recall,recall_recent,record_event,remember,stats,summarize_session,switch_scope,unpin,update"
 [[ "$TOOL_NAMES" == "$EXPECTED" ]] \
-    && ok "12 tools registered: $TOOL_NAMES" \
+    && ok "13 tools registered: $TOOL_NAMES" \
     || fail "tool list mismatch: got=$TOOL_NAMES expected=$EXPECTED"
 
 # ---------- L4 semantic ----------
@@ -308,12 +308,33 @@ TEXT=$(jq -r '.result.content[0].text' <<<"$RESP")
 
 # ---------- L3 episodic ----------
 
-step "L3 episodic — recall_recent / summarize_session"
-RESP=$(call_tool recall_recent '{"limit":20}')
+step "L3 episodic — record_event / recall_recent / summarize_session"
+
+# record_event — agent-driven L3 producer (ADR-0008). Drive a few
+# kinds: a user_message (server should mirror to L1), an
+# assistant_message (same), and a curated `decision` event.
+RESP=$(call_tool record_event '{"kind":"user_message","payload":{"content":"how do we deploy?"}}')
+TEXT=$(jq -r '.result.content[0].text' <<<"$RESP")
+[[ "$TEXT" == "recorded event "* ]] \
+    && ok "record_event(user_message) accepted" \
+    || fail "record_event response unexpected: $TEXT"
+
+call_tool record_event '{"kind":"assistant_message","payload":{"content":"via release-plz, then publish.yml"}}' >/dev/null
+call_tool record_event '{"kind":"decision","payload":{"content":"defer Homebrew automation post-1.0","reasoning":"low cadence + no review gate"}}' >/dev/null
+
+# record_event with bad weight is rejected
+RESP=$(call_tool record_event '{"kind":"observation","retrieval_weight":2.0}')
+ERR=$(jq -r '.error.message // ""' <<<"$RESP")
+[[ "$ERR" == *"retrieval_weight"* ]] \
+    && ok "record_event rejects out-of-range retrieval_weight" \
+    || fail "record_event accepted bad retrieval_weight: $RESP"
+
+RESP=$(call_tool recall_recent '{"limit":40}')
 RECENT_TEXT=$(jq -r '.result.content[0].text' <<<"$RESP")
 # Since v0.2.3 every successful tools/call auto-emits a `tool_call`
-# event, so by this point in the script the hot tier MUST contain
-# at least one entry. n=0 means the producer regressed.
+# event; v0.2.4 adds session_start, session_end, tool_call_failed,
+# and agent-driven kinds via record_event. By this point in the
+# script the hot tier MUST contain at least one of each canonical kind.
 if echo "$RECENT_TEXT" | jq -e 'type == "array"' >/dev/null 2>&1; then
     COUNT=$(echo "$RECENT_TEXT" | jq 'length')
     KINDS=$(echo "$RECENT_TEXT" | jq -r '[.[].kind] | unique | join(",")')
@@ -325,6 +346,55 @@ if echo "$RECENT_TEXT" | jq -e 'type == "array"' >/dev/null 2>&1; then
 else
     fail "recall_recent did not return a JSON array: $RECENT_TEXT"
 fi
+
+# Confirm v0.2.4 auto-emits made it into L3 (ADR-0009)
+HAS_SESSION_START=$(echo "$RECENT_TEXT" | jq '[.[] | select(.kind == "session_start")] | length')
+[[ "$HAS_SESSION_START" -ge 1 ]] \
+    && ok "session_start event present in L3" \
+    || fail "no session_start event found"
+
+HAS_FAILED=$(echo "$RECENT_TEXT" | jq '[.[] | select(.kind == "tool_call_failed")] | length')
+[[ "$HAS_FAILED" -ge 1 ]] \
+    && ok "tool_call_failed event present (from earlier no-such-memory + bad weight)" \
+    || fail "no tool_call_failed event found"
+
+# Confirm tool_call payload enrichment (ADR-0009): a remember call's
+# payload should include the `content` field, NOT the full args.
+# `payload` is stored as a JSON string in recall_recent's output;
+# `fromjson` parses it into an object before field access.
+REM_CONTENT=$(echo "$RECENT_TEXT" | jq -r '
+    [.[] | select(.kind == "tool_call")
+         | .payload | fromjson
+         | select(.tool == "remember")
+         | .content // empty
+    ] | .[0] // ""')
+REM_HAS_TAGS=$(echo "$RECENT_TEXT" | jq -r '
+    [.[] | select(.kind == "tool_call")
+         | .payload | fromjson
+         | select(.tool == "remember")
+         | has("tags")
+    ] | any')
+if [[ -n "$REM_CONTENT" ]]; then
+    [[ "$REM_CONTENT" == *"ruff"* || "$REM_CONTENT" == *"cargo"* ]] \
+        && ok "tool_call payload enriched: remember.content is captured" \
+        || fail "tool_call payload content unexpected: '$REM_CONTENT'"
+    [[ "$REM_HAS_TAGS" == "false" ]] \
+        && ok "tool_call payload omits args.tags (privacy invariant)" \
+        || fail "tool_call payload leaked args.tags"
+else
+    fail "no tool_call event for remember found in recall_recent results"
+fi
+
+# Confirm record_event kinds reached L3
+HAS_DECISION=$(echo "$RECENT_TEXT" | jq '[.[] | select(.kind == "decision")] | length')
+[[ "$HAS_DECISION" -ge 1 ]] \
+    && ok "decision event recorded via record_event" \
+    || fail "no decision event found"
+
+HAS_USER_MSG=$(echo "$RECENT_TEXT" | jq '[.[] | select(.kind == "user_message")] | length')
+[[ "$HAS_USER_MSG" -ge 1 ]] \
+    && ok "user_message event recorded; L1 mirror should also have pushed a turn" \
+    || fail "no user_message event found"
 
 RESP=$(call_tool summarize_session '{"session_id":"manual-test-1"}')
 SUMMARY=$(jq -r '.result.content[0].text // ""' <<<"$RESP")

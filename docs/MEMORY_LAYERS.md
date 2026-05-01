@@ -28,8 +28,8 @@ The rest of the doc is layer-by-layer detail.
 | Layer | What it holds | Embedded? | Where on disk | Auto-schedule (today) | Auto-schedule (v1 design) |
 |---|---|---|---|---|---|
 | **L0 Procedural** | Always-on pinned rules (`pin` / `unpin`) | No | `~/.mneme/procedural/pinned.jsonl` | Live: file watched every 500 ms; external edits picked up in <1 s | Same |
-| **L1 Working session** | The current session's turns, scratch state | No | `~/.mneme/sessions/<session_id>.snapshot` (atomic temp+rename per flush) | **Wired (v0.13)** — `CheckpointScheduler` flushes every 30 s OR every 5 tool calls | Same |
-| **L3 Episodic** | Time-ordered events, tool calls, summaries | No (lexical only) | `~/.mneme/episodic/` (redb), three prefixes: `epi:` hot, `wepi:` warm, `cold/` zstd | **Producer wired (v0.2.3)** — every successful `tools/call` auto-emits a `kind="tool_call"` event tagged with the active scope. **Tier promotion wired (v0.12)** — `ConsolidationScheduler` fires every 5 min when idle | Idle-time pass: hot → warm at age ≥ 28 d, warm → cold at age ≥ 180 d |
+| **L1 Working session** | The current session's turns (tool, user, assistant), scratch state | No | `~/.mneme/sessions/<session_id>.snapshot` (atomic temp+rename per flush) | **Checkpoint scheduler wired (v0.13)**; **conversation mirror wired (v0.2.4)** — `record_event(kind="user_message"/"assistant_message")` pushes a matching turn to L1 | Same |
+| **L3 Episodic** | Time-ordered events: tool calls, lifecycle events, conversation turns, curated semantic events | No (lexical only) | `~/.mneme/episodic/` (redb), three prefixes: `epi:` hot, `wepi:` warm, `cold/` zstd | **Auto-emit shipping (v0.2.3 + v0.2.4)** — `tool_call` (per-tool enriched payload), `tool_call_failed`, `session_start`, `session_end`. **Agent-driven (v0.2.4)** — `record_event` writes any kind. **Tier promotion wired (v0.12)** — `ConsolidationScheduler` fires every 5 min when idle | Idle-time pass: hot → warm at age ≥ 28 d, warm → cold at age ≥ 180 d |
 | **L4 Semantic** | Long-term facts, decisions, preferences | **Yes** — every `remember` / `update` re-embeds | `~/.mneme/episodic/` (redb), prefix `mem:` + `~/.mneme/index/hnsw.idx` snapshot + `~/.mneme/wal/` deltas | Live writes; **HNSW snapshot scheduler runs**: every 1000 inserts OR every 60 min, whichever first | Same |
 | **Auto-context resource** | Pinned + recent, packed to a token budget | Reads only | (assembled on demand) | On read of `mneme://context` | Same |
 | **Cold archive** | Quarter-bundled JSON, zstd-compressed | No | `~/.mneme/cold/<YYYY-Q>.zst` | Written only when L3 consolidation runs | Same as L3 |
@@ -153,15 +153,26 @@ fires a pass and refreshes its idle gate. Future modes
 (`every_<n>m`, cron, `on_demand`) belong to v1.1.
 
 **What runs today:**
-> **Producer is wired (v0.2.3).** Every successful `tools/call`
-> dispatched by `mcp::server::Server::handle_tools_call` appends one
-> `EpisodicEvent { kind: "tool_call", payload: {"tool": <name>} }`
-> to the hot tier, scoped to whatever `ScopeState::current()` returns
-> at emit time. Failed calls do not emit (same logic that protects
-> the L1 turn counter). Pre-v0.2.3 the layer had no production
-> writer despite the rest of the pipeline shipping — see the v0.19
-> note in `proj_docs/mneme-implementation-plan.md` for the
-> backstory.
+> **Auto-emit shipped through v0.2.4** (ADR-0009). Server-side
+> `Server::handle_tools_call` and `cli::run::async_main` emit:
+>
+> - `tool_call` after every successful dispatch — payload is enriched
+>   per-tool with the value-bearing arg (e.g. `remember.content`,
+>   `recall.query`); diagnostic tools keep just `{tool: <name>}`.
+>   The full `arguments` JSON is **never** mirrored (privacy).
+> - `tool_call_failed` when a dispatch errors (carries `error_kind`
+>   and a truncated `message` string). Mirrors the success-path emit
+>   but does NOT push a turn to L1.
+> - `session_start` on `mneme run` boot.
+> - `session_end` on graceful shutdown (`clean_shutdown=true`).
+>
+> **Agent-driven via `record_event` (v0.2.4, ADR-0008).** The agent
+> calls `mneme.record_event(kind, payload, ...)` for any kind beyond
+> the auto-emits. Canonical kinds: `user_message`, `assistant_message`
+> (server also pushes a matching turn to L1), `decision`, `problem`,
+> `resolution`, `milestone`, `preference`, `pivot`, `observation`,
+> `summary`. Free-form: agents can invent new kinds without a schema
+> migration.
 >
 > **Tier promotion is wired and runs in the background**
 > (`memory::consolidation_scheduler::ConsolidationScheduler`,

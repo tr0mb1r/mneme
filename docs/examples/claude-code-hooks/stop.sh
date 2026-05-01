@@ -12,14 +12,28 @@
 set -euo pipefail
 
 cat <<'NUDGE'
-Turn ended. If this turn established a fact, decision, preference,
-or rule that should outlive the session, call the matching mneme
-tool now:
+Turn ended. Three options for what to record, depending on
+significance:
 
-  - `mneme.remember` for facts / decisions / preferences /
-    conversational context worth recalling later.
-  - `mneme.pin` for hard rules ("always X", "never Y") that should
-    surface on every subsequent session.
+  1. Conversation capture (default for substantive turns):
+       - Call `mneme.record_event` with `kind="user_message"` for
+         the user's prompt and `kind="assistant_message"` for your
+         response. Server mirrors these into the L1 working session
+         too, so `mneme://context` reflects real conversation.
+       - Skip for one-line throwaway exchanges.
+
+  2. Curated semantic events (when something meaningful happened):
+       - Call `mneme.record_event` with `kind="decision"` /
+         `"problem"` / `"resolution"` / `"milestone"` /
+         `"preference"` / `"pivot"` / `"observation"` and a
+         payload that captures the substance + context.
+
+  3. Durable facts and rules (when something should be retrievable
+     across sessions):
+       - `mneme.remember` for facts / decisions / preferences /
+         conversational context worth recalling by similarity later.
+       - `mneme.pin` for hard rules ("always X", "never Y") that
+         should surface on every subsequent session.
 
 If only transient work happened (one-off questions, incidental
 shell commands, exploratory reads), do nothing. Noise is the

@@ -41,6 +41,117 @@ use crate::storage::Storage;
 /// for server-defined codes).
 const SERVER_NOT_INITIALIZED: i32 = -32002;
 
+/// Cap on the `message` field included in `tool_call_failed` event
+/// payloads. Bounded so a verbose error message doesn't bloat the
+/// L3 hot tier; the full message is still in the JSON-RPC error
+/// response the caller receives.
+const FAILED_MESSAGE_CAP: usize = 500;
+
+/// Build the L3 `tool_call` event payload for a successful invocation.
+/// Per ADR-0009: extract only the per-tool value-bearing arg(s);
+/// **never** the full `arguments` object. The resulting payload feeds
+/// into the L3 hot tier and ages into the cold zstd archive on disk,
+/// so leaking secrets through this path would be a privacy bug.
+///
+/// New tools added to the MCP surface MUST add an entry here in the
+/// same PR. The default for unknown tools is the bare
+/// `{"tool": <name>}` shape — explicit allowlist, not denylist.
+fn tool_call_payload(name: &str, args: &Value) -> Value {
+    let mut p = json!({ "tool": name });
+    let obj = p
+        .as_object_mut()
+        .expect("json!({...}) yields an object literal");
+
+    let pull = |obj: &mut serde_json::Map<String, Value>, args: &Value, key: &str| {
+        if let Some(v) = args.get(key)
+            && !matches!(v, Value::Null)
+        {
+            obj.insert(key.to_owned(), v.clone());
+        }
+    };
+
+    match name {
+        // L4 writers — content carries the user's actual data.
+        "remember" => {
+            pull(obj, args, "content");
+            pull(obj, args, "kind");
+            pull(obj, args, "scope");
+        }
+        // L0 writer — same shape as remember, no embedder involvement.
+        "pin" => {
+            pull(obj, args, "content");
+            pull(obj, args, "scope");
+        }
+        // Mutators — id + new content if provided.
+        "update" => {
+            pull(obj, args, "id");
+            pull(obj, args, "content");
+            pull(obj, args, "kind");
+        }
+        "forget" => {
+            pull(obj, args, "id");
+        }
+        "unpin" => {
+            pull(obj, args, "id");
+        }
+        // Readers — record the search intent.
+        "recall" => {
+            pull(obj, args, "query");
+            pull(obj, args, "k");
+        }
+        "recall_recent" => {
+            pull(obj, args, "limit");
+            pull(obj, args, "kind");
+            pull(obj, args, "scope");
+        }
+        "summarize_session" => {
+            pull(obj, args, "events");
+            pull(obj, args, "scope");
+        }
+        // State change.
+        "switch_scope" => {
+            // Tool's arg is `scope`; expose under `new_scope` so the
+            // L3 stream reads naturally ("we switched to <new>") on
+            // recall_recent.
+            if let Some(v) = args.get("scope") {
+                obj.insert("new_scope".to_owned(), v.clone());
+            }
+        }
+        // L3 producer (this very tool!) — capture the kind only, NOT
+        // the payload. The payload is already being recorded by the
+        // tool itself; double-recording would inflate the hot tier
+        // with duplicate content.
+        "record_event" => {
+            pull(obj, args, "kind");
+            pull(obj, args, "scope");
+        }
+        // Diagnostic / portability — no value-bearing args worth
+        // mirroring. Bare `{"tool": <name>}` is enough.
+        "stats" | "list_scopes" | "export" => {}
+        // Unknown tool — bare payload, intentional default.
+        _ => {}
+    }
+    p
+}
+
+/// Build the L3 `tool_call_failed` event payload. Capped message;
+/// no args (privacy: failed remember/pin still received the args, we
+/// don't re-emit them here).
+fn tool_call_failed_payload(name: &str, error_kind: &str, message: &str) -> Value {
+    let truncated: String = if message.len() > FAILED_MESSAGE_CAP {
+        let mut s = message.chars().take(FAILED_MESSAGE_CAP).collect::<String>();
+        s.push('…');
+        s
+    } else {
+        message.to_owned()
+    };
+    json!({
+        "tool": name,
+        "error_kind": error_kind,
+        "message": truncated,
+    })
+}
+
 pub struct Server<R, W> {
     transport: StdioTransport<R, W>,
     tools: Arc<ToolRegistry>,
@@ -231,6 +342,15 @@ where
         let tool = match self.tools.get(&name) {
             Some(t) => t,
             None => {
+                // Unknown tool — emit a `tool_call_failed` event
+                // (failures often matter most; ADR-0009) and return
+                // the JSON-RPC error.
+                self.emit_tool_call_failed(
+                    &name,
+                    "MethodNotFound",
+                    &format!("unknown tool: {name}"),
+                )
+                .await;
                 return Response::error(
                     id,
                     error_codes::METHOD_NOT_FOUND,
@@ -239,27 +359,28 @@ where
             }
         };
 
-        match tool.invoke(args).await {
+        match tool.invoke(args.clone()).await {
             Ok(result) => {
                 // Record the turn on the active session and poke the
                 // checkpoint scheduler. Two reasons to do it here, not
                 // before the invoke: (1) we don't want failed calls to
                 // count as turns; (2) we don't want to poke the
                 // scheduler if the call ultimately errors out and
-                // produces no observable effect. The recorded content
-                // is just the tool name — full args are typically
-                // sensitive and don't belong in the session log.
+                // produces no observable effect.
                 if let (Some(session), Some(sched)) =
                     (self.session.as_ref(), self.checkpoint_scheduler.as_ref())
                 {
                     session.push_turn("tool", &name);
                     sched.poke();
                 }
+                // Auto-emit the L3 `tool_call` event with a per-tool
+                // payload extracted from `args` (ADR-0009). Never the
+                // full args object — privacy.
                 if let (Some(episodic), Some(scope_state)) =
                     (self.episodic.as_ref(), self.scope_state.as_ref())
                 {
                     let scope = scope_state.current();
-                    let payload = json!({ "tool": &name });
+                    let payload = tool_call_payload(&name, &args);
                     if let Err(e) = episodic.record_json("tool_call", &scope, &payload).await {
                         // Non-fatal: the user already got their tool result;
                         // a missed L3 event is a degraded-mode signal, not a
@@ -274,12 +395,41 @@ where
                 Response::success(id, result.to_json())
             }
             Err(ToolError::InvalidArguments(msg)) => {
+                self.emit_tool_call_failed(&name, "InvalidArguments", &msg)
+                    .await;
                 Response::error(id, error_codes::INVALID_PARAMS, msg)
             }
             Err(ToolError::NotFound(msg)) => {
+                self.emit_tool_call_failed(&name, "NotFound", &msg).await;
                 Response::error(id, error_codes::METHOD_NOT_FOUND, msg)
             }
-            Err(ToolError::Internal(msg)) => Response::error(id, error_codes::INTERNAL_ERROR, msg),
+            Err(ToolError::Internal(msg)) => {
+                self.emit_tool_call_failed(&name, "Internal", &msg).await;
+                Response::error(id, error_codes::INTERNAL_ERROR, msg)
+            }
+        }
+    }
+
+    /// Emit a `tool_call_failed` L3 event when a tool dispatch fails.
+    /// Mirrors the success path's emit but skips the L1 turn / checkpoint
+    /// poke (failed calls don't count as turns — same logic that
+    /// protected `turns_total` pre-v0.2.4). Per ADR-0009.
+    async fn emit_tool_call_failed(&self, tool_name: &str, error_kind: &str, message: &str) {
+        if let (Some(episodic), Some(scope_state)) =
+            (self.episodic.as_ref(), self.scope_state.as_ref())
+        {
+            let scope = scope_state.current();
+            let payload = tool_call_failed_payload(tool_name, error_kind, message);
+            if let Err(e) = episodic
+                .record_json("tool_call_failed", &scope, &payload)
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    tool = %tool_name,
+                    "failed to record episodic tool_call_failed event"
+                );
+            }
         }
     }
 
@@ -443,11 +593,12 @@ mod tests {
         assert_eq!(out[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(out[0]["result"]["serverInfo"]["name"], SERVER_NAME);
         let tools = out[1]["result"]["tools"].as_array().unwrap();
-        // Phase 6 surface + switch_scope (v0.15): 12 tools across
-        // L0/L3/L4 + diagnostics (export, forget, list_scopes,
-        // pin, recall, recall_recent, remember, stats,
-        // summarize_session, switch_scope, unpin, update).
-        assert_eq!(tools.len(), 12);
+        // Phase 6 surface + switch_scope (v0.15) + record_event
+        // (v0.2.4, ADR-0008): 13 tools across L0/L3/L4 + diagnostics
+        // (export, forget, list_scopes, pin, recall, recall_recent,
+        // record_event, remember, stats, summarize_session,
+        // switch_scope, unpin, update).
+        assert_eq!(tools.len(), 13);
     }
 
     #[tokio::test]
@@ -662,11 +813,13 @@ mod tests {
         assert_eq!(payload["tool"], "remember");
     }
 
-    /// Failed tool calls must NOT emit an episodic event — same
-    /// reasoning as the existing turn-counter behaviour: we don't
-    /// want the hot tier to fill up with noise from invalid calls.
+    /// Failed tool calls emit `kind="tool_call_failed"` (ADR-0009)
+    /// but DO NOT push a turn to the active session — failures
+    /// don't count as turns, same logic that protects `turns_total`.
+    /// Pre-v0.2.4 this test asserted no emit at all; v0.2.4 changes
+    /// the contract: emit with a different kind, still no L1 turn.
     #[tokio::test]
-    async fn failed_tools_call_does_not_emit_episodic_event() {
+    async fn failed_tools_call_emits_tool_call_failed_only() {
         use crate::embed::Embedder;
         use crate::embed::stub::StubEmbedder;
         use crate::memory::checkpoint_scheduler::{CheckpointScheduler, CheckpointSchedulerConfig};
@@ -745,10 +898,206 @@ mod tests {
             .recall_recent(&RecentFilters::default(), 10)
             .await
             .unwrap();
+        // v0.2.4: ADR-0009 turns this into a `tool_call_failed` emit
+        // (was: no emit at all pre-v0.2.4). Should be exactly one
+        // event, with the failed kind, payload carrying the error
+        // class and the (truncated) message.
+        assert_eq!(events.len(), 1, "expected one tool_call_failed event");
+        let evt = &events[0];
+        assert_eq!(evt.kind, "tool_call_failed");
+        let payload = evt.payload_json().unwrap();
+        assert_eq!(payload["tool"], "no_such_tool");
+        assert_eq!(payload["error_kind"], "MethodNotFound");
         assert!(
-            events.is_empty(),
-            "failed tools/call should not emit, got {} event(s)",
-            events.len()
+            payload["message"]
+                .as_str()
+                .unwrap()
+                .contains("no_such_tool")
         );
+    }
+
+    /// `tool_call` payload is enriched per-tool (ADR-0009): the
+    /// value-bearing arg lands in the L3 event so `recall_recent`
+    /// reconstructs intent ("we remembered <content>", "we recalled
+    /// <query>"). Full args MUST NOT be mirrored — privacy.
+    #[tokio::test]
+    async fn successful_tools_call_payload_is_enriched_per_tool() {
+        use crate::embed::Embedder;
+        use crate::embed::stub::StubEmbedder;
+        use crate::memory::checkpoint_scheduler::{CheckpointScheduler, CheckpointSchedulerConfig};
+        use crate::memory::episodic::{EpisodicStore, RecentFilters};
+        use crate::memory::procedural::ProceduralStore;
+        use crate::memory::semantic::SemanticStore;
+        use crate::memory::working::ActiveSession;
+        use crate::orchestrator::{Orchestrator, TokenBudget};
+        use crate::scope::ScopeState;
+        use crate::storage::archive::ColdArchive;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = crate::storage::memory_impl::MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&storage), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage)));
+        let orchestrator = Arc::new(Orchestrator::new(
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+        ));
+        let cold = ColdArchive::new(tmp.path());
+        let active_session = ActiveSession::open(tmp.path().join("sessions")).unwrap();
+        let checkpoint_scheduler = CheckpointScheduler::start(
+            Arc::clone(&active_session),
+            CheckpointSchedulerConfig::disabled(),
+        );
+        let scope_state = ScopeState::new("work");
+
+        let mut input = String::new();
+        input.push_str(&req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18"}),
+        ));
+        input.push_str(&notif("notifications/initialized"));
+        input.push_str(&req(
+            2,
+            "tools/call",
+            json!({"name": "remember", "arguments": {
+                "content": "we use redb",
+                "kind": "fact",
+                "scope": "work",
+                "tags": ["storage"],
+            }}),
+        ));
+
+        let transport = StdioTransport::new(input.as_bytes(), Vec::<u8>::new());
+        let mut server = Server::new(
+            transport,
+            Arc::new(ToolRegistry::defaults(
+                Arc::clone(&semantic),
+                Arc::clone(&procedural),
+                Arc::clone(&episodic),
+                Arc::clone(&storage),
+                cold.clone(),
+                1,
+            )),
+            Arc::new(ResourceRegistry::defaults(
+                semantic,
+                procedural,
+                Arc::clone(&episodic),
+                orchestrator,
+                cold,
+                1,
+                TokenBudget::for_tests(2000),
+            )),
+            storage,
+        )
+        .with_session(
+            active_session,
+            checkpoint_scheduler,
+            Arc::clone(&episodic),
+            Arc::clone(&scope_state),
+        );
+        server.run().await.unwrap();
+
+        let events = episodic
+            .recall_recent(&RecentFilters::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let evt = &events[0];
+        assert_eq!(evt.kind, "tool_call");
+        let payload = evt.payload_json().unwrap();
+        assert_eq!(payload["tool"], "remember");
+        assert_eq!(payload["content"], "we use redb");
+        assert_eq!(payload["kind"], "fact");
+        assert_eq!(payload["scope"], "work");
+        // `tags` was passed but is NOT in the per-tool extraction
+        // table (ADR-0009 keeps the payload narrow); confirm it
+        // didn't leak through.
+        assert!(
+            payload.get("tags").is_none(),
+            "tags should NOT be in payload"
+        );
+    }
+
+    #[test]
+    fn tool_call_payload_per_tool_extraction() {
+        // White-box test of the extraction table. Catches drift if
+        // someone adds a tool and forgets to add an entry to the
+        // match in `tool_call_payload`.
+
+        // remember: content + kind + scope (tags excluded)
+        let p = tool_call_payload(
+            "remember",
+            &json!({"content": "x", "kind": "fact", "scope": "work", "tags": ["a"]}),
+        );
+        assert_eq!(p["tool"], "remember");
+        assert_eq!(p["content"], "x");
+        assert_eq!(p["kind"], "fact");
+        assert_eq!(p["scope"], "work");
+        assert!(p.get("tags").is_none());
+
+        // recall: query + k
+        let p = tool_call_payload("recall", &json!({"query": "redb", "k": 5, "scope": "x"}));
+        assert_eq!(p["query"], "redb");
+        assert_eq!(p["k"], 5);
+        assert!(
+            p.get("scope").is_none(),
+            "recall has no scope arg in extraction"
+        );
+
+        // forget: id only
+        let p = tool_call_payload("forget", &json!({"id": "01ABC"}));
+        assert_eq!(p["id"], "01ABC");
+
+        // switch_scope: arg `scope` exposed as `new_scope`
+        let p = tool_call_payload("switch_scope", &json!({"scope": "work"}));
+        assert_eq!(p["new_scope"], "work");
+        assert!(p.get("scope").is_none());
+
+        // record_event: kind only (NOT payload — would double-record)
+        let p = tool_call_payload(
+            "record_event",
+            &json!({"kind": "decision", "payload": {"content": "secret"}}),
+        );
+        assert_eq!(p["kind"], "decision");
+        assert!(
+            p.get("payload").is_none(),
+            "record_event payload must not double-record"
+        );
+
+        // Diagnostic tools: just {tool}
+        for diag in ["stats", "list_scopes", "export"] {
+            let p = tool_call_payload(diag, &json!({"limit": 100}));
+            assert_eq!(p["tool"], diag);
+            assert!(p.get("limit").is_none(), "{diag} must not leak args");
+        }
+
+        // Unknown tool: bare default, no args leak
+        let p = tool_call_payload("brand_new_tool", &json!({"secret": "xyz"}));
+        assert_eq!(p["tool"], "brand_new_tool");
+        assert!(
+            p.get("secret").is_none(),
+            "unknown tools must not leak args"
+        );
+    }
+
+    #[test]
+    fn tool_call_failed_payload_truncates_long_messages() {
+        let long = "x".repeat(800);
+        let p = tool_call_failed_payload("remember", "Internal", &long);
+        assert_eq!(p["tool"], "remember");
+        assert_eq!(p["error_kind"], "Internal");
+        let msg = p["message"].as_str().unwrap();
+        assert!(msg.len() <= FAILED_MESSAGE_CAP + 4); // +4 for the `…` UTF-8 bytes
+        assert!(msg.ends_with('…'));
+    }
+
+    #[test]
+    fn tool_call_failed_payload_short_message_is_verbatim() {
+        let p = tool_call_failed_payload("forget", "NotFound", "no such id");
+        assert_eq!(p["message"], "no such id");
     }
 }

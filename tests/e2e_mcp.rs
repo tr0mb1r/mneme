@@ -127,8 +127,8 @@ async fn full_mcp_handshake_and_tool_calls() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    // Phase 6 surface + switch_scope (v0.15): 12 tools.
-    assert_eq!(tool_names.len(), 12);
+    // Phase 6 + switch_scope (v0.15) + record_event (v0.2.4): 13 tools.
+    assert_eq!(tool_names.len(), 13);
     for expected in [
         "remember",
         "recall",
@@ -142,6 +142,7 @@ async fn full_mcp_handshake_and_tool_calls() {
         "list_scopes",
         "export",
         "switch_scope",
+        "record_event",
     ] {
         assert!(tool_names.contains(&expected), "missing tool {expected:?}");
     }

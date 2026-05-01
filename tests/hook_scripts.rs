@@ -60,28 +60,52 @@ fn session_start_hook_nudges_agent_to_read_procedural_and_context() {
 #[test]
 fn precompact_hook_nudges_agent_to_consolidate_before_compaction() {
     let out = run_hook("precompact.sh");
-    for needle in ["summarize_session", "mneme.remember", "mneme.pin"] {
+    // v0.2.4 (ADR-0008) — the precompact nudge should walk the
+    // consolidation loop: summarize_session → record_event(kind="summary")
+    // → remember/pin for durable bits.
+    for needle in [
+        "summarize_session",
+        "mneme.record_event",
+        "mneme.remember",
+        "mneme.pin",
+    ] {
         assert!(
             out.contains(needle),
             "precompact nudge missing `{needle}`: full stdout was:\n{out}"
         );
     }
+    assert!(
+        out.contains("kind=\"summary\"") || out.contains("kind=\"summary\""),
+        "precompact nudge should mention `kind=\"summary\"` so the agent \
+         lands the digest in L3 via record_event. stdout:\n{out}"
+    );
 }
 
 #[test]
 fn stop_hook_is_permissive_about_no_op_turns() {
     let out = run_hook("stop.sh");
-    for needle in ["mneme.remember", "mneme.pin"] {
+    // v0.2.4 — the stop nudge should mention `record_event` (for
+    // conversation capture and curated semantic events) alongside
+    // the older `remember` / `pin` paths.
+    for needle in ["mneme.record_event", "mneme.remember", "mneme.pin"] {
         assert!(
             out.contains(needle),
             "stop nudge missing `{needle}`: full stdout was:\n{out}"
+        );
+    }
+    // Mention the canonical message kinds explicitly so the agent
+    // knows record_event captures conversation, not just curated events.
+    for needle in ["user_message", "assistant_message"] {
+        assert!(
+            out.contains(needle),
+            "stop nudge missing message kind `{needle}`: full stdout was:\n{out}"
         );
     }
     let lower = out.to_lowercase();
     assert!(
         lower.contains("transient") || lower.contains("do nothing") || lower.contains("noise"),
         "stop nudge must explicitly permit no-op for transient turns; \
-         otherwise the agent will spam `remember` calls. full stdout was:\n{out}"
+         otherwise the agent will spam tool calls. full stdout was:\n{out}"
     );
 }
 

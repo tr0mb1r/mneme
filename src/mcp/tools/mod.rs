@@ -18,6 +18,7 @@ use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
+use crate::memory::working::ActiveSession;
 use crate::scope::ScopeState;
 use crate::storage::Storage;
 use crate::storage::archive::ColdArchive;
@@ -28,6 +29,7 @@ pub mod list_scopes;
 pub mod pin;
 pub mod recall;
 pub mod recall_recent;
+pub mod record_event;
 pub mod remember;
 pub mod stats;
 pub mod summarize_session;
@@ -136,6 +138,7 @@ impl ToolRegistry {
             None,
             None,
             ScopeState::new("personal"),
+            None,
         )
     }
 
@@ -144,7 +147,10 @@ impl ToolRegistry {
     /// the `stats` tool reports their observability counters.
     /// `scope_state` is the per-process default-scope cell that
     /// `switch_scope` mutates and `remember` / `pin` consult on
-    /// argument fall-back.
+    /// argument fall-back. `active_session` is the L1 working session
+    /// that `record_event` mirrors message-kind events into (per
+    /// ADR-0008); pass `None` in test fixtures that don't need the
+    /// L1 surface.
     #[allow(clippy::too_many_arguments)]
     pub fn defaults_with_schedulers(
         semantic: Arc<SemanticStore>,
@@ -156,6 +162,7 @@ impl ToolRegistry {
         consolidation: Option<Arc<ConsolidationScheduler>>,
         checkpoints: Option<Arc<CheckpointScheduler>>,
         scope_state: Arc<ScopeState>,
+        active_session: Option<Arc<ActiveSession>>,
     ) -> Self {
         let mut r = Self::new();
         // L4 — semantic memory.
@@ -179,6 +186,16 @@ impl ToolRegistry {
         r.register(Arc::new(summarize_session::SummarizeSession::new(
             Arc::clone(&episodic),
         )));
+        // record_event — agent-driven L3 producer (ADR-0008). For
+        // message-kind events (user_message / assistant_message) the
+        // tool also pushes a turn to the active session, so L1
+        // captures conversation content rather than just tool names.
+        let mut record_event_tool =
+            record_event::RecordEvent::new(Arc::clone(&episodic), Arc::clone(&scope_state));
+        if let Some(ref session) = active_session {
+            record_event_tool = record_event_tool.with_active_session(Arc::clone(session));
+        }
+        r.register(Arc::new(record_event_tool));
         // Session state: switch_scope tool.
         r.register(Arc::new(switch_scope::SwitchScope::new(Arc::clone(
             &scope_state,
@@ -265,7 +282,7 @@ mod tests {
         let (r, _tmp) = fresh_registry();
         let names: Vec<_> = r.list().iter().map(|d| d.name).collect();
         // BTreeMap ordering across L0/L3/L4 + Phase 6 diagnostics
-        // + switch_scope (v0.15).
+        // + switch_scope (v0.15) + record_event (v0.2.4, ADR-0008).
         assert_eq!(
             names,
             vec![
@@ -275,6 +292,7 @@ mod tests {
                 "pin",
                 "recall",
                 "recall_recent",
+                "record_event",
                 "remember",
                 "stats",
                 "summarize_session",
