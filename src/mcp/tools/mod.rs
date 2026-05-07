@@ -171,7 +171,11 @@ impl ToolRegistry {
             Arc::clone(&scope_state),
         )));
         r.register(Arc::new(recall::Recall::new(Arc::clone(&semantic))));
-        r.register(Arc::new(forget::Forget::new(Arc::clone(&semantic))));
+        r.register(Arc::new(forget::Forget::new(
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+        )));
         r.register(Arc::new(update::Update::new(Arc::clone(&semantic))));
         // L0 — procedural memory.
         r.register(Arc::new(pin::Pin::new(

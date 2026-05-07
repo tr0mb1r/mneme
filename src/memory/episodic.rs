@@ -334,6 +334,30 @@ impl EpisodicStore {
         self.storage.delete(&epi_key(&id)).await
     }
 
+    /// Agent-driven point delete: remove an event from whichever live
+    /// tier holds it (hot, then warm). Returns `true` if anything was
+    /// deleted, `false` if the id wasn't present in either tier.
+    ///
+    /// Cold-archive entries are intentionally not reachable from here
+    /// — the cold quarter files are append-only by design and the
+    /// 180-day blast radius is a deliberate privacy floor (see the
+    /// privacy discipline note on `record_event`). If an event has
+    /// migrated past the warm tier the agent should treat it as
+    /// out-of-scope until v1.1's daemon channel.
+    pub async fn forget(&self, id: EventId) -> Result<bool> {
+        let hot = epi_key(&id);
+        if self.storage.get(&hot).await?.is_some() {
+            self.storage.delete(&hot).await?;
+            return Ok(true);
+        }
+        let warm = warm_key(&id);
+        if self.storage.get(&warm).await?.is_some() {
+            self.storage.delete(&warm).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Lookup an event in either the hot or warm tier. Returns `None`
     /// if it's not in redb (callers can fall back to the cold archive
     /// via `storage::archive::ColdArchive::find_anywhere`).
@@ -558,6 +582,32 @@ mod tests {
         assert!(s.get(id).await.unwrap().is_none());
         let hits = s.recall_recent(&RecentFilters::default(), 5).await.unwrap();
         assert!(hits.iter().all(|e| e.id != id));
+    }
+
+    #[tokio::test]
+    async fn forget_removes_from_hot_tier() {
+        let s = store();
+        let id = s.record("k", "p", "\"hot\"").await.unwrap();
+        assert!(s.forget(id).await.unwrap(), "should report deletion");
+        assert!(s.get(id).await.unwrap().is_none());
+        assert!(!s.forget(id).await.unwrap(), "second forget is a no-op");
+    }
+
+    #[tokio::test]
+    async fn forget_removes_from_warm_tier() {
+        let s = store();
+        let id = s.record("k", "p", "\"warm\"").await.unwrap();
+        assert!(s.promote_to_warm(id).await.unwrap());
+        assert!(s.get(id).await.unwrap().is_none(), "no longer hot");
+        assert!(s.forget(id).await.unwrap(), "warm tier delete reported");
+        assert_eq!(s.count_warm().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn forget_unknown_id_returns_false() {
+        let s = store();
+        let absent = EventId::new();
+        assert!(!s.forget(absent).await.unwrap());
     }
 
     /// Exit-criterion preview from plan §3 Phase 4: backdated events
