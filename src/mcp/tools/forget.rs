@@ -35,14 +35,14 @@ arguments are reserved for a future bulk-delete tool and currently \
 return an error. Deletion is permanent — confirm with the user before \
 invoking.";
 
-pub struct Forget {
+pub(crate) struct Forget {
     semantic: Arc<SemanticStore>,
     procedural: Arc<ProceduralStore>,
     episodic: Arc<EpisodicStore>,
 }
 
 impl Forget {
-    pub fn new(
+    pub(crate) fn new(
         semantic: Arc<SemanticStore>,
         procedural: Arc<ProceduralStore>,
         episodic: Arc<EpisodicStore>,

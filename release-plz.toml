@@ -73,4 +73,23 @@ changelog_update = true
 # Pre-1.0 release-plz interprets `feat!` / `BREAKING CHANGE` as a
 # 0.MINOR bump (Cargo's pre-1.0 SemVer convention); post-1.0 the same
 # triggers MAJOR.
-semver_check = true
+#
+# `semver_check` is OFF pre-1.0. The motivating false positive: v0.2.6
+# touched `Forget::new`'s arity to wire L0 + L3 stores into the
+# `forget` MCP tool. That constructor is internal (only called from
+# `src/mcp/tools/mod.rs::defaults_with_schedulers`), but it was
+# accidentally `pub`, so cargo-semver-checks classed the arity change
+# as a public-API break and release-plz proposed a 0.3.0 MINOR bump
+# for what is plainly a PATCH-shaped bug fix. Repeat misfires would
+# erode the meaningful signal and force noisy ad-hoc bumps.
+#
+# The contract that actually matters pre-1.0 is the MCP wire surface
+# documented in `book/src/mcp-surface.md` (13 tools + 5 resources,
+# frozen for v1.0 per pin 01KQM0VE4BW95RYKWD1SEEHXCP). The Rust
+# library API has no external consumers — the crate publishes a
+# binary, not a library worth depending on. Re-enable `semver_check`
+# at the v1.0 cutover, when the Rust API surface freezes alongside
+# the MCP one. Internal tool constructors should be `pub(crate)` going
+# forward (see `Forget` in `src/mcp/tools/forget.rs` for the pattern)
+# so they don't leak into the apparent public surface either way.
+semver_check = false
