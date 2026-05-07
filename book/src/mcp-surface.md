@@ -11,7 +11,7 @@ and 5 resources. This page is the canonical inventory.
 |------|-------|----------|
 | `remember` | L4 semantic | The user shares a fact, decision, or preference that should persist across sessions. |
 | `update` | L4 semantic | The user revises an existing memory; re-embeds automatically when `content` changes. |
-| `forget` | L4 semantic | The user explicitly asks to remove a memory. Confirm before calling. |
+| `forget` | L4 semantic, L0 procedural, L3 episodic (hot+warm) | The user explicitly asks to remove a memory. `id=…` resolves the ULID across all three layers, first hit wins; cold-archive entries stay out of reach by design. Confirm before calling. |
 | `pin` | L0 procedural | A *rule* should surface on every recall context (e.g. "always use `uv`, not `pip`"). |
 | `unpin` | L0 procedural | A previously-pinned rule no longer applies. |
 | `record_event` | L3 episodic (+ L1 mirror for message kinds) | Capture a structured event with a free-form `kind`. Use `user_message`/`assistant_message` for conversation turns; `decision`/`milestone`/`pivot`/etc. for curated semantic events; `summary` after `summarize_session` to land a digest. See [§Event kinds](#event-kinds) below. |

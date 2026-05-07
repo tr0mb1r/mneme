@@ -39,8 +39,10 @@ you want a different default for write tools (`remember`, `pin`,
   populated.
 - `mneme.update(id, ...)` — revise an existing memory; auto-re-embeds
   if `content` changes.
-- `mneme.forget(id)` — permanent delete. **Always confirm with the user
-  before calling.**
+- `mneme.forget(id)` — permanent delete. Resolves the ULID across L4
+  semantic, L0 procedural, and L3 episodic (hot+warm tiers); first hit
+  wins. Cold-archive entries are not reachable. **Always confirm with the
+  user before calling.**
 - `mneme.summarize_session(session_id)` — returns a prompt template
   populated with recent L3 events. Feed it through your own completion
   path, then land the digest via `record_event(kind="summary",

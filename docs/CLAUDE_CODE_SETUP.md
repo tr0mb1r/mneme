@@ -200,7 +200,8 @@ Keep the single `~/.mneme/` palace and pass `scope` in tool calls:
 Use remember with content "<fact>", scope "myrepo".
 ```
 
-`recall` and `forget` accept the same `scope` argument. Use
+`recall` accepts a `scope` argument as a filter; `forget(id=…)`
+resolves the ULID across every layer regardless of scope. Use
 `list_scopes` to see what buckets exist. The default scope is set in
 `~/.mneme/config.toml` under `[scopes] default = "personal"`.
 
