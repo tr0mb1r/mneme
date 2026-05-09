@@ -68,6 +68,34 @@ this on a current build, the symlink chain in `~/.mneme/models/` is
 unusual; report with the full path listing
 (`ls -la ~/.mneme/models/`).
 
+## Where did `~/.mneme/diagnostics.log` come from?
+
+v1.1's first boot against an existing data directory runs a one-shot
+upgrade audit (release-planning v2.1 §5.3). It scans L4 once for
+memories above `[budgets].max_remember_chars` (default 10,000) and
+appends a passive summary to `~/.mneme/diagnostics.log`. Format:
+
+```
+2026-05-09T12:34:56+00:00 v1.1 upgrade audit | max_remember_chars=10000 | total=1234 normal=1180 advisory=45 warning=8 over_limit=1
+  over-limit memory IDs (use `mneme inspect <id>` to view; `mneme.forget` to remove if desired):
+    01HABC...
+  Existing oversized memories remain readable + recall-able (verbatim principle preserved). Only NEW writes/updates above 10000 chars are rejected by the `remember`/`update` tools.
+```
+
+Gated by `~/.mneme/run/upgrade-audit.done` so it runs at most once
+per data directory. **Existing oversized memories are NEVER
+auto-modified** — they remain `recall`-able. Only new writes/updates
+above the limit are rejected.
+
+To re-run the audit (e.g. after `mneme.forget`-ing oversized
+entries) delete the marker:
+
+```sh
+rm ~/.mneme/run/upgrade-audit.done
+```
+
+The next `mneme run` will scan again and append a fresh entry.
+
 ## Diagnosing scheduler health
 
 `mneme://stats` (or `mneme stats`) surfaces:

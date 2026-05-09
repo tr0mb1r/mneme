@@ -14,6 +14,25 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **First-boot upgrade audit writes `~/.mneme/diagnostics.log`** (Q4
+  of release-planning v2.1 §5.3 + §6.2; Invariant 7 of pin
+  `01KR5ZB7ED01HADZXZKKBV882Z`). On v1.1's first boot against an
+  existing data directory, scans L4 once for memories exceeding
+  `[budgets].max_remember_chars` and appends a passive summary
+  (per-tier counts + IDs of over-limit entries) to
+  `~/.mneme/diagnostics.log`. Gated by
+  `~/.mneme/run/upgrade-audit.done` — runs at most once per data
+  directory; deleting the marker forces a re-audit. PASSIVE
+  notification only — existing memories are NEVER auto-modified
+  (verbatim principle). v1.0 users upgrading can locate any
+  pre-existing oversized memories via the log without spelunking;
+  the C.M2 enforcement only gates new writes. Module
+  `src/upgrade_audit.rs` consumes the same
+  `size_tier::count_corpus` helper that powers `mneme://stats`'s
+  `large_memory_count` field, so the audit log + the live stats
+  view share one classifier — no risk of classification drift.
+  `book/src/troubleshooting.md` documents the log format + how to
+  re-trigger.
 - **`mneme://stats` and `mneme stats` report `memories.large_memory_count`**
   (C.M3 of release-planning v2.1 §5.6). New
   `size_tier::count_corpus` walks the L4 `mem:` prefix on every

@@ -141,6 +141,37 @@ pub fn execute() -> Result<()> {
     // `size_tier` are fixed.
     let max_remember_chars = config.budgets.max_remember_chars;
 
+    // First-boot upgrade audit (release-planning §5.3, Invariant 7).
+    // Scans L4 once for memories above max_remember_chars and writes
+    // a passive summary to ~/.mneme/diagnostics.log so users
+    // upgrading from v1.0 (which accepted arbitrary-size content)
+    // can find oversized entries without spelunking. Gated by
+    // ~/.mneme/run/upgrade-audit.done — runs at most once per data
+    // dir. Existing memories are NEVER auto-modified (verbatim
+    // principle). Best-effort: log + continue on error rather than
+    // refuse to boot — the audit is informational, not load-bearing.
+    match runtime.block_on(crate::upgrade_audit::run_if_needed(
+        &root,
+        &storage_dyn,
+        max_remember_chars,
+    )) {
+        Ok(crate::upgrade_audit::AuditOutcome::AlreadyDone) => {}
+        Ok(crate::upgrade_audit::AuditOutcome::Ran(stats)) => {
+            tracing::info!(
+                total = stats.total(),
+                normal = stats.normal,
+                advisory = stats.advisory,
+                warning = stats.warning,
+                over_limit = stats.over_limit,
+                log_path = %crate::upgrade_audit::diagnostics_log_path(&root).display(),
+                "v1.1 first-boot upgrade audit complete"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "v1.1 first-boot upgrade audit failed; continuing");
+        }
+    }
+
     // Spawn the L3 consolidation scheduler. Watches the semantic +
     // episodic activity counters for idle windows; fires
     // `consolidation::run` on the configured cadence so hot-tier
