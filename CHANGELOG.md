@@ -14,6 +14,31 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **D.M2: `mneme demo` walkthrough command**
+  (release-planning v2.1 §7.2, task #22). New `mneme demo`
+  CLI subcommand prints a 4-pattern walkthrough to stdout
+  covering the v1.1 memory surface end-to-end:
+    1. Cross-session recall (the Vim-keybindings example shared
+       with the post-install prompt — same wording, expanded
+       narrative).
+    2. `record_event` for time-anchored decisions / problems /
+       milestones with the canonical kinds list.
+    3. `pin` for binding rules ("always X" / "never Y") +
+       guidance on the pin-vs-remember boundary.
+    4. `mneme://context` — what the agent sees on first turn,
+       per-layer scoring weights, how to read the inputs from
+       a shell.
+  Pure text output — no live MCP traffic, no storage writes,
+  no subprocess. Users pair the walkthrough with a real Claude
+  Code session to see the patterns work end-to-end. Per the
+  pre-committed cut order (pin `01KR5ZB7ED01HADZXZKKBV882Z`),
+  this command is the explicit cut candidate if September
+  slips — but the implementation is bounded, the post-install
+  prompt covers the load-bearing first-run flow either way,
+  and the standalone command lets users come back to the
+  patterns after the initial install. Subcommand count goes
+  9 → 10. One smoke test pins "runs to completion without
+  error"; specific wording is not test-pinned (will iterate).
 - **D.M3 partial: v1.1 troubleshooting guide expansion**
   (release-planning v2.1 §7.1, partial task #23). Extends
   `book/src/troubleshooting.md` with three new sections covering

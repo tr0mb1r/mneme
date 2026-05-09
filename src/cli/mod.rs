@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 pub mod auth;
 pub mod backup;
 pub mod daemon;
+pub mod demo;
 pub mod export;
 pub mod init;
 pub mod inspect;
@@ -98,6 +99,12 @@ pub enum Command {
         #[arg(long)]
         include_models: bool,
     },
+    /// Print a 4-pattern walkthrough of the v1.1 memory surface
+    /// (remember/recall, record_event, pin, mneme://context).
+    /// Pure text — pair it with a real Claude Code session to
+    /// see the patterns work end-to-end. Complements
+    /// `mneme init claude-code`'s post-install prompt.
+    Demo,
     /// Daemon auth-token administration (ADR-0012 D3/D4).
     /// `mneme auth rotate` regenerates the token at
     /// `~/.mneme/run/auth.token` (atomic; existing connections
@@ -135,6 +142,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             output,
             include_models,
         } => backup::execute(output, include_models),
+        Command::Demo => demo::execute(),
         Command::Auth { command } => match command {
             AuthCommand::Rotate => auth::rotate(),
             AuthCommand::ShowPath => auth::show_path(),
