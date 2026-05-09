@@ -120,6 +120,20 @@ the work that landed before automation was wired up.
 
 ### Fixed
 
+- **`[scopes] default` now defaults to `"global"`, not `"personal"`.**
+  `src/config.rs::default_scope()` returned `"personal"` since v0.x,
+  which contradicted the cross-project convention that "global" is
+  the right default for any rule, identity fact, or preference that
+  isn't tied to a single project. Fresh installs and the
+  silent-default-fallback path (when `~/.mneme/config.toml` is
+  missing) now both land on `"global"`. Pre-1.1.x users with
+  `default = "personal"` literally written to their config.toml are
+  unaffected — `Config::load` reads what's on disk; this only changes
+  the in-binary default that fills missing fields. The two
+  `defaults_match_spec` and `partial_file_inherits_defaults` tests
+  in `src/config.rs` are updated accordingly. `mneme init`'s
+  starter config.toml will now ship `default = "global"`.
+
 - **Daemon auth-token rotation now actually takes effect mid-session
   (ADR-0012 D3 regression caught by A.M5 test).** A.M4's first
   enforcement commit (commit 7273255) snapshotted the token in

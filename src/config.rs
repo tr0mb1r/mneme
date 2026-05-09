@@ -180,7 +180,7 @@ fn default_consolidation_schedule() -> String {
     "idle".into()
 }
 fn default_scope() -> String {
-    "personal".into()
+    "global".into()
 }
 fn default_mcp_transport() -> String {
     "stdio".into()
@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(c.embeddings.batch_size, 32);
         assert_eq!(c.consolidation.hot_to_warm_days, 28);
         assert_eq!(c.consolidation.warm_to_cold_days, 180);
-        assert_eq!(c.scopes.default, "personal");
+        assert_eq!(c.scopes.default, "global");
         assert_eq!(c.mcp.transport, "stdio");
         assert_eq!(c.mcp.sse_port, 7878);
         assert_eq!(c.budgets.default_recall_limit, 10);
@@ -399,6 +399,6 @@ mod tests {
         assert_eq!(c.storage.max_size_gb, 50);
         // Other fields fall back to defaults.
         assert_eq!(c.embeddings.model, "bge-m3");
-        assert_eq!(c.scopes.default, "personal");
+        assert_eq!(c.scopes.default, "global");
     }
 }
