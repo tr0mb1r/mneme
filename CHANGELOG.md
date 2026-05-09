@@ -14,6 +14,30 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **A.M3 first commit: long-running multi-client accept loop**
+  (release-planning v2.1 §3.9, ADR-0012 D8). New
+  `TransportMode::DaemonServeMany` replaces the M2 single-shot
+  daemon: bind, spawn a per-connection tokio task on every accept,
+  serve concurrently. Storage writes serialise through the existing
+  single-writer seam — no new concurrency primitives needed
+  (ADR-0012 D8). Registries (tool + resource) are built once per
+  process and `Arc::clone`d into each connection task; storage and
+  scheduler handles likewise. Per-connection `Server` instances use
+  the concrete `OwnedReadHalf` / `OwnedWriteHalf` types directly
+  (Send + Sync, unlike the boxed-trait stdio path) so
+  `tokio::spawn` can lift the future. The loop exits on
+  SIGTERM/Ctrl-C via the existing `shutdown_signal()` handler;
+  in-flight tasks are aborted with the runtime (graceful drain
+  lands in a follow-up M3 commit). `mneme daemon` switches from
+  `DaemonAcceptOne` to `DaemonServeMany` — `DaemonAcceptOne` is
+  retained as a debugging / single-shot test mode. New
+  `tests/daemon_e2e.rs::daemon_serves_two_clients_concurrently`
+  exercises the multi-client path; the existing single-client +
+  second-daemon-refused tests gain SIGTERM-driven shutdown via
+  `libc::kill(pid, SIGTERM)` since the daemon no longer auto-exits
+  on client EOF. Pending M3 follow-ups: idle-timeout shutdown
+  (D6), SSE keepalive (D7), graceful-drain on SIGTERM. M4 still
+  owns auth verification (D3) + Windows named-pipe (D2/D9).
 - **CI perf regression gate** (Q3 of release-planning v2.1 §6.2,
   task #18). New `.github/workflows/perf.yml` runs the four
   hot-path criterion benches on every push / PR that touches

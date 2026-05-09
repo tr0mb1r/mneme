@@ -44,12 +44,10 @@ use crate::{MnemeError, migrate};
 const EMBEDDER_OVERRIDE_ENV: &str = "MNEME_EMBEDDER";
 
 /// Which transport the MCP server speaks. The boot path
-/// ([`execute_with_mode`]) is identical for both modes — only the
-/// reader/writer pair fed to `Server::new` differs. M2 (this code)
-/// ships single-client semantics for the daemon mode: bind, accept
-/// ONE connection, serve until EOF, exit. M3 will expand
-/// `DaemonAcceptOne` into a long-running multi-connection accept
-/// loop with idle-timeout shutdown (ADR-0012 D6).
+/// ([`execute_with_mode`]) is identical for every mode — only the
+/// reader/writer pair fed to `Server::new` differs. The `Daemon*`
+/// variants share registry construction across connections via Arc;
+/// per-connection auth verification (ADR-0012 D3) lands in M4.
 #[derive(Debug)]
 pub enum TransportMode {
     /// Read JSON-RPC frames from stdin, write replies to stdout.
@@ -58,10 +56,22 @@ pub enum TransportMode {
     Stdio,
     /// Bind `<root>/run/mneme.sock`, accept exactly one client
     /// connection, then drop the listener (RAII unlinks the socket
-    /// file). Serve the accepted stream until EOF. Per-connection
-    /// auth-token verification (D3) and multi-client lifecycle (D6,
-    /// D7) land in M4 / M3 respectively.
+    /// file). Serve the accepted stream until EOF. Used by M2's
+    /// `daemon_e2e` baseline test and as a debugging aid; production
+    /// `mneme daemon` uses [`Self::DaemonServeMany`].
     DaemonAcceptOne,
+    /// M3 production daemon mode (ADR-0012 D2/D6/D7). Bind
+    /// `<root>/run/mneme.sock` and run a long-running accept loop:
+    /// every accepted connection is spawned as its own tokio task
+    /// that builds a `Server` wrapping the socket halves and runs
+    /// until EOF. The accept loop terminates only on
+    /// SIGTERM/Ctrl-C or process death. Multiple clients are served
+    /// concurrently; storage writes serialise through the existing
+    /// single-writer seam (ADR-0012 D8). Idle-timeout shutdown
+    /// (D6 — auto-exit after `[daemon] idle_timeout_minutes` with
+    /// no clients) and SSE keepalive (D7) land in following M3
+    /// commits.
+    DaemonServeMany,
 }
 
 pub fn execute() -> Result<()> {
@@ -348,18 +358,103 @@ async fn async_main(
         tracing::warn!(error = %e, "failed to record session_start event");
     }
 
-    // Build the transport reader/writer pair. Boxed trait objects
-    // so both stdio and accepted-socket halves produce the same
-    // concrete `StdioTransport<Box<...>, Box<...>>` type — single
-    // monomorphisation of `Server::new` for both modes. The boxed
-    // dispatch is a per-syscall virtual call, negligible against
-    // JSON-RPC frame parsing + storage IO.
+    // Boxed trait objects so every transport variant produces the
+    // same concrete `StdioTransport<Box<...>, Box<...>>` type — one
+    // monomorphisation of `Server::new` regardless of mode. Per-
+    // syscall virtual call cost is negligible against JSON-RPC
+    // frame parsing + storage IO.
     type AsyncReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
     type AsyncWriter = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
-    let (reader, writer): (AsyncReader, AsyncWriter) = match mode {
+
+    // Build registries ONCE per process. `DaemonServeMany` Arc::clones
+    // them per accepted connection; the single-shot modes also use
+    // the shared instances so the construction cost (cheap, but
+    // not free — every `defaults_with_schedulers` Arc-wraps every
+    // tool/resource) lands once.
+    let tool_registry: Arc<ToolRegistry> = Arc::new(ToolRegistry::defaults_with_schedulers(
+        Arc::clone(&semantic),
+        Arc::clone(&procedural),
+        Arc::clone(&episodic),
+        Arc::clone(&storage),
+        cold.clone(),
+        schema_version,
+        Some(Arc::clone(&consolidation)),
+        Some(Arc::clone(&checkpoint_scheduler)),
+        Arc::clone(&scope_state),
+        Some(Arc::clone(&active_session)),
+        max_remember_chars,
+    ));
+    let resource_registry: Arc<ResourceRegistry> =
+        Arc::new(ResourceRegistry::defaults_with_schedulers(
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+            orchestrator,
+            cold.clone(),
+            schema_version,
+            auto_context_budget,
+            Some(Arc::clone(&consolidation)),
+            Some(Arc::clone(&checkpoint_scheduler)),
+            Some(Arc::clone(&active_session)),
+            Some(sessions_dir),
+            Some(Arc::clone(&scope_state)),
+            Some((Arc::clone(&storage), max_remember_chars)),
+        ));
+
+    // Per-connection helper: build the Server for a transport pair
+    // and run it until EOF. Used by every mode; the `with_signal`
+    // flag wraps `server.run()` in a `tokio::select!` against
+    // shutdown_signal so single-shot modes can exit on SIGTERM
+    // mid-serve. `DaemonServeMany` passes `false` because the
+    // outer accept loop owns the signal.
+    let serve_one = |reader: AsyncReader,
+                     writer: AsyncWriter,
+                     with_signal: bool,
+                     tool: Arc<ToolRegistry>,
+                     resource: Arc<ResourceRegistry>,
+                     storage: Arc<dyn Storage>,
+                     active_session: Arc<ActiveSession>,
+                     checkpoint_scheduler: Arc<CheckpointScheduler>,
+                     episodic: Arc<EpisodicStore>,
+                     scope_state: Arc<ScopeState>| {
+        async move {
+            let transport = StdioTransport::new(reader, writer);
+            let mut server = Server::new(transport, tool, resource, storage).with_session(
+                active_session,
+                checkpoint_scheduler,
+                episodic,
+                scope_state,
+            );
+            if with_signal {
+                tokio::select! {
+                    result = server.run() => result?,
+                    _ = shutdown_signal() => {
+                        tracing::info!("shutdown signal received");
+                    }
+                }
+            } else {
+                server.run().await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    };
+
+    match mode {
         TransportMode::Stdio => {
             tracing::info!("transport=stdio: reading frames from stdin");
-            (Box::new(tokio::io::stdin()), Box::new(tokio::io::stdout()))
+            serve_one(
+                Box::new(tokio::io::stdin()),
+                Box::new(tokio::io::stdout()),
+                true,
+                Arc::clone(&tool_registry),
+                Arc::clone(&resource_registry),
+                Arc::clone(&storage),
+                Arc::clone(&active_session),
+                Arc::clone(&checkpoint_scheduler),
+                Arc::clone(&episodic),
+                Arc::clone(&scope_state),
+            )
+            .await?;
         }
         TransportMode::DaemonAcceptOne => {
             let listener = crate::daemon::bind_listener(&root)
@@ -370,66 +465,129 @@ async fn async_main(
                     .path()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
-                "transport=daemon: listener bound; awaiting first client"
+                "transport=daemon-accept-one: listener bound; awaiting first client"
             );
             let (stream, _addr) = listener.as_inner().accept().await?;
             tracing::info!(
-                "transport=daemon: client accepted; unbinding listener so the \
-                 socket file is gone before serving begins"
+                "transport=daemon-accept-one: client accepted; unbinding listener \
+                 so the socket file is gone before serving begins"
             );
-            // Drop the listener now — RAII unlinks the socket file.
-            // The accepted stream is independent of the listener; we
-            // serve over the connected fd until EOF. Subsequent
-            // `mneme daemon` invocations see a clean filesystem.
             drop(listener);
             let (read, write) = stream.into_split();
-            (Box::new(read), Box::new(write))
+            serve_one(
+                Box::new(read),
+                Box::new(write),
+                true,
+                Arc::clone(&tool_registry),
+                Arc::clone(&resource_registry),
+                Arc::clone(&storage),
+                Arc::clone(&active_session),
+                Arc::clone(&checkpoint_scheduler),
+                Arc::clone(&episodic),
+                Arc::clone(&scope_state),
+            )
+            .await?;
         }
-    };
-    let transport = StdioTransport::new(reader, writer);
-    let mut server = Server::new(
-        transport,
-        Arc::new(ToolRegistry::defaults_with_schedulers(
-            Arc::clone(&semantic),
-            Arc::clone(&procedural),
-            Arc::clone(&episodic),
-            Arc::clone(&storage),
-            cold.clone(),
-            schema_version,
-            Some(Arc::clone(&consolidation)),
-            Some(Arc::clone(&checkpoint_scheduler)),
-            Arc::clone(&scope_state),
-            Some(Arc::clone(&active_session)),
-            max_remember_chars,
-        )),
-        Arc::new(ResourceRegistry::defaults_with_schedulers(
-            semantic,
-            procedural,
-            Arc::clone(&episodic),
-            orchestrator,
-            cold,
-            schema_version,
-            auto_context_budget,
-            Some(consolidation),
-            Some(Arc::clone(&checkpoint_scheduler)),
-            Some(Arc::clone(&active_session)),
-            Some(sessions_dir),
-            Some(Arc::clone(&scope_state)),
-            Some((Arc::clone(&storage), max_remember_chars)),
-        )),
-        storage,
-    )
-    .with_session(
-        Arc::clone(&active_session),
-        checkpoint_scheduler,
-        Arc::clone(&episodic),
-        Arc::clone(&scope_state),
-    );
+        TransportMode::DaemonServeMany => {
+            let listener = crate::daemon::bind_listener(&root)
+                .await
+                .map_err(|e| anyhow::anyhow!("daemon listener bind failed: {e}"))?;
+            tracing::info!(
+                socket = %listener
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                "transport=daemon-serve-many: listener bound; serving until SIGTERM"
+            );
 
-    tokio::select! {
-        result = server.run() => result?,
-        _ = shutdown_signal() => {
-            tracing::info!("shutdown signal received");
+            // Track in-flight connection count so future commits
+            // (idle-timeout shutdown, graceful-drain on SIGTERM)
+            // have a counter to consult. Today it's read-only —
+            // the accept loop exits abruptly on signal and
+            // spawned tasks abort with the runtime.
+            let active_clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            // The spawned per-connection tasks need their futures
+            // to be `Send` for `tokio::spawn`. The boxed-trait-object
+            // pair we use for stdio doesn't satisfy `Sync` (Stdin
+            // isn't Sync), so spawning a `Server<Box<dyn _>, Box<dyn _>>`
+            // future fails the `Sync`-via-Send-of-`&Server` chain.
+            // The Unix socket's owned halves (`OwnedReadHalf` /
+            // `OwnedWriteHalf`) are themselves `Send + Sync` — passing
+            // them through directly skips the boxing problem and
+            // monomorphises a separate `Server` for socket
+            // connections.
+            tokio::select! {
+                _ = shutdown_signal() => {
+                    tracing::info!(
+                        active = active_clients.load(std::sync::atomic::Ordering::Relaxed),
+                        "transport=daemon-serve-many: shutdown signal received"
+                    );
+                }
+                _ = async {
+                    loop {
+                        match listener.as_inner().accept().await {
+                            Ok((stream, _addr)) => {
+                                let n = active_clients
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                    + 1;
+                                tracing::info!(
+                                    active = n,
+                                    "transport=daemon-serve-many: client accepted"
+                                );
+                                let (read, write) = stream.into_split();
+                                let tool = Arc::clone(&tool_registry);
+                                let resource = Arc::clone(&resource_registry);
+                                let storage = Arc::clone(&storage);
+                                let active_session_c = Arc::clone(&active_session);
+                                let checkpoint_c = Arc::clone(&checkpoint_scheduler);
+                                let episodic_c = Arc::clone(&episodic);
+                                let scope_c = Arc::clone(&scope_state);
+                                let counter = Arc::clone(&active_clients);
+                                tokio::spawn(async move {
+                                    // Concrete owned-half types →
+                                    // Server<OwnedReadHalf, OwnedWriteHalf>
+                                    // monomorphisation (separate from
+                                    // the boxed-trait-object stdio
+                                    // monomorphisation).
+                                    let transport = StdioTransport::new(read, write);
+                                    let mut server = Server::new(
+                                        transport,
+                                        tool,
+                                        resource,
+                                        storage,
+                                    )
+                                    .with_session(
+                                        active_session_c,
+                                        checkpoint_c,
+                                        episodic_c,
+                                        scope_c,
+                                    );
+                                    if let Err(e) = server.run().await {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "client serve loop ended with error"
+                                        );
+                                    }
+                                    let n = counter
+                                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+                                        - 1;
+                                    tracing::info!(
+                                        active = n,
+                                        "transport=daemon-serve-many: client disconnected"
+                                    );
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "accept error; continuing");
+                            }
+                        }
+                    }
+                    // Unreachable, but the future has to type-check.
+                    #[allow(unreachable_code)]
+                    Ok::<(), anyhow::Error>(())
+                } => {}
+            }
         }
     }
 

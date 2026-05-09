@@ -1,10 +1,7 @@
-//! v1.1 daemon end-to-end test (release-planning §3.9 M2 release gate).
-//!
-//! Spawns `mneme daemon` as a subprocess, connects via Unix domain
-//! socket, runs the standard MCP initialize handshake, asserts the
-//! response shape, closes the connection, and confirms the daemon
-//! exits cleanly. This is the ADR-0012 "single client works
-//! end-to-end" criterion that gates A.M2 from M3 work.
+//! v1.1 daemon end-to-end tests covering A.M2 (single client) and
+//! A.M3 (multi-client + SIGTERM-driven shutdown). Per
+//! release-planning v2.1 §3.9 + ADR-0012, these are release gates
+//! for the daemon-mode track.
 //!
 //! Linux + macOS only (cfg(unix)) — Windows named-pipe support is M4
 //! per ADR-0012 D2/D9.
@@ -18,10 +15,20 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_mneme");
+
+/// Send SIGTERM to the daemon process. M3's `DaemonServeMany` mode
+/// runs forever until interrupted, so tests need an explicit kill.
+fn sigterm(child: &Child) {
+    let pid = child.id().expect("daemon has a PID") as i32;
+    // SAFETY: PID is the child we just spawned; SIGTERM is the
+    // signal the daemon's `shutdown_signal()` handler installs.
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    assert_eq!(rc, 0, "kill(SIGTERM, {pid}) must succeed");
+}
 
 /// Poll for the socket file to appear; the daemon performs boot work
 /// (storage open, embed migrate, audit, scheduler spawn) before
@@ -110,25 +117,117 @@ async fn daemon_serves_one_client_end_to_end() {
     assert_eq!(payload["result"]["protocolVersion"], "2025-06-18");
     assert!(payload["result"]["capabilities"]["tools"].is_object());
 
-    // Daemon should exit on its own once the client closes. Bound
-    // wait so a hung shutdown is loud rather than silent.
+    // M3 multi-client mode: the daemon does NOT exit on a single
+    // client EOF — it loops on accept waiting for the next client.
+    // Send SIGTERM and verify the shutdown_signal() handler exits
+    // cleanly within 10 s.
+    sigterm(&daemon);
     let exit_status = timeout(Duration::from_secs(10), daemon.wait())
         .await
-        .expect("daemon exited within 10 s")
+        .expect("daemon exited within 10 s of SIGTERM")
         .expect("daemon wait succeeded");
     assert!(
         exit_status.success(),
-        "daemon exited non-zero: {exit_status:?}"
+        "daemon exited non-zero on SIGTERM: {exit_status:?}"
     );
 
-    // Post-exit: socket file must be gone (RAII unlink fires when
-    // the listener was dropped pre-serve, but we verify here as a
-    // belt-and-suspenders check).
+    // Post-exit: the listener's RAII unlink runs as the future is
+    // dropped, so the socket file must be gone.
     assert!(
         !socket.exists(),
         "socket file {} should not exist after daemon exit",
         socket.display()
     );
+}
+
+/// Two clients connect concurrently, both run the initialize
+/// handshake and get distinct correct responses, then close. The
+/// daemon serves them in parallel via tokio::spawn (M3
+/// DaemonServeMany). Then we SIGTERM and confirm clean exit.
+#[tokio::test]
+async fn daemon_serves_two_clients_concurrently() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    let socket = data_dir.join("run").join("mneme.sock");
+
+    let mut daemon = Command::new(BINARY)
+        .arg("daemon")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .env("MNEME_EMBEDDER", "stub")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mneme daemon");
+
+    wait_for_socket(&socket).await;
+
+    async fn one_handshake(socket: &Path, client_label: &str) -> serde_json::Value {
+        let mut stream = UnixStream::connect(socket)
+            .await
+            .unwrap_or_else(|_| panic!("client {client_label} connect"));
+        let init = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": client_label, "version": "1" },
+            },
+        })
+        .to_string();
+        stream.write_all(init.as_bytes()).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+        let initialized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        })
+        .to_string();
+        stream.write_all(initialized.as_bytes()).await.unwrap();
+        stream.write_all(b"\n").await.unwrap();
+
+        let (read, write) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        let mut response = String::new();
+        timeout(Duration::from_secs(5), reader.read_line(&mut response))
+            .await
+            .unwrap_or_else(|_| panic!("client {client_label} response timeout"))
+            .unwrap_or_else(|_| panic!("client {client_label} response read err"));
+        drop(write);
+        drop(reader);
+        serde_json::from_str(response.trim())
+            .unwrap_or_else(|_| panic!("client {client_label} response parse"))
+    }
+
+    // Run two handshakes concurrently against the same daemon.
+    let (a, b) = tokio::join!(
+        one_handshake(&socket, "client-A"),
+        one_handshake(&socket, "client-B")
+    );
+    assert_eq!(a["jsonrpc"], "2.0");
+    assert_eq!(a["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(b["jsonrpc"], "2.0");
+    assert_eq!(b["result"]["protocolVersion"], "2025-06-18");
+
+    // Daemon stays alive after both clients close — verify by
+    // connecting a third client. (Bounded so we don't hang if the
+    // daemon shut down unexpectedly.)
+    let third = timeout(Duration::from_secs(2), UnixStream::connect(&socket))
+        .await
+        .expect("third connect within 2 s")
+        .expect("third connect ok");
+    drop(third);
+
+    // Now SIGTERM and confirm clean shutdown.
+    sigterm(&daemon);
+    let exit_status = timeout(Duration::from_secs(10), daemon.wait())
+        .await
+        .expect("daemon exited within 10 s of SIGTERM")
+        .expect("daemon wait succeeded");
+    assert!(exit_status.success(), "{exit_status:?}");
+    assert!(!socket.exists(), "socket should be gone post-exit");
 }
 
 #[tokio::test]
@@ -173,10 +272,8 @@ async fn second_daemon_against_same_data_dir_refuses_to_start() {
         output.status
     );
 
-    // Connect a real client to the first daemon so its accept
-    // returns and it shuts down — keeps the test from leaking a
-    // process across runs.
-    let stream = UnixStream::connect(&socket).await.expect("connect to first");
-    drop(stream);
+    // SIGTERM the first daemon so the test doesn't leak a
+    // background process across runs.
+    sigterm(&first);
     let _ = timeout(Duration::from_secs(10), first.wait()).await;
 }
