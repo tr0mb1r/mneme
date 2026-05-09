@@ -563,3 +563,119 @@ async fn token_rotation_mid_session_preserves_existing_connection() {
         .expect("daemon wait succeeded");
     assert!(exit_status.success(), "{exit_status:?}");
 }
+
+/// Per-connection isolation per ADR-0012 D8: a client crashing
+/// mid-conversation does NOT affect other clients connected to
+/// the same daemon. Each connection runs in its own tokio task;
+/// dropping one task's transport must not poison the storage
+/// seam or wedge the accept loop.
+///
+/// Sequence:
+///   1. Start daemon.
+///   2. Client A connects + authenticates + sends initialize.
+///   3. Client A's stream is dropped abruptly without closing
+///      the MCP session (simulates `kill -9` on the client side
+///      or a network partition).
+///   4. Client B connects + authenticates + sends initialize +
+///      `tools/call stats` and gets a normal response. Proves the
+///      daemon is unimpaired by client A's crash.
+///   5. SIGTERM, verify clean exit.
+#[tokio::test]
+async fn client_crash_does_not_affect_other_clients() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    let socket = data_dir.join("run").join("mneme.sock");
+
+    let mut daemon = Command::new(BINARY)
+        .arg("daemon")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .env("MNEME_EMBEDDER", "stub")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mneme daemon");
+    wait_for_socket(&socket).await;
+
+    let auth = auth_line(data_dir);
+
+    // Step 2: Client A — authenticate, send initialize, then
+    // drop the stream abruptly without reading the response.
+    {
+        let mut client_a = UnixStream::connect(&socket).await.unwrap();
+        client_a.write_all(auth.as_bytes()).await.unwrap();
+        client_a
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"client-A-crash","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+"#,
+            )
+            .await
+            .unwrap();
+        // Step 3: Drop without `shutdown()` — simulates a
+        // crashed client that vanished without closing cleanly.
+        // The OS drops the fd; the daemon sees EOF on its read
+        // half some indeterminate time later and tears the
+        // connection task down.
+        drop(client_a);
+    }
+
+    // Give the daemon a moment to process the dropped connection
+    // (decrement active counter, log the disconnect). 200 ms is
+    // generous on local IPC.
+    sleep(Duration::from_millis(200)).await;
+
+    // Step 4: Client B — full handshake + tools/call stats. The
+    // response proves the daemon is unimpaired.
+    let mut client_b = UnixStream::connect(&socket).await.unwrap();
+    client_b.write_all(auth.as_bytes()).await.unwrap();
+    client_b
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"client-B-survivor","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"stats","arguments":{}}}
+"#,
+        )
+        .await
+        .unwrap();
+
+    let (b_read, b_write) = client_b.into_split();
+    let mut b_reader = BufReader::new(b_read);
+
+    // Read the initialize response (id=1).
+    let mut line = String::new();
+    timeout(Duration::from_secs(5), b_reader.read_line(&mut line))
+        .await
+        .expect("client B initialize within 5s")
+        .expect("client B read ok");
+    let init: serde_json::Value = serde_json::from_str(line.trim()).expect("init JSON");
+    assert_eq!(init["id"], 1);
+    assert!(init["result"]["protocolVersion"].is_string());
+
+    // Read the stats response (id=2).
+    let mut line = String::new();
+    timeout(Duration::from_secs(5), b_reader.read_line(&mut line))
+        .await
+        .expect("client B stats within 5s")
+        .expect("client B stats read ok");
+    let stats: serde_json::Value = serde_json::from_str(line.trim()).expect("stats JSON");
+    assert_eq!(stats["id"], 2);
+    assert!(
+        stats["result"]["content"][0]["text"].is_string(),
+        "stats response shape unchanged after client A crash, got {stats:?}"
+    );
+
+    drop(b_write);
+    drop(b_reader);
+
+    sigterm(&daemon);
+    let exit_status = timeout(Duration::from_secs(10), daemon.wait())
+        .await
+        .expect("daemon exited within 10s of SIGTERM")
+        .expect("daemon wait succeeded");
+    assert!(
+        exit_status.success(),
+        "daemon must exit cleanly post-client-crash: {exit_status:?}"
+    );
+}

@@ -12,6 +12,22 @@ the work that landed before automation was wired up.
 
 ## [Unreleased] — develop track (v1.1)
 
+### Added
+
+- **A.M5 partial: client-crash isolation test**
+  (release-planning v2.1 §3.9 M5, partial task #8). New
+  `tests/daemon_e2e.rs::client_crash_does_not_affect_other_clients`
+  pins ADR-0012 D8's per-connection isolation guarantee:
+  client A authenticates, sends initialize, then drops its
+  socket abruptly without sending the standard MCP shutdown
+  (simulates `kill -9` on the client side or a network
+  partition). Client B then connects, authenticates, sends a
+  full initialize + tools/call stats sequence and gets normal
+  responses. Proves the daemon's accept loop and the storage
+  seam are unimpaired by client A's vanish — each connection
+  task is independent. Daemon SIGTERM still produces a clean
+  exit. 7 daemon_e2e tests pass.
+
 ### Fixed
 
 - **Daemon auth-token rotation now actually takes effect mid-session
