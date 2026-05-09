@@ -135,15 +135,63 @@ fn install(paths: &Paths) -> Result<(), AgentError> {
         Ok(())
     })?;
 
-    eprintln!(
-        "mneme installed for Claude Code under {}",
-        paths
-            .settings
-            .parent()
-            .map(Path::display)
-            .map_or_else(|| "(unknown)".to_owned(), |d| d.to_string())
-    );
+    print_post_install(paths);
     Ok(())
+}
+
+/// First-run prompt (release-planning v2.1 §7.2 / D.M1). The
+/// post-install message is what the user sees after a successful
+/// install; per §7.2 the design goal is "every new user
+/// experiences memory recall within their first 5 minutes" — so
+/// the message names what was wired, the next concrete action
+/// (restart Claude Code), a 2-message conversation that
+/// demonstrates recall across sessions, and the verification
+/// command. Kept on stderr so it doesn't pollute scripted
+/// pipelines that consume stdout.
+fn print_post_install(paths: &Paths) {
+    let claude_dir = paths
+        .settings
+        .parent()
+        .map(Path::display)
+        .map_or_else(|| "~/.claude".to_owned(), |d| d.to_string());
+    eprintln!();
+    eprintln!("✓ mneme installed for Claude Code at {claude_dir}");
+    eprintln!();
+    eprintln!("  Wired up:");
+    eprintln!(
+        "    • MNEME.md (your agent's memory guide)            {}",
+        paths.mneme_md.display()
+    );
+    eprintln!(
+        "    • mcpServers.mneme entry in settings.json         {}",
+        paths.settings.display()
+    );
+    eprintln!(
+        "    • Lifecycle hooks (SessionStart/PreCompact/Stop)  {}/",
+        paths.hooks_dir.display()
+    );
+    eprintln!(
+        "    • Marker block in CLAUDE.md (your existing content preserved)  {}",
+        paths.claude_md.display()
+    );
+    eprintln!();
+    eprintln!("  Next steps:");
+    eprintln!();
+    eprintln!("    1. Restart Claude Code so it picks up the new MCP server.");
+    eprintln!();
+    eprintln!("    2. Try this conversation to confirm memory works end-to-end:");
+    eprintln!();
+    eprintln!("       You: \"Remember that I prefer Vim keybindings.\"");
+    eprintln!("       (then quit and start a fresh Claude Code session)");
+    eprintln!("       You: \"What editor do I prefer?\"");
+    eprintln!();
+    eprintln!("       Claude should recall the preference via mneme.recall.");
+    eprintln!();
+    eprintln!("    3. To verify storage outside Claude Code:");
+    eprintln!("         mneme stats");
+    eprintln!();
+    eprintln!("  Reverse anytime with:  mneme init claude-code --uninstall");
+    eprintln!();
 }
 
 fn uninstall(paths: &Paths) -> Result<(), AgentError> {
@@ -200,7 +248,17 @@ fn uninstall(paths: &Paths) -> Result<(), AgentError> {
         let _ = std::fs::remove_dir(hooks_parent);
     }
 
-    eprintln!("mneme uninstalled from Claude Code");
+    eprintln!();
+    eprintln!("✓ mneme uninstalled from Claude Code");
+    eprintln!();
+    eprintln!("  Removed mneme's mcpServers entry, lifecycle hooks, MNEME.md, and the");
+    eprintln!("  marker block from CLAUDE.md. Your settings.json keeps every other");
+    eprintln!("  entry; CLAUDE.md keeps every line outside the marker.");
+    eprintln!();
+    eprintln!("  Restart Claude Code so the MCP server entry drops out of its session.");
+    eprintln!();
+    eprintln!("  Re-install anytime with:  mneme init claude-code");
+    eprintln!();
     Ok(())
 }
 

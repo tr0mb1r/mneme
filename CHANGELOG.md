@@ -12,6 +12,32 @@ the work that landed before automation was wired up.
 
 ## [Unreleased] — develop track (v1.1)
 
+### Changed
+
+- **D.M1: `mneme init claude-code` first-run prompt** (release-
+  planning v2.1 §7.2, task #21). Replaces the prior bare
+  "mneme installed for Claude Code under <path>" line with a
+  guided post-install message per §7.2's "every new user
+  experiences memory recall within their first 5 minutes"
+  design goal. Names what was wired (MNEME.md + mcpServers
+  entry + 3 hooks + marker block, with concrete paths), then
+  walks the user through the 3 next steps:
+    1. Restart Claude Code (MCP servers are session-bound, the
+       new entry only takes effect on the next launch).
+    2. A 2-message conversation that demonstrates recall across
+       sessions (per §7.2's example: "remember Vim", restart,
+       "what editor do I prefer?").
+    3. Out-of-Claude-Code verification via `mneme stats`.
+  Plus the reversal command. Symmetric post-uninstall message
+  documents what was removed + what's preserved (other
+  settings.json entries, CLAUDE.md content outside the marker)
+  so users know it's clean. Both go to stderr so scripted
+  pipelines that consume stdout aren't polluted. Per the
+  pre-committed cut order in pin
+  `01KR5ZB7ED01HADZXZKKBV882Z`, the post-init prompt stays
+  even if `mneme demo` standalone (D.M2) gets cut — this
+  commit lands the load-bearing piece.
+
 ### Added
 
 - **A.M4 second commit: daemon-side auth-token verification on
