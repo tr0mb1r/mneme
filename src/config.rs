@@ -21,6 +21,8 @@ pub struct Config {
     #[serde(default)]
     pub mcp: McpConfig,
     #[serde(default)]
+    pub daemon: DaemonConfig,
+    #[serde(default)]
     pub budgets: BudgetsConfig,
     #[serde(default)]
     pub checkpoints: CheckpointsConfig,
@@ -72,6 +74,35 @@ pub struct McpConfig {
     pub transport: String,
     #[serde(default = "default_sse_port")]
     pub sse_port: u16,
+}
+
+/// `[daemon]` — v1.1 daemon-mode tuning per ADR-0012. The daemon
+/// itself isn't fully wired yet (A.M2-M5 of release-planning §3.9
+/// land it in stages); this struct is committed early so the config
+/// surface is stable from the first commit and tests can pin the
+/// defaults end-to-end.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaemonConfig {
+    /// Idle-timeout shutdown threshold (ADR-0012 D6). The daemon
+    /// stops after no clients have been connected for this long. `0`
+    /// disables the timeout — the daemon then only stops via
+    /// `mneme stop` / SIGTERM. Counted from "last client
+    /// disconnected", not "last request seen".
+    #[serde(default = "default_daemon_idle_timeout_minutes")]
+    pub idle_timeout_minutes: u64,
+    /// Path to the auth-token file (ADR-0012 D3). `"default"` resolves
+    /// to `~/.mneme/run/auth.token` at boot. The token value lives in
+    /// exactly one file with mode `0600`; agent configs reference the
+    /// path, never the value. `mneme auth rotate` rewrites only this
+    /// one file.
+    #[serde(default = "default_daemon_auth_token_path")]
+    pub auth_token_path: String,
+    /// Daemon-only log level override. Falls back to the global
+    /// `[logging] level` when set to `"default"`. Lets users turn
+    /// the daemon up to `debug` without making the rest of the
+    /// binary chatty.
+    #[serde(default = "default_daemon_log_level")]
+    pub log_level: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -166,6 +197,15 @@ fn default_auto_context_budget() -> usize {
 fn default_max_remember_chars() -> usize {
     10_000
 }
+fn default_daemon_idle_timeout_minutes() -> u64 {
+    30
+}
+fn default_daemon_auth_token_path() -> String {
+    "default".into()
+}
+fn default_daemon_log_level() -> String {
+    "default".into()
+}
 fn default_session_interval_secs() -> u64 {
     30
 }
@@ -244,6 +284,15 @@ impl Default for BudgetsConfig {
         }
     }
 }
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_minutes: default_daemon_idle_timeout_minutes(),
+            auth_token_path: default_daemon_auth_token_path(),
+            log_level: default_daemon_log_level(),
+        }
+    }
+}
 impl Default for CheckpointsConfig {
     fn default() -> Self {
         Self {
@@ -312,6 +361,9 @@ mod tests {
         assert_eq!(c.budgets.default_recall_limit, 10);
         assert_eq!(c.budgets.auto_context_token_budget, 4000);
         assert_eq!(c.budgets.max_remember_chars, 10_000);
+        assert_eq!(c.daemon.idle_timeout_minutes, 30);
+        assert_eq!(c.daemon.auth_token_path, "default");
+        assert_eq!(c.daemon.log_level, "default");
         assert_eq!(c.checkpoints.session_interval_secs, 30);
         assert_eq!(c.checkpoints.session_interval_turns, 5);
         assert_eq!(c.checkpoints.hnsw_snapshot_inserts, 1000);

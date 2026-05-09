@@ -11,7 +11,7 @@ nothing on this page is reachable through MCP.
 Default data directory is `~/.mneme/` (override with `MNEME_DATA_DIR` —
 see [Configuration](./configuration.md#environment-overrides)).
 
-## Subcommands (8)
+## Subcommands (9)
 
 ### Lifecycle
 
@@ -19,6 +19,7 @@ see [Configuration](./configuration.md#environment-overrides)).
 |------------|--------------|
 | `mneme init` | Scaffold `~/.mneme/` (config, schema_version, directory layout) and run the schema migration to the binary's `CURRENT_SCHEMA_VERSION`. Idempotent — safe to rerun; only fills in missing pieces. Writes `config.toml` if absent; leaves an existing file alone. |
 | `mneme run` | Start the MCP server. Speaks JSON-RPC over stdio against MCP `2025-06-18`. Acquires `~/.mneme/.lock` for the lifetime of the process; refuses to boot if another instance holds it. SIGTERM / Ctrl-C / SIGINT are treated as a clean exit. |
+| `mneme daemon` | v1.1 daemon entry point per ADR-0012. **Currently a stdio passthrough** (functionally `mneme run` until A.M2's SSE transport lands in subsequent commits); ships at the CLI surface from M2 commit #1 so systemd / launchd unit files have a stable command name. Once the SSE transport lands, `mneme daemon` binds the per-platform listener (Unix socket / Windows named pipe), spawns into the background (Unix double-fork), and serves multiple MCP clients concurrently. |
 | `mneme stop` | Find the running server via the lockfile, send SIGTERM, and wait up to 10 s for it to drop the lock. Stale lockfile (PID no longer running) is cleaned up automatically. Exits 0 on either path; non-zero only if the process is alive but won't exit within the timeout. |
 
 ### Diagnostics

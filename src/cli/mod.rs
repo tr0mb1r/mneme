@@ -4,6 +4,7 @@ use crate::Result;
 use clap::{Parser, Subcommand};
 
 pub mod backup;
+pub mod daemon;
 pub mod export;
 pub mod init;
 pub mod inspect;
@@ -29,6 +30,12 @@ pub enum Command {
     Init,
     /// Start the MCP server
     Run,
+    /// Start the v1.1 daemon (M2-M5 of release-planning §3.9 land
+    /// the SSE transport in stages; today this command shares the
+    /// stdio runner with `mneme run` and exists primarily as the
+    /// stable entry point for systemd/launchd unit files and for
+    /// the future client-spawn-and-connect flow per ADR-0012 D12).
+    Daemon,
     /// Show memory health and size
     Stats,
     /// Inspect a memory by id or query
@@ -70,6 +77,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Init => init::execute(),
         Command::Run => run::execute(),
+        Command::Daemon => daemon::execute(),
         Command::Stats => stats::execute(),
         Command::Inspect { id, query } => inspect::execute(id, query),
         Command::Export { scope, format } => export::execute(scope, format),

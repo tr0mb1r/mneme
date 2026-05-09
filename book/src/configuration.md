@@ -45,6 +45,11 @@ max_remember_chars         = 10000
 transport = "stdio"
 sse_port  = 7878
 
+[daemon]
+idle_timeout_minutes = 30
+auth_token_path      = "default"
+log_level            = "default"
+
 [telemetry]
 enabled  = false
 endpoint = ""
@@ -413,6 +418,60 @@ transports (with auth + TLS) are deferred to v1.1.
 | **Affects** | (unused in v1.0) |
 
 Reserved for the future SSE transport. Setting it today is a no-op.
+
+---
+
+## `[daemon]` — v1.1 daemon-mode tuning
+
+The `[daemon]` section is committed early so the config surface is
+stable from the first M2 commit. The daemon itself ships
+incrementally across A.M2–A.M5 (release-planning v2.1 §3.9); these
+knobs are honored as each piece lands. ADR-0012 documents the full
+design.
+
+### `idle_timeout_minutes`
+
+| | |
+|---|---|
+| **Type** | unsigned integer (minutes) |
+| **Default** | `30` |
+| **Affects** | daemon shutdown after no clients connected |
+
+Idle-timeout shutdown threshold (ADR-0012 D6). The daemon stops
+after no clients have been connected for this long. `0` disables
+the timeout — the daemon then only stops via `mneme stop` or
+SIGTERM. Counted from "last client disconnected", not "last request
+seen", so a long HNSW snapshot that blocks requests but not
+connections doesn't accidentally trigger shutdown.
+
+### `auth_token_path`
+
+| | |
+|---|---|
+| **Type** | string (path or `"default"`) |
+| **Default** | `"default"` (resolves to `~/.mneme/run/auth.token`) |
+| **Affects** | daemon authentication (ADR-0012 D3) |
+
+Path to the auth-token file. The token value lives in **exactly one
+file** with mode `0600`; agent configs reference the path, never
+the value. `mneme auth rotate` rewrites only this file (atomically
+via tmpfile + rename per D4); clients pick up the new value on
+next connection. NEVER embed the token value in `settings.json`,
+`claude_desktop_config.json`, `.cursorrules`, or any other agent
+config file.
+
+### `log_level`
+
+| | |
+|---|---|
+| **Type** | string (`"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`, or `"default"`) |
+| **Default** | `"default"` (inherits `[logging] level`) |
+| **Affects** | daemon-only verbosity |
+
+Daemon-only log level override. Falls back to the global
+`[logging] level` when set to `"default"`. Lets you turn the daemon
+up to `debug` while leaving CLI tools (`mneme stats`,
+`mneme inspect`, etc.) at the global level.
 
 ---
 

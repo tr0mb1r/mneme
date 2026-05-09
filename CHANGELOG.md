@@ -14,6 +14,19 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **`[daemon]` config section + `mneme daemon` CLI subcommand** (first
+  commit of A.M2 / release-planning v2.1 §3.9 per ADR-0012). The
+  config struct ships with three knobs — `idle_timeout_minutes`
+  (default `30`, ADR-0012 D6), `auth_token_path` (default
+  `"default"` → `~/.mneme/run/auth.token`, ADR-0012 D3), and
+  `log_level` (default `"default"` → inherits `[logging] level`).
+  The subcommand is currently a stdio passthrough (functionally
+  `mneme run`); subsequent A.M2 commits replace the body with
+  daemonization (D9), per-platform listener bind (D2), orphaned
+  socket cleanup (D5), and the SSE transport (D1) without
+  changing the public CLI shape. Documented in
+  `book/src/configuration.md` §`[daemon]` and `book/src/cli.md`.
+  Subcommand count goes from 8 to 9.
 - **First-boot upgrade audit writes `~/.mneme/diagnostics.log`** (Q4
   of release-planning v2.1 §5.3 + §6.2; Invariant 7 of pin
   `01KR5ZB7ED01HADZXZKKBV882Z`). On v1.1's first boot against an
