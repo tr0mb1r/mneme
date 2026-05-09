@@ -12,6 +12,21 @@ the work that landed before automation was wired up.
 
 ## [Unreleased] — develop track (v1.1)
 
+### Added
+
+- **v0.2.6 performance baseline frozen at `benches/baselines/v0_2_6.json`**
+  (release-planning v2.1 §6.2). Captures p50/p95/p99 + min/max +
+  criterion mean/median/stddev for the four hot-path benches
+  (`recall`, `auto_context`, `cold_start`, `remember`) at the
+  default `MNEME_BENCH_N=1000` corpus, with git sha + uname so the
+  measurement is traceable. `benches/baselines/extract_baseline.py`
+  generates the JSON from criterion's per-bench output;
+  `benches/baselines/README.md` documents the capture procedure
+  and a one-liner percent-slowdown comparator. Real-embedder
+  latency, memory footprint, and larger corpora (n=10k/100k) are
+  explicitly out-of-scope for the baseline and deferred to Q3
+  (task #18) when the CI regression gate scaffolding lands.
+
 ### Changed
 
 - **`remember` MCP tool description rewritten with explicit size
