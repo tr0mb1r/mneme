@@ -11,16 +11,18 @@ nothing on this page is reachable through MCP.
 Default data directory is `~/.mneme/` (override with `MNEME_DATA_DIR` —
 see [Configuration](./configuration.md#environment-overrides)).
 
-## Subcommands (9)
+## Subcommands (11)
 
 ### Lifecycle
 
 | Subcommand | What it does |
 |------------|--------------|
 | `mneme init` | Scaffold `~/.mneme/` (config, schema_version, directory layout) and run the schema migration to the binary's `CURRENT_SCHEMA_VERSION`. Idempotent — safe to rerun; only fills in missing pieces. Writes `config.toml` if absent; leaves an existing file alone. |
+| `mneme init <agent> [--upgrade\|--uninstall\|--show]` | v1.1 per-agent installer per ADR-0012 / release-planning §4. `<agent>` ∈ {`claude-code`, `claude-desktop`, `cursor`, `cline`, `codex`, `gemini-cli`}. Today `claude-code` and `claude-desktop` ship fully wired; the others return `NotYetImplemented` with a tracked task pointer until each integration is validated end-to-end on a real install. Atomic (tmpfile + fsync + rename per file), idempotent (re-run is byte-identical), reversible (`--uninstall` removes mneme-owned files + entries while preserving every other key in the user's config files). `--show` previews the plan without writing. |
 | `mneme run` | Start the MCP server. Speaks JSON-RPC over stdio against MCP `2025-06-18`. Acquires `~/.mneme/.lock` for the lifetime of the process; refuses to boot if another instance holds it. SIGTERM / Ctrl-C / SIGINT are treated as a clean exit. |
-| `mneme daemon` | v1.1 daemon entry point per ADR-0012. **Currently a stdio passthrough** (functionally `mneme run` until A.M2's SSE transport lands in subsequent commits); ships at the CLI surface from M2 commit #1 so systemd / launchd unit files have a stable command name. Once the SSE transport lands, `mneme daemon` binds the per-platform listener (Unix socket / Windows named pipe), spawns into the background (Unix double-fork), and serves multiple MCP clients concurrently. |
+| `mneme daemon` | v1.1 daemon entry point per ADR-0012. Binds `~/.mneme/run/mneme.sock` (Unix domain socket on macOS / Linux; Windows named pipe lands in M4), accepts multiple MCP clients concurrently, gates each connection on the auth handshake (`MNEME-AUTH: <token>\n` per ADR-0012 D3), serves them via `tokio::spawn` per connection. Storage writes serialise through the existing single-writer seam (D8). Auto-shuts-down after `[daemon].idle_timeout_minutes` (default 30; `0` disables) of no clients. SIGTERM drains in-flight clients up to 30 s before runtime tears them down. |
 | `mneme stop` | Find the running server via the lockfile, send SIGTERM, and wait up to 10 s for it to drop the lock. Stale lockfile (PID no longer running) is cleaned up automatically. Exits 0 on either path; non-zero only if the process is alive but won't exit within the timeout. |
+| `mneme demo` | Print a 4-pattern walkthrough of the v1.1 memory surface (cross-session recall, `record_event`, `pin`, `mneme://context`). Pure text — pair with a real Claude Code / Claude Desktop session to see the patterns work end-to-end. Complements `mneme init <agent>`'s post-install prompt for users who want to come back to the patterns later. |
 
 ### Diagnostics
 

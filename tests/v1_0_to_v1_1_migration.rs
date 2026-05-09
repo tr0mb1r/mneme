@@ -108,25 +108,26 @@ async fn prepare_v1_0_data_dir(data_dir: &Path) {
         .status()
         .await
         .expect("init spawn");
-    assert!(status.success(), "init must succeed against v1.0-shaped config");
+    assert!(
+        status.success(),
+        "init must succeed against v1.0-shaped config"
+    );
 }
 
 /// Boot `mneme run` against the data dir, send an MCP initialize +
 /// the supplied tools/call sequence, then close stdin. Returns the
 /// concatenated JSON-RPC response text. Bounded by `bound` so a
 /// hung server doesn't wedge CI.
-async fn run_with_calls(
-    data_dir: &Path,
-    tool_calls: &[&str],
-    bound: Duration,
-) -> String {
+async fn run_with_calls(data_dir: &Path, tool_calls: &[&str], bound: Duration) -> String {
     let mut input = String::new();
     input.push_str(
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"upgrade-test","version":"1"}}}
 "#,
     );
-    input.push_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}
-"#);
+    input.push_str(
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}
+"#,
+    );
     for (i, call) in tool_calls.iter().enumerate() {
         input.push_str(&format!(
             r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{call}}}
@@ -180,8 +181,7 @@ async fn v1_0_config_boots_clean_under_v1_1_binary() {
     // second. Both must parse as valid JSON-RPC.
     let mut lines = response.lines().filter(|l| !l.trim().is_empty());
     let init: serde_json::Value =
-        serde_json::from_str(lines.next().expect("initialize response"))
-            .expect("init json");
+        serde_json::from_str(lines.next().expect("initialize response")).expect("init json");
     assert_eq!(init["jsonrpc"], "2.0");
     assert_eq!(init["id"], 1);
     let stats: serde_json::Value =
@@ -190,8 +190,7 @@ async fn v1_0_config_boots_clean_under_v1_1_binary() {
     let text = stats["result"]["content"][0]["text"]
         .as_str()
         .expect("stats text");
-    let stats_body: serde_json::Value =
-        serde_json::from_str(text).expect("stats body json");
+    let stats_body: serde_json::Value = serde_json::from_str(text).expect("stats body json");
     // Sanity: schema_version, memories.semantic, etc. all present.
     assert!(stats_body.get("schema_version").is_some());
     assert!(stats_body["memories"].get("semantic").is_some());
@@ -230,8 +229,7 @@ async fn memories_persist_across_v1_0_to_v1_1_reboot() {
         .filter(|l| !l.trim().is_empty())
         .find(|l| l.contains("\"id\":2"))
         .expect("recall response");
-    let parsed: serde_json::Value =
-        serde_json::from_str(recall).expect("recall json");
+    let parsed: serde_json::Value = serde_json::from_str(recall).expect("recall json");
     let text = parsed["result"]["content"][0]["text"]
         .as_str()
         .expect("recall text");
