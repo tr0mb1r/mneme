@@ -14,6 +14,19 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **A.M3 graceful-drain on shutdown** (release-planning v2.1 §3.9
+  M3, ADR-0012 D8). New `wait_for_drain` runs after the
+  `DaemonServeMany` `tokio::select!` resolves (SIGTERM, idle
+  timeout, or — with an `error!` log — accept-loop unexpected
+  return): polls the active-client counter every 100 ms, returns
+  cleanly when it reaches zero, bails at a 30-second
+  `DRAIN_DEADLINE` if a stuck client wedges the count. The drain
+  step gives in-flight MCP exchanges a chance to complete their
+  pending response before the runtime aborts the spawned tasks.
+  Empty-counter fast-path returns immediately so SIGTERM on an
+  idle daemon adds no shutdown latency. Three new paused-clock
+  unit tests cover empty, drains-before-deadline, and
+  bails-at-deadline. Total lib suite at 368 passed.
 - **A.M3 idle-timeout shutdown** (ADR-0012 D6, release-planning v2.1
   §3.9 M3). New `idle_timeout_watcher` runs alongside the daemon
   accept loop in a third `tokio::select!` arm; when

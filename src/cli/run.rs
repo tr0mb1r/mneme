@@ -524,14 +524,17 @@ async fn async_main(
             // them through directly skips the boxing problem and
             // monomorphises a separate `Server` for socket
             // connections.
+            let exit_reason: &'static str;
             tokio::select! {
                 _ = shutdown_signal() => {
+                    exit_reason = "shutdown_signal";
                     tracing::info!(
                         active = active_clients.load(std::sync::atomic::Ordering::Relaxed),
                         "transport=daemon-serve-many: shutdown signal received"
                     );
                 }
                 _ = idle_timeout_watcher(idle_watcher_counter, daemon_idle_timeout_minutes) => {
+                    exit_reason = "idle_timeout";
                     tracing::info!(
                         idle_minutes = daemon_idle_timeout_minutes,
                         "transport=daemon-serve-many: idle timeout reached; shutting down"
@@ -599,8 +602,30 @@ async fn async_main(
                     // Unreachable, but the future has to type-check.
                     #[allow(unreachable_code)]
                     Ok::<(), anyhow::Error>(())
-                } => {}
+                } => {
+                    // The accept-loop arm should never resolve;
+                    // surface that as an error so a future change
+                    // that accidentally makes it return doesn't
+                    // exit silently.
+                    exit_reason = "accept_loop_returned_unexpectedly";
+                    tracing::error!(
+                        "transport=daemon-serve-many: accept loop returned unexpectedly"
+                    );
+                }
             }
+
+            // Graceful drain: stop accepting (the listener is moved
+            // into the select arm and dropped here, so subsequent
+            // connect attempts will see ECONNREFUSED), wait briefly
+            // for in-flight spawned tasks to finish their MCP
+            // exchanges, then return. Bounded by `DRAIN_DEADLINE` so
+            // a stuck client doesn't wedge shutdown.
+            tracing::info!(
+                exit_reason,
+                active = active_clients.load(std::sync::atomic::Ordering::Relaxed),
+                "transport=daemon-serve-many: entering graceful drain"
+            );
+            wait_for_drain(Arc::clone(&active_clients)).await;
         }
     }
 
@@ -708,6 +733,52 @@ async fn idle_timeout_watcher(
 /// the default 30-minute idle and frugal on syscalls.
 const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Maximum time `wait_for_drain` will wait for active connections to
+/// finish before letting the runtime tear them down. 30 s is long
+/// enough for typical MCP exchanges to complete, short enough that a
+/// stuck client doesn't wedge a daemon shutdown for minutes.
+const DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often `wait_for_drain` polls the counter while draining.
+/// 100 ms is responsive enough that a normal client closing within a
+/// second is barely waited on; rare enough that a stuck-but-large
+/// drain isn't a tight CPU loop.
+const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Wait for the active-client counter to reach zero, capped by
+/// [`DRAIN_DEADLINE`]. Logs `info` on clean drain, `warn` on
+/// timeout. Used by `DaemonServeMany` after the accept loop exits
+/// (SIGTERM or idle timeout) to give in-flight MCP exchanges a
+/// chance to complete before the runtime aborts their tasks.
+async fn wait_for_drain(active_clients: Arc<std::sync::atomic::AtomicUsize>) {
+    let initial = active_clients.load(std::sync::atomic::Ordering::Relaxed);
+    if initial == 0 {
+        return;
+    }
+    tracing::info!(active = initial, "draining active clients before exit");
+    let start = tokio::time::Instant::now();
+    loop {
+        let now = active_clients.load(std::sync::atomic::Ordering::Relaxed);
+        if now == 0 {
+            tracing::info!(
+                drained_count = initial,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "all clients drained cleanly"
+            );
+            return;
+        }
+        if start.elapsed() >= DRAIN_DEADLINE {
+            tracing::warn!(
+                active = now,
+                deadline_s = DRAIN_DEADLINE.as_secs(),
+                "drain deadline reached; remaining clients will abort with the runtime"
+            );
+            return;
+        }
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    }
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -776,6 +847,70 @@ mod tests {
             result.is_err(),
             "watcher must NOT resolve while a client is connected"
         );
+    }
+
+    /// Already-drained counter (count == 0 at entry) returns
+    /// immediately — no syscalls, no log noise. The fast path
+    /// matters because most graceful-shutdown calls happen with
+    /// no clients connected (idle daemon receives SIGTERM).
+    #[tokio::test(start_paused = true)]
+    async fn drain_returns_immediately_when_empty() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let start = tokio::time::Instant::now();
+        wait_for_drain(counter).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(50),
+            "empty drain must be near-instant, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Counter that ticks down to zero before the deadline returns
+    /// cleanly. Drives the counter externally to mimic spawned
+    /// connection tasks finishing their work.
+    #[tokio::test(start_paused = true)]
+    async fn drain_returns_when_clients_finish_before_deadline() {
+        let counter = Arc::new(AtomicUsize::new(3));
+        let drain_counter = Arc::clone(&counter);
+
+        let driver = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            counter.fetch_sub(1, Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            counter.fetch_sub(1, Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            counter.fetch_sub(1, Ordering::Relaxed);
+        };
+
+        // Tokio paused-clock advances both the driver's sleeps and
+        // the drain's poll interval simultaneously.
+        tokio::join!(wait_for_drain(drain_counter), driver);
+    }
+
+    /// Counter that never reaches zero: drain should bail at the
+    /// `DRAIN_DEADLINE` bound rather than wait forever. The bounded
+    /// timeout is the load-bearing safety: a stuck client must not
+    /// wedge daemon shutdown.
+    #[tokio::test(start_paused = true)]
+    async fn drain_bails_at_deadline_on_stuck_clients() {
+        let counter = Arc::new(AtomicUsize::new(2));
+        let start = tokio::time::Instant::now();
+        wait_for_drain(Arc::clone(&counter)).await;
+        let elapsed = start.elapsed();
+        // Should take at least DRAIN_DEADLINE (counter never moves)
+        // but not significantly more.
+        assert!(
+            elapsed >= DRAIN_DEADLINE,
+            "drain must hit deadline, only waited {elapsed:?}"
+        );
+        assert!(
+            elapsed < DRAIN_DEADLINE + std::time::Duration::from_millis(500),
+            "drain ran past deadline + slack, took {elapsed:?}"
+        );
+        // Counter is still at the original 2 (we don't touch it
+        // from the drain) — the spawned tasks abort with the
+        // runtime when async_main returns.
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
     }
 
     /// Counter goes 1 → 0 → 1 mid-window resets the idle clock —
