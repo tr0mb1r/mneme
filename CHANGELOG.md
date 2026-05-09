@@ -14,6 +14,41 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **A.M4 first commit: daemon auth-token primitive +
+  `mneme auth` subcommand** (ADR-0012 D3 / D4, task #7). New
+  `src/daemon/auth.rs` ships:
+  - `ensure_token(root)` — generates a 32-byte random token (43-char
+    URL-safe base64, no padding) at `~/.mneme/run/auth.token`,
+    mode `0600` on Unix, `0700` on the parent `run/` dir if
+    absent. No-op if a token already exists (rotation is an
+    explicit user action, not a startup side effect).
+  - `read_token(root)` / `tokens_match(presented, expected)` —
+    constant-time comparison via the `subtle` crate to guard
+    against prefix-match timing leakage on the daemon's
+    verification path (next A.M4 commit).
+  - `rotate_token(root)` — generates a fresh value, atomic
+    replace via tmpfile + fsync + rename + parent-dir fsync per
+    D4. POSIX rename semantics; existing daemon connections stay
+    valid (token check fires only at handshake per D3) — the new
+    value takes effect on the next connect.
+  New `mneme auth rotate` and `mneme auth show-path` CLI
+  subcommands wrap the primitive. The token value lives in
+  exactly one file by design (Invariant 3); agent configs
+  reference the path, never the value. Inline ~50-line URL-safe
+  base64 encoder so no `base64` dep is needed; pinned with
+  test vectors so a future swap to a real base64 dep is a pure
+  refactor. 12 unit tests (perms / generation length /
+  rotation atomicity / constant-time match / no-tmp-leftover /
+  base64 vectors / concurrent-read-during-rotate-yields-no-
+  partial-token). End-to-end smoke verified — `mneme auth
+  rotate` produces 0o600 file with 43 base64-url chars; second
+  rotate produces a different token. Two new direct deps:
+  `rand = "0.9"` (already transitive via tokio), `subtle = "2"`
+  (~50 LOC, no transitive bloat). **Daemon-side enforcement on
+  the connect handshake lands in the next A.M4 commit** — it
+  touches the MCP protocol surface (defines a pre-`initialize`
+  handshake step) and benefits from this primitive being
+  settled first.
 - **B.M1 close + B.M2: `mneme init <agent>` subcommand with Claude
   Code as the fully-working reference implementation**
   (release-planning v2.1 §4 + §4.7). New `mneme init` modes:

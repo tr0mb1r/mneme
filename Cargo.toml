@@ -57,6 +57,14 @@ crc32c = "0.6"
 fs2 = "0.4"
 dirs = "5"
 toml = "0.8"
+# v1.1 daemon auth-token generation (ADR-0012 D3/D4). Already in the
+# transitive tree via tokio + candle deps; adding direct so the
+# fill_bytes API is reachable without re-exporting through one of those.
+rand = "0.9"
+# Constant-time comparison of auth tokens — guards against timing
+# side-channel leakage on the daemon's verification path. Tiny dep
+# (~50 LOC), no transitive bloat.
+subtle = "2"
 
 # Phase 3 — semantic layer (embedding model + HNSW vector index).
 # `candle-*` is the pure-Rust ML runtime (ADR-0002). MSRV-wise these are 1.83+,

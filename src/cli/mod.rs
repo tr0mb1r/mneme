@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use crate::Result;
 use clap::{Parser, Subcommand};
 
+pub mod auth;
 pub mod backup;
 pub mod daemon;
 pub mod export;
@@ -22,6 +23,18 @@ pub mod stop;
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuthCommand {
+    /// Generate a fresh auth token at `~/.mneme/run/auth.token`,
+    /// atomically replacing any existing token. Agents that
+    /// reference the file by path keep working; existing daemon
+    /// connections stay valid until they re-handshake.
+    Rotate,
+    /// Print the auth-token path. Useful for agent config
+    /// snippets that want to embed the path string.
+    ShowPath,
 }
 
 #[derive(Subcommand, Debug)]
@@ -85,6 +98,15 @@ pub enum Command {
         #[arg(long)]
         include_models: bool,
     },
+    /// Daemon auth-token administration (ADR-0012 D3/D4).
+    /// `mneme auth rotate` regenerates the token at
+    /// `~/.mneme/run/auth.token` (atomic; existing connections
+    /// stay valid, the new token fires at next handshake).
+    /// `mneme auth show-path` prints the path agents reference.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Restore a `mneme backup`-produced archive into the data directory
     Restore {
         /// Path to the .tar.gz archive
@@ -113,6 +135,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             output,
             include_models,
         } => backup::execute(output, include_models),
+        Command::Auth { command } => match command {
+            AuthCommand::Rotate => auth::rotate(),
+            AuthCommand::ShowPath => auth::show_path(),
+        },
         Command::Restore { input, force } => restore::execute(input, force),
     }
 }

@@ -14,6 +14,8 @@
 //! returns an error pointing at the M4 milestone — the daemon is
 //! Unix-only until then.
 
+pub mod auth;
+
 #[cfg(unix)]
 pub mod listener;
 
