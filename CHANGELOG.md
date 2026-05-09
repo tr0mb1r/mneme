@@ -14,6 +14,30 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **D.M3 partial: v1.1 troubleshooting guide expansion**
+  (release-planning v2.1 §7.1, partial task #23). Extends
+  `book/src/troubleshooting.md` with three new sections covering
+  every v1.1-specific failure mode the spec calls out:
+  - **v1.1 daemon mode** — daemon-already-running rejection,
+    stale-socket cleanup edge cases, idle shutdown semantics
+    (D6), 30s drain on SIGTERM, the five distinct auth
+    handshake rejection log lines (PrematureEof / LineTooLong /
+    Timeout / MissingPrefix / TokenMismatch) with diagnostic
+    pointers per failure mode, `mneme auth rotate` no-drop-
+    existing-connections semantic, force-fresh-token recipe.
+  - **v1.1 `mneme init` issues** — config-already-present
+    semantics (vs --upgrade for per-agent), Claude-Code-doesn't-
+    see-the-MCP-server (PATH gotcha + restart requirement),
+    SessionStart hook not firing (verification + repair recipe),
+    --uninstall-left-files-behind (which is by design — user
+    content preserved).
+  - **v1.1 → v1.0 rollback** — the hard-promise procedure,
+    plus the v1.0-pre-v1.0.1 backup warning users may see.
+  Cross-linked from the v1.1 release notes. Lands as a complete
+  v1.1.0 troubleshooting reference; per-agent setup guides
+  (one page per Tier-1 agent beyond Claude Code) remain the
+  last D.M3 deliverable, blocked on the corresponding agent
+  installers landing.
 - **D.M3 partial: v1.1 release notes draft published**
   (release-planning v2.1 §7.1, partial task #23). New
   `book/src/release-notes-v1_1.md` captures everything shipped
