@@ -14,6 +14,25 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **D.M3 partial: v1.1 release notes draft published**
+  (release-planning v2.1 §7.1, partial task #23). New
+  `book/src/release-notes-v1_1.md` captures everything shipped
+  on develop in user-facing narrative form: `mneme init <agent>`
+  install pattern (Claude Code reference + Claude Desktop), daemon
+  mode + Unix socket transport, per-installation auth token
+  (token-by-path + rotation), content size guardrails,
+  first-boot upgrade audit, MCP `_meta` annotations, perf
+  regression gate in CI, backup auth-token leak fix, the v1.0 →
+  v1.1 migration test gate, the rollback path. Plus an explicit
+  "What's NOT in v1.1" section documenting deferrals: SSE
+  framing + keepalive (ADR-0012 amendment A1), Tier-2 features
+  (hybrid search, encryption at rest), OpenCode (Tier-2
+  conditional), `mneme demo` standalone command. Linked from
+  `SUMMARY.md` under a new "Release notes" mdBook section.
+  Lands as a draft on develop; the polished launch version
+  ships with the v1.1.0 tag. Per-agent setup guides (one per
+  Tier-1 agent) and the troubleshooting guide are the remaining
+  D.M3 deliverables.
 - **A.M5 partial: client-crash isolation test**
   (release-planning v2.1 §3.9 M5, partial task #8). New
   `tests/daemon_e2e.rs::client_crash_does_not_affect_other_clients`

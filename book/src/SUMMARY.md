@@ -20,6 +20,10 @@
 - [Troubleshooting](./troubleshooting.md)
 - [Versioning](./versioning.md)
 
+# Release notes
+
+- [v1.1 (draft)](./release-notes-v1_1.md)
+
 # Contributing
 
 - [How to contribute](./contributing.md)
