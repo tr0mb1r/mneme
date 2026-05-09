@@ -30,6 +30,27 @@ fn sigterm(child: &Child) {
     assert_eq!(rc, 0, "kill(SIGTERM, {pid}) must succeed");
 }
 
+/// Read the auth token the daemon generated at boot. Per ADR-0012
+/// D3 every connection must present this as the first line —
+/// `MNEME-AUTH: <token>\n`. Tests use this helper to mimic what
+/// `mneme run`'s spawn-and-connect (deferred A.M2 piece D12) will
+/// do automatically once it lands.
+fn read_auth_token(data_dir: &Path) -> String {
+    let path = data_dir.join("run").join("auth.token");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "auth token at {} not found ({e}); daemon should have created it",
+            path.display()
+        )
+    });
+    String::from_utf8(bytes).expect("token is utf-8 (43 chars URL-safe base64)")
+}
+
+/// Build the canonical auth prefix line: `MNEME-AUTH: <token>\n`.
+fn auth_line(data_dir: &Path) -> String {
+    format!("MNEME-AUTH: {}\n", read_auth_token(data_dir))
+}
+
 /// Poll for the socket file to appear; the daemon performs boot work
 /// (storage open, embed migrate, audit, scheduler spawn) before
 /// binding, so a fresh data dir on slow disk can take ~1s. Cap at 5s
@@ -68,10 +89,17 @@ async fn daemon_serves_one_client_end_to_end() {
 
     wait_for_socket(&socket).await;
 
-    // Connect a client and run the standard MCP handshake.
+    // Connect a client and run the standard MCP handshake. Per
+    // ADR-0012 D3 every DaemonServeMany connection must present
+    // the auth prefix as the first line — without it, the daemon
+    // drops the connection (see `daemon_rejects_missing_token`).
     let mut stream = UnixStream::connect(&socket)
         .await
         .expect("client connect to daemon socket");
+    stream
+        .write_all(auth_line(data_dir).as_bytes())
+        .await
+        .unwrap();
     let initialize = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -163,10 +191,15 @@ async fn daemon_serves_two_clients_concurrently() {
 
     wait_for_socket(&socket).await;
 
-    async fn one_handshake(socket: &Path, client_label: &str) -> serde_json::Value {
+    async fn one_handshake(
+        socket: &Path,
+        client_label: &str,
+        auth_prefix: String,
+    ) -> serde_json::Value {
         let mut stream = UnixStream::connect(socket)
             .await
             .unwrap_or_else(|_| panic!("client {client_label} connect"));
+        stream.write_all(auth_prefix.as_bytes()).await.unwrap();
         let init = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -202,9 +235,10 @@ async fn daemon_serves_two_clients_concurrently() {
     }
 
     // Run two handshakes concurrently against the same daemon.
+    let auth = auth_line(data_dir);
     let (a, b) = tokio::join!(
-        one_handshake(&socket, "client-A"),
-        one_handshake(&socket, "client-B")
+        one_handshake(&socket, "client-A", auth.clone()),
+        one_handshake(&socket, "client-B", auth.clone())
     );
     assert_eq!(a["jsonrpc"], "2.0");
     assert_eq!(a["result"]["protocolVersion"], "2025-06-18");
@@ -212,12 +246,13 @@ async fn daemon_serves_two_clients_concurrently() {
     assert_eq!(b["result"]["protocolVersion"], "2025-06-18");
 
     // Daemon stays alive after both clients close — verify by
-    // connecting a third client. (Bounded so we don't hang if the
-    // daemon shut down unexpectedly.)
-    let third = timeout(Duration::from_secs(2), UnixStream::connect(&socket))
+    // connecting a third client and authenticating. (Bounded so
+    // we don't hang if the daemon shut down unexpectedly.)
+    let mut third = timeout(Duration::from_secs(2), UnixStream::connect(&socket))
         .await
         .expect("third connect within 2 s")
         .expect("third connect ok");
+    third.write_all(auth.as_bytes()).await.unwrap();
     drop(third);
 
     // Now SIGTERM and confirm clean shutdown.
@@ -276,4 +311,100 @@ async fn second_daemon_against_same_data_dir_refuses_to_start() {
     // background process across runs.
     sigterm(&first);
     let _ = timeout(Duration::from_secs(10), first.wait()).await;
+}
+
+/// A client that connects without sending the auth prefix gets
+/// dropped — the daemon writes a JSON-RPC error frame and closes.
+/// Validates the ADR-0012 D3 enforcement at the connection
+/// boundary.
+#[tokio::test]
+async fn daemon_rejects_missing_auth_token() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    let socket = data_dir.join("run").join("mneme.sock");
+
+    let mut daemon = Command::new(BINARY)
+        .arg("daemon")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .env("MNEME_EMBEDDER", "stub")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mneme daemon");
+    wait_for_socket(&socket).await;
+
+    // Connect without sending the MNEME-AUTH prefix; instead jump
+    // straight to MCP initialize — daemon should reject and drop.
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+    let bad_first_line = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n";
+    stream.write_all(bad_first_line).await.unwrap();
+
+    // Read the rejection frame (or EOF).
+    let (read, _write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    let mut response = String::new();
+    let _ = timeout(Duration::from_secs(5), reader.read_line(&mut response)).await;
+    let parsed: serde_json::Value = serde_json::from_str(response.trim()).expect("rejection JSON");
+    assert_eq!(parsed["jsonrpc"], "2.0");
+    assert!(
+        parsed["error"]["code"].is_number(),
+        "rejection must carry a JSON-RPC error code, got {parsed:?}"
+    );
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("MNEME-AUTH"),
+        "rejection message must mention the missing prefix, got {parsed:?}"
+    );
+    drop(reader);
+
+    sigterm(&daemon);
+    let _ = timeout(Duration::from_secs(10), daemon.wait()).await;
+}
+
+/// A client that presents the wrong token gets dropped with a
+/// `TokenMismatch` error. The daemon must NOT proceed to MCP
+/// dispatch.
+#[tokio::test]
+async fn daemon_rejects_invalid_auth_token() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    let socket = data_dir.join("run").join("mneme.sock");
+
+    let mut daemon = Command::new(BINARY)
+        .arg("daemon")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .env("MNEME_EMBEDDER", "stub")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mneme daemon");
+    wait_for_socket(&socket).await;
+
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+    stream
+        .write_all(b"MNEME-AUTH: deliberately-wrong-token\n")
+        .await
+        .unwrap();
+
+    let (read, _write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    let mut response = String::new();
+    let _ = timeout(Duration::from_secs(5), reader.read_line(&mut response)).await;
+    let parsed: serde_json::Value = serde_json::from_str(response.trim()).expect("rejection JSON");
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("does not match"),
+        "rejection message must mention token mismatch, got {parsed:?}"
+    );
+
+    sigterm(&daemon);
+    let _ = timeout(Duration::from_secs(10), daemon.wait()).await;
 }

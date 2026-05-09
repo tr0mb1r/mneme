@@ -14,6 +14,35 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **A.M4 second commit: daemon-side auth-token verification on
+  connect handshake** (ADR-0012 D3, task #7). Every
+  `DaemonServeMany` connection must now present
+  `MNEME-AUTH: <token>\n` as its first line before any MCP
+  frame is processed. New `daemon::auth::handshake(read, &mut
+  write, expected)` reads the first line via a bounded
+  `BufReader` (≤ 256 bytes, ≤ 5 s timeout — anti-DoS),
+  validates the prefix + constant-time-compares the token via
+  the existing `tokens_match`, returns the BufReader for
+  StdioTransport reuse on success or writes a JSON-RPC error
+  frame (code -32001 "auth handshake rejected: <reason>") and
+  returns the structured `HandshakeError` on failure. The
+  daemon's spawn block reads the expected token at boot from
+  `~/.mneme/run/auth.token` (auto-generated via
+  `auth::ensure_token` on first daemon start), Arc-clones the
+  bytes into each per-connection task. Stdio + DaemonAcceptOne
+  bypass the handshake entirely (debug / scaffolding modes).
+  Updated `tests/daemon_e2e.rs`: existing tests now read the
+  daemon's auth.token + send the prefix; two new tests
+  (`daemon_rejects_missing_auth_token`,
+  `daemon_rejects_invalid_auth_token`) pin the rejection path
+  with response-frame assertions. The MCP host wiring side
+  (auto-prepend the auth prefix on `mneme run`'s spawn-and-
+  connect) lands when D12 ships; today the daemon's auth gate
+  is enforced in code + tested but not yet load-bearing for
+  Claude Code (which uses stdio per current install). 5
+  daemon_e2e tests pass (was 3, +2 for rejection); 440 lib
+  tests still pass. Total integration suites land in CI when
+  the next test pass runs.
 - **Q1 release gate: v1.0 → v1.1 upgrade migration test**
   (release-planning v2.1 §6.1, task #16). New
   `tests/v1_0_to_v1_1_migration.rs` exercises the migration

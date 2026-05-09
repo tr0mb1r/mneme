@@ -181,6 +181,22 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     // disables — daemon then only stops via SIGTERM / `mneme stop`.
     let daemon_idle_timeout_minutes = config.daemon.idle_timeout_minutes;
 
+    // Daemon auth token (ADR-0012 D3). `ensure_token` generates the
+    // file if absent (no-op if present); `read_token` snapshots the
+    // current value into memory for the per-connection handshake
+    // helper. Per Invariant 3 (pin 01KR5ZB7ED01HADZXZKKBV882Z) the
+    // token value lives in exactly one file — but we read it once
+    // at boot for the comparison hot path; rotation semantics
+    // (next-handshake pickup, existing connections unaffected) are
+    // preserved because the daemon doesn't re-read mid-session
+    // and clients reconnect on rotation.
+    crate::daemon::auth::ensure_token(&root)
+        .map_err(|e| MnemeError::Config(format!("ensure auth token: {e}")))?;
+    let daemon_auth_token = Arc::new(
+        crate::daemon::auth::read_token(&root)
+            .map_err(|e| MnemeError::Config(format!("read auth token: {e}")))?,
+    );
+
     // First-boot upgrade audit (release-planning §5.3, Invariant 7).
     // Scans L4 once for memories above max_remember_chars and writes
     // a passive summary to ~/.mneme/diagnostics.log so users
@@ -271,6 +287,7 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
             active_model_name.clone(),
             max_remember_chars,
             daemon_idle_timeout_minutes,
+            daemon_auth_token,
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
 
@@ -331,6 +348,7 @@ async fn async_main(
     active_model_name: String,
     max_remember_chars: usize,
     daemon_idle_timeout_minutes: u64,
+    daemon_auth_token: Arc<Vec<u8>>,
 ) -> anyhow::Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -560,13 +578,46 @@ async fn async_main(
                                 let episodic_c = Arc::clone(&episodic);
                                 let scope_c = Arc::clone(&scope_state);
                                 let counter = Arc::clone(&active_clients);
+                                let auth_token = Arc::clone(&daemon_auth_token);
                                 tokio::spawn(async move {
-                                    // Concrete owned-half types →
-                                    // Server<OwnedReadHalf, OwnedWriteHalf>
-                                    // monomorphisation (separate from
-                                    // the boxed-trait-object stdio
-                                    // monomorphisation).
-                                    let transport = StdioTransport::new(read, write);
+                                    // ADR-0012 D3: every connection
+                                    // starts with the auth handshake
+                                    // before any MCP frame is read.
+                                    // `handshake` returns the
+                                    // BufReader subsequent reads
+                                    // share — we hand it to
+                                    // StdioTransport so the same
+                                    // internal buffer carries
+                                    // through.
+                                    let mut write = write;
+                                    let buffered_read = match crate::daemon::auth::handshake(
+                                        read,
+                                        &mut write,
+                                        &auth_token,
+                                    )
+                                    .await
+                                    {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "transport=daemon-serve-many: auth handshake rejected; dropping connection"
+                                            );
+                                            let n = counter
+                                                .fetch_sub(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                )
+                                                - 1;
+                                            tracing::info!(
+                                                active = n,
+                                                "transport=daemon-serve-many: client disconnected"
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    let transport =
+                                        StdioTransport::new(buffered_read, write);
                                     let mut server = Server::new(
                                         transport,
                                         tool,

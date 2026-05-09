@@ -32,9 +32,28 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rand::RngCore;
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+
+/// Wire-protocol prefix every client must send as the first line of
+/// a `DaemonServeMany` connection (ADR-0012 D3). Format:
+/// `MNEME-AUTH: <token>\n`. The whole line MUST fit in
+/// [`AUTH_LINE_MAX_BYTES`]; the daemon drops connections that send
+/// more than that without a newline.
+pub const AUTH_HEADER_PREFIX: &str = "MNEME-AUTH: ";
+
+/// Hard cap on the auth-handshake first line. 256 bytes is well
+/// past `prefix(12) + token(43) + newline(1) = 56`; lets us bound
+/// the read without parsing every byte.
+pub const AUTH_LINE_MAX_BYTES: usize = 256;
+
+/// Hard cap on how long the handshake itself may take. Local IPC
+/// hands off the token in microseconds; anything beyond this is a
+/// stuck/malicious peer and we drop.
+pub const AUTH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Filename of the daemon auth token under `<root>/run/`.
 pub const AUTH_TOKEN_FILENAME: &str = "auth.token";
@@ -57,6 +76,37 @@ pub enum AuthError {
         #[source]
         source: io::Error,
     },
+}
+
+/// Failure modes of the per-connection auth handshake. Each variant
+/// is observable via daemon logs (the connect handler emits a `warn`
+/// line per failure) so a misconfigured client surfaces quickly.
+#[derive(Debug, Error)]
+pub enum HandshakeError {
+    /// Client closed the connection before sending the auth line.
+    /// Common during port-scan / health-probe traffic; logged but
+    /// not actionable.
+    #[error("client disconnected before completing auth handshake")]
+    PrematureEof,
+    /// Client sent more than [`AUTH_LINE_MAX_BYTES`] without a
+    /// newline. Either malformed protocol or attempted resource
+    /// exhaustion; the daemon drops without parsing further.
+    #[error("auth line exceeded {limit} bytes without a newline")]
+    LineTooLong { limit: usize },
+    /// Client took longer than [`AUTH_HANDSHAKE_TIMEOUT`] to send
+    /// the auth line.
+    #[error("auth handshake timed out after {duration:?}")]
+    Timeout { duration: Duration },
+    /// First line didn't start with `MNEME-AUTH: `.
+    #[error("auth line missing `{AUTH_HEADER_PREFIX}` prefix")]
+    MissingPrefix,
+    /// Prefix matched but the token didn't.
+    #[error("auth token does not match the daemon's expected value")]
+    TokenMismatch,
+    /// IO error reading the auth line or writing the rejection
+    /// response.
+    #[error("auth handshake IO error: {0}")]
+    Io(#[from] io::Error),
 }
 
 /// Path to the auth-token file given the data-dir root.
@@ -106,11 +156,138 @@ pub fn rotate_token(root: &Path) -> Result<PathBuf, AuthError> {
 
 /// Constant-time comparison of two tokens. Returns `true` if
 /// they're byte-identical, `false` otherwise. Used by the daemon's
-/// verification path (next A.M4 commit) to avoid leaking
-/// prefix-match timing information.
+/// verification path ([`handshake`]) to avoid leaking prefix-match
+/// timing information.
 pub fn tokens_match(presented: &[u8], expected: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     presented.ct_eq(expected).into()
+}
+
+/// Per-connection auth handshake (ADR-0012 D3). Reads the first
+/// newline-terminated line from `reader`; expects
+/// `MNEME-AUTH: <token>\n`; constant-time-compares the token
+/// against `expected`. On success returns the [`BufReader`] the
+/// caller should hand to `StdioTransport` (so subsequent MCP frames
+/// reuse the same internal buffer). On any failure writes a
+/// JSON-RPC error frame to `writer`, drops the connection, and
+/// returns the structured error.
+///
+/// Bounded by [`AUTH_LINE_MAX_BYTES`] + [`AUTH_HANDSHAKE_TIMEOUT`].
+/// Both bounds are intentional anti-DoS measures — a slow / silent
+/// peer can't tie up a daemon worker indefinitely waiting on the
+/// handshake.
+pub async fn handshake<R, W>(
+    reader: R,
+    writer: &mut W,
+    expected: &[u8],
+) -> Result<BufReader<R>, HandshakeError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffered = BufReader::new(reader);
+    let mut line = Vec::with_capacity(AUTH_LINE_MAX_BYTES);
+
+    let read_outcome = tokio::time::timeout(
+        AUTH_HANDSHAKE_TIMEOUT,
+        read_capped_line(&mut buffered, &mut line, AUTH_LINE_MAX_BYTES),
+    )
+    .await;
+    let read_result = match read_outcome {
+        Ok(r) => r,
+        Err(_) => {
+            let err = HandshakeError::Timeout {
+                duration: AUTH_HANDSHAKE_TIMEOUT,
+            };
+            write_rejection(writer, &err).await.ok();
+            return Err(err);
+        }
+    };
+    read_result?;
+
+    // Strip the trailing \n (and optional \r) so the comparison
+    // sees just the prefix + token.
+    while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
+        line.pop();
+    }
+
+    let prefix = AUTH_HEADER_PREFIX.as_bytes();
+    if !line.starts_with(prefix) {
+        let err = HandshakeError::MissingPrefix;
+        write_rejection(writer, &err).await.ok();
+        return Err(err);
+    }
+    let presented = &line[prefix.len()..];
+    if !tokens_match(presented, expected) {
+        let err = HandshakeError::TokenMismatch;
+        write_rejection(writer, &err).await.ok();
+        return Err(err);
+    }
+
+    Ok(buffered)
+}
+
+/// Read up to `cap` bytes into `buf`, stopping at the first `\n`
+/// (which IS included in `buf`). Errors with `LineTooLong` if `cap`
+/// is hit without a newline; errors with `PrematureEof` if the
+/// reader returns 0 bytes before a newline.
+async fn read_capped_line<R>(
+    reader: &mut BufReader<R>,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> Result<(), HandshakeError>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Err(HandshakeError::PrematureEof);
+            }
+            // Got partial data, then EOF without newline — same
+            // failure mode as a peer that disconnected mid-line.
+            return Err(HandshakeError::PrematureEof);
+        }
+        let take = available.len().min(cap.saturating_sub(buf.len()));
+        if take == 0 {
+            return Err(HandshakeError::LineTooLong { limit: cap });
+        }
+        if let Some(nl_idx) = available[..take].iter().position(|b| *b == b'\n') {
+            buf.extend_from_slice(&available[..=nl_idx]);
+            reader.consume(nl_idx + 1);
+            return Ok(());
+        }
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if buf.len() >= cap {
+            return Err(HandshakeError::LineTooLong { limit: cap });
+        }
+    }
+}
+
+async fn write_rejection<W>(writer: &mut W, err: &HandshakeError) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    // JSON-RPC 2.0 error response. id=null because we haven't
+    // received a real request yet — the client may not even have
+    // sent a JSON frame. Code -32001 is reserved per the MCP /
+    // JSON-RPC convention for "implementation-defined server
+    // error"; we picked it for "auth rejection" specifically.
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "error": {
+            "code": -32001,
+            "message": format!("auth handshake rejected: {err}"),
+        }
+    });
+    let mut bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    bytes.push(b'\n');
+    writer.write_all(&bytes).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 fn generate_token() -> Vec<u8> {
