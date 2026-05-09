@@ -14,6 +14,29 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **A.M2 ✅: `mneme daemon` serves a single client end-to-end over
+  Unix domain socket** (release-planning v2.1 §3.9 M2 release gate
+  per ADR-0012). New `cli::run::TransportMode::DaemonAcceptOne`
+  shares the entire boot path with the stdio runner — only the
+  reader/writer pair fed to `Server::new` differs. The dispatch
+  uses boxed trait objects (`Box<dyn AsyncRead+Send+Unpin>`) so
+  both transports produce the same concrete `StdioTransport` type
+  and `Server::new` is monomorphised once. Daemon flow: bind via
+  `daemon::bind_listener`, accept ONE client, drop the listener
+  (RAII unlinks the socket file before serving begins so the next
+  daemon start sees a clean filesystem), then run the existing MCP
+  stack over the connected stream until EOF. The socket file's
+  brief existence (only between bind and accept) bounds the
+  observability window for stale-socket scenarios. New
+  `tests/daemon_e2e.rs` integration suite spawns the binary,
+  connects via `UnixStream`, runs the standard MCP initialize
+  handshake, asserts the response shape, closes, and confirms the
+  daemon exits cleanly + the socket is gone — this is the M2
+  release gate. A second test confirms two daemons against the
+  same data dir refuse via the existing lockfile contract. Spawn-
+  and-connect from `mneme run` default mode (ADR-0012 D12) and
+  long-running multi-client lifecycle (M3 / D6+D7) ship in
+  subsequent A.M3 commits.
 - **Unix-domain-socket listener with stale-cleanup probe** (second
   commit of A.M2 per ADR-0012 D2/D5). New `src/daemon/listener.rs`
   module owns the socket-binding lifecycle: bind at

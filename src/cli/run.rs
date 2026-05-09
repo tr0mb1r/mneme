@@ -43,7 +43,32 @@ use crate::{MnemeError, migrate};
 /// nobody thinks they're embedding for real.
 const EMBEDDER_OVERRIDE_ENV: &str = "MNEME_EMBEDDER";
 
+/// Which transport the MCP server speaks. The boot path
+/// ([`execute_with_mode`]) is identical for both modes — only the
+/// reader/writer pair fed to `Server::new` differs. M2 (this code)
+/// ships single-client semantics for the daemon mode: bind, accept
+/// ONE connection, serve until EOF, exit. M3 will expand
+/// `DaemonAcceptOne` into a long-running multi-connection accept
+/// loop with idle-timeout shutdown (ADR-0012 D6).
+#[derive(Debug)]
+pub enum TransportMode {
+    /// Read JSON-RPC frames from stdin, write replies to stdout.
+    /// v1.0 default, retained as the `--stdio` opt-in per ADR-0012
+    /// D10.
+    Stdio,
+    /// Bind `<root>/run/mneme.sock`, accept exactly one client
+    /// connection, then drop the listener (RAII unlinks the socket
+    /// file). Serve the accepted stream until EOF. Per-connection
+    /// auth-token verification (D3) and multi-client lifecycle (D6,
+    /// D7) land in M4 / M3 respectively.
+    DaemonAcceptOne,
+}
+
 pub fn execute() -> Result<()> {
+    execute_with_mode(TransportMode::Stdio)
+}
+
+pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     // Ignore SIGTTIN/SIGTTOU. If the user runs `mneme run &` in an
     // interactive shell, our stdin read would otherwise trigger SIGTTIN
     // → process stopped, and any SIGTERM the user sends afterwards gets
@@ -213,6 +238,8 @@ pub fn execute() -> Result<()> {
     let sessions_dir = root.join("sessions");
     let result = runtime
         .block_on(async_main(
+            mode,
+            root.clone(),
             Arc::clone(&storage_dyn),
             Arc::clone(&semantic),
             Arc::clone(&procedural),
@@ -270,6 +297,8 @@ pub fn execute() -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 async fn async_main(
+    mode: TransportMode,
+    root: std::path::PathBuf,
     storage: Arc<dyn Storage>,
     semantic: Arc<SemanticStore>,
     procedural: Arc<ProceduralStore>,
@@ -319,9 +348,45 @@ async fn async_main(
         tracing::warn!(error = %e, "failed to record session_start event");
     }
 
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let transport = StdioTransport::new(stdin, stdout);
+    // Build the transport reader/writer pair. Boxed trait objects
+    // so both stdio and accepted-socket halves produce the same
+    // concrete `StdioTransport<Box<...>, Box<...>>` type — single
+    // monomorphisation of `Server::new` for both modes. The boxed
+    // dispatch is a per-syscall virtual call, negligible against
+    // JSON-RPC frame parsing + storage IO.
+    type AsyncReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+    type AsyncWriter = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
+    let (reader, writer): (AsyncReader, AsyncWriter) = match mode {
+        TransportMode::Stdio => {
+            tracing::info!("transport=stdio: reading frames from stdin");
+            (Box::new(tokio::io::stdin()), Box::new(tokio::io::stdout()))
+        }
+        TransportMode::DaemonAcceptOne => {
+            let listener = crate::daemon::bind_listener(&root)
+                .await
+                .map_err(|e| anyhow::anyhow!("daemon listener bind failed: {e}"))?;
+            tracing::info!(
+                socket = %listener
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                "transport=daemon: listener bound; awaiting first client"
+            );
+            let (stream, _addr) = listener.as_inner().accept().await?;
+            tracing::info!(
+                "transport=daemon: client accepted; unbinding listener so the \
+                 socket file is gone before serving begins"
+            );
+            // Drop the listener now — RAII unlinks the socket file.
+            // The accepted stream is independent of the listener; we
+            // serve over the connected fd until EOF. Subsequent
+            // `mneme daemon` invocations see a clean filesystem.
+            drop(listener);
+            let (read, write) = stream.into_split();
+            (Box::new(read), Box::new(write))
+        }
+    };
+    let transport = StdioTransport::new(reader, writer);
     let mut server = Server::new(
         transport,
         Arc::new(ToolRegistry::defaults_with_schedulers(
