@@ -149,8 +149,10 @@ fn on_disk_size(root: &Path) -> u64 {
         for entry in entries.flatten() {
             let p = entry.path();
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            // Top-level skip — only check at depth 1.
-            if dir == root && (name == "models" || name == "logs") {
+            // Top-level skip — only check at depth 1. `run/` holds
+            // daemon runtime state (sockets, auth tokens) that
+            // shouldn't inflate the user-facing on-disk headline.
+            if dir == root && (name == "models" || name == "logs" || name == "run") {
                 continue;
             }
             let meta = match entry.metadata() {
@@ -237,6 +239,19 @@ mod tests {
         assert_eq!(human_bytes(1024), "1.00 KiB");
         assert_eq!(human_bytes(1024 * 1024), "1.00 MiB");
         assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.00 GiB");
+    }
+
+    #[test]
+    fn on_disk_size_excludes_run_dir() {
+        // Regression for v1.0 → v1.1 rollback discovery 2026-05-09:
+        // ~/.mneme/run/ holds daemon runtime state and shouldn't
+        // inflate the user-facing on-disk byte count.
+        let (_tmp, root) = fresh_root();
+        std::fs::create_dir_all(root.join("run")).unwrap();
+        std::fs::write(root.join("run").join("auth.token"), vec![0u8; 4096]).unwrap();
+        std::fs::write(root.join("config.toml"), b"[foo]\n").unwrap();
+        let bytes = on_disk_size(&root);
+        assert!(bytes < 4096, "expected run/ skipped, got {bytes}");
     }
 
     #[test]
