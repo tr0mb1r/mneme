@@ -23,15 +23,18 @@ work that the agent would otherwise forget.**
 
 ## Status
 
-Pre-1.0 — `0.2.x` line, latest `0.2.6` published as
-[`mneme-mcp`](https://crates.io/crates/mneme-mcp) on crates.io and via
-[Homebrew](https://github.com/tr0mb1r/homebrew-mneme). Phases 0–5
-complete; Phase 6 (portability + diagnostics + release infrastructure)
-substantially complete. Code-side feature work for 1.0 is done; the
-remaining gates are calendar-bound: 30-day soak (clock started
-2026-04-29) and one full release cycle without a `schema_version` bump.
-The on-disk format is stable behind a versioned schema with a migration
-path. Treat as production-capable for personal use, not yet 1.0. See
+Pre-1.0 cycle wrapping. Latest published release is `0.2.6` on
+[`mneme-mcp`](https://crates.io/crates/mneme-mcp) (crates.io) and via
+[Homebrew](https://github.com/tr0mb1r/homebrew-mneme). The `develop`
+branch is at `1.1.0` (preview — not yet tagged) and accumulates the
+v1.1 cycle work per the release-planning doc: daemon mode + SSE-default
+transport (ADR-0012), per-agent installer (`mneme init <agent>`, fully
+wired for `claude-code` and `claude-desktop`), size guardrails +
+first-boot audit, and v1.0 → v1.1 migration tests. The v1.0 release is
+calendar-gated on the 30-day soak (Day 0 = 2026-04-29) + one cycle
+without a `schema_version` bump and ships before v1.1. Treat as
+production-capable for personal use; the on-disk format is stable
+behind a versioned schema with a migration path. See
 [Versioning](./versioning.md) for the policy and 1.0 gates.
 
 ## What works today
