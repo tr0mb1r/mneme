@@ -14,6 +14,59 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **B.M1 close + B.M2: `mneme init <agent>` subcommand with Claude
+  Code as the fully-working reference implementation**
+  (release-planning v2.1 §4 + §4.7). New `mneme init` modes:
+  - `mneme init` (no agent) — preserves v1.0 scaffold-only
+    behaviour (write `~/.mneme/` layout, default `config.toml`,
+    schema migration). Idempotent.
+  - `mneme init claude-code` — full install: writes the three
+    hook scripts to `~/.claude/hooks/mneme/*.sh` (mode 0755),
+    `MNEME.md` from the embedded template, upserts the marker
+    block in `CLAUDE.md` (preserves surrounding user content
+    verbatim), adds `mcpServers.mneme` + `hooks.{SessionStart,
+    PreCompact,Stop}` to `settings.json` (preserves unrelated
+    keys via `init::json_config`). Every write atomic via
+    tmpfile + fsync + rename. **Pre-v1.1 users had to copy
+    hook scripts manually per `CLAUDE_CODE_SETUP.md` §7 + edit
+    settings.json by hand; this commit closes that footgun
+    end-to-end.** Idempotent — re-running produces byte-identical
+    output.
+  - `mneme init claude-code --upgrade` — same code path; the
+    install IS the upgrade (overwrites mneme-owned files like
+    MNEME.md, the marker block, the hook scripts). Future
+    behavioural split possible without changing the flag.
+  - `mneme init claude-code --uninstall` — reverses the install:
+    removes mneme entries from settings.json (prunes empty
+    `mcpServers: {}` / `hooks: {}` containers it created),
+    deletes MNEME.md, removes the marker block from CLAUDE.md
+    (deletes the file if marker was its only content),
+    `remove_dir_all`s `~/.claude/hooks/mneme/`, prunes empty
+    `~/.claude/hooks/` parent. Idempotent.
+  - `mneme init claude-code --show` — prints the install plan
+    to stdout without writing.
+  - `mneme init {claude-desktop,cursor,cline,codex,gemini-cli}`
+    — returns `NotYetImplemented` with the tracked task pointer
+    (B.M3 / B.M4). Per the user's redirect 2026-05-09: don't
+    scaffold without a working installer; ship Claude Code 100%
+    now and expand to the others as each is wired and validated
+    end-to-end.
+  - OpenCode is omitted from the `Agent` enum entirely (Tier-2
+    conditional per ADR-0012 — won't ship in v1.1 unless the
+    plugin API stabilises by mid-July M4).
+  Doc surface (Checklist E — CLI subcommand): subcommand
+  enriched in `clap` with subcommand-level docs visible via
+  `--help`. 12 new tests in `init::agents::claude_code`
+  (install / preserves-existing-settings /
+  preserves-existing-CLAUDE.md / idempotent / upgrade /
+  uninstall / preserves-around-marker / preserves-unrelated-
+  settings / uninstall-idempotent / show-no-write). End-to-end
+  smoke also verified manually with a temp `$HOME`. Total lib
+  suite at 428 passed (was 418, +10 from agents +
+  agents::claude_code). Closes B.M1 (the framework + reference
+  installer in one) and merges the M2 deliverable in one
+  commit per the user's "must work 100%" framing for Claude
+  Code.
 - **B.M1 third commit: JSON config-merge primitive**
   (release-planning v2.1 §4.4). New `src/init/json_config.rs`
   surgically inserts / updates / removes mneme-owned entries

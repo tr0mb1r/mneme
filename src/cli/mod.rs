@@ -26,8 +26,30 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Scaffold ~/.mneme and download embedding model
-    Init,
+    /// Scaffold `~/.mneme/`, or install mneme into a specific
+    /// agent (`claude-code` is fully wired today; the other Tier-1
+    /// agents land per release-planning §4.7 B.M3-M4).
+    Init {
+        /// Target agent. Omit for v1.0 scaffold-only behaviour
+        /// (writes ~/.mneme/, schema migration, default config).
+        #[arg(value_enum)]
+        agent: Option<crate::init::agents::Agent>,
+        /// Re-run the install, overwriting mneme-owned files. Same
+        /// effect as plain install today (per §4.6 the install is
+        /// the upgrade); the flag exists so a future behaviour
+        /// split is easy to land.
+        #[arg(long, conflicts_with_all = ["uninstall", "show"])]
+        upgrade: bool,
+        /// Reverse the install: remove every artifact mneme created.
+        /// Idempotent — safe to re-run.
+        #[arg(long, conflicts_with_all = ["upgrade", "show"])]
+        uninstall: bool,
+        /// Print the install plan to stdout without writing
+        /// anything. Useful for "what would `mneme init <agent>`
+        /// do?" before committing.
+        #[arg(long, conflicts_with_all = ["upgrade", "uninstall"])]
+        show: bool,
+    },
     /// Start the MCP server
     Run,
     /// Start the v1.1 daemon (M2-M5 of release-planning §3.9 land
@@ -75,7 +97,12 @@ pub enum Command {
 
 pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Init => init::execute(),
+        Command::Init {
+            agent,
+            upgrade,
+            uninstall,
+            show,
+        } => init::execute(agent, upgrade, uninstall, show),
         Command::Run => run::execute(),
         Command::Daemon => daemon::execute(),
         Command::Stats => stats::execute(),
