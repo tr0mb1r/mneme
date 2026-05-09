@@ -12,6 +12,23 @@ the work that landed before automation was wired up.
 
 ## [Unreleased] — develop track (v1.1)
 
+### Changed
+
+- **`remember` MCP tool description rewritten with explicit size
+  guidance and good/bad examples** (release-planning v2.1 §5.6 M1).
+  The tool description is the contract the LLM reads to decide how
+  to call `remember`; making the size target (under 500 chars)
+  and the tier behavior (500–2k advisory, 2k–10k warning, over 10k
+  rejected) explicit primes the agent to call the tool well rather
+  than waiting for the server to push back. Description-only
+  change: tier enforcement and `length_advisory` /
+  `length_warning` response fields land in C.M2, the
+  `large_memory_count` stats counter in C.M3. `book/src/mcp-surface.md`
+  gains a §Size guardrails subsection documenting the steady-state
+  contract; `docs/examples/claude-code-config/CLAUDE.md` template
+  bullet for `mneme.remember` is updated to surface the size
+  guidance to copy/pasting users.
+
 ### Fixed
 
 - **`mneme backup` no longer archives `~/.mneme/run/` contents and

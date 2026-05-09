@@ -11,11 +11,24 @@ use crate::memory::semantic::{MemoryKind, SemanticStore};
 use crate::scope::ScopeState;
 
 const DESCRIPTION: &str = "Store a piece of information for future recall. \
-Use this when the user shares a fact, makes a decision, or expresses a \
-preference that should persist across sessions. Do NOT use for transient \
-information from tool outputs (those are handled automatically). Do NOT \
-use to store the contents of source code files (those are read live from \
-disk).";
+Use when the user shares a fact, makes a decision, or expresses a \
+preference that should persist across sessions.\n\
+\n\
+SIZE: Target under 500 characters. Mneme stores concise facts, not \
+source material.\n\
+- Good: \"user prefers tabs over spaces\" (32 chars).\n\
+- Bad: pasting a 4,000-char Slack thread. Instead, extract the insight: \
+\"team agreed 2026-04-29 to migrate auth to Auth0 by Q3\".\n\
+- 500-2,000 chars: accepted; the response carries a `length_advisory` \
+field suggesting future memories be more concise.\n\
+- 2,000-10,000 chars: accepted; the response carries a stronger \
+`length_warning` field.\n\
+- Over 10,000 chars: rejected with a structured error. Extract a key \
+insight or store a brief summary plus a source reference instead.\n\
+\n\
+DO NOT use for: transient information from tool outputs (those are \
+captured automatically), or contents of source code files (those are \
+read live from disk).";
 
 pub struct Remember {
     store: Arc<SemanticStore>,

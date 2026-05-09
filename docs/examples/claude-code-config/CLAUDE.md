@@ -28,6 +28,10 @@ you want a different default for write tools (`remember`, `pin`,
   Pass `kind` to filter by event kind (e.g. `decision`, `milestone`).
 - `mneme.remember(content, kind, tags?, scope?)` — write L3 + L4.
   `kind` ∈ {`fact`, `decision`, `preference`, `conversation`}.
+  **Size:** target under 500 chars; 500–2k accepted with a
+  `length_advisory`, 2k–10k with a `length_warning`, over 10k
+  rejected. Extract the key insight rather than pasting source
+  material. See `book/src/mcp-surface.md` §Size guardrails.
 - `mneme.pin(content, tags?, scope?)` — write L0 procedural. Use for
   hard rules ("always X", "never Y") that should surface every session.
 - `mneme.record_event(kind, payload, tags?, scope?, retrieval_weight?)`

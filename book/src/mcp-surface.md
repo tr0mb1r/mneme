@@ -9,7 +9,7 @@ and 5 resources. This page is the canonical inventory.
 
 | Tool | Layer | Use when |
 |------|-------|----------|
-| `remember` | L4 semantic | The user shares a fact, decision, or preference that should persist across sessions. |
+| `remember` | L4 semantic | The user shares a fact, decision, or preference that should persist across sessions. **Size guidance:** target under 500 chars; 500–2k accepted with a `length_advisory`, 2k–10k with a `length_warning`, over 10k rejected with a structured error. See [§Size guardrails](#size-guardrails) below. |
 | `update` | L4 semantic | The user revises an existing memory; re-embeds automatically when `content` changes. |
 | `forget` | L4 semantic, L0 procedural, L3 episodic (hot+warm) | The user explicitly asks to remove a memory. `id=…` resolves the ULID across all three layers, first hit wins; cold-archive entries stay out of reach by design. Confirm before calling. |
 | `pin` | L0 procedural | A *rule* should surface on every recall context (e.g. "always use `uv`, not `pip`"). |
@@ -95,3 +95,32 @@ When the orchestrator assembles `mneme://context`, it scores items as
 
 Recency decay is a 14-day half-life. The per-layer reservation in the
 budget pass guarantees no single layer is starved by another.
+
+## Size guardrails
+
+Mneme stores concise facts, not source material. The `remember` tool
+description (visible to the agent in `tools/list`) makes the size
+contract explicit so the agent calls the tool well rather than
+needing the server to push back. v1.1 ships the size tiers in three
+phases per release planning §5.6:
+
+| Content length | Behavior |
+|---|---|
+| < 500 chars | Stored normally. No advisory. |
+| 500–2,000 chars | Stored. Response carries a `length_advisory` field suggesting future memories be more concise. |
+| 2,000–10,000 chars | Stored. Response carries a stronger `length_warning` field; logged at `info` level. |
+| > 10,000 chars | Rejected with a structured error suggesting the agent extract a key insight or store a brief summary plus a source reference. |
+
+The 10,000-character hard limit is configurable via
+`[budgets] max_remember_chars`. Existing memories that exceed any
+tier remain readable and `recall`-able — the verbatim principle is
+preserved; only new writes/updates above the limit are rejected. v1.0
+users upgrading to v1.1 see a one-time `~/.mneme/diagnostics.log`
+audit summary on first boot (gated by the
+`~/.mneme/run/upgrade-audit.done` marker) so any pre-existing
+oversized memories are surfaced without any of them being
+auto-modified.
+
+C.M1 (this revision) ships the description; C.M2 ships the runtime
+tier checks + response fields; C.M3 wires the tier counts into
+`mneme://stats` as `large_memory_count`.
