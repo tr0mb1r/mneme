@@ -121,6 +121,25 @@ audit summary on first boot (gated by the
 oversized memories are surfaced without any of them being
 auto-modified.
 
-C.M1 (this revision) ships the description; C.M2 ships the runtime
-tier checks + response fields; C.M3 wires the tier counts into
-`mneme://stats` as `large_memory_count`.
+C.M1 shipped the tool description; **C.M2 (current state)** ships
+the runtime tier checks. `remember` and `update` now classify
+content via `src/mcp/tools/size_tier.rs::classify` and attach
+structured `_meta` to the tools/call response:
+
+- **Advisory tier (500–2,000 chars).** `_meta = {"length_advisory":
+  {"tier": "advisory", "content_length": <N>, "limit":
+  <max_remember_chars>, "message": "..."}}`. Memory is stored;
+  agent gets the nudge to be more concise next time.
+- **Warning tier (2,000–10,000 chars).** `_meta = {"length_warning":
+  {"tier": "warning", "content_length": <N>, "limit":
+  <max_remember_chars>, "message": "..."}}` and a server-side
+  `info`-level log line. Memory is stored.
+- **Over-limit (> `max_remember_chars`).** Tools/call response has
+  `isError=true`, the text content surfaces the human-readable
+  rejection, and `_meta = {"error": {"code": "memory_too_large",
+  "content_length": <N>, "limit": <max_remember_chars>,
+  "suggestion": "..."}}`. Embedding is NEVER performed for
+  rejected content (§5.5).
+
+C.M3 will wire the tier counts into `mneme://stats` as
+`large_memory_count`.

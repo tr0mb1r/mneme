@@ -135,6 +135,12 @@ pub fn execute() -> Result<()> {
     // `[scopes] default`; mutated by the `switch_scope` tool.
     let scope_state = ScopeState::new(&config.scopes.default);
 
+    // `remember` / `update` content ceiling (release-planning v2.1
+    // §5.3). Configured via `[budgets] max_remember_chars`; the
+    // 500/2,000-character advisory and warning bounds inside
+    // `size_tier` are fixed.
+    let max_remember_chars = config.budgets.max_remember_chars;
+
     // Spawn the L3 consolidation scheduler. Watches the semantic +
     // episodic activity counters for idle windows; fires
     // `consolidation::run` on the configured cadence so hot-tier
@@ -190,6 +196,7 @@ pub fn execute() -> Result<()> {
             sessions_dir,
             scope_state,
             active_model_name.clone(),
+            max_remember_chars,
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
 
@@ -246,6 +253,7 @@ async fn async_main(
     sessions_dir: std::path::PathBuf,
     scope_state: Arc<ScopeState>,
     active_model_name: String,
+    max_remember_chars: usize,
 ) -> anyhow::Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -296,6 +304,7 @@ async fn async_main(
             Some(Arc::clone(&checkpoint_scheduler)),
             Arc::clone(&scope_state),
             Some(Arc::clone(&active_session)),
+            max_remember_chars,
         )),
         Arc::new(ResourceRegistry::defaults_with_schedulers(
             semantic,

@@ -80,6 +80,14 @@ pub struct BudgetsConfig {
     pub default_recall_limit: usize,
     #[serde(default = "default_auto_context_budget")]
     pub auto_context_token_budget: usize,
+    /// Hard ceiling on `remember` / `update` content length, in
+    /// characters. Above this, the tool returns a structured error
+    /// (release-planning v2.1 §5.4) suggesting the agent extract a
+    /// key insight or summarize. Existing oversized memories remain
+    /// readable — the verbatim principle is preserved; only new
+    /// writes/updates are rejected.
+    #[serde(default = "default_max_remember_chars")]
+    pub max_remember_chars: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -155,6 +163,9 @@ fn default_recall_limit() -> usize {
 fn default_auto_context_budget() -> usize {
     4000
 }
+fn default_max_remember_chars() -> usize {
+    10_000
+}
 fn default_session_interval_secs() -> u64 {
     30
 }
@@ -229,6 +240,7 @@ impl Default for BudgetsConfig {
         Self {
             default_recall_limit: default_recall_limit(),
             auto_context_token_budget: default_auto_context_budget(),
+            max_remember_chars: default_max_remember_chars(),
         }
     }
 }
@@ -299,6 +311,7 @@ mod tests {
         assert_eq!(c.mcp.sse_port, 7878);
         assert_eq!(c.budgets.default_recall_limit, 10);
         assert_eq!(c.budgets.auto_context_token_budget, 4000);
+        assert_eq!(c.budgets.max_remember_chars, 10_000);
         assert_eq!(c.checkpoints.session_interval_secs, 30);
         assert_eq!(c.checkpoints.session_interval_turns, 5);
         assert_eq!(c.checkpoints.hnsw_snapshot_inserts, 1000);

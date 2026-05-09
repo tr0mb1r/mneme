@@ -14,6 +14,22 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **`remember` and `update` enforce content size tiers** (C.M2 of
+  release-planning v2.1 §5.6). Content classified via the new
+  `src/mcp/tools/size_tier.rs` module: under 500 chars stored
+  silently, 500–2,000 chars stored with `_meta.length_advisory`,
+  2,000–10,000 chars stored with `_meta.length_warning` plus an
+  `info`-level log line, over 10,000 chars rejected with
+  `isError=true` + `_meta.error.code = "memory_too_large"`. The
+  ceiling is configurable via the new `[budgets] max_remember_chars`
+  knob (default `10000`); the 500/2,000 advisory/warning bounds are
+  fixed in code by design. Embedding is never performed for
+  rejected content (§5.5). The verbatim principle is preserved —
+  existing oversized memories remain `recall`-able; only new
+  writes/updates are gated. `ToolResult` gained a `meta:
+  Option<Value>` field that surfaces as the MCP `_meta` field on
+  tools/call responses; existing tools emit `null`. C.M3 will wire
+  the tier counts into `mneme://stats` as `large_memory_count`.
 - **v0.2.6 performance baseline frozen at `benches/baselines/v0_2_6.json`**
   (release-planning v2.1 §6.2). Captures p50/p95/p99 + min/max +
   criterion mean/median/stddev for the four hot-path benches

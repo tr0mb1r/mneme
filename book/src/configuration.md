@@ -39,6 +39,7 @@ schedule          = "idle"
 [budgets]
 default_recall_limit       = 10
 auto_context_token_budget  = 4000
+max_remember_chars         = 10000
 
 [mcp]
 transport = "stdio"
@@ -357,6 +358,34 @@ you're running a smaller model.
 The estimator is `chars / 4` per spec §0; replacing it with a real
 tokenizer (`tokenizers`/`tiktoken-rs`) is a one-function swap
 without a config change.
+
+### `max_remember_chars`
+
+| | |
+|---|---|
+| **Type** | unsigned integer (characters) |
+| **Default** | `10000` |
+| **Affects** | `remember` and `update` content acceptance ceiling |
+
+Hard ceiling on `remember` / `update` content length. Above this,
+the tool returns a structured `memory_too_large` error
+(`isError=true`, `_meta.error.code = "memory_too_large"`) suggesting
+the agent extract a key insight or summarize first. The verbatim
+principle is preserved: existing oversized memories remain readable
+and `recall`-able — only new writes/updates above the ceiling are
+rejected.
+
+The 500-character advisory boundary and the 2,000-character warning
+boundary are deliberately fixed in code (`src/mcp/tools/size_tier.rs`)
+and do NOT vary with `max_remember_chars`. They represent the
+steady-state size guidance and shouldn't drift per-installation. See
+[`book/src/mcp-surface.md` §Size guardrails](mcp-surface.html#size-guardrails)
+for the full tier semantics and `_meta` shape.
+
+Raise this only when you have a specific need (research notes, long
+runbooks). The advisory + warning meta will still surface above
+500/2,000 chars; tightening the ceiling moves only the rejection
+threshold.
 
 ---
 

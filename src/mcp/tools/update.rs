@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use ulid::Ulid;
 
+use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
 use super::{Tool, ToolDescriptor, ToolError, ToolResult};
 use crate::ids::MemoryId;
 use crate::memory::semantic::{MemoryKind, SemanticStore, UpdatePatch};
@@ -25,11 +26,25 @@ Re-embedding happens automatically when `content` changes.";
 
 pub struct Update {
     store: Arc<SemanticStore>,
+    /// Hard ceiling on replacement content length; updates above
+    /// this are rejected with `memory_too_large` (release-planning
+    /// v2.1 §5.4). Mirrors `remember`'s ceiling so the contract is
+    /// uniform across writes.
+    max_chars: usize,
 }
 
 impl Update {
     pub fn new(store: Arc<SemanticStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            max_chars: DEFAULT_MAX_CHARS,
+        }
+    }
+
+    /// Override the over-limit ceiling. Mirrors `Remember::with_max_chars`.
+    pub fn with_max_chars(mut self, max_chars: usize) -> Self {
+        self.max_chars = max_chars;
+        self
     }
 }
 
@@ -87,6 +102,23 @@ impl Tool for Update {
             }
         };
 
+        // Size-tier check on replacement content only — metadata-only
+        // updates (kind/tags/scope) bypass the check entirely. Done
+        // before the storage call so we don't waste a re-embed on
+        // content that's about to be rejected (§5.5).
+        let content_tier = match &content {
+            Some(s) => {
+                let len = size_tier::count_chars(s);
+                let tier = size_tier::classify(len, self.max_chars);
+                if tier == Tier::OverLimit {
+                    let (text, meta) = size_tier::rejection(len, self.max_chars);
+                    return Ok(ToolResult::text(text).with_error().with_meta(meta));
+                }
+                Some((tier, len))
+            }
+            None => None,
+        };
+
         let kind = match args.get("type") {
             None => None,
             Some(Value::String(s)) => Some(MemoryKind::parse(s).ok_or_else(|| {
@@ -142,11 +174,30 @@ impl Tool for Update {
             .await
             .map_err(|e| ToolError::Internal(format!("update failed: {e}")))?;
 
-        Ok(ToolResult::text(if existed {
+        if let Some((Tier::Warning, len)) = content_tier {
+            tracing::info!(
+                content_len = len,
+                limit = self.max_chars,
+                memory_id = %memory_id,
+                "update: replacement content is large (warning tier)"
+            );
+        }
+
+        let mut result = ToolResult::text(if existed {
             format!("updated memory {memory_id}")
         } else {
             format!("no such memory {memory_id}")
-        }))
+        });
+        // Only attach an advisory/warning if the update actually
+        // landed and the content was the field changing — no point
+        // in advising on a no-op or a metadata-only patch.
+        if existed
+            && let Some((tier, len)) = content_tier
+            && let Some(meta) = size_tier::success_meta(tier, len, self.max_chars)
+        {
+            result = result.with_meta(meta);
+        }
+        Ok(result)
     }
 }
 
@@ -296,6 +347,69 @@ mod tests {
         assert_eq!(item.kind, MemoryKind::Decision);
         assert_eq!(item.tags, vec!["governance".to_string()]);
         assert_eq!(item.scope, "work");
+    }
+
+    /// Updating with content over the configured ceiling: rejected
+    /// with structured `memory_too_large` meta. The original memory
+    /// is unchanged.
+    #[tokio::test]
+    async fn over_limit_content_rejects_with_memory_too_large() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let id = s
+            .remember("original", MemoryKind::Fact, vec![], "personal".into())
+            .await
+            .unwrap();
+        let u = Update::new(Arc::clone(&s));
+        let payload = "z".repeat(15_000);
+        let res = u
+            .invoke(json!({ "id": id.to_string(), "content": &payload }))
+            .await
+            .unwrap();
+        assert!(res.is_error);
+        let meta = res.meta.expect("expected error meta");
+        assert_eq!(meta["error"]["code"], "memory_too_large");
+        assert_eq!(meta["error"]["content_length"], 15_000);
+        // Original memory unchanged.
+        let item = s.get(id).await.unwrap().unwrap();
+        assert_eq!(item.content, "original");
+    }
+
+    /// Replacement content in the advisory tier surfaces the meta
+    /// annotation; metadata-only updates do not.
+    #[tokio::test]
+    async fn advisory_tier_content_surfaces_length_advisory() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let id = s
+            .remember("hi", MemoryKind::Fact, vec![], "personal".into())
+            .await
+            .unwrap();
+        let u = Update::new(Arc::clone(&s));
+        let payload = "a".repeat(700);
+        let res = u
+            .invoke(json!({ "id": id.to_string(), "content": payload }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let meta = res.meta.expect("expected length_advisory meta");
+        assert!(meta.get("length_advisory").is_some());
+    }
+
+    #[tokio::test]
+    async fn metadata_only_update_has_no_size_meta() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let id = s
+            .remember("hi", MemoryKind::Fact, vec![], "personal".into())
+            .await
+            .unwrap();
+        let u = Update::new(Arc::clone(&s));
+        let res = u
+            .invoke(json!({ "id": id.to_string(), "tags": ["x"] }))
+            .await
+            .unwrap();
+        assert!(res.meta.is_none());
     }
 
     #[tokio::test]
