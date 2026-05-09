@@ -12,6 +12,22 @@ the work that landed before automation was wired up.
 
 ## [Unreleased] — develop track (v1.1)
 
+### Changed
+
+- **`docs/CLAUDE_CODE_SETUP.md` updated to lead with
+  `mneme init claude-code`** (D.M3 follow-up; release-planning
+  v2.1 §7.1). Pre-v1.1 the doc walked users through manual
+  `cargo build` + `claude mcp add` + manual hook copy + manual
+  `settings.json` edit — six steps, easy to typo, easy to skip
+  the hooks. v1.1 ships `mneme init claude-code` which does all
+  of it atomically; the doc now opens with a TL;DR section
+  showing the single-command path. The §7.2 "manual install
+  (pre-v1.1)" subsection retains the old instructions for users
+  on older mneme builds or who want to script their own variant
+  — same content, demoted to "if you want to know what's
+  happening underneath" reference. Closes a doc-gap that would
+  have left v1.1 users following pre-v1.1 instructions.
+
 ### Added
 
 - **D.M2: `mneme demo` walkthrough command**

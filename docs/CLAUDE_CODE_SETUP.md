@@ -1,12 +1,30 @@
 # Setting up Mneme with Claude Code
 
 This guide walks you from a stock Claude Code install to a session where
-the agent can call `remember`, `recall`, and the rest of mneme's 13 tools
-— including verification, project-vs-personal scoping, and troubleshooting.
+the agent can call `remember`, `recall`, and the rest of mneme's tools.
 
-If you only want the three lines: build the binary, run `mneme init`, then
-`claude mcp add --scope user mneme /absolute/path/to/mneme run`. Restart
-Claude Code, type `/mcp`, and you should see mneme listed.
+## TL;DR (v1.1+)
+
+```sh
+brew install mneme              # or build from source per §1
+mneme init claude-code          # writes settings.json + MNEME.md + CLAUDE.md marker + 3 hook scripts
+# Restart Claude Code so it picks up the new MCP server.
+```
+
+`mneme init claude-code` is idempotent (safe to re-run), atomic (every
+file write is `tmpfile` + `fsync` + `rename` so a crashed install never
+half-clobbers your config), and reversible (`mneme init claude-code
+--uninstall` reverts every change while preserving every other entry in
+your `settings.json` and every line of `CLAUDE.md` outside the marker
+block). Use `--show` first if you want to see what it would write.
+
+The post-install message walks you through a 2-minute Vim-keybindings
+recall demo to confirm memory works end-to-end across sessions.
+
+The rest of this guide explains what `mneme init claude-code` does,
+covers the manual install path (for users on pre-v1.1 mneme or who want
+to script their own variant), and documents the project-scoping +
+verification + troubleshooting workflows.
 
 ---
 
@@ -304,7 +322,24 @@ the running `mneme run` process directly — that would conflict
 with the exclusive lockfile. A direct hook-to-mneme control
 channel is on the v1.1 roadmap.
 
-### 7.1 Install the example scripts
+### 7.1 The easy path (v1.1+): `mneme init claude-code`
+
+```sh
+mneme init claude-code
+```
+
+That installs the three hook scripts to `~/.claude/hooks/mneme/`
+(mode 0755) AND adds the `hooks` block to `settings.json` AND
+writes `MNEME.md` AND adds the marker block to `CLAUDE.md` — all
+atomically. Skip to §7.3 to verify it worked.
+
+The rest of this section (§7.2 manual install) is preserved for
+users on pre-v1.1 mneme or who want to script their own variant.
+
+### 7.2 Manual install (pre-v1.1)
+
+If you're on pre-v1.1 mneme (no `mneme init claude-code` yet),
+copy the three scripts manually:
 
 ```sh
 # From the repo root, copy the three scripts to a stable location
@@ -317,12 +352,10 @@ cp docs/examples/claude-code-hooks/session-start.sh \
 chmod +x ~/.claude/hooks/mneme/*.sh
 ```
 
-### 7.2 Wire them into Claude Code
-
-Add the following block to your Claude Code settings (typically
-`~/.claude/settings.json` for user scope, or `<repo>/.claude/
-settings.json` for project scope). Merge with existing `hooks`
-keys if you have any.
+Then add the following block to your Claude Code settings
+(typically `~/.claude/settings.json` for user scope, or
+`<repo>/.claude/settings.json` for project scope). Merge with
+existing `hooks` keys if you have any.
 
 ```json
 {
