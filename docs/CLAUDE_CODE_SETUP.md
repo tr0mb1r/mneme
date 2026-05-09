@@ -55,7 +55,9 @@ You need:
 
   This creates `~/.mneme/` with `config.toml`, the schema-version stamp,
   and the directory layout. It does **not** download the embedding model
-  yet — that happens on the first `mneme run`.
+  yet — that happens on the first MCP server boot (when `mneme daemon`
+  starts under the v1.1 daemon flow, or when `mneme run` first serves a
+  host under the single-host fallback).
 
   > **Embedding model size.** The default model is `bge-m3` (~1.5 GB,
   > 1024-dim, multilingual, top-tier recall). If you want a smaller model
@@ -89,12 +91,26 @@ Most users want **user scope**. Skip to step 3a.
 
 ---
 
+> **Which subcommand does Claude Code spawn?** Two MCP server modes
+> ship — `daemon` (long-lived, multi-client; paired with the
+> `mneme client` per-session bridge) and `run` (single-host stdio
+> fallback). The recipes below default to `client` because that's
+> what `mneme init claude-code` writes; swap in `run` if you want
+> the single-host shape. Full decision narrative + diagrams +
+> what each subcommand does (and doesn't) live in
+> [CLI surface § Two MCP server modes](../book/src/cli.md#two-mcp-server-modes-daemon-vs-run).
+>
+> | Mode | What's in `mcpServers.mneme.args` | Best for |
+> |---|---|---|
+> | daemon (v1.1 default) | `["client"]` | Multiple hosts share one warm process; one cold start across all sessions. |
+> | run (single-host fallback) | `["run"]` | One host only; CI / debugging / restricted shells. |
+
 ## 3a. User scope (recommended)
 
 ```sh
 # Replace the path with the absolute location of your mneme binary.
 # If `mneme` is on $PATH, the literal string "mneme" works too.
-claude mcp add --scope user mneme "$(command -v mneme)" run
+claude mcp add --scope user mneme "$(command -v mneme)" client
 ```
 
 Verify:
@@ -105,14 +121,21 @@ mneme: connected
 ```
 
 The registration is stored under `~/.claude.json` and will be loaded by
-every Claude Code session you start from now on.
+every Claude Code session you start from now on. The first connection
+spawns `mneme daemon` automatically (D12 spawn protocol); subsequent
+agent sessions reuse the running daemon.
+
+> **Single-host fallback.** If you'd rather skip the daemon, replace
+> the trailing `client` with `run` — Claude Code then spawns mneme
+> directly with no shared socket. Same data directory; only one Claude
+> Code session can have mneme open at a time (the lockfile is exclusive).
 
 ## 3b. Project scope
 
 From inside the repo where you want mneme available:
 
 ```sh
-claude mcp add --scope project mneme mneme run
+claude mcp add --scope project mneme mneme client
 ```
 
 This writes (or updates) `.mcp.json` at the repo root. Commit it if you
@@ -123,7 +146,7 @@ want collaborators to pick it up. The file looks like:
   "mcpServers": {
     "mneme": {
       "command": "mneme",
-      "args": ["run"]
+      "args": ["client"]
     }
   }
 }
@@ -138,7 +161,7 @@ want collaborators to pick it up. The file looks like:
 ## 3c. Local scope (try before you commit)
 
 ```sh
-claude mcp add mneme mneme run     # no --scope flag = local
+claude mcp add mneme mneme client     # no --scope flag = local
 ```
 
 Same registration mechanism as user scope, but only active when Claude
@@ -221,7 +244,9 @@ Use remember with content "<fact>", scope "myrepo".
 `recall` accepts a `scope` argument as a filter; `forget(id=…)`
 resolves the ULID across every layer regardless of scope. Use
 `list_scopes` to see what buckets exist. The default scope is set in
-`~/.mneme/config.toml` under `[scopes] default = "personal"`.
+`~/.mneme/config.toml` under `[scopes] default = "global"` (changed in
+v1.1.x — pre-1.1.x installs defaulted to `"personal"`; the global
+default better reflects the cross-project convention).
 
 Pattern B is simpler and lets the agent cross-reference memories
 across scopes when useful. Pattern A is right when you have a hard
@@ -260,7 +285,11 @@ proactively rather than only when you ask:
   when the turn produces them.
 - Do NOT call `record_event` for `tool_call`, `tool_call_failed`,
   `session_start`, or `session_end` — the server emits these
-  automatically; double-recording creates duplicates.
+  automatically; double-recording creates duplicates. Note that
+  `session_start` / `session_end` mark the **MCP server's** lifecycle
+  (the `mneme daemon` process, or a single-host `mneme run`), not the
+  individual agent's session. `mneme client` connections are per-agent
+  bridges and emit no lifecycle events.
 - Privacy: `record_event` and `remember` payloads are opaque to
   mneme. Never include credentials, secrets, or API tokens — the
   L3 cold archive retains them for 180+ days.
@@ -318,9 +347,9 @@ these as a deterministic load-and-save loop:
 The hooks themselves are tiny shell scripts that emit a nudge on
 stdout; Claude Code surfaces that as additional context, and the
 agent makes the actual mneme tool calls. The hooks don't talk to
-the running `mneme run` process directly — that would conflict
-with the exclusive lockfile. A direct hook-to-mneme control
-channel is on the v1.1 roadmap.
+the running MCP server (`mneme daemon` or `mneme run`) directly —
+that would conflict with the exclusive lockfile. A direct
+hook-to-mneme control channel is on the v1.1 roadmap.
 
 ### 7.1 The easy path (v1.1+): `mneme init claude-code`
 
@@ -447,11 +476,33 @@ make the load-and-save loop deterministic.
 Run the binary directly to see stderr:
 
 ```sh
+# v1.1 daemon-mode install (the default after `mneme init claude-code`):
+mneme daemon                    # starts the long-lived MCP server; Ctrl-C to stop
+mneme client </dev/null         # in another shell, exercises the bridge end-to-end
+
+# Single-host fallback install (args=["run"] in mcpServers):
 mneme run </dev/null
 ```
 
 Anything fatal will print before the process exits. Also tail
 `~/.mneme/logs/mneme.log`.
+
+### `config.toml` is missing — what happens?
+
+If `~/.mneme/config.toml` is missing (renamed away, deleted, never
+created), `Config::load` silently returns
+`Config::default()` (`src/config.rs::load`) — the daemon boots on
+all-default values without a warning. To recover:
+
+```sh
+mneme init                                  # writes a fresh defaults file
+diff ~/.mneme/config.toml ~/.mneme/config.toml.bak  # if you kept a backup
+mneme stop                                  # restart so the new file lands
+```
+
+(The silent fallback is a known UX gap; a `WARN` log line at load
+time is queued for a future patch — see the v1.1.x followup
+observation in mneme.)
 
 ### First tool call takes 30+ seconds, then succeeds
 
@@ -461,10 +512,15 @@ The embedding model is downloading (~1.5 GB for `bge-m3`, ~80 MB for
 
 ### "Another mneme is running" / lockfile error
 
-`~/.mneme/.lock` is held by a live process. Find it (`pgrep -f "mneme run"`)
-and shut it down with `mneme stop`. Only delete `.lock` manually if
-you've confirmed no process holds it — a stale lockfile is rare and
-usually means a previous crash.
+`~/.mneme/.lock` is held by a live process. Find it
+(`pgrep -af "mneme (daemon|run)"`) and shut it down with `mneme stop`.
+Only delete `.lock` manually if you've confirmed no process holds it
+— a stale lockfile is rare and usually means a previous crash.
+
+(Note: `mneme client` does NOT take the lockfile — it's just a
+stdio↔socket bridge. The lock is held by whichever MCP server is
+serving the data dir: `mneme daemon` for the v1.1 default flow,
+`mneme run` for the single-host fallback.)
 
 ### `/mcp` doesn't list mneme
 

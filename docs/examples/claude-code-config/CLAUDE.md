@@ -12,9 +12,10 @@ memory server. Mneme has four memory layers:
 - **L4 semantic** — long-term facts / decisions / preferences /
   conversations; embedding-indexed.
 
-The default scope is `personal`. Use `switch_scope` once per session if
-you want a different default for write tools (`remember`, `pin`,
-`record_event`); the filter tools (`recall`, `recall_recent`, `forget`,
+The default scope is `global` (v1.1.x+; pre-1.1.x installs defaulted
+to `personal`). Use `switch_scope` once per session if you want a
+different default for write tools (`remember`, `pin`, `record_event`);
+the filter tools (`recall`, `recall_recent`, `forget`,
 `summarize_session`, `export`) treat omitted `scope` as no-filter.
 
 ### Tools
@@ -77,7 +78,11 @@ you want a different default for write tools (`remember`, `pin`,
 - **Auto-emits are server-emitted; never double-record.** The server
   writes `tool_call`, `tool_call_failed`, `session_start`, and
   `session_end` automatically. Do NOT call `record_event` for these
-  kinds — you'll create duplicates.
+  kinds — you'll create duplicates. Note: `session_start` and
+  `session_end` mark the **MCP server's** lifecycle (the
+  `mneme daemon` process under v1.1's default flow, or a single-host
+  `mneme run`). They are NOT per-agent-session events — `mneme client`
+  connections come and go without emitting any lifecycle event.
 - **`tool_call` payloads carry only the value-bearing arg** of each
   tool (`remember.content`, `recall.query`, `forget.id`, etc.). The
   full `arguments` object is never mirrored — that's an explicit

@@ -18,6 +18,48 @@ the work that landed before automation was wired up.
 > binaries reflect the milestone they're being tested against; the
 > tagged release will follow the planning doc's `v1.0 → v1.1` order.
 
+### Documentation
+
+- **User-facing docs rewired for the daemon / client / run model.**
+  The v1.1 default install (commit `03b2674`) writes `args=["client"]`
+  into agent MCP configs so multiple hosts share one long-lived
+  `mneme daemon` over `~/.mneme/run/mneme.sock`. Pre-v1.1 docs were
+  written when `mneme run` was the single MCP server entry point and
+  every agent spawned its own copy; a number of references stayed
+  stale after the daemon/client split shipped. This pass refreshes:
+  - **`docs/CLAUDE_CODE_SETUP.md`** — manual install commands now
+    use `mneme client` (matching `mneme init claude-code`); a §3
+    blockquote explains the daemon vs run trade-off and links to the
+    canonical narrative; the §6.5 auto-emit blurb clarifies that
+    `session_start`/`session_end` mark the MCP server's lifecycle
+    (daemon process), not per-agent sessions; §7 hooks prose, §8
+    troubleshooting (`mneme run </dev/null` sanity check, lockfile
+    `pgrep` recipe) updated; new §8 section covering
+    `~/.mneme/config.toml` going missing (silent default fallback in
+    `Config::load`).
+  - **`docs/examples/claude-code-config/CLAUDE.md`** (the template
+    that `mneme init claude-code` transcludes into the user's
+    `CLAUDE.md` marker block) — `session_start`/`session_end` blurb
+    clarified; default scope text moved from "personal" to "global"
+    matching the `fix(config)` commit.
+  - **`book/src/cli.md`** — header rewritten to introduce the daemon
+    + client pair; new "Two MCP server modes: daemon vs run" section
+    with ASCII diagrams, decision matrix, "what `mneme client` is
+    NOT" enumeration, and a per-install-path `args` mapping table;
+    subcommand table updated (12 subcommands now, was 11);
+    `mneme client` entry added between `daemon` and `run`; lockfile
+    contract section updated to acknowledge both daemon and run as
+    lock-holders and `mneme client` as a non-holder bridge.
+  - **`book/src/troubleshooting.md`** — `claude mcp list` failure
+    sanity check covers daemon-mode and run-mode separately; new
+    "`~/.mneme/config.toml` is missing" section flags the silent
+    default fallback as a known UX gap; lockfile-error pgrep recipe
+    broadened to match both daemon and run.
+  Net effect: a user reading any of these docs cold gets the right
+  mental model of which subcommand their agent is invoking, why,
+  and where the lifecycle events come from. Closes the doc drift
+  flagged in this session's verification pass.
+
 ### Changed
 
 - **`docs/CLAUDE_CODE_SETUP.md` updated to lead with

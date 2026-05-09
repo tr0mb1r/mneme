@@ -9,11 +9,32 @@ their fixes.
 Run the binary directly to see stderr:
 
 ```sh
+# v1.1 daemon-mode install (the default after `mneme init claude-code`):
+mneme daemon                    # starts the long-lived MCP server; Ctrl-C to stop
+mneme client </dev/null         # in another shell, exercises the bridge end-to-end
+
+# Single-host fallback install (args=["run"] in mcpServers):
 mneme run </dev/null
 ```
 
 Anything fatal will print before the process exits. Also tail
 `~/.mneme/logs/mneme.log`.
+
+## `~/.mneme/config.toml` is missing — what does that mean?
+
+`Config::load` (`src/config.rs::load`) silently returns
+`Config::default()` when the file is absent. The MCP server boots
+on all-default values without a warning — easy to miss after you
+rename or delete the file. Fix:
+
+```sh
+mneme init                                  # writes a fresh defaults file
+diff ~/.mneme/config.toml ~/.mneme/config.toml.bak  # if you kept a backup
+mneme stop                                  # restart so the new file lands
+```
+
+(A `WARN` log line at load time when the file is missing is queued
+for a future v1.1.x patch — see the related observation in mneme.)
 
 ## First tool call takes 30+ seconds, then succeeds
 
@@ -23,10 +44,15 @@ The embedding model is downloading (~1.5 GB for `bge-m3`, ~80 MB for
 
 ## "Another mneme is running" / lockfile error
 
-`~/.mneme/.lock` is held by a live process. Find it (`pgrep -f "mneme run"`)
-and shut it down with `mneme stop`. Only delete `.lock` manually if
-you've confirmed no process holds it — a stale lockfile is rare and
-usually means a previous crash.
+`~/.mneme/.lock` is held by a live process. Find it
+(`pgrep -af "mneme (daemon|run)"`) and shut it down with `mneme stop`.
+Only delete `.lock` manually if you've confirmed no process holds it
+— a stale lockfile is rare and usually means a previous crash.
+
+(`mneme client` does NOT take the lockfile — it's just a stdio↔socket
+bridge. The lock is held by whichever MCP server is serving the data
+dir: `mneme daemon` for the v1.1 default flow, `mneme run` for the
+single-host fallback.)
 
 ## `/mcp` doesn't list mneme
 
@@ -94,7 +120,8 @@ entries) delete the marker:
 rm ~/.mneme/run/upgrade-audit.done
 ```
 
-The next `mneme run` will scan again and append a fresh entry.
+The next MCP server boot (`mneme daemon` or `mneme run`) will scan
+again and append a fresh entry.
 
 ## Diagnosing scheduler health
 
