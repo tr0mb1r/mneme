@@ -176,6 +176,11 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     // `size_tier` are fixed.
     let max_remember_chars = config.budgets.max_remember_chars;
 
+    // Daemon idle-timeout (ADR-0012 D6). Honored only by
+    // `DaemonServeMany`; stdio + DaemonAcceptOne ignore it. `0`
+    // disables — daemon then only stops via SIGTERM / `mneme stop`.
+    let daemon_idle_timeout_minutes = config.daemon.idle_timeout_minutes;
+
     // First-boot upgrade audit (release-planning §5.3, Invariant 7).
     // Scans L4 once for memories above max_remember_chars and writes
     // a passive summary to ~/.mneme/diagnostics.log so users
@@ -265,6 +270,7 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
             scope_state,
             active_model_name.clone(),
             max_remember_chars,
+            daemon_idle_timeout_minutes,
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
 
@@ -324,6 +330,7 @@ async fn async_main(
     scope_state: Arc<ScopeState>,
     active_model_name: String,
     max_remember_chars: usize,
+    daemon_idle_timeout_minutes: u64,
 ) -> anyhow::Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -500,12 +507,12 @@ async fn async_main(
                 "transport=daemon-serve-many: listener bound; serving until SIGTERM"
             );
 
-            // Track in-flight connection count so future commits
-            // (idle-timeout shutdown, graceful-drain on SIGTERM)
-            // have a counter to consult. Today it's read-only —
-            // the accept loop exits abruptly on signal and
-            // spawned tasks abort with the runtime.
+            // Track in-flight connection count. Read by the
+            // idle-timeout watcher (ADR-0012 D6) below; future
+            // commits will also consult it for graceful-drain on
+            // SIGTERM.
             let active_clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let idle_watcher_counter = Arc::clone(&active_clients);
 
             // The spawned per-connection tasks need their futures
             // to be `Send` for `tokio::spawn`. The boxed-trait-object
@@ -522,6 +529,12 @@ async fn async_main(
                     tracing::info!(
                         active = active_clients.load(std::sync::atomic::Ordering::Relaxed),
                         "transport=daemon-serve-many: shutdown signal received"
+                    );
+                }
+                _ = idle_timeout_watcher(idle_watcher_counter, daemon_idle_timeout_minutes) => {
+                    tracing::info!(
+                        idle_minutes = daemon_idle_timeout_minutes,
+                        "transport=daemon-serve-many: idle timeout reached; shutting down"
                     );
                 }
                 _ = async {
@@ -655,6 +668,46 @@ fn active_embedder_model_name(config: &Config) -> String {
     }
 }
 
+/// Idle-timeout watcher for `DaemonServeMany` (ADR-0012 D6).
+///
+/// Polls `active_clients` every [`IDLE_POLL_INTERVAL`]; tracks the
+/// most recent moment the count was non-zero. When the count has
+/// been zero for at least `idle_timeout_minutes`, the future
+/// resolves — the caller wires this into a `tokio::select!` arm
+/// next to `shutdown_signal()`. `idle_timeout_minutes == 0` disables
+/// the timeout (the future pends forever) per the config knob's
+/// documented "0 = never" semantics.
+///
+/// Counted from "last client disconnected", not "last request
+/// seen": a long HNSW snapshot that blocks requests but not
+/// connections doesn't accidentally trigger shutdown.
+async fn idle_timeout_watcher(
+    active_clients: Arc<std::sync::atomic::AtomicUsize>,
+    idle_timeout_minutes: u64,
+) {
+    if idle_timeout_minutes == 0 {
+        std::future::pending::<()>().await;
+        return;
+    }
+    let timeout = std::time::Duration::from_secs(idle_timeout_minutes * 60);
+    // First measurement: assume the daemon was just-spawned with no
+    // clients, so the idle clock starts now.
+    let mut last_nonzero = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(IDLE_POLL_INTERVAL).await;
+        if active_clients.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            last_nonzero = tokio::time::Instant::now();
+        } else if last_nonzero.elapsed() >= timeout {
+            return;
+        }
+    }
+}
+
+/// How often `idle_timeout_watcher` checks the client counter.
+/// 30 s gives ≤ 30 s overshoot on the configured timeout — fine for
+/// the default 30-minute idle and frugal on syscalls.
+const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -676,5 +729,91 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `idle_timeout_minutes == 0` is the documented "never auto-
+    /// shutdown" sentinel — the future must pend forever so the
+    /// `tokio::select!` arm never fires.
+    #[tokio::test(start_paused = true)]
+    async fn watcher_with_zero_timeout_pends_forever() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let watcher = idle_timeout_watcher(counter, 0);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(86_400), watcher).await;
+        assert!(result.is_err(), "watcher with timeout=0 must never resolve");
+    }
+
+    /// With a non-zero timeout and a counter that stays at zero
+    /// for the full duration, the watcher resolves shortly after
+    /// the timeout elapses (within one poll interval of slack).
+    #[tokio::test(start_paused = true)]
+    async fn watcher_resolves_when_idle_for_timeout() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        // 1 minute timeout — the test-clock advances instantly.
+        let watcher = idle_timeout_watcher(Arc::clone(&counter), 1);
+        let bound = IDLE_POLL_INTERVAL + std::time::Duration::from_secs(60 + 5);
+        tokio::time::timeout(bound, watcher)
+            .await
+            .expect("watcher resolved within timeout + one poll");
+    }
+
+    /// A non-zero counter keeps resetting the idle clock — the
+    /// watcher must NOT resolve while clients are connected, even
+    /// across many timeout-worth of paused time.
+    #[tokio::test(start_paused = true)]
+    async fn watcher_does_not_resolve_while_clients_connected() {
+        let counter = Arc::new(AtomicUsize::new(1));
+        let watcher = idle_timeout_watcher(Arc::clone(&counter), 1);
+        // Advance way past 10 minute-equivalents of paused time.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10 * 60), watcher).await;
+        assert!(
+            result.is_err(),
+            "watcher must NOT resolve while a client is connected"
+        );
+    }
+
+    /// Counter goes 1 → 0 → 1 mid-window resets the idle clock —
+    /// the watcher should not resolve based on the earlier zero
+    /// observation. Only a continuous full-timeout zero stretch
+    /// triggers shutdown.
+    #[tokio::test(start_paused = true)]
+    async fn watcher_resets_clock_on_reconnect() {
+        let counter = Arc::new(AtomicUsize::new(1));
+        let watcher_counter = Arc::clone(&counter);
+        let watcher = idle_timeout_watcher(watcher_counter, 1);
+
+        let driver = async move {
+            // Idle for 30 s — not enough to fire.
+            counter.store(0, Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            // Client reconnects — the watcher's poll on next tick
+            // sees > 0 and resets last_nonzero.
+            counter.store(1, Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+            // 75 s elapsed total but the idle stretch was only 30 s
+            // before the reconnect. Watcher should still be pending.
+            counter.store(0, Ordering::Relaxed);
+            // Let the new idle stretch run the full 1-minute
+            // timeout; the watcher should resolve here.
+            tokio::time::sleep(IDLE_POLL_INTERVAL + std::time::Duration::from_secs(60 + 5)).await;
+        };
+
+        tokio::select! {
+            _ = watcher => {
+                // Driver may have exited or still be running; either
+                // is fine. Assertion is that the watcher resolved
+                // ONLY after the second idle stretch.
+            }
+            _ = driver => {
+                panic!("driver finished without watcher firing; \
+                        idle clock didn't reset on reconnect");
+            }
+        }
     }
 }

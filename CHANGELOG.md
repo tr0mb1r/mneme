@@ -14,6 +14,23 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **A.M3 idle-timeout shutdown** (ADR-0012 D6, release-planning v2.1
+  §3.9 M3). New `idle_timeout_watcher` runs alongside the daemon
+  accept loop in a third `tokio::select!` arm; when
+  `active_clients` has been zero for `[daemon].idle_timeout_minutes`
+  the future resolves and the daemon exits cleanly via the same
+  shutdown path SIGTERM uses. Polls the counter every 30 s — gives
+  ≤ 30 s overshoot on the configured timeout. `idle_timeout_minutes
+  = 0` (the documented "never" sentinel) makes the watcher pend
+  forever via `std::future::pending`. Counted from "last client
+  disconnected", not "last request seen", so a long HNSW snapshot
+  that blocks requests but not connections doesn't accidentally
+  trigger shutdown. Four new unit tests use
+  `#[tokio::test(start_paused = true)]` to exercise the
+  zero-sentinel, normal-firing, never-fires-while-connected, and
+  reset-on-reconnect paths in deterministic paused-clock time
+  (no real wall-clock waits in CI). `Cargo.toml` dev tokio gains
+  `test-util` for the paused runtime.
 - **A.M3 first commit: long-running multi-client accept loop**
   (release-planning v2.1 §3.9, ADR-0012 D8). New
   `TransportMode::DaemonServeMany` replaces the M2 single-shot

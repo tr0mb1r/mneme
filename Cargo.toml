@@ -91,7 +91,7 @@ libc = "0.2"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "process", "time", "sync", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "process", "time", "sync", "fs", "test-util"] }
 # Phase 3 §13 latency benches. Plain (non-async) criterion — bench
 # bodies wrap a single tokio::Runtime created once per bench; we
 # `block_on` per iteration. That avoids pulling the `async_tokio`
