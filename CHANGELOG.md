@@ -162,6 +162,29 @@ the work that landed before automation was wired up.
 
 ### Fixed
 
+- **INFO logs now actually land in `~/.mneme/logs/mneme.log`.**
+  Pre-fix, `src/main.rs::init_logging()` only wired a stderr
+  writer — the `LoggingConfig` knobs (`logging.file`,
+  `logging.level`, `logging.max_size_mb`, `logging.max_files`)
+  existed in `config.toml` but no code read them, and the
+  documented log file was never created. Multiple docs
+  (`docs/CLAUDE_CODE_SETUP.md` §8, `book/src/troubleshooting.md`)
+  told users to `tail ~/.mneme/logs/mneme.log` against a path
+  that didn't exist on disk. Fix: layered subscriber writes WARN+
+  to stderr (unchanged user-visible behaviour) AND INFO+ to the
+  configured log file. The file appender uses `file-rotate` for
+  size-based rotation (`tracing-appender` only does time-based)
+  honoring `logging.max_size_mb` (default 100 MB) and
+  `logging.max_files` (default 5; rotated files land alongside as
+  `.1`, `.2`, …). `MNEME_LOG` env override still wins; absent
+  that, the file filter follows `[logging] level` (default
+  `info`). `default_log_file()` now resolves through
+  `layout::default_root()` so `MNEME_DATA_DIR` correctly relocates
+  the log file along with the rest of the data dir. New
+  integration test `tests/logging_to_file.rs` boots `mneme run`
+  with the stub embedder, asserts the log file exists and
+  contains the expected boot/stop INFO lines.
+
 - **`[scopes] default` now defaults to `"global"`, not `"personal"`.**
   `src/config.rs::default_scope()` returned `"personal"` since v0.x,
   which contradicted the cross-project convention that "global" is

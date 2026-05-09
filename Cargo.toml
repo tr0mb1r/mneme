@@ -44,7 +44,14 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
+# Non-blocking writer wrapper for the file appender.
+tracing-appender = "0.2"
+# Size-based file rotation honoring `[logging] max_size_mb` and
+# `max_files` from `~/.mneme/config.toml`. tracing-appender only
+# supports time-based rotation, so we use file-rotate's
+# `FileRotate<Write>` impl behind the non-blocking wrapper.
+file-rotate = "0.7"
 ulid = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

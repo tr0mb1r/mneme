@@ -222,9 +222,13 @@ fn default_log_level() -> String {
     "info".into()
 }
 fn default_log_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".mneme/logs/mneme.log")
+    // Honor MNEME_DATA_DIR by going through layout::default_root —
+    // a tester / power user pointing the data dir elsewhere expects
+    // logs to follow. Falls back to `~/.mneme/logs/mneme.log` only
+    // if the home dir lookup itself fails.
+    crate::storage::layout::default_root()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".mneme"))
+        .join("logs/mneme.log")
 }
 fn default_log_max_size_mb() -> u32 {
     100
