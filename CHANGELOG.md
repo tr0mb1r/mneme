@@ -14,6 +14,31 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **Q1 release gate: v1.0 → v1.1 upgrade migration test**
+  (release-planning v2.1 §6.1, task #16). New
+  `tests/v1_0_to_v1_1_migration.rs` exercises the migration
+  surface end-to-end:
+  - `v1_0_config_boots_clean_under_v1_1_binary` — hand-written
+    v1.0-shaped `config.toml` (no `[daemon]`, no
+    `max_remember_chars`) parses cleanly under the v1.1 binary
+    via `serde(default)` backfill; tools/list returns the
+    expected stats output.
+  - `memories_persist_across_v1_0_to_v1_1_reboot` — write 3
+    memories under the v1.0-shaped config, exit, re-boot the
+    same data dir, recall the memories. Same-binary
+    same-storage round-trip — would catch any accidental
+    `schema_version` bump (Invariant 1) and any config-migration
+    regression that loses data.
+  - `explicit_stdio_transport_preserved` — pre-existing
+    `[mcp].transport = "stdio"` survives boot. ADR-0012 D11's
+    auto-flip-to-SSE for unset/missing transport is a follow-up
+    A.M2 closing-touch commit (D12 spawn-and-connect prerequisite);
+    today's behaviour is preserve-explicit.
+  Three integration tests, all passing in 2.3s. Linux + macOS only
+  (Windows daemon-mode integration tests land in M4).
+  **Cannot tag v1.1 without this passing** per §6.1. Sibling
+  `tests/v1_1_to_v1_0_rollback.rs` (Q2, task #17) blocked on the
+  v1.0.1 backup-run-exclusion patch landing upstream.
 - **A.M4 first commit: daemon auth-token primitive +
   `mneme auth` subcommand** (ADR-0012 D3 / D4, task #7). New
   `src/daemon/auth.rs` ships:
