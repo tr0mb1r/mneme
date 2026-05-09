@@ -57,6 +57,7 @@ pub mod embed;
 pub mod error;
 pub mod ids;
 pub mod index;
+pub mod init;
 pub mod mcp;
 pub mod memory;
 pub mod migrate;

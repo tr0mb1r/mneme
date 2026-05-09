@@ -12,6 +12,35 @@ the work that landed before automation was wired up.
 
 ## [Unreleased] — develop track (v1.1)
 
+### Added
+
+- **B.M1 first commit: marker-block parser for the mneme-managed
+  section of a user's primary instructions file**
+  (release-planning v2.1 §4.3, task #9). New `src/init/marker.rs`
+  module owns the cross-agent primitive every per-agent
+  integration in B.M2–B.M5 will consume: find / upsert / remove
+  the `<!-- mneme:begin --> ... <!-- mneme:end -->` block in
+  CLAUDE.md, .cursorrules, AGENTS.md, etc., without touching
+  surrounding user content. Strict line-anchored sentinel
+  matching avoids false positives on inline marker mentions
+  (the literal text in a paragraph won't trigger a match — must
+  appear on its own line). `find_block` returns `Ok(None)` /
+  `Ok(Some)` / `Err(Malformed)` distinguishing the three valid
+  states from orphan markers, swapped order, and duplicate
+  pairs. `upsert_block` is idempotent — running twice produces
+  the same output. `remove_block` collapses the visual separator
+  the block typically had (the section is gone, including its
+  surround). Round-trip tests confirm
+  `upsert(input, body) → remove → input`. 30 unit tests cover
+  all the edge cases (empty, no markers, multi-line body,
+  malformed orphans, swapped order, duplicates, idempotent
+  upsert, round-trip with and without pre-existing block).
+  Total lib suite at 393 passed (was 368, +25 new — three of the
+  marker tests share name-stem with existing tests, slight
+  registry-count variance). Subsequent B.M1 sub-commits land the
+  MNEME.md template loader, the JSON/TOML/YAML config-merge
+  utilities, and the `mneme init <agent>` subcommand structure.
+
 ### Architecture decisions
 
 - **ADR-0012 amendment A1: D7 (SSE keepalive) deferred to v1.1.x
