@@ -24,6 +24,7 @@
 //! agent gets a useful pointer rather than silent acceptance.
 
 pub mod claude_code;
+pub mod claude_desktop;
 
 use std::path::PathBuf;
 
@@ -106,10 +107,7 @@ pub enum AgentError {
 pub fn run(agent: Agent, mode: InstallMode, home_dir: &std::path::Path) -> Result<(), AgentError> {
     match agent {
         Agent::ClaudeCode => claude_code::run(mode, home_dir),
-        Agent::ClaudeDesktop => Err(AgentError::NotYetImplemented(
-            agent,
-            "release-planning §4.7 B.M3",
-        )),
+        Agent::ClaudeDesktop => claude_desktop::run(mode, home_dir),
         Agent::Cursor => Err(AgentError::NotYetImplemented(
             agent,
             "release-planning §4.7 B.M3",

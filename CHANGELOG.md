@@ -12,6 +12,37 @@ the work that landed before automation was wired up.
 
 ## [Unreleased] — develop track (v1.1)
 
+### Added
+
+- **B.M3 first agent: `mneme init claude-desktop`** (release-
+  planning v2.1 §4.4, partial task #11). Adds full Claude
+  Desktop installer following the `claude_code` reference's
+  shape, scoped to what Claude Desktop actually supports:
+  - Platform-aware config path: macOS
+    `~/Library/Application Support/Claude/claude_desktop_config.json`,
+    Linux `~/.config/Claude/claude_desktop_config.json`. Windows
+    deferred until A.M4 Windows pipe lands.
+  - Single `mcpServers.mneme = {"command": "mneme", "args":
+    ["run"]}` upsert via `init::json_config::upsert_file`;
+    surrounding settings keys preserved.
+  - Standalone MNEME.md copy written to `~/.mneme/MNEME.md` so
+    users have a paste-able guidance source for Claude
+    Desktop's system-prompt field — Claude Desktop has no
+    hooks API and no per-project instruction file, so agent
+    calibration is necessarily opt-in.
+  - Symmetric `--uninstall` removes the mcpServers entry +
+    standalone MNEME.md, prunes empty `mcpServers: {}` if
+    needed, preserves unrelated settings keys.
+  - Post-install message documents the no-hooks limitation
+    explicitly + walks through the system-prompt opt-in path,
+    same Vim-keybindings recall demo as Claude Code's prompt.
+  8 unit tests + end-to-end smoke verified with a temp `$HOME`
+  on macOS. Cursor / Cline / Codex / Gemini CLI still return
+  `NotYetImplemented` with B.M3 / B.M4 task pointers — they
+  need real-install validation before shipping per the user's
+  redirect "as for the rest, can be scaffolded when we install
+  those agents." Total lib suite at 448 passed (was 440, +8).
+
 ### Changed
 
 - **D.M1: `mneme init claude-code` first-run prompt** (release-
