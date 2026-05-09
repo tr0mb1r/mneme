@@ -23,7 +23,7 @@
 //!     does in M4 — for now Claude Desktop on Windows is `cfg`-gated
 //!     to defer.)
 //! - Adds (or updates) `mcpServers.mneme = {"command": "mneme",
-//!   "args": ["run"]}` in that file via the existing
+//!   "args": ["client"]}` in that file via the existing
 //!   `init::json_config::upsert_file` atomic helper. Surrounding
 //!   keys (other `mcpServers`, top-level fields) preserved verbatim.
 //! - Writes a copy of `MNEME.md` to `~/.mneme/MNEME.md` so users
@@ -91,13 +91,20 @@ pub fn run(mode: InstallMode, home_dir: &Path) -> Result<(), AgentError> {
 }
 
 fn install(settings: &Path, mneme_md: &Path) -> Result<(), AgentError> {
+    // `args=["client"]` so each Claude Desktop session spawns the
+    // thin stdio↔unix-socket wrapper. Two Claude Desktop instances
+    // (or Claude Desktop alongside Claude Code) all share one
+    // `mneme daemon` instead of fighting over the lockfile that
+    // `args=["run"]` would imply. Token stays at
+    // `~/.mneme/run/auth.token`; the wrapper reads it at spawn —
+    // never embedded in this config file.
     json_config::upsert_file(settings, |value| {
         json_config::set_path(
             value,
             &["mcpServers", "mneme"],
             json!({
                 "command": "mneme",
-                "args": ["run"],
+                "args": ["client"],
             }),
         )?;
         Ok(())
@@ -218,7 +225,7 @@ mod tests {
         let settings: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(settings["mcpServers"]["mneme"]["command"], "mneme");
-        assert_eq!(settings["mcpServers"]["mneme"]["args"], json!(["run"]));
+        assert_eq!(settings["mcpServers"]["mneme"]["args"], json!(["client"]));
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

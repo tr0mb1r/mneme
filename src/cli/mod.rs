@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 pub mod auth;
 pub mod backup;
+pub mod client;
 pub mod daemon;
 pub mod demo;
 pub mod export;
@@ -64,14 +65,28 @@ pub enum Command {
         #[arg(long, conflicts_with_all = ["upgrade", "uninstall"])]
         show: bool,
     },
-    /// Start the MCP server
+    /// Start the MCP server (stdio). Right pick when the host
+    /// (Claude Desktop, Cursor, etc.) spawns mneme directly as a
+    /// subprocess with no shared daemon. For multi-session sharing,
+    /// use `mneme daemon` + `mneme client` instead.
     Run,
-    /// Start the v1.1 daemon (M2-M5 of release-planning §3.9 land
-    /// the SSE transport in stages; today this command shares the
-    /// stdio runner with `mneme run` and exists primarily as the
-    /// stable entry point for systemd/launchd unit files and for
-    /// the future client-spawn-and-connect flow per ADR-0012 D12).
+    /// Start the v1.1 daemon (ADR-0012). Binds
+    /// `~/.mneme/run/mneme.sock`, accepts many concurrent client
+    /// connections (each gated by the `MNEME-AUTH:` handshake against
+    /// `~/.mneme/run/auth.token`), serves them through the same
+    /// in-process MCP `Server`. Storage writes serialise through
+    /// the existing single-writer seam (D8). Auto-shuts-down after
+    /// `[daemon].idle_timeout_minutes`. Pair with `mneme client`
+    /// in each agent's MCP config so multiple agents share one daemon.
     Daemon,
+    /// Stdio↔unix-socket bridge to a running `mneme daemon`. Spawned
+    /// by MCP hosts as their per-session subprocess; reads the auth
+    /// token from `~/.mneme/run/auth.token`, presents it to the
+    /// daemon, then byte-pipes stdin↔socket and socket↔stdout. The
+    /// agent sees a normal stdio MCP server; the daemon sees a
+    /// normal authenticated client. Token never lands in any agent
+    /// config file (Invariant 3).
+    Client,
     /// Show memory health and size
     Stats,
     /// Inspect a memory by id or query
@@ -134,6 +149,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         } => init::execute(agent, upgrade, uninstall, show),
         Command::Run => run::execute(),
         Command::Daemon => daemon::execute(),
+        Command::Client => client::execute(),
         Command::Stats => stats::execute(),
         Command::Inspect { id, query } => inspect::execute(id, query),
         Command::Export { scope, format } => export::execute(scope, format),

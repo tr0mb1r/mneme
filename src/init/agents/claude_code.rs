@@ -110,13 +110,20 @@ fn install(paths: &Paths) -> Result<(), AgentError> {
     // 4. settings.json: add mcpServers.mneme + hooks.<event>
     //    entries. Single upsert so atomic — the user's existing
     //    settings file is read once, transformed, and written back.
+    //    `args=["client"]` not `["run"]` so each Claude Code session
+    //    spawns a thin stdio↔unix-socket bridge to the long-running
+    //    `mneme daemon`. Multiple Claude Code sessions can run
+    //    concurrently this way (the lockfile contention that bites
+    //    `args=["run"]` only allows one stdio session per data dir).
+    //    Token stays at `~/.mneme/run/auth.token`; the wrapper reads
+    //    it at spawn — never embedded in this settings file.
     json_config::upsert_file(&paths.settings, |value| {
         json_config::set_path(
             value,
             &["mcpServers", "mneme"],
             json!({
                 "command": "mneme",
-                "args": ["run"],
+                "args": ["client"],
             }),
         )?;
         for (event, filename) in HOOK_EVENTS {
@@ -175,11 +182,22 @@ fn print_post_install(paths: &Paths) {
         paths.claude_md.display()
     );
     eprintln!();
+    eprintln!("  Architecture: Claude Code now spawns `mneme client` per session,");
+    eprintln!("    which connects to a long-running `mneme daemon` over a unix");
+    eprintln!("    socket. Multiple Claude Code sessions can run concurrently.");
+    eprintln!("    The auth token at `~/.mneme/run/auth.token` (mode 0600) stays");
+    eprintln!("    out of settings.json — the wrapper reads it at spawn.");
+    eprintln!();
     eprintln!("  Next steps:");
     eprintln!();
-    eprintln!("    1. Restart Claude Code so it picks up the new MCP server.");
+    eprintln!("    1. Start the daemon in a long-lived terminal");
+    eprintln!("       (or background it with launchd/systemd later):");
     eprintln!();
-    eprintln!("    2. Try this conversation to confirm memory works end-to-end:");
+    eprintln!("         mneme daemon");
+    eprintln!();
+    eprintln!("    2. Restart Claude Code so it picks up the new MCP server.");
+    eprintln!();
+    eprintln!("    3. Try this conversation to confirm memory works end-to-end:");
     eprintln!();
     eprintln!("       You: \"Remember that I prefer Vim keybindings.\"");
     eprintln!("       (then quit and start a fresh Claude Code session)");
@@ -187,8 +205,15 @@ fn print_post_install(paths: &Paths) {
     eprintln!();
     eprintln!("       Claude should recall the preference via mneme.recall.");
     eprintln!();
-    eprintln!("    3. To verify storage outside Claude Code:");
+    eprintln!("    4. To verify storage outside Claude Code:");
     eprintln!("         mneme stats");
+    eprintln!();
+    eprintln!("  If `mneme client` errors with `daemon socket: No such file`,");
+    eprintln!("  the daemon isn't running — start it with `mneme daemon`.");
+    eprintln!();
+    eprintln!("  Rotate the auth token anytime with:  mneme auth rotate");
+    eprintln!("  (no settings.json rewrite needed — the wrapper re-reads on");
+    eprintln!("  every spawn.)");
     eprintln!();
     eprintln!("  Reverse anytime with:  mneme init claude-code --uninstall");
     eprintln!();
@@ -336,7 +361,7 @@ mod tests {
         let settings: Value =
             serde_json::from_str(&std::fs::read_to_string(&paths.settings).unwrap()).unwrap();
         assert_eq!(settings["mcpServers"]["mneme"]["command"], "mneme");
-        assert_eq!(settings["mcpServers"]["mneme"]["args"], json!(["run"]));
+        assert_eq!(settings["mcpServers"]["mneme"]["args"], json!(["client"]));
         for (event, _) in HOOK_EVENTS {
             assert!(
                 settings["hooks"][event].is_array(),
