@@ -195,6 +195,34 @@ the work that landed before automation was wired up.
 
 ### Fixed
 
+- **Size-tier rejection observability.** `remember`/`update` calls
+  rejected for content over `[budgets] max_remember_chars` (default
+  10,000) now produce three observable signals where they previously
+  produced none: (1) a `tracing::warn!` line in
+  `~/.mneme/logs/mneme.log` with `tool`, `content_chars`, and
+  `max_chars` fields; (2) the L3 auto-emit fires `tool_call_failed`
+  (kind), not `tool_call`, so `recall_recent { kind: "tool_call_failed" }`
+  surfaces the rejection cleanly; (3) the L3 mirror skips the args
+  object so the rejected oversized content cannot land in the cold
+  archive (privacy + noise — pre-fix a 15 KB rejected payload would
+  have parked in L3 for 180+ days).
+
+  Mechanism: `Ok(ToolResult::with_error())` (returned by the size-tier
+  reject path) is now routed through `emit_tool_call_failed` with
+  `error_kind = "Rejected"`, mirroring the existing hard-error
+  treatment. The new `soft_error_message()` helper extracts the
+  structured rejection code (e.g. `memory_too_large`) from
+  `_meta.error.code` for the `message` field — so downstream queries
+  can filter on machine-readable rejection reasons. Soft errors also
+  no longer count as turns / poke the checkpoint scheduler, matching
+  the hard-error rule.
+
+  Regression test: `successful_tools_call_emits_episodic_event` (the
+  pre-existing happy path) plus the new
+  `soft_error_tools_call_emits_tool_call_failed_with_rejected_kind`
+  pin both contracts. The new test also asserts that the rejected
+  content does NOT leak into the L3 payload.
+
 - **INFO logs now actually land in `~/.mneme/logs/mneme.log`.**
   Pre-fix, `src/main.rs::init_logging()` only wired a stderr
   writer — the `LoggingConfig` knobs (`logging.file`,

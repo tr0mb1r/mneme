@@ -134,6 +134,34 @@ fn tool_call_payload(name: &str, args: &Value) -> Value {
     p
 }
 
+/// Extract a short diagnostic message from a soft-error
+/// `ToolResult` (one returned via `Ok(ToolResult::with_error())`,
+/// e.g. the size-tier rejection from `remember`/`update`). We
+/// prefer the structured `_meta.error.code` when present so
+/// downstream queries can filter on it; otherwise fall back to the
+/// human-facing text. `tool_call_failed_payload` will further cap
+/// the message at `FAILED_MESSAGE_CAP` chars on the way to L3.
+fn soft_error_message(result: &crate::mcp::tools::ToolResult) -> String {
+    // Structured error code wins — e.g. "memory_too_large".
+    if let Some(meta) = &result.meta
+        && let Some(code) = meta
+            .get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(Value::as_str)
+    {
+        return code.to_owned();
+    }
+    // Otherwise pull the first text block; "<no text>" if none.
+    // The `match` is exhaustive against today's single-variant
+    // ContentBlock; if a future variant is added, the compiler
+    // surfaces the gap here.
+    use crate::mcp::tools::ContentBlock;
+    match result.content.first() {
+        Some(ContentBlock::Text(s)) => s.clone(),
+        None => "<no text>".to_owned(),
+    }
+}
+
 /// Build the L3 `tool_call_failed` event payload. Capped message;
 /// no args (privacy: failed remember/pin still received the args, we
 /// don't re-emit them here).
@@ -360,6 +388,21 @@ where
         };
 
         match tool.invoke(args.clone()).await {
+            Ok(result) if result.is_error => {
+                // Soft error: the tool returned `Ok(ToolResult::with_error())`
+                // (e.g. size-tier rejection from `remember`/`update`). The
+                // user's intent failed even though the dispatch succeeded
+                // syntactically, so route to the failed-emit path so:
+                // (1) `recall_recent { kind: "tool_call_failed" }` surfaces it,
+                // (2) the L3 payload skips the args object — no risk of
+                //     parking the rejected oversized content in cold archive,
+                // (3) the call doesn't count as a turn (matches the
+                //     hard-error rule below).
+                let message = soft_error_message(&result);
+                self.emit_tool_call_failed(&name, "Rejected", &message)
+                    .await;
+                Response::success(id, result.to_json())
+            }
             Ok(result) => {
                 // Record the turn on the active session and poke the
                 // checkpoint scheduler. Two reasons to do it here, not
@@ -913,6 +956,133 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("no_such_tool")
+        );
+    }
+
+    /// Soft-error tool calls — `Ok(ToolResult::with_error())` from
+    /// e.g. `remember`'s size-tier rejection — emit
+    /// `kind="tool_call_failed"` with `error_kind="Rejected"`, NOT
+    /// `tool_call`. The L3 mirror skips the args object so rejected
+    /// oversized content never lands in the cold archive (privacy +
+    /// noise). Also verifies the rejection-reason code surfaces in
+    /// the message field for downstream filtering.
+    #[tokio::test]
+    async fn soft_error_tools_call_emits_tool_call_failed_with_rejected_kind() {
+        use crate::embed::Embedder;
+        use crate::embed::stub::StubEmbedder;
+        use crate::memory::checkpoint_scheduler::{CheckpointScheduler, CheckpointSchedulerConfig};
+        use crate::memory::episodic::{EpisodicStore, RecentFilters};
+        use crate::memory::procedural::ProceduralStore;
+        use crate::memory::semantic::SemanticStore;
+        use crate::memory::working::ActiveSession;
+        use crate::orchestrator::{Orchestrator, TokenBudget};
+        use crate::scope::ScopeState;
+        use crate::storage::archive::ColdArchive;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = crate::storage::memory_impl::MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&storage), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage)));
+        let orchestrator = Arc::new(Orchestrator::new(
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+        ));
+        let cold = ColdArchive::new(tmp.path());
+        let active_session = ActiveSession::open(tmp.path().join("sessions")).unwrap();
+        let checkpoint_scheduler = CheckpointScheduler::start(
+            Arc::clone(&active_session),
+            CheckpointSchedulerConfig::disabled(),
+        );
+        let scope_state = ScopeState::new("work");
+
+        // 15k chars is over the default 10k ceiling — triggers the
+        // size-tier rejection path that returns
+        // `Ok(ToolResult::with_error())`.
+        let oversized = "z".repeat(15_000);
+
+        let mut input = String::new();
+        input.push_str(&req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18"}),
+        ));
+        input.push_str(&notif("notifications/initialized"));
+        input.push_str(&req(
+            2,
+            "tools/call",
+            json!({"name": "remember", "arguments": { "content": oversized }}),
+        ));
+
+        let transport = StdioTransport::new(input.as_bytes(), Vec::<u8>::new());
+        let mut server = Server::new(
+            transport,
+            Arc::new(ToolRegistry::defaults(
+                Arc::clone(&semantic),
+                Arc::clone(&procedural),
+                Arc::clone(&episodic),
+                Arc::clone(&storage),
+                cold.clone(),
+                10_000,
+            )),
+            Arc::new(ResourceRegistry::defaults(
+                semantic,
+                procedural,
+                Arc::clone(&episodic),
+                orchestrator,
+                cold,
+                1,
+                TokenBudget::for_tests(2000),
+            )),
+            storage,
+        )
+        .with_session(
+            active_session,
+            checkpoint_scheduler,
+            Arc::clone(&episodic),
+            scope_state,
+        );
+        server.run().await.unwrap();
+
+        let events = episodic
+            .recall_recent(&RecentFilters::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "soft-error rejection must produce exactly one L3 event"
+        );
+        let evt = &events[0];
+        assert_eq!(
+            evt.kind, "tool_call_failed",
+            "soft-error rejection must emit tool_call_failed, not tool_call"
+        );
+        let payload = evt.payload_json().unwrap();
+        assert_eq!(payload["tool"], "remember");
+        assert_eq!(payload["error_kind"], "Rejected");
+        let msg = payload["message"].as_str().unwrap();
+        assert_eq!(
+            msg, "memory_too_large",
+            "message should carry the structured error code (size_tier::rejection sets `_meta.error.code = memory_too_large`)"
+        );
+
+        // Privacy invariant: the rejected 15k-char content must NOT
+        // be mirrored into the L3 payload anywhere. tool_call_failed_payload
+        // explicitly omits args; this test pins that contract for soft
+        // errors.
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !serialized.contains("zzzz"),
+            "rejected content must not leak into the L3 mirror; got payload {serialized}"
+        );
+        assert!(
+            serialized.len() < 200,
+            "tool_call_failed payload should be compact; got {} chars",
+            serialized.len()
         );
     }
 

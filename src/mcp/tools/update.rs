@@ -112,6 +112,12 @@ impl Tool for Update {
                 let tier = size_tier::classify(len, self.max_chars);
                 if tier == Tier::OverLimit {
                     let (text, meta) = size_tier::rejection(len, self.max_chars);
+                    tracing::warn!(
+                        tool = "update",
+                        content_chars = len,
+                        max_chars = self.max_chars,
+                        "rejected: content over size limit"
+                    );
                     return Ok(ToolResult::text(text).with_error().with_meta(meta));
                 }
                 Some((tier, len))
