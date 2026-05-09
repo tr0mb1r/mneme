@@ -14,6 +14,39 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **B.M1 third commit: JSON config-merge primitive**
+  (release-planning v2.1 §4.4). New `src/init/json_config.rs`
+  surgically inserts / updates / removes mneme-owned entries
+  inside per-agent settings files (Claude Code's `settings.json`,
+  Claude Desktop's `claude_desktop_config.json`, Cursor's
+  `settings.json`, Cline's MCP config) without touching unrelated
+  keys. Path addressing uses `&[&str]` segment slices rather than
+  dotted strings — JSON keys can contain dots. `read` returns
+  `Ok(None)` for absent / empty / whitespace-only files so
+  installers don't have to special-case "fresh install" vs "edit
+  existing" — just `read.unwrap_or_else(|| json!({}))`.
+  Malformed-JSON existing files return `ConfigError::Parse`
+  rather than silently clobbering — installers surface the
+  error so the user can fix it. `set_path` creates intermediate
+  objects but errors with `ConfigError::NonObjectInPath` rather
+  than overwriting a non-object intermediate (e.g., user has
+  `"mcpServers": "off"` and we're asked to set
+  `["mcpServers", "mneme"]`). `remove_path` is idempotent —
+  returns `Ok(true)` on hit, `Ok(false)` on miss, never errors
+  on missing intermediate paths. `upsert_file` does the
+  read → transform → atomic write loop via existing
+  `assets::write_text` (tmpfile + fsync + rename); pretty-prints
+  with 2-space indent + trailing newline so editor tooling
+  doesn't bark. TOML/YAML primitives intentionally NOT shipped —
+  no Tier-1 v1.1 agent needs them; speculative abstractions
+  invent complexity without consumers. 19 new unit tests cover
+  read variants, set/remove edge cases, atomic write, parse-
+  error preservation, and the round-trip property
+  (set → remove → original keys preserved). Total lib suite at
+  418 passed (was 399, +19). Three remaining B.M1 sub-pieces:
+  `mneme init <agent>` subcommand structure, plus the per-agent
+  installer scaffolding (the actual Claude Code install lands
+  in B.M2).
 - **B.M1 second commit: embedded install assets + atomic write
   helpers** (release-planning v2.1 §4.4 / §4.5; clarified hook
   installation per user request 2026-05-09). New

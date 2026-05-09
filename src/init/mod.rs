@@ -17,4 +17,5 @@
 //! Claude Code reference implementation.
 
 pub mod assets;
+pub mod json_config;
 pub mod marker;
