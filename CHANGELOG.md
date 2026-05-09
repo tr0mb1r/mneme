@@ -12,8 +12,41 @@ the work that landed before automation was wired up.
 
 ## [Unreleased] — develop track (v1.1)
 
+### Fixed
+
+- **Daemon auth-token rotation now actually takes effect mid-session
+  (ADR-0012 D3 regression caught by A.M5 test).** A.M4's first
+  enforcement commit (commit 7273255) snapshotted the token in
+  memory once at boot — which contradicted ADR-0012 D3's explicit
+  "no in-memory caching that would defeat rotation" requirement.
+  The new
+  `tests/daemon_e2e.rs::token_rotation_mid_session_preserves_existing_connection`
+  test exercises the full sequence (start daemon → connect with
+  T1 → `mneme auth rotate` → verify old T1 rejected on new
+  connection + new T2 accepted + existing T1 connection
+  unaffected) and caught the cached-snapshot bug. Fix: the per-
+  connection spawn block now calls `auth::read_token(&root)` per
+  handshake, picking up the current on-disk value. Cost: one
+  extra syscall on connection establishment, not on the per-
+  request hot path — matches D3's "once per connection, not once
+  per request" cost analysis. Threading change: the daemon now
+  passes `Arc<PathBuf>` (the data-dir root) to spawned tasks
+  instead of `Arc<Vec<u8>>` (the cached token bytes).
+
 ### Added
 
+- **A.M5 partial: token rotation mid-session test**
+  (release-planning v2.1 §3.9 M5, partial task #8). New
+  `tests/daemon_e2e.rs::token_rotation_mid_session_preserves_existing_connection`
+  exercises the full ADR-0012 D3/D4 rotation contract end-to-end
+  via a real spawned daemon + three client connections. Pins:
+  (1) `mneme auth rotate` produces a different token, (2)
+  existing connection's MCP traffic continues unaffected,
+  (3) new connection with the OLD token gets `TokenMismatch`,
+  (4) new connection with the NEW token gets accepted. This
+  test is what caught the in-memory caching bug fixed above —
+  exactly the kind of "release-gate" pressure the M5 spec
+  asks for.
 - **B.M3 first agent: `mneme init claude-desktop`** (release-
   planning v2.1 §4.4, partial task #11). Adds full Claude
   Desktop installer following the `claude_code` reference's

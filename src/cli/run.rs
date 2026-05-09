@@ -182,20 +182,20 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     let daemon_idle_timeout_minutes = config.daemon.idle_timeout_minutes;
 
     // Daemon auth token (ADR-0012 D3). `ensure_token` generates the
-    // file if absent (no-op if present); `read_token` snapshots the
-    // current value into memory for the per-connection handshake
-    // helper. Per Invariant 3 (pin 01KR5ZB7ED01HADZXZKKBV882Z) the
-    // token value lives in exactly one file — but we read it once
-    // at boot for the comparison hot path; rotation semantics
-    // (next-handshake pickup, existing connections unaffected) are
-    // preserved because the daemon doesn't re-read mid-session
-    // and clients reconnect on rotation.
+    // file if absent (no-op if present). The handshake helper
+    // reads the token from disk PER CONNECTION — not once at boot —
+    // per D3's explicit "no in-memory caching that would defeat
+    // rotation" requirement. An in-memory snapshot would let stale
+    // `mneme auth rotate`-out tokens still pass the gate (caught by
+    // `tests/daemon_e2e.rs::token_rotation_mid_session_*`). The
+    // disk read is a one-syscall hop on connection establishment,
+    // not the per-request hot path — D3's "once per connection,
+    // not once per request" cost analysis.
     crate::daemon::auth::ensure_token(&root)
         .map_err(|e| MnemeError::Config(format!("ensure auth token: {e}")))?;
-    let daemon_auth_token = Arc::new(
-        crate::daemon::auth::read_token(&root)
-            .map_err(|e| MnemeError::Config(format!("read auth token: {e}")))?,
-    );
+    // Share the data-dir root with each spawned connection task so
+    // its handshake can re-read the current token bytes.
+    let daemon_root = Arc::new(root.clone());
 
     // First-boot upgrade audit (release-planning §5.3, Invariant 7).
     // Scans L4 once for memories above max_remember_chars and writes
@@ -287,7 +287,7 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
             active_model_name.clone(),
             max_remember_chars,
             daemon_idle_timeout_minutes,
-            daemon_auth_token,
+            daemon_root,
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
 
@@ -348,7 +348,7 @@ async fn async_main(
     active_model_name: String,
     max_remember_chars: usize,
     daemon_idle_timeout_minutes: u64,
-    daemon_auth_token: Arc<Vec<u8>>,
+    daemon_root: Arc<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -578,8 +578,37 @@ async fn async_main(
                                 let episodic_c = Arc::clone(&episodic);
                                 let scope_c = Arc::clone(&scope_state);
                                 let counter = Arc::clone(&active_clients);
-                                let auth_token = Arc::clone(&daemon_auth_token);
+                                let root_for_auth = Arc::clone(&daemon_root);
                                 tokio::spawn(async move {
+                                    // ADR-0012 D3: read the token
+                                    // from disk PER CONNECTION (not
+                                    // a cached snapshot) so
+                                    // `mneme auth rotate` takes
+                                    // effect for the next handshake
+                                    // without restarting the daemon.
+                                    let mut write = write;
+                                    let auth_token = match crate::daemon::auth::read_token(
+                                        &root_for_auth,
+                                    ) {
+                                        Ok(t) => t,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "transport=daemon-serve-many: failed to read auth token; dropping connection"
+                                            );
+                                            let n = counter
+                                                .fetch_sub(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                )
+                                                - 1;
+                                            tracing::info!(
+                                                active = n,
+                                                "transport=daemon-serve-many: client disconnected"
+                                            );
+                                            return;
+                                        }
+                                    };
                                     // ADR-0012 D3: every connection
                                     // starts with the auth handshake
                                     // before any MCP frame is read.
@@ -589,7 +618,6 @@ async fn async_main(
                                     // StdioTransport so the same
                                     // internal buffer carries
                                     // through.
-                                    let mut write = write;
                                     let buffered_read = match crate::daemon::auth::handshake(
                                         read,
                                         &mut write,

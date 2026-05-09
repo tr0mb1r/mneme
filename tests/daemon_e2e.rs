@@ -408,3 +408,158 @@ async fn daemon_rejects_invalid_auth_token() {
     sigterm(&daemon);
     let _ = timeout(Duration::from_secs(10), daemon.wait()).await;
 }
+
+/// Token rotation mid-session preserves existing connections (per
+/// ADR-0012 D3/D4) but takes effect for the NEXT new connection.
+/// Pins the no-drop semantic that the `mneme auth rotate`
+/// subcommand promises in its user-facing message.
+///
+/// Sequence:
+///   1. Start daemon → token T1 generated.
+///   2. Connect client A with T1, send initialize, capture
+///      response. Don't close — leave it idle.
+///   3. Run `mneme auth rotate` against the same data dir →
+///      token becomes T2.
+///   4. Connect client B with the OLD T1 → must be rejected
+///      (TokenMismatch).
+///   5. Connect client C with the NEW T2 → must be accepted +
+///      get a normal initialize response.
+///   6. Drop client A → daemon's accept loop continues unaffected.
+///   7. SIGTERM, verify clean exit.
+///
+/// Together these prove: rotation doesn't break client A, the
+/// new token is required immediately for new connections, the
+/// daemon stays responsive throughout.
+#[tokio::test]
+async fn token_rotation_mid_session_preserves_existing_connection() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    let socket = data_dir.join("run").join("mneme.sock");
+
+    let mut daemon = Command::new(BINARY)
+        .arg("daemon")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .env("MNEME_EMBEDDER", "stub")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mneme daemon");
+    wait_for_socket(&socket).await;
+
+    // Step 2: Client A authenticates with T1 + sends initialize.
+    let token_t1 = read_auth_token(data_dir);
+    let mut client_a = UnixStream::connect(&socket).await.unwrap();
+    client_a
+        .write_all(format!("MNEME-AUTH: {token_t1}\n").as_bytes())
+        .await
+        .unwrap();
+    client_a
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"client-A","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+"#,
+        )
+        .await
+        .unwrap();
+    let (a_read, a_write) = client_a.into_split();
+    let mut a_reader = BufReader::new(a_read);
+    let mut a_init_response = String::new();
+    timeout(
+        Duration::from_secs(5),
+        a_reader.read_line(&mut a_init_response),
+    )
+    .await
+    .expect("client A init response within 5s")
+    .expect("client A read ok");
+    assert!(
+        a_init_response.contains("\"protocolVersion\""),
+        "client A initialize must succeed pre-rotation, got: {a_init_response}"
+    );
+
+    // Step 3: Rotate the token via the CLI subcommand. Idle the
+    // existing connection to avoid races between the rotate's
+    // file write and a concurrent in-flight read.
+    let rotate_status = Command::new(BINARY)
+        .arg("auth")
+        .arg("rotate")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .expect("auth rotate spawn");
+    assert!(rotate_status.success(), "auth rotate must succeed");
+
+    let token_t2 = read_auth_token(data_dir);
+    assert_ne!(token_t1, token_t2, "rotate must produce a different token");
+
+    // Step 4: Client B presents the OLD T1 → must be rejected.
+    let mut client_b = UnixStream::connect(&socket).await.unwrap();
+    client_b
+        .write_all(format!("MNEME-AUTH: {token_t1}\n").as_bytes())
+        .await
+        .unwrap();
+    let (b_read, _b_write) = client_b.into_split();
+    let mut b_reader = BufReader::new(b_read);
+    let mut b_response = String::new();
+    timeout(Duration::from_secs(5), b_reader.read_line(&mut b_response))
+        .await
+        .expect("client B rejection within 5s")
+        .expect("client B read ok");
+    let b_parsed: serde_json::Value =
+        serde_json::from_str(b_response.trim()).expect("rejection JSON");
+    assert!(
+        b_parsed["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("does not match"),
+        "client B (old token) must be rejected with mismatch, got {b_parsed:?}"
+    );
+
+    // Step 5: Client C presents the NEW T2 → must be accepted.
+    let mut client_c = UnixStream::connect(&socket).await.unwrap();
+    client_c
+        .write_all(format!("MNEME-AUTH: {token_t2}\n").as_bytes())
+        .await
+        .unwrap();
+    client_c
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"client-C","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+"#,
+        )
+        .await
+        .unwrap();
+    let (c_read, c_write) = client_c.into_split();
+    let mut c_reader = BufReader::new(c_read);
+    let mut c_init_response = String::new();
+    timeout(
+        Duration::from_secs(5),
+        c_reader.read_line(&mut c_init_response),
+    )
+    .await
+    .expect("client C init response within 5s")
+    .expect("client C read ok");
+    assert!(
+        c_init_response.contains("\"protocolVersion\""),
+        "client C (new token) must succeed, got: {c_init_response}"
+    );
+
+    // Drop A and C explicitly so the daemon sees their EOFs +
+    // decrements active counter cleanly before SIGTERM.
+    drop(a_write);
+    drop(a_reader);
+    drop(c_write);
+    drop(c_reader);
+
+    sigterm(&daemon);
+    let exit_status = timeout(Duration::from_secs(10), daemon.wait())
+        .await
+        .expect("daemon exited within 10s of SIGTERM")
+        .expect("daemon wait succeeded");
+    assert!(exit_status.success(), "{exit_status:?}");
+}
