@@ -8,10 +8,16 @@
 //! Layout (global `~/.claude/` install only — project mode is a
 //! deferred follow-up):
 //!
-//! - `~/.claude/settings.json` — `mcpServers.mneme` entry +
-//!   `hooks.{SessionStart,PreCompact,Stop}` block wired to the
-//!   shipped scripts. Surrounding settings keys preserved verbatim
-//!   via `init::json_config`.
+//! - `~/.claude.json` — `mcpServers.mneme` entry. This is Claude
+//!   Code's per-user MCP-server registry (the file `claude mcp add`
+//!   writes to). The MCP layer reads this file at session start —
+//!   v1.1.1 dogfood caught that pre-v1.1.1 the entry was being
+//!   written to `~/.claude/settings.json` instead, which Claude
+//!   Code does not read for MCP servers, so the install silently
+//!   no-op'd.
+//! - `~/.claude/settings.json` — `hooks.{SessionStart,PreCompact,
+//!   Stop}` block wired to the shipped scripts. Surrounding settings
+//!   keys preserved verbatim via `init::json_config`.
 //! - `~/.claude/MNEME.md` — written from
 //!   `init::assets::MNEME_MD_TEMPLATE`. Mneme owns this file
 //!   (`mneme init claude-code --upgrade` overwrites; `--uninstall`
@@ -53,7 +59,22 @@ const HOOK_EVENTS: &[(&str, &str)] = &[
 /// Resolved set of paths under the agent's `~/.claude/` directory.
 /// Pulled out so tests can override `home_dir` with a tempdir
 /// and so `--show` can print the plan without writing.
+///
+/// Two settings files for two purposes (the v1.1.1 dogfood caught
+/// that we were writing to the wrong one for MCP servers):
+///
+/// - `~/.claude.json` — Claude Code's per-user MCP-server registry
+///   (the file `claude mcp add` writes to). This is the file the
+///   MCP layer reads at session-start. `mcpServers.mneme` MUST
+///   land here or Claude Code never sees the entry.
+/// - `~/.claude/settings.json` — hooks, model defaults, telemetry
+///   knobs, etc. The hooks API only reads this file. Writing
+///   `mcpServers` here is harmless but ignored.
 struct Paths {
+    /// `~/.claude.json` — MCP-server registry (`mcpServers` belongs
+    /// here, not in `settings`).
+    user_config: PathBuf,
+    /// `~/.claude/settings.json` — hooks + model defaults.
     settings: PathBuf,
     mneme_md: PathBuf,
     claude_md: PathBuf,
@@ -64,6 +85,7 @@ impl Paths {
     fn under(home: &Path) -> Self {
         let claude = home.join(".claude");
         Self {
+            user_config: home.join(".claude.json"),
             settings: claude.join("settings.json"),
             mneme_md: claude.join("MNEME.md"),
             claude_md: claude.join("CLAUDE.md"),
@@ -107,25 +129,37 @@ fn install(paths: &Paths) -> Result<(), AgentError> {
     let claude_md_new = marker::upsert_block(&claude_md_existing, MARKER_BODY)?;
     assets::write_text(&paths.claude_md, &claude_md_new)?;
 
-    // 4. settings.json: add mcpServers.mneme + hooks.<event>
-    //    entries. Single upsert so atomic — the user's existing
-    //    settings file is read once, transformed, and written back.
-    //    `args=["client"]` not `["run"]` so each Claude Code session
-    //    spawns a thin stdio↔unix-socket bridge to the long-running
-    //    `mneme daemon`. Multiple Claude Code sessions can run
-    //    concurrently this way (the lockfile contention that bites
-    //    `args=["run"]` only allows one stdio session per data dir).
-    //    Token stays at `~/.mneme/run/auth.token`; the wrapper reads
-    //    it at spawn — never embedded in this settings file.
-    json_config::upsert_file(&paths.settings, |value| {
+    // 4. ~/.claude.json (Claude Code's MCP-server registry — the
+    //    file `claude mcp add` writes to and the MCP layer reads at
+    //    session start): upsert mcpServers.mneme. The
+    //    `args=["client"]` shape spawns the thin stdio↔unix-socket
+    //    bridge so multiple Claude Code sessions share one daemon
+    //    instead of fighting over the lockfile. `type=stdio` is the
+    //    explicit shape `claude mcp add` writes; including it here
+    //    keeps the entry compatible with `claude mcp list` /
+    //    `claude mcp remove` round-trips. Token stays at
+    //    `~/.mneme/run/auth.token`; the wrapper reads it at spawn —
+    //    never embedded in this file.
+    json_config::upsert_file(&paths.user_config, |value| {
         json_config::set_path(
             value,
             &["mcpServers", "mneme"],
             json!({
+                "type": "stdio",
                 "command": "mneme",
                 "args": ["client"],
+                "env": {},
             }),
         )?;
+        Ok(())
+    })?;
+
+    // 5. ~/.claude/settings.json: only hooks land here. The hooks
+    //    API reads `~/.claude/settings.json`; writing `mcpServers`
+    //    here is harmless but ignored — the v1.1.1 dogfood caught
+    //    that the install was writing the MCP entry to the wrong
+    //    file.
+    json_config::upsert_file(&paths.settings, |value| {
         for (event, filename) in HOOK_EVENTS {
             let script = paths.hooks_dir.join(filename);
             json_config::set_path(
@@ -170,11 +204,15 @@ fn print_post_install(paths: &Paths) {
         paths.mneme_md.display()
     );
     eprintln!(
-        "    • mcpServers.mneme entry in settings.json         {}",
+        "    • mcpServers.mneme entry in ~/.claude.json        {}",
+        paths.user_config.display()
+    );
+    eprintln!(
+        "    • Lifecycle hooks block in settings.json          {}",
         paths.settings.display()
     );
     eprintln!(
-        "    • Lifecycle hooks (SessionStart/PreCompact/Stop)  {}/",
+        "    • Hook scripts (SessionStart/PreCompact/Stop)     {}/",
         paths.hooks_dir.display()
     );
     eprintln!(
@@ -220,18 +258,32 @@ fn print_post_install(paths: &Paths) {
 }
 
 fn uninstall(paths: &Paths) -> Result<(), AgentError> {
-    // Reverse the install order: settings.json edits first (so a
-    // partial uninstall leaves the agent in a clean state pointing
-    // at no-longer-existent scripts only briefly), then file
-    // removals.
+    // Reverse the install order: config edits first (so a partial
+    // uninstall leaves the agent in a clean state pointing at
+    // no-longer-existent scripts only briefly), then file removals.
+    //
+    // Two config files to touch:
+    // - `~/.claude.json` — drop mcpServers.mneme.
+    // - `~/.claude/settings.json` — drop the three hooks entries.
+    //   Pre-v1.1.1 mneme also wrote mcpServers here (wrong file —
+    //   the install was buggy and Claude Code didn't actually read
+    //   the entry). Dropping it on uninstall is still correct so
+    //   stale buggy entries from older installs get cleaned.
+    if paths.user_config.exists() {
+        json_config::upsert_file(&paths.user_config, |value| {
+            json_config::remove_path(value, &["mcpServers", "mneme"])?;
+            prune_empty_object(value, &["mcpServers"]);
+            Ok(())
+        })?;
+    }
     if paths.settings.exists() {
         json_config::upsert_file(&paths.settings, |value| {
+            // Pre-v1.1.1 mistakenly wrote mcpServers here too —
+            // remove on uninstall so old buggy installs clean up.
             json_config::remove_path(value, &["mcpServers", "mneme"])?;
             for (event, _) in HOOK_EVENTS {
                 json_config::remove_path(value, &["hooks", event])?;
             }
-            // Don't leave empty `mcpServers: {}` / `hooks: {}`
-            // blocks behind — clean up containers that go empty.
             prune_empty_object(value, &["mcpServers"]);
             prune_empty_object(value, &["hooks"]);
             Ok(())
@@ -311,7 +363,11 @@ fn print_plan(paths: &Paths) {
         paths.claude_md.display()
     );
     println!(
-        "  {}  [mcpServers.mneme + hooks block, other keys preserved]",
+        "  {}  [mcpServers.mneme entry, other keys preserved]",
+        paths.user_config.display()
+    );
+    println!(
+        "  {}  [hooks.{{SessionStart,PreCompact,Stop}} block, other keys preserved]",
         paths.settings.display()
     );
     println!();
@@ -357,11 +413,21 @@ mod tests {
         assert!(claude_md.contains(MARKER_BODY));
         assert!(claude_md.contains("<!-- mneme:end -->"));
 
-        // settings.json has mcpServers.mneme + all three hook events.
+        // ~/.claude.json has mcpServers.mneme — the file Claude Code's
+        // MCP layer actually reads. v1.1.1 dogfood caught that we were
+        // writing to the wrong file before.
+        let user_config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.user_config).unwrap()).unwrap();
+        assert_eq!(user_config["mcpServers"]["mneme"]["command"], "mneme");
+        assert_eq!(
+            user_config["mcpServers"]["mneme"]["args"],
+            json!(["client"])
+        );
+        assert_eq!(user_config["mcpServers"]["mneme"]["type"], "stdio");
+
+        // ~/.claude/settings.json has hooks (no mcpServers).
         let settings: Value =
             serde_json::from_str(&std::fs::read_to_string(&paths.settings).unwrap()).unwrap();
-        assert_eq!(settings["mcpServers"]["mneme"]["command"], "mneme");
-        assert_eq!(settings["mcpServers"]["mneme"]["args"], json!(["client"]));
         for (event, _) in HOOK_EVENTS {
             assert!(
                 settings["hooks"][event].is_array(),
@@ -369,6 +435,10 @@ mod tests {
                 settings["hooks"][event]
             );
         }
+        assert!(
+            settings.get("mcpServers").is_none(),
+            "mcpServers must NOT live in settings.json (Claude Code reads ~/.claude.json)"
+        );
     }
 
     #[test]
@@ -376,12 +446,11 @@ mod tests {
         let home = fresh_home();
         let paths = Paths::under(home.path());
         std::fs::create_dir_all(paths.settings.parent().unwrap()).unwrap();
+
+        // Existing ~/.claude/settings.json with hooks + unrelated keys.
         std::fs::write(
             &paths.settings,
             r#"{
-  "mcpServers": {
-    "other-server": {"command": "elsewhere"}
-  },
   "unrelated_top_level": 42,
   "hooks": {
     "PreToolUse": [{"hooks": [{"type": "command", "command": "user-script.sh"}]}]
@@ -391,21 +460,42 @@ mod tests {
         )
         .unwrap();
 
+        // Existing ~/.claude.json with another MCP server already
+        // registered (e.g. via `claude mcp add`); mneme must coexist.
+        std::fs::write(
+            &paths.user_config,
+            r#"{
+  "mcpServers": {
+    "other-server": {"type": "stdio", "command": "elsewhere", "args": []}
+  },
+  "unrelated_user_key": "preserve-me"
+}
+"#,
+        )
+        .unwrap();
+
         run(InstallMode::Install, home.path()).unwrap();
 
+        // Hooks file: hooks preserved, no mcpServers.
         let settings: Value =
             serde_json::from_str(&std::fs::read_to_string(&paths.settings).unwrap()).unwrap();
-        // User's other-server preserved.
+        assert!(settings["hooks"]["PreToolUse"].is_array());
+        assert_eq!(settings["unrelated_top_level"], 42);
+        assert!(settings.get("mcpServers").is_none());
+
+        // User config: other MCP server preserved AND mneme added.
+        let user_config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.user_config).unwrap()).unwrap();
         assert_eq!(
-            settings["mcpServers"]["other-server"]["command"],
+            user_config["mcpServers"]["other-server"]["command"],
             "elsewhere"
         );
-        // User's PreToolUse hook preserved.
-        assert!(settings["hooks"]["PreToolUse"].is_array());
-        // User's top-level key preserved.
-        assert_eq!(settings["unrelated_top_level"], 42);
-        // mneme entry added.
-        assert_eq!(settings["mcpServers"]["mneme"]["command"], "mneme");
+        assert_eq!(user_config["unrelated_user_key"], "preserve-me");
+        assert_eq!(user_config["mcpServers"]["mneme"]["command"], "mneme");
+        assert_eq!(
+            user_config["mcpServers"]["mneme"]["args"],
+            json!(["client"])
+        );
     }
 
     #[test]
