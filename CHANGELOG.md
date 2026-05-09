@@ -14,6 +14,29 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **B.M1 second commit: embedded install assets + atomic write
+  helpers** (release-planning v2.1 §4.4 / §4.5; clarified hook
+  installation per user request 2026-05-09). New
+  `src/init/assets.rs` ships the MNEME.md template (sourced from
+  `templates/MNEME.md` via `include_str!`) and the three Claude
+  Code lifecycle hook scripts (sourced from
+  `docs/examples/claude-code-hooks/{session-start,precompact,stop}.sh`)
+  as embedded `&str` constants — `mneme init claude-code` (B.M2)
+  will write them automatically rather than asking the user to
+  `cp` from docs/. The `write_text` / `write_executable` helpers
+  do tmpfile + fsync + rename atomic writes; the executable
+  variant additionally `chmod`s `0o755` on Unix. Single source of
+  truth: the in-tree files (templates/, docs/examples/) ARE the
+  embedded content — no copy-paste drift between "documented
+  example" and "thing the binary writes". Per-agent applicability:
+  Claude Code gets all three hooks (SessionStart, PreCompact,
+  Stop); Cursor/Cline/Codex/Gemini hook conventions are TBD per
+  agent in B.M2-M4; Claude Desktop has no hooks API. Six new
+  tests pin: template sections, hook shebangs, atomic-write
+  parent-dir creation, executable bit on Unix, overwrite
+  semantics, bare-filename handling. `release-planning §4.4
+  Claude Code` updated to make hook installation an explicit
+  step of the install sequence (was implicit / manual in v1.0).
 - **B.M1 first commit: marker-block parser for the mneme-managed
   section of a user's primary instructions file**
   (release-planning v2.1 §4.3, task #9). New `src/init/marker.rs`

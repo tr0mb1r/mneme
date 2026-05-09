@@ -16,4 +16,5 @@
 //! write, where) live in `src/cli/init.rs` once B.M2 lands the
 //! Claude Code reference implementation.
 
+pub mod assets;
 pub mod marker;
