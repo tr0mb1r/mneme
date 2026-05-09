@@ -160,6 +160,39 @@ the work that landed before automation was wired up.
   task is independent. Daemon SIGTERM still produces a clean
   exit. 7 daemon_e2e tests pass.
 
+### Added
+
+- **`mneme daemon` self-detaches by default (ADR-0012 D9).** Invoke
+  `mneme daemon` in a shell and it now spawns a detached child,
+  prints the child PID to stdout, and exits the parent with status
+  0 — the shell prompt returns immediately, and Ctrl-C / shell exit
+  do not kill the daemon. Replaces the pre-fix workaround of having
+  to wrap the invocation in `&`, `nohup`, or a launchd/systemd
+  unit. Detachment is platform-specific: Unix uses `setsid(2)` via
+  `Command::pre_exec` so the child starts a new session with no
+  controlling terminal; Windows uses `DETACHED_PROCESS |
+  CREATE_NEW_PROCESS_GROUP` (Windows path is wired but not yet
+  CI-tested per the Windows-named-pipe gap; tracked under M4).
+  Stdio is redirected to `/dev/null` (NUL on Windows) — the daemon
+  writes its diagnostics to `~/.mneme/logs/mneme.log` (per the
+  v1.1.x logging fix) so users do not need stderr-on-terminal to
+  see what the daemon is doing.
+
+  New `--foreground` flag opts out of self-detach. Right pick when
+  running under a service manager (systemd, launchd) that expects
+  the process to stay in the foreground, or when debugging:
+
+  ```sh
+  mneme daemon                 # self-detach; PID on stdout; shell returns
+  mneme daemon --foreground    # stays attached; Ctrl-C stops it
+  mneme stop                   # stop a detached daemon (or kill <pid>)
+  ```
+
+  New integration tests in `tests/daemon_self_detach.rs` pin both
+  paths: the no-flag invocation returns within 5 s with a parseable
+  PID and the child binds the socket; the `--foreground` invocation
+  stays attached until killed.
+
 ### Fixed
 
 - **INFO logs now actually land in `~/.mneme/logs/mneme.log`.**

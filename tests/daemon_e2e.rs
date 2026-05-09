@@ -78,6 +78,12 @@ async fn daemon_serves_one_client_end_to_end() {
     // transport.
     let mut daemon = Command::new(BINARY)
         .arg("daemon")
+        // `--foreground` keeps the spawned process attached so the
+        // test's `Child` handle controls the actual daemon's
+        // lifetime. Without this flag, ADR-0012 D9's self-detach
+        // would have the parent exit immediately and leave the
+        // daemon as an orphan the test has no handle to.
+        .arg("--foreground")
         .env("MNEME_LOG", "off")
         .env("MNEME_DATA_DIR", data_dir)
         .env("MNEME_EMBEDDER", "stub")
@@ -180,6 +186,12 @@ async fn daemon_serves_two_clients_concurrently() {
 
     let mut daemon = Command::new(BINARY)
         .arg("daemon")
+        // `--foreground` keeps the spawned process attached so the
+        // test's `Child` handle controls the actual daemon's
+        // lifetime. Without this flag, ADR-0012 D9's self-detach
+        // would have the parent exit immediately and leave the
+        // daemon as an orphan the test has no handle to.
+        .arg("--foreground")
         .env("MNEME_LOG", "off")
         .env("MNEME_DATA_DIR", data_dir)
         .env("MNEME_EMBEDDER", "stub")
@@ -274,6 +286,12 @@ async fn second_daemon_against_same_data_dir_refuses_to_start() {
     // First daemon — let it boot + bind + idle on accept.
     let mut first = Command::new(BINARY)
         .arg("daemon")
+        // `--foreground` keeps the spawned process attached so the
+        // test's `Child` handle controls the actual daemon's
+        // lifetime. Without this flag, ADR-0012 D9's self-detach
+        // would have the parent exit immediately and leave the
+        // daemon as an orphan the test has no handle to.
+        .arg("--foreground")
         .env("MNEME_LOG", "off")
         .env("MNEME_DATA_DIR", data_dir)
         .env("MNEME_EMBEDDER", "stub")
@@ -289,6 +307,12 @@ async fn second_daemon_against_same_data_dir_refuses_to_start() {
     // catches it before the listener bind even runs.
     let second = Command::new(BINARY)
         .arg("daemon")
+        // `--foreground` keeps the spawned process attached so the
+        // test's `Child` handle controls the actual daemon's
+        // lifetime. Without this flag, ADR-0012 D9's self-detach
+        // would have the parent exit immediately and leave the
+        // daemon as an orphan the test has no handle to.
+        .arg("--foreground")
         .env("MNEME_LOG", "off")
         .env("MNEME_DATA_DIR", data_dir)
         .env("MNEME_EMBEDDER", "stub")
@@ -325,6 +349,12 @@ async fn daemon_rejects_missing_auth_token() {
 
     let mut daemon = Command::new(BINARY)
         .arg("daemon")
+        // `--foreground` keeps the spawned process attached so the
+        // test's `Child` handle controls the actual daemon's
+        // lifetime. Without this flag, ADR-0012 D9's self-detach
+        // would have the parent exit immediately and leave the
+        // daemon as an orphan the test has no handle to.
+        .arg("--foreground")
         .env("MNEME_LOG", "off")
         .env("MNEME_DATA_DIR", data_dir)
         .env("MNEME_EMBEDDER", "stub")
@@ -376,6 +406,12 @@ async fn daemon_rejects_invalid_auth_token() {
 
     let mut daemon = Command::new(BINARY)
         .arg("daemon")
+        // `--foreground` keeps the spawned process attached so the
+        // test's `Child` handle controls the actual daemon's
+        // lifetime. Without this flag, ADR-0012 D9's self-detach
+        // would have the parent exit immediately and leave the
+        // daemon as an orphan the test has no handle to.
+        .arg("--foreground")
         .env("MNEME_LOG", "off")
         .env("MNEME_DATA_DIR", data_dir)
         .env("MNEME_EMBEDDER", "stub")
@@ -438,6 +474,12 @@ async fn token_rotation_mid_session_preserves_existing_connection() {
 
     let mut daemon = Command::new(BINARY)
         .arg("daemon")
+        // `--foreground` keeps the spawned process attached so the
+        // test's `Child` handle controls the actual daemon's
+        // lifetime. Without this flag, ADR-0012 D9's self-detach
+        // would have the parent exit immediately and leave the
+        // daemon as an orphan the test has no handle to.
+        .arg("--foreground")
         .env("MNEME_LOG", "off")
         .env("MNEME_DATA_DIR", data_dir)
         .env("MNEME_EMBEDDER", "stub")
@@ -588,6 +630,12 @@ async fn client_crash_does_not_affect_other_clients() {
 
     let mut daemon = Command::new(BINARY)
         .arg("daemon")
+        // `--foreground` keeps the spawned process attached so the
+        // test's `Child` handle controls the actual daemon's
+        // lifetime. Without this flag, ADR-0012 D9's self-detach
+        // would have the parent exit immediately and leave the
+        // daemon as an orphan the test has no handle to.
+        .arg("--foreground")
         .env("MNEME_LOG", "off")
         .env("MNEME_DATA_DIR", data_dir)
         .env("MNEME_EMBEDDER", "stub")

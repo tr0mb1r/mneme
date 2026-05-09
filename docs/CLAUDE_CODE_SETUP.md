@@ -477,8 +477,12 @@ Run the binary directly to see stderr:
 
 ```sh
 # v1.1 daemon-mode install (the default after `mneme init claude-code`):
-mneme daemon                    # starts the long-lived MCP server; Ctrl-C to stop
+mneme daemon                    # self-detaches; prints PID; shell prompt returns
+mneme stop                      # stop the daemon (or `kill <pid>`)
 mneme client </dev/null         # in another shell, exercises the bridge end-to-end
+
+# Foreground variant for systemd/launchd or when debugging:
+mneme daemon --foreground       # stays attached; Ctrl-C stops it
 
 # Single-host fallback install (args=["run"] in mcpServers):
 mneme run </dev/null

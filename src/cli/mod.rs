@@ -78,7 +78,23 @@ pub enum Command {
     /// the existing single-writer seam (D8). Auto-shuts-down after
     /// `[daemon].idle_timeout_minutes`. Pair with `mneme client`
     /// in each agent's MCP config so multiple agents share one daemon.
-    Daemon,
+    ///
+    /// By default the daemon **self-detaches** from the controlling
+    /// terminal (ADR-0012 D9): the parent process spawns a detached
+    /// child, prints the child PID, and exits 0 — the shell prompt
+    /// returns immediately and Ctrl-C / shell exit do not kill the
+    /// daemon. Pass `--foreground` to keep the daemon attached for
+    /// systemd/launchd unit files (which manage their own lifecycle)
+    /// and for debugging.
+    Daemon {
+        /// Run the daemon in the foreground, attached to the
+        /// controlling terminal. Skips the self-detach step. Use
+        /// when running under a service manager (systemd, launchd)
+        /// that expects the process to stay in the foreground, or
+        /// when debugging.
+        #[arg(long)]
+        foreground: bool,
+    },
     /// Stdio↔unix-socket bridge to a running `mneme daemon`. Spawned
     /// by MCP hosts as their per-session subprocess; reads the auth
     /// token from `~/.mneme/run/auth.token`, presents it to the
@@ -148,7 +164,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             show,
         } => init::execute(agent, upgrade, uninstall, show),
         Command::Run => run::execute(),
-        Command::Daemon => daemon::execute(),
+        Command::Daemon { foreground } => daemon::execute(foreground),
         Command::Client => client::execute(),
         Command::Stats => stats::execute(),
         Command::Inspect { id, query } => inspect::execute(id, query),
