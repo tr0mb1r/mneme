@@ -14,6 +14,25 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **CI perf regression gate** (Q3 of release-planning v2.1 §6.2,
+  task #18). New `.github/workflows/perf.yml` runs the four
+  hot-path criterion benches on every push / PR that touches
+  `src/`, `benches/`, or `Cargo.{toml,lock}` — extracts a fresh
+  per-iteration baseline JSON via the existing
+  `benches/baselines/extract_baseline.py` and diffs it against the
+  frozen `benches/baselines/v0_2_6.json`. Any p95 regressing > 10 %
+  blocks merge; the comparator (`benches/baselines/compare.py`)
+  prints the full delta table so the regression is easy to find.
+  Justified regressions (e.g. the v1.1 daemon-mode network hop)
+  update the baseline JSON in the same commit and document the
+  trade. Linux-only for measurement stability — macOS / Windows
+  baselines would be different shapes and aren't gated. Workflow
+  caches the bench build via `Swatinem/rust-cache@v2` and
+  `actions/upload-artifact@v4` archives the criterion report for
+  14 days. `.github/workflows/ci.yml` extended to also fire on
+  `develop` so v1.1 PRs run the standard lint + test matrix
+  (rustfmt, clippy, build, test on Linux + macOS + Windows).
+  `CONTRIBUTING.md` documents the gate + the local-run command.
 - **A.M2 ✅: `mneme daemon` serves a single client end-to-end over
   Unix domain socket** (release-planning v2.1 §3.9 M2 release gate
   per ADR-0012). New `cli::run::TransportMode::DaemonAcceptOne`

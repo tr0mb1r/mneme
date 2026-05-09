@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # `develop` carries v1.1 work per release-planning v2.1 §1.1;
+    # both branches gate on the same CI matrix so cherry-picks
+    # don't accumulate drift.
+    branches: [main, develop]
     paths-ignore:
       - '**.md'
       - 'book/**'
@@ -10,8 +13,9 @@ on:
       - 'docs/**'
       - 'LICENSE'
       - '.github/workflows/pages.yml'
+      - '.github/workflows/perf.yml'
   pull_request:
-    branches: [main]
+    branches: [main, develop]
     paths-ignore:
       - '**.md'
       - 'book/**'
@@ -19,6 +23,7 @@ on:
       - 'docs/**'
       - 'LICENSE'
       - '.github/workflows/pages.yml'
+      - '.github/workflows/perf.yml'
 
 env:
   CARGO_TERM_COLOR: always

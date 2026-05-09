@@ -87,10 +87,30 @@ for k, b in base.items():
 PY
 ```
 
-The Q3 / task #18 implementation will replace this with a CI-runnable
-comparator that fails the build on any p95 regression > 10% (per
-release-planning §6.2 "regression alerts (>10% slowdown in any tier)
-block merge unless explicitly justified").
+**`benches/baselines/compare.py` is the canonical comparator** —
+walks two extract-baseline JSONs, prints per-bench p95 deltas,
+exits 1 if any regresses beyond the tolerance (default 10 %).
+Used by `.github/workflows/perf.yml` as the v1.1 release gate
+(release-planning §6.2). Local invocation:
+
+```sh
+python3 benches/baselines/compare.py \
+    benches/baselines/v0_2_6.json \
+    benches/baselines/<your-fresh>.json
+```
+
+Flags:
+
+- `--tolerance-pct N` — slowdown threshold in percent (default 10).
+- `--metric KEY` — metric to compare; defaults to `p95_ns`. Useful
+  values: `p50_ns`, `p99_ns`, `mean_ns`.
+- `--include PATTERN` / `--exclude PATTERN` — substring filter on
+  bench keys; can be repeated.
+
+Exit codes: `0` on hold, `1` on regression, `1` on missing/invalid
+input. The comparator is intentionally Python (not Rust) so it can
+run in CI without rebuilding the workspace and so the threshold
+logic stays trivial to audit.
 
 ## v0.2.6 reference numbers
 

@@ -1,0 +1,105 @@
+name: perf
+
+# v1.1 release-gate per release-planning v2.1 §6.2: any p95 regression
+# > 10 % vs the frozen `benches/baselines/<release>.json` blocks merge
+# unless explicitly justified. Runs only on Linux for measurement
+# stability — macOS / Windows runners give different numbers and
+# would need their own per-platform baselines (deferred to v1.2 if
+# the cross-platform perf surface ever surfaces an actual issue).
+#
+# Trigger scope: pushes / PRs that touch code or bench infrastructure.
+# Doc-only changes don't pay the ~5 minute bench cost. The
+# `paths-include` list here mirrors the inverse of `ci.yml`'s
+# `paths-ignore`.
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'benches/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/perf.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'benches/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/perf.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  # Bench corpus size. Default is 1k for fast CI; pre-release sweeps
+  # at 10k / 100k are documented in benches/baselines/README.md and
+  # run manually rather than in CI.
+  MNEME_BENCH_N: '1000'
+
+jobs:
+  perf:
+    name: criterion + p95 regression gate
+    runs-on: ubuntu-latest
+    # The bench job genuinely takes ~3-5 minutes (model-free, stub
+    # embedder, but four benches × 50 samples × ~1k iters each adds
+    # up). Cap at 20 minutes so a wedged bench doesn't sit forever.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Bench artefacts go under target/release/deps/<bench>-<hash>;
+          # cache them alongside the rest so re-runs on the same
+          # branch reuse builds.
+          shared-key: perf-bench
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: cargo bench (hot path, n=${{ env.MNEME_BENCH_N }})
+        # Run the four hot-path benches. `criterion` writes per-bench
+        # JSON under target/criterion/<group>/<id>/new/. The next step
+        # extracts a single comparable JSON from those.
+        run: |
+          cargo bench --bench remember --bench recall \
+                      --bench cold_start --bench auto_context \
+                      -- --quick
+
+      - name: extract baseline JSON for this run
+        run: |
+          mkdir -p /tmp/perf
+          python3 benches/baselines/extract_baseline.py \
+                  /tmp/perf/this-run.json \
+                  --corpus ${{ env.MNEME_BENCH_N }}
+          echo "::group::This run's numbers (p95 µs)"
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/perf/this-run.json'))['benches']
+          for k, v in d.items():
+              print(f'{k:55s}  p95={v[\"p95_ns\"]/1000:>10.2f} µs')
+          "
+          echo "::endgroup::"
+
+      - name: compare against frozen baseline
+        # FAIL on any p95 > 10 % over the frozen v0.2.6 reference.
+        # The `compare.py` script handles the diff + exit code. PRs
+        # that legitimately need to regress perf (rare) should
+        # update the baseline JSON in the same commit and explain
+        # in the description per release-planning §6.2.
+        run: |
+          python3 benches/baselines/compare.py \
+                  benches/baselines/v0_2_6.json \
+                  /tmp/perf/this-run.json
+
+      - name: archive criterion report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report-${{ github.sha }}
+          path: |
+            target/criterion/**/new/estimates.json
+            target/criterion/**/new/sample.json
+            /tmp/perf/this-run.json
+          retention-days: 14
