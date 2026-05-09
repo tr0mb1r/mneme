@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
+use crate::config::Config;
 use crate::index::snapshot;
+use crate::mcp::tools::size_tier;
 use crate::memory::episodic::EpisodicStore;
 use crate::storage::Storage;
 use crate::storage::archive::ColdArchive;
@@ -59,6 +61,18 @@ pub fn stats_json(root: &Path) -> Result<Value> {
             .unwrap_or(0)
     });
 
+    // L4 size-tier scan (release-planning v2.1 §5.5). Reads
+    // [budgets].max_remember_chars from the on-disk config so the
+    // CLI matches what `mneme run` enforces. Best-effort: a missing
+    // config falls back to defaults.
+    let max_remember_chars = Config::load(&root.join("config.toml"))
+        .map(|c| c.budgets.max_remember_chars)
+        .unwrap_or(size_tier::DEFAULT_MAX_CHARS);
+    let large_memory_count = runtime
+        .block_on(async { size_tier::count_corpus(&storage, max_remember_chars).await })
+        .map(|s| s.to_json())
+        .unwrap_or(Value::Null);
+
     // L3 episodic — same backing storage, different prefixes.
     let episodic = EpisodicStore::new(Arc::clone(&storage));
     let (hot_count, warm_count) = runtime.block_on(async {
@@ -95,6 +109,7 @@ pub fn stats_json(root: &Path) -> Result<Value> {
                 "cold_quarters": cold_quarters,
             },
             "total_redb": semantic_count + hot_count + warm_count,
+            "large_memory_count": large_memory_count,
         },
         "semantic_index": {
             "applied_lsn": applied_lsn,

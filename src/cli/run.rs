@@ -319,6 +319,7 @@ async fn async_main(
             Some(Arc::clone(&active_session)),
             Some(sessions_dir),
             Some(Arc::clone(&scope_state)),
+            Some((Arc::clone(&storage), max_remember_chars)),
         )),
         storage,
     )

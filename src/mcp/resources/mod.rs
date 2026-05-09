@@ -20,6 +20,7 @@ use crate::memory::semantic::SemanticStore;
 use crate::memory::working::ActiveSession;
 use crate::orchestrator::{Orchestrator, TokenBudget};
 use crate::scope::ScopeState;
+use crate::storage::Storage;
 use crate::storage::archive::ColdArchive;
 
 pub mod context;
@@ -116,6 +117,7 @@ impl ResourceRegistry {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -141,6 +143,7 @@ impl ResourceRegistry {
         active_session: Option<Arc<ActiveSession>>,
         sessions_dir: Option<PathBuf>,
         scope_state: Option<Arc<ScopeState>>,
+        size_scan: Option<(Arc<dyn Storage>, usize)>,
     ) -> Self {
         let mut r = Self::new();
         let mut stats_resource = stats::Stats::new(
@@ -158,6 +161,9 @@ impl ResourceRegistry {
         }
         if let Some(s) = scope_state.as_ref() {
             stats_resource = stats_resource.with_scope_state(Arc::clone(s));
+        }
+        if let Some((storage, max_chars)) = size_scan {
+            stats_resource = stats_resource.with_size_scan(storage, max_chars);
         }
         r.register(Arc::new(stats_resource));
         r.register(Arc::new(procedural::Procedural::new(Arc::clone(

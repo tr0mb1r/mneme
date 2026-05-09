@@ -17,7 +17,19 @@
 //! deliberately fixed — they represent the steady-state size guidance
 //! and should not vary per-installation.
 
+use std::sync::Arc;
+
 use serde_json::{Value, json};
+
+use crate::Result;
+use crate::ids::MemoryId;
+use crate::memory::semantic::MemoryItem;
+use crate::storage::Storage;
+
+/// Same `mem:` prefix `memory::semantic` and `cli::stats` use.
+/// Re-declared here so this module doesn't reach into a private
+/// const owned by another module.
+const MEM_KEY_PREFIX: &[u8] = b"mem:";
 
 /// Lower bound (inclusive) of the advisory tier — stored, but the
 /// response carries a `length_advisory` annotation suggesting future
@@ -87,6 +99,81 @@ pub fn success_meta(tier: Tier, content_length: usize, max_chars: usize) -> Opti
             }
         })),
     }
+}
+
+/// Per-tier counts across the L4 corpus, plus the IDs of any
+/// over-limit memories. Built by [`count_corpus`]; consumed by
+/// `mneme://stats` (as `large_memory_count`) and by Q4's first-boot
+/// upgrade audit (which writes `over_limit_ids` to
+/// `~/.mneme/diagnostics.log` so the user can `recall` and trim them
+/// without the server auto-modifying anything — verbatim principle).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CorpusSizeStats {
+    /// Memories under the advisory boundary (< 500 chars).
+    pub normal: u64,
+    /// Memories in [500, 2,000) chars.
+    pub advisory: u64,
+    /// Memories in [2,000, max_chars] chars.
+    pub warning: u64,
+    /// Memories above the configured `max_remember_chars` ceiling.
+    /// Existing oversized memories are NOT auto-modified — they
+    /// remain `recall`-able.
+    pub over_limit: u64,
+    /// IDs of the over-limit memories. Useful for Q4's audit log
+    /// so users can find what they have without spelunking.
+    pub over_limit_ids: Vec<MemoryId>,
+}
+
+impl CorpusSizeStats {
+    /// Total count across all tiers.
+    pub fn total(&self) -> u64 {
+        self.normal + self.advisory + self.warning + self.over_limit
+    }
+
+    /// JSON shape emitted on `mneme://stats` as `large_memory_count`.
+    /// `over_limit_ids` is included so an agent reading stats can
+    /// surface the offenders without a separate scan.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "tier_normal": self.normal,
+            "tier_advisory": self.advisory,
+            "tier_warning": self.warning,
+            "tier_over_limit": self.over_limit,
+            "over_limit_ids": self.over_limit_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Walk the L4 corpus (`mem:` prefix in redb), decode each
+/// `MemoryItem`, classify by content length against `max_chars`, and
+/// accumulate per-tier counts. O(N) over the corpus — `mneme://stats`
+/// reads are low-frequency (per-session diagnostic / per-boot audit),
+/// so this is acceptable without caching for v1.1 cardinalities.
+/// If that assumption breaks in v1.2+, cache invalidation hooks into
+/// `remember` / `update` / `forget` are the right place to add
+/// memoisation.
+pub async fn count_corpus(storage: &Arc<dyn Storage>, max_chars: usize) -> Result<CorpusSizeStats> {
+    let raw = storage.scan_prefix(MEM_KEY_PREFIX).await?;
+    let mut counts = CorpusSizeStats::default();
+    for (_k, v) in raw {
+        let item: MemoryItem = postcard::from_bytes(&v).map_err(|e| {
+            crate::MnemeError::Storage(format!("decode MemoryItem in size scan: {e}"))
+        })?;
+        let len = count_chars(&item.content);
+        match classify(len, max_chars) {
+            Tier::Normal => counts.normal += 1,
+            Tier::Advisory => counts.advisory += 1,
+            Tier::Warning => counts.warning += 1,
+            Tier::OverLimit => {
+                counts.over_limit += 1;
+                counts.over_limit_ids.push(item.id);
+            }
+        }
+    }
+    Ok(counts)
 }
 
 /// Build the rejection `_meta` + display message for over-limit
@@ -164,6 +251,92 @@ mod tests {
         assert!(warning.get("length_warning").is_some());
         assert!(warning.get("length_advisory").is_none());
         assert_eq!(warning["length_warning"]["content_length"], 5_000);
+    }
+
+    #[tokio::test]
+    async fn count_corpus_classifies_seeded_memories() {
+        use crate::embed::Embedder;
+        use crate::embed::stub::StubEmbedder;
+        use crate::memory::semantic::{MemoryKind, SemanticStore};
+        use crate::storage::memory_impl::MemoryStorage;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&storage), embedder).unwrap();
+
+        // Seed one memory in each tier against the default 10_000
+        // ceiling — sizes chosen to land cleanly in Normal, Advisory,
+        // Warning, and OverLimit.
+        semantic
+            .remember(&"n".repeat(50), MemoryKind::Fact, vec![], "s".into())
+            .await
+            .unwrap(); // Normal
+        semantic
+            .remember(&"a".repeat(700), MemoryKind::Fact, vec![], "s".into())
+            .await
+            .unwrap(); // Advisory
+        semantic
+            .remember(&"w".repeat(5_000), MemoryKind::Fact, vec![], "s".into())
+            .await
+            .unwrap(); // Warning
+        let over_id = semantic
+            .remember(&"o".repeat(15_000), MemoryKind::Fact, vec![], "s".into())
+            .await
+            .unwrap(); // OverLimit @ default ceiling
+
+        let counts = count_corpus(&storage, DEFAULT_MAX_CHARS).await.unwrap();
+        assert_eq!(counts.normal, 1);
+        assert_eq!(counts.advisory, 1);
+        assert_eq!(counts.warning, 1);
+        assert_eq!(counts.over_limit, 1);
+        assert_eq!(counts.over_limit_ids, vec![over_id]);
+        assert_eq!(counts.total(), 4);
+
+        // Tighter ceiling demotes the 5_000-char Warning entry to
+        // OverLimit too — verifies max_chars actually flows through.
+        let tight = count_corpus(&storage, 1_000).await.unwrap();
+        assert_eq!(tight.normal, 1);
+        assert_eq!(tight.advisory, 1); // 700 still ≤ 1_000
+        assert_eq!(tight.warning, 0); // 5k > 1k → OverLimit
+        assert_eq!(tight.over_limit, 2);
+        assert_eq!(tight.over_limit_ids.len(), 2);
+        assert_eq!(tight.total(), 4);
+    }
+
+    #[tokio::test]
+    async fn count_corpus_empty_storage_is_all_zeros() {
+        let storage: Arc<dyn Storage> = crate::storage::memory_impl::MemoryStorage::new();
+        let counts = count_corpus(&storage, DEFAULT_MAX_CHARS).await.unwrap();
+        assert_eq!(counts, CorpusSizeStats::default());
+        assert_eq!(counts.total(), 0);
+    }
+
+    #[test]
+    fn corpus_size_stats_to_json_emits_id_strings() {
+        use ulid::Ulid;
+        let mut counts = CorpusSizeStats {
+            normal: 10,
+            advisory: 5,
+            warning: 2,
+            over_limit: 1,
+            over_limit_ids: vec![MemoryId(Ulid::new())],
+        };
+        let v = counts.to_json();
+        assert_eq!(v["tier_normal"], 10);
+        assert_eq!(v["tier_advisory"], 5);
+        assert_eq!(v["tier_warning"], 2);
+        assert_eq!(v["tier_over_limit"], 1);
+        let ids = v["over_limit_ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 1);
+        // ULID string form is 26 chars; not asserting exact value,
+        // just that it serialises as a string.
+        assert!(ids[0].as_str().unwrap().len() == 26);
+        // total sums all four tiers.
+        counts.over_limit = 3;
+        assert_eq!(counts.total(), 10 + 5 + 2 + 3);
     }
 
     #[test]

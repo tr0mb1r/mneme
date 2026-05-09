@@ -75,7 +75,7 @@ between events travel inside the JSON payload (e.g. `"references":
 
 | URI | What it returns | When to read |
 |-----|----------------|--------------|
-| `mneme://stats` | JSON: per-layer counts, schema version, HNSW applied LSN, scheduler observability counters (consolidation + working blocks). | Diagnostics; first thing to read on any "mneme misbehaving" report. |
+| `mneme://stats` | JSON: per-layer counts, schema version, HNSW applied LSN, scheduler observability counters (consolidation + working blocks), and `memories.large_memory_count` (per-tier size distribution + IDs of over-limit entries — see [§Size guardrails](#size-guardrails)). | Diagnostics; first thing to read on any "mneme misbehaving" report. |
 | `mneme://procedural` | JSON: every pinned item. | On session start — these are the binding rules. |
 | `mneme://recent` | JSON: most recent episodic events, newest-first. | "What was the last thing on this branch?" |
 | `mneme://context` | Pre-assembled prompt context: pinned rules + recent events + working-session turns + (optional) semantic-recall hits, packed against a token budget. | On session start — single-call replacement for reading procedural + recent + recall separately. |
@@ -141,5 +141,31 @@ structured `_meta` to the tools/call response:
   "suggestion": "..."}}`. Embedding is NEVER performed for
   rejected content (§5.5).
 
-C.M3 will wire the tier counts into `mneme://stats` as
-`large_memory_count`.
+**C.M3 (current state)** wires the tier counts into `mneme://stats`
+as `memories.large_memory_count`:
+
+```json
+{
+  "memories": {
+    "semantic": 1234,
+    "large_memory_count": {
+      "tier_normal":     1180,
+      "tier_advisory":     45,
+      "tier_warning":       8,
+      "tier_over_limit":    1,
+      "over_limit_ids": ["01HABC..."]
+    }
+  }
+}
+```
+
+The scan walks the `mem:` prefix on every `mneme://stats` read (or
+`mneme stats` CLI invocation) and classifies each `MemoryItem` via
+`size_tier::classify` against the configured `max_remember_chars`.
+O(N) over the L4 corpus — acceptable for v1.1 cardinalities given
+that stats is a per-session diagnostic resource. If profiling
+surfaces a problem in v1.2+, cache invalidation hooks into
+`remember` / `update` / `forget` are the right place to add
+memoisation. `over_limit_ids` lets agents surface the offenders so
+the user can `recall` and trim them — never auto-modified
+(verbatim principle).

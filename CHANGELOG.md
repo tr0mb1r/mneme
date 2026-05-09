@@ -14,6 +14,22 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **`mneme://stats` and `mneme stats` report `memories.large_memory_count`**
+  (C.M3 of release-planning v2.1 §5.6). New
+  `size_tier::count_corpus` walks the L4 `mem:` prefix on every
+  stats read, classifies each `MemoryItem` against the configured
+  `max_remember_chars`, and emits per-tier counts plus the IDs of
+  over-limit entries. The Stats resource gains a `with_size_scan`
+  builder and the CLI's `stats_json` reads
+  `[budgets].max_remember_chars` from the on-disk config so both
+  paths see the same ceiling. O(N) over the corpus per call — fine
+  for v1.1 cardinalities given stats is a per-session diagnostic
+  resource. Q4 (first-boot upgrade audit) consumes the same helper
+  so the audit log surface and the live stats view share one
+  classifier. The `large_memory_count` field is `null` when the
+  scan is unwired (test fixtures without a `with_size_scan` call)
+  so clients can disambiguate "size check disabled" from
+  "all-normal corpus".
 - **`remember` and `update` enforce content size tiers** (C.M2 of
   release-planning v2.1 §5.6). Content classified via the new
   `src/mcp/tools/size_tier.rs` module: under 500 chars stored

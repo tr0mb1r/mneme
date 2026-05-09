@@ -8,15 +8,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{Resource, ResourceContent, ResourceDescriptor, ResourceError};
+use crate::mcp::tools::size_tier;
 use crate::memory::checkpoint_scheduler::CheckpointScheduler;
 use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
 use crate::scope::ScopeState;
+use crate::storage::Storage;
 use crate::storage::archive::ColdArchive;
 
 pub struct Stats {
@@ -38,6 +40,13 @@ pub struct Stats {
     /// `Some(_)` in production. Surfaces the active default scope
     /// (mutated by the `switch_scope` tool) on the `working` block.
     scope_state: Option<Arc<ScopeState>>,
+    /// `(storage, max_remember_chars)` tuple for the L4 size-tier
+    /// scan that produces `large_memory_count`. `None` in fixtures
+    /// that don't bother with the scan; the field is then `null` in
+    /// the resource output. Scoped together because both halves are
+    /// needed for the scan — no useful mode where one is set and the
+    /// other isn't.
+    size_scan: Option<(Arc<dyn Storage>, usize)>,
 }
 
 impl Stats {
@@ -57,6 +66,7 @@ impl Stats {
             consolidation: None,
             checkpoints: None,
             scope_state: None,
+            size_scan: None,
         }
     }
 
@@ -79,6 +89,17 @@ impl Stats {
     /// surfaces on the `working` block as `current_scope`.
     pub fn with_scope_state(mut self, state: Arc<ScopeState>) -> Self {
         self.scope_state = Some(state);
+        self
+    }
+
+    /// Wire the L4 size-tier scan: every `read()` walks the `mem:`
+    /// prefix and emits the per-tier counts as
+    /// `memories.large_memory_count` (release-planning v2.1 §5.5).
+    /// Cost is O(N) over the L4 corpus; `mneme://stats` is a
+    /// per-session diagnostic resource so this is acceptable
+    /// without caching for v1.1 cardinalities.
+    pub fn with_size_scan(mut self, storage: Arc<dyn Storage>, max_chars: usize) -> Self {
+        self.size_scan = Some((storage, max_chars));
         self
     }
 }
@@ -143,6 +164,14 @@ impl Resource for Stats {
             })
         });
 
+        let large_memory_count: Value = match &self.size_scan {
+            Some((storage, max_chars)) => size_tier::count_corpus(storage, *max_chars)
+                .await
+                .map_err(|e| ResourceError::Internal(format!("size scan: {e}")))?
+                .to_json(),
+            None => Value::Null,
+        };
+
         let body = json!({
             "schema_version": self.schema_version,
             "memories": {
@@ -154,6 +183,7 @@ impl Resource for Stats {
                     "cold_quarters": cold_quarters,
                 },
                 "total_redb": semantic_count + hot_count + warm_count,
+                "large_memory_count": large_memory_count,
             },
             "semantic_index": {
                 "applied_lsn": self.semantic.applied_lsn(),
@@ -223,6 +253,58 @@ mod tests {
         assert_eq!(v["memories"]["episodic"]["cold_quarters"], 0);
         assert_eq!(v["memories"]["total_redb"], 3);
         assert_eq!(v["semantic_index"]["embed_dim"], 4);
+    }
+
+    /// Without `with_size_scan`, `large_memory_count` is `null` so
+    /// fixtures don't pay the O(N) scan cost and clients can
+    /// disambiguate "size check disabled" from "all-normal corpus".
+    #[tokio::test]
+    async fn read_omits_large_memory_count_without_size_scan() {
+        let (s, _tmp) = fixture().await;
+        let c = s.read("mneme://stats").await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
+        assert!(v["memories"]["large_memory_count"].is_null());
+    }
+
+    /// With `with_size_scan` wired, the resource walks `mem:` and
+    /// reports per-tier counts (release-planning v2.1 §5.5).
+    #[tokio::test]
+    async fn read_reports_large_memory_count_when_scan_wired() {
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&backing)));
+
+        // Seed: 1 normal, 1 advisory (700 chars), 1 over-limit
+        // against a 600-char ceiling.
+        semantic
+            .remember("short", MemoryKind::Fact, vec![], "s".into())
+            .await
+            .unwrap();
+        semantic
+            .remember(&"a".repeat(700), MemoryKind::Fact, vec![], "s".into())
+            .await
+            .unwrap();
+        semantic
+            .remember(&"b".repeat(1_500), MemoryKind::Fact, vec![], "s".into())
+            .await
+            .unwrap();
+
+        let cold = ColdArchive::new(tmp.path());
+        let s = Stats::new(semantic, procedural, episodic, cold, 1)
+            .with_size_scan(Arc::clone(&backing), 600);
+
+        let c = s.read("mneme://stats").await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
+        let lmc = &v["memories"]["large_memory_count"];
+        assert_eq!(lmc["tier_normal"], 1);
+        assert_eq!(lmc["tier_advisory"], 0); // ceiling=600 demotes 700/1500 to over_limit
+        assert_eq!(lmc["tier_warning"], 0);
+        assert_eq!(lmc["tier_over_limit"], 2);
+        assert_eq!(lmc["over_limit_ids"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
