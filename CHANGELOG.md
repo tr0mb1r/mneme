@@ -14,6 +14,26 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **Unix-domain-socket listener with stale-cleanup probe** (second
+  commit of A.M2 per ADR-0012 D2/D5). New `src/daemon/listener.rs`
+  module owns the socket-binding lifecycle: bind at
+  `<root>/run/mneme.sock`, mode `0600`, with the `run/` parent dir
+  pinned to `0700`. Stale-cleanup probe (D5) attempts a 250 ms
+  `connect()` before binding — if the entry isn't a socket (regular
+  file from a restored backup, etc.) it's unlinked unconditionally;
+  if `connect` returns `ECONNREFUSED` / `NotFound` the socket is
+  stale and gets unlinked; if `connect` succeeds the bind is
+  refused with `ListenerError::AlreadyAlive` so two daemons can't
+  step on each other; timeout treats a hung peer as alive. RAII
+  `Listener` guard auto-unlinks the socket on drop so subsequent
+  daemon starts see a clean filesystem; `take_path()` opts out of
+  the auto-unlink for the future hand-off-to-child-process flow.
+  Wired into `mneme daemon`: bind → log path → drop → fall through
+  to the stdio runner (so existing clients keep working). The
+  accept-and-serve wiring lands in the next A.M2 commit, which
+  refactors `cli::run::async_main` to be transport-generic. Adds
+  the `net` feature to tokio. Windows named-pipe support is M4 per
+  ADR-0012 D2/D9; `src/daemon/mod.rs` gates Unix-only via `cfg(unix)`.
 - **`[daemon]` config section + `mneme daemon` CLI subcommand** (first
   commit of A.M2 / release-planning v2.1 §3.9 per ADR-0012). The
   config struct ships with three knobs — `idle_timeout_minutes`

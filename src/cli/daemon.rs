@@ -1,41 +1,67 @@
 //! `mneme daemon` — v1.1 daemon entry point per ADR-0012.
 //!
-//! Today this command is a thin wrapper around [`crate::cli::run::execute`],
-//! so functionally `mneme daemon` ≡ `mneme run` (stdio MCP server).
-//! It exists at the CLI surface from the first M2 commit so:
+//! Today (A.M2 mid-series) the command:
 //!
-//! 1. systemd / launchd unit files can reference a stable command
-//!    name (`ExecStart=/usr/local/bin/mneme daemon`) without churn
-//!    as M2-M5 land the SSE transport in stages.
-//! 2. ADR-0012 D12's spawn-and-connect flow has a target to invoke
-//!    once the SSE transport lands — `mneme run` (no flags) will
-//!    spawn `mneme daemon` via the same binary path then poll the
-//!    socket.
-//! 3. Documentation, tests, and integrations can be written against
-//!    the final command surface even though the implementation is
-//!    iterating underneath.
+//! 1. Binds the per-data-dir Unix domain socket at
+//!    `<root>/run/mneme.sock` after the stale-cleanup probe (D5).
+//! 2. Logs the bind result so operators can confirm the listener
+//!    came up.
+//! 3. Falls through to the stdio MCP server. Connections to the
+//!    socket are accepted but immediately dropped — the
+//!    accept-loop + per-connection serve wiring lands in the next
+//!    commit, which extracts `cli::run::async_main`'s server build
+//!    into a transport-generic helper and routes `tokio::net::UnixStream`
+//!    halves through it.
 //!
-//! Subsequent A.M2 commits replace the body with:
+//! The split lets reviewers see the binding logic stand on its own
+//! before it's tangled with the transport refactor. systemd / launchd
+//! unit files can already reference `mneme daemon` even though the
+//! socket isn't serving yet — the next commit fills it in without
+//! the CLI shape changing.
 //!
-//! - Daemonization (D9: double-fork-and-setsid on Unix,
-//!   `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows).
-//! - Orphaned socket cleanup (D5).
-//! - Listener bind on `~/.mneme/run/mneme.sock` (Unix) or
-//!   `\\.\pipe\mneme-{user_sid}` (Windows) (D2).
-//! - SSE transport (D1) instead of stdio.
-//! - Auth-token verification on every client connection (D3).
-//! - Idle-timeout shutdown (D6) and SSE keepalive (D7).
+//! Remaining A.M2 commits per ADR-0012:
 //!
-//! For now: stdio runner. Sufficient to land the surface today and
-//! iterate on the transport in following commits without breaking
-//! the public CLI shape.
+//! - Refactor `cli::run::async_main` to be transport-generic; wire
+//!   the listener into a single-shot accept-and-serve loop that runs
+//!   the existing MCP stack over the socket connection.
+//! - Spawn-and-connect from `mneme run` default mode (D12).
+//! - M3 onward: long-running multi-client lifecycle, idle timeout
+//!   (D6), keepalive (D7), graceful shutdown.
+//! - M4: auth-token verification (D3) + Windows named-pipe support
+//!   (D2/D9).
 
 use crate::Result;
+use crate::storage::layout;
+use crate::{MnemeError, daemon};
 
 pub fn execute() -> Result<()> {
+    let root = layout::default_root().ok_or_else(|| {
+        MnemeError::Config("could not resolve home directory for ~/.mneme".into())
+    })?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(MnemeError::Io)?;
+
+    let listener = runtime
+        .block_on(daemon::bind_listener(&root))
+        .map_err(|e| MnemeError::Config(format!("daemon listener: {e}")))?;
+
     tracing::info!(
-        "`mneme daemon` is currently a stdio passthrough; SSE transport \
-         lands in subsequent A.M2 commits per ADR-0012"
+        socket = %listener.path().map(|p| p.display().to_string()).unwrap_or_default(),
+        "mneme daemon listener bound"
     );
+    tracing::info!(
+        "accept-and-serve wiring lands in the next A.M2 commit; \
+         falling through to stdio MCP server so clients keep working"
+    );
+
+    // Drop the listener before falling through so its RAII unlink
+    // fires now rather than racing the stdio runner's signal
+    // handlers. Future commit replaces this with the actual
+    // accept-and-serve loop.
+    drop(listener);
+
     crate::cli::run::execute()
 }
