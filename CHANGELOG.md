@@ -12,6 +12,28 @@ the work that landed before automation was wired up.
 
 ## [Unreleased] — develop track (v1.1)
 
+### Architecture decisions
+
+- **ADR-0012 amendment A1: D7 (SSE keepalive) deferred to v1.1.x
+  or v1.2.** A.M3 closes with multi-client + idle-timeout +
+  graceful-drain shipped; keepalive is intentionally NOT in
+  v1.1.0. Two reasons: (1) the wire format is currently
+  newline-delimited JSON over the Unix socket, not actual SSE
+  event-stream framing — D7's `: keepalive\n\n` SSE comment frame
+  prescription presupposes real SSE; (2) on a local Unix socket,
+  kernel-level dead-peer detection covers 99 % of cases via EOF
+  on read. The residual hung-peer case (process alive but stuck —
+  deadlock, not crash) is rare on local IPC and recoverable via
+  `mneme stop`. Implementing proper write-side keepalive needs
+  either an `Arc<Mutex<W>>` refactor of `StdioTransport` or a
+  read-side instrumentation; both will land naturally alongside
+  the SSE-framing switch (which itself depends on per-MCP-host
+  compat decisions). v1.1 release notes will document manual
+  recovery for the hung-peer edge case. Re-evaluation trigger:
+  if real users report the case during v1.1 soak, ship a
+  read-side timeout in v1.1.x without waiting for the framing
+  decision.
+
 ### Added
 
 - **A.M3 graceful-drain on shutdown** (release-planning v2.1 §3.9
