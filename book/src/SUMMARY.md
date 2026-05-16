@@ -5,6 +5,7 @@
 # Getting started
 
 - [Installation](./installation.md)
+- [Supported agents](./agents.md)
 - [Setting up with Claude Code](./claude-code-setup.md)
 - [Recommended Claude Code config](./claude-code-config.md)
 
@@ -22,7 +23,7 @@
 
 # Release notes
 
-- [v1.1 (draft)](./release-notes-v1_1.md)
+- [v1.1](./release-notes-v1_1.md)
 
 # Contributing
 
