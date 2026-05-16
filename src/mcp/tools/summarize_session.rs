@@ -114,3 +114,91 @@ impl Tool for SummarizeSession {
         Ok(ToolResult::text(prompt))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::tools::ContentBlock;
+    use crate::storage::Storage;
+    use crate::storage::memory_impl::MemoryStorage;
+    use tempfile::TempDir;
+
+    fn store() -> (Arc<EpisodicStore>, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let store = Arc::new(EpisodicStore::new(backing));
+        (store, tmp)
+    }
+
+    fn text(res: ToolResult) -> String {
+        match &res.content[0] {
+            ContentBlock::Text(t) => t.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_events_count_is_30() {
+        let (s, _tmp) = store();
+        let tool = SummarizeSession::new(s);
+        let res = tool.invoke(json!({})).await.unwrap();
+        let prompt = text(res);
+        assert!(prompt.starts_with("You are summarizing a session."));
+    }
+
+    #[tokio::test]
+    async fn custom_events_count_is_accepted() {
+        let (s, _tmp) = store();
+        let tool = SummarizeSession::new(s);
+        let res = tool.invoke(json!({"events": 5})).await.unwrap();
+        let prompt = text(res);
+        assert!(prompt.starts_with("You are summarizing a session."));
+    }
+
+    #[tokio::test]
+    async fn scope_filter_propagates() {
+        let (s, _tmp) = store();
+        s.record("k1", "work", "\"a\"").await.unwrap();
+        s.record("k2", "personal", "\"b\"").await.unwrap();
+        let tool = SummarizeSession::new(s);
+        let res = tool.invoke(json!({"scope": "work"})).await.unwrap();
+        let prompt = text(res);
+        assert!(prompt.contains("k1"));
+        assert!(!prompt.contains("k2"));
+    }
+
+    #[tokio::test]
+    async fn empty_store_returns_no_recent_events() {
+        let (s, _tmp) = store();
+        let tool = SummarizeSession::new(s);
+        let res = tool.invoke(json!({})).await.unwrap();
+        let prompt = text(res);
+        assert!(prompt.contains("(no recent events)"));
+    }
+
+    #[tokio::test]
+    async fn events_zero_returns_invalid_arguments() {
+        let (s, _tmp) = store();
+        let tool = SummarizeSession::new(s);
+        let err = tool.invoke(json!({"events": 0})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn events_over_max_returns_invalid_arguments() {
+        let (s, _tmp) = store();
+        let tool = SummarizeSession::new(s);
+        let err = tool.invoke(json!({"events": 201})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_events_type_returns_invalid_arguments() {
+        let (s, _tmp) = store();
+        let tool = SummarizeSession::new(s);
+        let err = tool
+            .invoke(json!({"events": "not-a-number"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+}

@@ -100,3 +100,109 @@ impl Tool for RecallRecent {
         Ok(ToolResult::text(text))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::tools::ContentBlock;
+    use crate::storage::Storage;
+    use crate::storage::memory_impl::MemoryStorage;
+    use tempfile::TempDir;
+
+    fn store() -> (Arc<EpisodicStore>, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let store = Arc::new(EpisodicStore::new(backing));
+        (store, tmp)
+    }
+
+    fn text(res: ToolResult) -> String {
+        match &res.content[0] {
+            ContentBlock::Text(t) => t.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_limit_is_20() {
+        let (s, _tmp) = store();
+        for i in 0..25 {
+            s.record(&format!("k{i}"), "g", "\"x\"").await.unwrap();
+        }
+        let tool = RecallRecent::new(s);
+        let res = tool.invoke(json!({})).await.unwrap();
+        let v: Vec<Value> = serde_json::from_str(&text(res)).unwrap();
+        assert_eq!(v.len(), 20);
+    }
+
+    #[tokio::test]
+    async fn custom_limit_is_accepted() {
+        let (s, _tmp) = store();
+        for i in 0..10 {
+            s.record(&format!("k{i}"), "g", "\"x\"").await.unwrap();
+        }
+        let tool = RecallRecent::new(s);
+        let res = tool.invoke(json!({"limit": 5})).await.unwrap();
+        let v: Vec<Value> = serde_json::from_str(&text(res)).unwrap();
+        assert_eq!(v.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn scope_filter_propagates() {
+        let (s, _tmp) = store();
+        s.record("k1", "work", "\"a\"").await.unwrap();
+        s.record("k2", "personal", "\"b\"").await.unwrap();
+        let tool = RecallRecent::new(s);
+        let res = tool.invoke(json!({"scope": "work"})).await.unwrap();
+        let v: Vec<Value> = serde_json::from_str(&text(res)).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["kind"], "k1");
+    }
+
+    #[tokio::test]
+    async fn kind_filter_propagates() {
+        let (s, _tmp) = store();
+        s.record("msg", "g", "\"a\"").await.unwrap();
+        s.record("tool_call", "g", "\"b\"").await.unwrap();
+        let tool = RecallRecent::new(s);
+        let res = tool.invoke(json!({"kind": "msg"})).await.unwrap();
+        let v: Vec<Value> = serde_json::from_str(&text(res)).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["kind"], "msg");
+    }
+
+    #[tokio::test]
+    async fn empty_store_returns_empty_array() {
+        let (s, _tmp) = store();
+        let tool = RecallRecent::new(s);
+        let res = tool.invoke(json!({})).await.unwrap();
+        let v: Vec<Value> = serde_json::from_str(&text(res)).unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[tokio::test]
+    async fn limit_zero_returns_invalid_arguments() {
+        let (s, _tmp) = store();
+        let tool = RecallRecent::new(s);
+        let err = tool.invoke(json!({"limit": 0})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn limit_over_max_returns_invalid_arguments() {
+        let (s, _tmp) = store();
+        let tool = RecallRecent::new(s);
+        let err = tool.invoke(json!({"limit": 201})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_limit_type_returns_invalid_arguments() {
+        let (s, _tmp) = store();
+        let tool = RecallRecent::new(s);
+        let err = tool
+            .invoke(json!({"limit": "not-a-number"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+}

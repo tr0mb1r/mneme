@@ -63,3 +63,56 @@ impl Resource for Recent {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Storage;
+    use crate::storage::memory_impl::MemoryStorage;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn empty_store_returns_empty_array() {
+        let _tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let store = Arc::new(EpisodicStore::new(storage));
+        let recent = Recent::new(store);
+        let c = recent.read("mneme://recent").await.unwrap();
+        assert_eq!(c.text, "[]");
+    }
+
+    #[tokio::test]
+    async fn events_in_reverse_chronological_order() {
+        let _tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let store = Arc::new(EpisodicStore::new(storage));
+        store.record("kind_a", "global", "\"first\"").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        store
+            .record("kind_b", "global", "\"second\"")
+            .await
+            .unwrap();
+        let recent = Recent::new(store);
+        let c = recent.read("mneme://recent").await.unwrap();
+        let v: Vec<serde_json::Value> = serde_json::from_str(&c.text).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0]["kind"], "kind_b");
+        assert_eq!(v[1]["kind"], "kind_a");
+    }
+
+    #[tokio::test]
+    async fn payload_field_round_trips() {
+        let _tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let store = Arc::new(EpisodicStore::new(storage));
+        let payload = "hello world";
+        store.record("test", "s1", payload).await.unwrap();
+        let recent = Recent::new(store);
+        let c = recent.read("mneme://recent").await.unwrap();
+        let v: Vec<serde_json::Value> = serde_json::from_str(&c.text).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["payload"], "hello world");
+        assert_eq!(v[0]["kind"], "test");
+        assert_eq!(v[0]["scope"], "s1");
+    }
+}

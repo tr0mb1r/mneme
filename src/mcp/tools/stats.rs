@@ -164,3 +164,153 @@ impl Tool for Stats {
         Ok(ToolResult::text(text))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embed::Embedder;
+    use crate::embed::stub::StubEmbedder;
+    use crate::mcp::tools::ContentBlock;
+    use crate::memory::consolidation::ConsolidationParams;
+    use crate::memory::consolidation_scheduler::{ConsolidationScheduler, SchedulerConfig};
+    use crate::memory::semantic::MemoryKind;
+    use crate::storage::Storage;
+    use crate::storage::memory_impl::MemoryStorage;
+    use tempfile::TempDir;
+
+    fn text(res: ToolResult) -> String {
+        match &res.content[0] {
+            ContentBlock::Text(t) => t.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_schedulers_attached_returns_null_blocks() {
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(backing));
+        let cold = ColdArchive::new(tmp.path());
+        let stats = Stats::new(semantic, procedural, episodic, cold, 1);
+        let res = stats.invoke(json!({})).await.unwrap();
+        let v: Value = serde_json::from_str(&text(res)).unwrap();
+        assert!(v["consolidation"].is_null());
+        assert!(v["working"].is_null());
+    }
+
+    #[tokio::test]
+    async fn empty_stores_report_zero() {
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(backing));
+        let cold = ColdArchive::new(tmp.path());
+        let stats = Stats::new(semantic, procedural, episodic, cold, 1);
+        let res = stats.invoke(json!({})).await.unwrap();
+        let v: Value = serde_json::from_str(&text(res)).unwrap();
+        assert_eq!(v["memories"]["semantic"], 0);
+        assert_eq!(v["memories"]["procedural"], 0);
+        assert_eq!(v["memories"]["episodic"]["hot"], 0);
+        assert_eq!(v["memories"]["episodic"]["warm"], 0);
+    }
+
+    #[tokio::test]
+    async fn with_semantic_items_reports_count() {
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        semantic
+            .remember("a", MemoryKind::Fact, vec![], "s".into())
+            .await
+            .unwrap();
+        semantic
+            .remember("b", MemoryKind::Fact, vec![], "s".into())
+            .await
+            .unwrap();
+        semantic
+            .remember("c", MemoryKind::Fact, vec![], "s".into())
+            .await
+            .unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(backing));
+        let cold = ColdArchive::new(tmp.path());
+        let stats = Stats::new(semantic, procedural, episodic, cold, 1);
+        let res = stats.invoke(json!({})).await.unwrap();
+        let v: Value = serde_json::from_str(&text(res)).unwrap();
+        assert_eq!(v["memories"]["semantic"], 3);
+    }
+
+    #[tokio::test]
+    async fn consolidation_scheduler_metrics_surface() {
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&backing)));
+        let cold = ColdArchive::new(tmp.path());
+        let sched = ConsolidationScheduler::start(
+            backing,
+            ColdArchive::new(tmp.path()),
+            ConsolidationParams {
+                hot_to_warm_days: 28,
+                warm_to_cold_days: 180,
+            },
+            SchedulerConfig::disabled(),
+            vec![],
+        );
+        let stats = Stats::new(semantic, procedural, episodic, cold, 1).with_consolidation(sched);
+        let res = stats.invoke(json!({})).await.unwrap();
+        let v: Value = serde_json::from_str(&text(res)).unwrap();
+        assert!(v["consolidation"].is_object());
+        assert!(v["consolidation"]["last_consolidation_at"].is_null());
+        assert_eq!(v["consolidation"]["runs_total"], 0);
+        assert_eq!(v["consolidation"]["errors_total"], 0);
+    }
+
+    #[tokio::test]
+    async fn builder_pattern_chains_all_options() {
+        use crate::memory::checkpoint_scheduler::{CheckpointScheduler, CheckpointSchedulerConfig};
+        use crate::memory::working::ActiveSession;
+
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&backing)));
+        let cold = ColdArchive::new(tmp.path());
+        let cons = ConsolidationScheduler::start(
+            backing,
+            ColdArchive::new(tmp.path()),
+            ConsolidationParams {
+                hot_to_warm_days: 28,
+                warm_to_cold_days: 180,
+            },
+            SchedulerConfig::disabled(),
+            vec![],
+        );
+        let active = ActiveSession::open(tmp.path().to_path_buf()).unwrap();
+        let cp = CheckpointScheduler::start(active, CheckpointSchedulerConfig::disabled());
+        let scope = ScopeState::new("test-scope");
+        let stats = Stats::new(semantic, procedural, episodic, cold, 1)
+            .with_consolidation(cons)
+            .with_checkpoints(cp)
+            .with_scope_state(scope);
+        let res = stats.invoke(json!({})).await.unwrap();
+        let v: Value = serde_json::from_str(&text(res)).unwrap();
+        assert!(v["consolidation"].is_object());
+        assert!(v["working"].is_object());
+        assert_eq!(v["working"]["current_scope"], "test-scope");
+    }
+}
