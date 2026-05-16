@@ -3,6 +3,7 @@
 //! Wire layer: newline-delimited JSON-RPC 2.0 over stdio.
 //! Negotiated protocol version: see [`PROTOCOL_VERSION`].
 
+pub mod dispatch;
 pub mod jsonrpc;
 pub mod resources;
 pub mod server;
