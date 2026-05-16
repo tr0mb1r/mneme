@@ -2,10 +2,12 @@ name: CI
 
 on:
   push:
-    # `develop` carries v1.1 work per release-planning v2.1 §1.1;
-    # both branches gate on the same CI matrix so cherry-picks
-    # don't accumulate drift.
-    branches: [main, develop]
+    # `dev` is the project's remote integration branch (local
+    # `develop` pushes to `origin/dev` per the upstream convention);
+    # `develop` is retained for backwards-compat with feature
+    # branches that may use that name directly. All gate on the
+    # same CI matrix so cherry-picks don't accumulate drift.
+    branches: [main, dev, develop]
     paths-ignore:
       - '**.md'
       - 'book/**'
@@ -15,7 +17,7 @@ on:
       - '.github/workflows/pages.yml'
       - '.github/workflows/perf.yml'
   pull_request:
-    branches: [main, develop]
+    branches: [main, dev, develop]
     paths-ignore:
       - '**.md'
       - 'book/**'

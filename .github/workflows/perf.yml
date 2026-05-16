@@ -14,7 +14,7 @@ name: perf
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, dev, develop]
     paths:
       - 'src/**'
       - 'benches/**'
@@ -22,7 +22,7 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/perf.yml'
   pull_request:
-    branches: [main, develop]
+    branches: [main, dev, develop]
     paths:
       - 'src/**'
       - 'benches/**'
