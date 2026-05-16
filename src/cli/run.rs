@@ -38,6 +38,38 @@ use crate::storage::lockfile::LockGuard;
 use crate::storage::redb_impl::RedbStorage;
 use crate::{MnemeError, migrate};
 
+/// Lightweight RAII guard for the daemon's per-connection
+/// `active_clients` counter. Creates at accept time (increments),
+/// drops on task exit (decrements + logs). Replaces three manual
+/// `fetch_sub` + `tracing::info!` sites that were easy to forget
+/// in an early-return path.
+struct ConnectionGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ConnectionGuard {
+    fn new(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::info!(active = n, "transport=daemon-serve-many: client accepted");
+        Self {
+            counter: Arc::clone(counter),
+        }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let n = self
+            .counter
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(1);
+        tracing::info!(
+            active = n,
+            "transport=daemon-serve-many: client disconnected"
+        );
+    }
+}
+
 /// Env-var override that swaps the embedder for the deterministic
 /// stub. Set by tests + offline CI runs; logging mentions it loudly so
 /// nobody thinks they're embedding for real.
@@ -269,25 +301,33 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     let sessions_dir = root.join("sessions");
     let result = runtime
         .block_on(async_main(
-            mode,
-            root.clone(),
-            Arc::clone(&storage_dyn),
-            Arc::clone(&semantic),
-            Arc::clone(&procedural),
-            Arc::clone(&episodic),
-            Arc::clone(&orchestrator),
-            cold,
-            on_disk_version.max(migrate::CURRENT_SCHEMA_VERSION),
-            auto_context_budget,
-            Arc::clone(&consolidation_scheduler),
-            Arc::clone(&active_session),
-            Arc::clone(&checkpoint_scheduler),
-            sessions_dir,
-            scope_state,
-            active_model_name.clone(),
-            max_remember_chars,
-            daemon_idle_timeout_minutes,
-            daemon_root,
+            BootedStorage {
+                storage: Arc::clone(&storage_dyn),
+                cold,
+            },
+            BootedMemory {
+                semantic: Arc::clone(&semantic),
+                procedural: Arc::clone(&procedural),
+                episodic: Arc::clone(&episodic),
+            },
+            BootedSchedulers {
+                consolidation: Arc::clone(&consolidation_scheduler),
+                checkpoint_scheduler: Arc::clone(&checkpoint_scheduler),
+                active_session: Arc::clone(&active_session),
+            },
+            DaemonRuntimeConfig {
+                mode,
+                root: root.clone(),
+                orchestrator: Arc::clone(&orchestrator),
+                scope_state,
+                sessions_dir,
+                auto_context_budget,
+                schema_version: on_disk_version.max(migrate::CURRENT_SCHEMA_VERSION),
+                active_model_name: active_model_name.clone(),
+                max_remember_chars,
+                daemon_idle_timeout_minutes,
+                daemon_root,
+            },
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
 
@@ -328,28 +368,79 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     result
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn async_main(
-    mode: TransportMode,
-    root: std::path::PathBuf,
+/// Bundles the raw storage layer: the `Storage` trait handle and the
+/// cold-tier archive. Constructed once in `execute_with_mode` and
+/// consumed by `async_main`.
+struct BootedStorage {
     storage: Arc<dyn Storage>,
+    cold: crate::storage::archive::ColdArchive,
+}
+
+/// Bundles the three memory store Arcs: L4 semantic, L0 procedural,
+/// L3 episodic.
+struct BootedMemory {
     semantic: Arc<SemanticStore>,
     procedural: Arc<ProceduralStore>,
     episodic: Arc<EpisodicStore>,
-    orchestrator: Arc<Orchestrator>,
-    cold: crate::storage::archive::ColdArchive,
-    schema_version: u32,
-    auto_context_budget: TokenBudget,
+}
+
+/// Bundles background-task handles: L3 consolidation scheduler, L1
+/// checkpoint scheduler, and the active-session tracker.
+struct BootedSchedulers {
     consolidation: Arc<ConsolidationScheduler>,
-    active_session: Arc<ActiveSession>,
     checkpoint_scheduler: Arc<CheckpointScheduler>,
-    sessions_dir: std::path::PathBuf,
+    active_session: Arc<ActiveSession>,
+}
+
+/// Runtime configuration knobs that don't belong to a single lifecycle
+/// layer: transport mode, paths, scope state, token budget, etc.
+struct DaemonRuntimeConfig {
+    mode: TransportMode,
+    root: std::path::PathBuf,
+    orchestrator: Arc<Orchestrator>,
     scope_state: Arc<ScopeState>,
+    sessions_dir: std::path::PathBuf,
+    auto_context_budget: TokenBudget,
+    schema_version: u32,
     active_model_name: String,
     max_remember_chars: usize,
     daemon_idle_timeout_minutes: u64,
     daemon_root: Arc<std::path::PathBuf>,
+}
+
+async fn async_main(
+    booted_storage: BootedStorage,
+    booted_memory: BootedMemory,
+    booted_schedulers: BootedSchedulers,
+    cfg: DaemonRuntimeConfig,
 ) -> anyhow::Result<()> {
+    // Destructure the bundles so the function body reads identically
+    // to the pre-refactor 19-param version — no body changes needed.
+    let BootedStorage { storage, cold } = booted_storage;
+    let BootedMemory {
+        semantic,
+        procedural,
+        episodic,
+    } = booted_memory;
+    let BootedSchedulers {
+        consolidation,
+        checkpoint_scheduler,
+        active_session,
+    } = booted_schedulers;
+    let DaemonRuntimeConfig {
+        mode,
+        root,
+        orchestrator,
+        scope_state,
+        sessions_dir,
+        auto_context_budget,
+        schema_version,
+        active_model_name,
+        max_remember_chars,
+        daemon_idle_timeout_minutes,
+        daemon_root,
+    } = cfg;
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         protocol = crate::mcp::PROTOCOL_VERSION,
@@ -576,13 +667,6 @@ async fn async_main(
                     loop {
                         match listener.as_inner().accept().await {
                             Ok((stream, _addr)) => {
-                                let n = active_clients
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                                    + 1;
-                                tracing::info!(
-                                    active = n,
-                                    "transport=daemon-serve-many: client accepted"
-                                );
                                 let (read, write) = stream.into_split();
                                 let tool = Arc::clone(&tool_registry);
                                 let resource = Arc::clone(&resource_registry);
@@ -595,6 +679,16 @@ async fn async_main(
                                 let root_for_auth = Arc::clone(&daemon_root);
                                 let mut shutdown_rx = shutdown_rx_outer.clone();
                                 tokio::spawn(async move {
+                                    // The guard must live for the
+                                    // SPAWNED task's lifetime, not the
+                                    // accept-arm scope — creating it
+                                    // outside the `async move` would
+                                    // drop it as soon as `tokio::spawn`
+                                    // returns, leaving the counter
+                                    // perpetually at zero and breaking
+                                    // both `wait_for_drain` and the
+                                    // idle-timeout watcher (D6).
+                                    let _guard = ConnectionGuard::new(&counter);
                                     // ADR-0012 D3: read the token
                                     // from disk PER CONNECTION (not
                                     // a cached snapshot) so
@@ -610,16 +704,6 @@ async fn async_main(
                                             tracing::warn!(
                                                 error = %e,
                                                 "transport=daemon-serve-many: failed to read auth token; dropping connection"
-                                            );
-                                            let n = counter
-                                                .fetch_sub(
-                                                    1,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                )
-                                                - 1;
-                                            tracing::info!(
-                                                active = n,
-                                                "transport=daemon-serve-many: client disconnected"
                                             );
                                             return;
                                         }
@@ -645,16 +729,6 @@ async fn async_main(
                                             tracing::warn!(
                                                 error = %e,
                                                 "transport=daemon-serve-many: auth handshake rejected; dropping connection"
-                                            );
-                                            let n = counter
-                                                .fetch_sub(
-                                                    1,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                )
-                                                - 1;
-                                            tracing::info!(
-                                                active = n,
-                                                "transport=daemon-serve-many: client disconnected"
                                             );
                                             return;
                                         }
@@ -701,13 +775,7 @@ async fn async_main(
                                             }
                                         }
                                     }
-                                    let n = counter
-                                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
-                                        - 1;
-                                    tracing::info!(
-                                        active = n,
-                                        "transport=daemon-serve-many: client disconnected"
-                                    );
+                                    // guard drops here → counter -= 1
                                 });
                             }
                             Err(e) => {

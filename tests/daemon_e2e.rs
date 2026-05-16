@@ -13,7 +13,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
@@ -1093,6 +1093,16 @@ async fn client_crash_does_not_affect_other_clients() {
 /// well under 5 s because the per-connection task observes the
 /// `watch::changed()` notification, drops the socket halves, and the
 /// drain counter falls to zero.
+///
+/// Also asserts log invariants that catch a class of `ConnectionGuard`
+/// lifetime regressions (where the guard's `Drop` would fire
+/// synchronously around `tokio::spawn` instead of at task exit,
+/// leaving the counter perpetually at zero):
+///   - "client accepted" with `active=1`
+///   - "shutdown signal received" with `active=1` (counter still
+///     reflects the connected client at drain time)
+///   - "client disconnected" with `active=0` (guard's Drop ran
+///     INSIDE the spawned task, not in the accept-arm scope)
 #[tokio::test]
 async fn daemon_drains_idle_clients_promptly_on_sigterm() {
     let tmp = TempDir::new().unwrap();
@@ -1102,12 +1112,20 @@ async fn daemon_drains_idle_clients_promptly_on_sigterm() {
     let mut daemon = Command::new(BINARY)
         .arg("daemon")
         .arg("--foreground")
-        .env("MNEME_LOG", "off")
+        // Enable INFO logging on stderr so the test can assert on
+        // the active-counter values surfaced by the daemon's
+        // "client accepted active=N" / "shutdown signal received
+        // active=N" tracing lines. NO_COLOR disables ANSI escape
+        // codes (per the no-color.org convention, honored by
+        // tracing-subscriber) so substring matches don't have to
+        // navigate `active\x1b[2m=\x1b[0m1`.
+        .env("MNEME_LOG", "info,mneme=info")
+        .env("NO_COLOR", "1")
         .env("MNEME_DATA_DIR", data_dir)
         .env("MNEME_EMBEDDER", "stub")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mneme daemon");
     wait_for_socket(&socket).await;
@@ -1144,35 +1162,70 @@ async fn daemon_drains_idle_clients_promptly_on_sigterm() {
     let init: serde_json::Value = serde_json::from_str(line.trim()).expect("init JSON");
     assert_eq!(init["id"], 1);
 
-    // Confirm the client is actually connected (active=1 from the
-    // daemon's perspective) before we SIGTERM. We do this by
-    // letting the read half stay parked in `read_line` — if the
-    // daemon disconnected us prematurely it'd EOF immediately, but
-    // we expect it to stay open until SIGTERM.
-
     let started = std::time::Instant::now();
     sigterm(&daemon);
+
+    // Capture stderr concurrently with the wait so we don't deadlock
+    // on a full pipe buffer for the long-lived "INFO" stream.
+    let stderr = daemon.stderr.take().expect("daemon stderr was piped");
+    let stderr_buf = tokio::spawn(async move {
+        let mut out = String::new();
+        let mut reader = BufReader::new(stderr);
+        let _ = reader.read_to_string(&mut out).await;
+        out
+    });
+
     let exit_status = timeout(Duration::from_secs(5), daemon.wait())
         .await
         .expect("daemon must exit within 5 s of SIGTERM (active-drain broadcast)")
         .expect("daemon wait succeeded");
     let elapsed = started.elapsed();
+    let log = stderr_buf.await.expect("stderr collector finished");
 
     assert!(
         exit_status.success(),
-        "daemon exited non-zero on SIGTERM: {exit_status:?}"
+        "daemon exited non-zero on SIGTERM: {exit_status:?}\nlog:\n{log}"
     );
     // Generous upper bound — the broadcast path completes in
     // ~tens of ms locally, but CI can be slow. Anything under 5 s
     // proves we're not on the 30 s deadline path.
     assert!(
         elapsed < Duration::from_secs(5),
-        "drain took {elapsed:?}; expected <5 s with active-drain broadcast"
+        "drain took {elapsed:?}; expected <5 s with active-drain broadcast\nlog:\n{log}"
     );
     assert!(
         !socket.exists(),
-        "socket file {} should be unlinked after daemon exit",
+        "socket file {} should be unlinked after daemon exit\nlog:\n{log}",
         socket.display()
+    );
+
+    // ConnectionGuard lifetime invariants — these fail if the guard
+    // is created in the accept arm but the spawned task doesn't own
+    // it (synchronous create+drop would leave active=0 throughout).
+    let saw_accepted_with_one = log
+        .lines()
+        .any(|l| l.contains("client accepted") && l.contains("active=1"));
+    assert!(
+        saw_accepted_with_one,
+        "expected a 'client accepted active=1' line; ConnectionGuard \
+         may be created at the wrong scope.\nlog:\n{log}"
+    );
+    let saw_shutdown_with_one = log
+        .lines()
+        .any(|l| l.contains("shutdown signal received") && l.contains("active=1"));
+    assert!(
+        saw_shutdown_with_one,
+        "expected 'shutdown signal received active=1' (counter must \
+         still reflect the connected client at drain time, NOT \
+         active=0).\nlog:\n{log}"
+    );
+    let saw_disconnect_with_zero = log
+        .lines()
+        .any(|l| l.contains("client disconnected") && l.contains("active=0"));
+    assert!(
+        saw_disconnect_with_zero,
+        "expected 'client disconnected active=0' from the guard's \
+         Drop running inside the spawned task.\nlog:\n{log}"
     );
 
     drop(write);
