@@ -860,6 +860,109 @@ async fn daemon_is_spawned_by_detach_primitive() {
     assert!(!socket.exists(), "socket must be removed after SIGTERM");
 }
 
+/// Regression: `mneme client` against an empty data dir must
+/// auto-spawn the daemon AND deliver the agent's MCP initialize
+/// response back over stdout before the spawn-wait budget expires.
+///
+/// Pre-fix history: ADR-0012 D12 capped [`super::SPAWN_WAIT_DEADLINE`]
+/// at 5 s, which was tight enough that a cold daemon boot (bge-m3
+/// model_loader's HuggingFace HEAD probe + HNSW snapshot replay +
+/// first-boot upgrade audit) routinely exceeded it. The client then
+/// returned `daemon did not start within 5 s` and exited. Claude
+/// Code (and other MCP hosts) saw the subprocess die and required
+/// the user to manually `/mcp` reconnect; the second attempt
+/// succeeded only because the orphaned daemon was now up.
+///
+/// This test exercises the actual `mneme client` binary end-to-end
+/// (no daemon pre-started), proving the auto-spawn → connect →
+/// auth → byte-pipe path produces a valid initialize response on
+/// stdout. It uses `MNEME_EMBEDDER=stub` to keep the test fast and
+/// deterministic — the bug class we're guarding against is
+/// "client gives up before daemon is ready," which is independent
+/// of which embedder is loaded.
+#[tokio::test]
+async fn client_auto_spawns_daemon_on_first_connect() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    let socket = data_dir.join("run").join("mneme.sock");
+    let lockfile = data_dir.join(".lock");
+
+    // No daemon pre-started — `mneme client`'s D12 path must spawn
+    // it. Pipe stdio so the test can act as the MCP host.
+    let mut client = Command::new(BINARY)
+        .arg("client")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .env("MNEME_EMBEDDER", "stub")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mneme client");
+
+    let mut client_stdin = client.stdin.take().expect("client stdin open");
+    let mut client_stdout = BufReader::new(client.stdout.take().expect("client stdout open"));
+
+    // Send the agent's MCP initialize as soon as the subprocess
+    // exists. The bridge buffers it during the spawn-wait window
+    // and forwards once connected.
+    client_stdin
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"d12-autospawn-test","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+"#,
+        )
+        .await
+        .expect("write initialize to client stdin");
+
+    // 30 s matches the new SPAWN_WAIT_DEADLINE so the test fails
+    // (rather than hangs) if the budget regresses.
+    let mut response = String::new();
+    timeout(
+        Duration::from_secs(30),
+        client_stdout.read_line(&mut response),
+    )
+    .await
+    .expect("initialize response within 30 s of mneme client spawn")
+    .expect("read initialize response line");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(response.trim()).expect("initialize response is valid JSON");
+    assert_eq!(parsed["jsonrpc"], "2.0", "response is JSON-RPC 2.0");
+    assert_eq!(parsed["id"], 1, "response correlates with our request id");
+    assert!(
+        parsed["result"]["protocolVersion"].is_string(),
+        "initialize result carries protocolVersion: {parsed:?}"
+    );
+    assert!(
+        parsed["result"]["capabilities"]["tools"].is_object(),
+        "initialize result advertises the tools capability: {parsed:?}"
+    );
+
+    // Cleanup: close the client's stdin so it exits, then SIGTERM
+    // the auto-spawned daemon via the PID it wrote to the lockfile.
+    drop(client_stdin);
+    let _ = timeout(Duration::from_secs(5), client.wait()).await;
+
+    let daemon_pid: i32 = std::fs::read_to_string(&lockfile)
+        .expect("daemon wrote its PID to the lockfile")
+        .trim()
+        .parse()
+        .expect("lockfile contains a numeric PID");
+    let rc = unsafe { libc::kill(daemon_pid, libc::SIGTERM) };
+    assert_eq!(rc, 0, "kill(SIGTERM, {daemon_pid}) must succeed");
+
+    // Wait for the socket to disappear so the next test on the same
+    // CI worker doesn't trip the stale-socket cleanup probe.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if !socket.exists() {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Per-connection isolation per ADR-0012 D8: a client crashing
 /// mid-conversation does NOT affect other clients connected to
 /// the same daemon. Each connection runs in its own tokio task;

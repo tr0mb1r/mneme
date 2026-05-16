@@ -80,14 +80,39 @@ fn is_connect_error(e: &io::Error) -> bool {
     )
 }
 
+/// Total time `mneme client` will wait for an auto-spawned daemon's
+/// socket to appear before giving up. ADR-0012 D12's original 5 s
+/// budget did not account for the bge-m3 model_loader's
+/// HuggingFace HEAD/GET probe (~1–4 s even with weights cached
+/// locally), the HNSW snapshot replay (~50–500 ms), or the
+/// first-boot upgrade audit. A warm-cache `mneme daemon` boot
+/// routinely exceeded 5 s in production, causing the client to exit
+/// before the daemon finished booting. The agent's MCP host then
+/// saw the subprocess die and forced the user into a manual `/mcp`
+/// reconnect. 30 s is well above the warm-cache worst-case (~5 s
+/// with the model already on disk) and tight enough to surface real
+/// failures (lockfile contention, OOM at boot, etc.) instead of
+/// hanging forever. First-ever boots that have to download the
+/// embedder weights from HuggingFace still exceed this budget; that
+/// scenario surfaces a clear `daemon did not start within 30s`
+/// error rather than the silent 5 s exit, and the next agent
+/// `mneme client` invocation reconnects to the daemon once the
+/// download completes.
+const SPAWN_WAIT_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Spawn a detached daemon and wait for its socket to appear.
 /// Exponential backoff: 10 ms initial, 2× per attempt, 1 s cap,
-/// 5 s total budget per ADR-0012 D12.
+/// total budget [`SPAWN_WAIT_DEADLINE`] per ADR-0012 D12.
 async fn spawn_daemon_with_backoff(socket: &Path) -> Result<()> {
     crate::daemon::spawn_daemon_detached()?;
-    wait_for_socket(socket, Duration::from_secs(5))
+    wait_for_socket(socket, SPAWN_WAIT_DEADLINE)
         .await
-        .map_err(|e| MnemeError::Mcp(format!("daemon did not start within 5 s: {e}")))
+        .map_err(|e| {
+            MnemeError::Mcp(format!(
+                "daemon did not start within {:?}: {e}",
+                SPAWN_WAIT_DEADLINE
+            ))
+        })
 }
 
 /// Build an auth-line string `MNEME-AUTH: <token>\n` from raw token bytes.
