@@ -59,19 +59,41 @@ fn auth_line(data_dir: &Path) -> String {
     format!("MNEME-AUTH: {}\n", read_auth_token(data_dir))
 }
 
-/// Poll for the socket file to appear; the daemon performs boot work
-/// (storage open, embed migrate, audit, scheduler spawn) before
-/// binding, so a fresh data dir on slow disk can take ~1s. Cap at 5s
-/// so a hung daemon doesn't wedge the test suite.
+/// Poll the daemon socket until a `UnixStream::connect` succeeds.
+/// The daemon performs boot work (storage open, embed migrate,
+/// audit, scheduler spawn) before binding, so a fresh data dir on
+/// slow disk can take ~1s; CI ubuntu under load occasionally pushes
+/// past that. Cap at 15s so a hung daemon doesn't wedge the suite.
+///
+/// We probe with `connect` rather than `socket.exists()` because the
+/// file can be present-but-not-yet-accepting in two cases that
+/// matter to the daemon-restart tests:
+///
+/// 1. A killed daemon leaves a stale socket file on disk (Drop
+///    didn't run) — `exists()` is true the whole time the new
+///    daemon is booting.
+/// 2. Between `bind_listener` removing the stale socket and the
+///    new `UnixListener::bind` returning, there's a brief window
+///    where the path doesn't resolve to a working listener.
+///
+/// Both windows would let the caller race ahead and read 0 bytes
+/// from the client (panic: "post-reconnect stats JSON: EOF while
+/// parsing a value" at line 484).
 async fn wait_for_socket(socket: &Path) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let probe_timeout = Duration::from_millis(250);
     while std::time::Instant::now() < deadline {
-        if socket.exists() {
+        if let Ok(Ok(_stream)) =
+            tokio::time::timeout(probe_timeout, UnixStream::connect(socket)).await
+        {
             return;
         }
         sleep(Duration::from_millis(50)).await;
     }
-    panic!("socket {} did not appear within 5 s", socket.display());
+    panic!(
+        "socket {} did not accept connections within 15 s",
+        socket.display()
+    );
 }
 
 #[tokio::test]
@@ -374,19 +396,35 @@ async fn client_reconnects_after_daemon_restart() {
     wait_for_socket(&socket).await;
 
     // Spawn `mneme client` as a subprocess with piped stdio.
+    // Capture client stderr (with MNEME_LOG=warn so reconnect/reinit
+    // failures surface) so when this test flakes on CI, the failure
+    // dump in `cargo test --log-failed` includes the diagnostic info
+    // needed to identify whether the client exited via reconnect
+    // timeout, reinit failure, auth-token read error, or something
+    // else. Without this, a panic on `read_line → EOF` gives no
+    // signal about what the client subprocess was doing.
     let mut client = Command::new(BINARY)
         .arg("client")
-        .env("MNEME_LOG", "off")
+        .env("MNEME_LOG", "warn")
         .env("MNEME_DATA_DIR", data_dir)
         .env("MNEME_EMBEDDER", "stub")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mneme client");
 
     let mut client_stdin = client.stdin.take().expect("client stdin open");
     let mut client_stdout = BufReader::new(client.stdout.take().expect("client stdout open"));
+    let client_stderr = client.stderr.take().expect("client stderr open");
+    // Drain stderr in the background and print on test failure via a
+    // task handle the panic-or-success path joins below.
+    let stderr_drain = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let mut reader = BufReader::new(client_stderr);
+        let _ = reader.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    });
 
     // Step 1: send a full MCP initialize handshake through the client
     // and verify we get a valid response back.
@@ -461,7 +499,12 @@ async fn client_reconnects_after_daemon_restart() {
 
     // Give the client time to detect the disconnect, reconnect with
     // backoff, re-auth, and replay the MCP initialize handshake.
-    sleep(Duration::from_millis(1500)).await;
+    // Bumped 1500ms → 3000ms after the same panic kept surfacing on
+    // ubuntu CI even after wait_for_socket grew a connect probe — the
+    // tighter budget was leaving no slack for boot variance on the
+    // CI runner. Stays well under the read_line 5s timeout so a hung
+    // client still fails loudly.
+    sleep(Duration::from_millis(3000)).await;
 
     // Step 3: send another request. If the client reconnected
     // transparently, this should succeed.
@@ -480,8 +523,29 @@ async fn client_reconnects_after_daemon_restart() {
     .await
     .expect("post-reconnect stats response within 5s")
     .expect("read post-reconnect stats response");
-    let parsed: serde_json::Value =
-        serde_json::from_str(response.trim()).expect("post-reconnect stats JSON");
+
+    // Replace `.expect("post-reconnect stats JSON")` with a manual
+    // failure path that closes the client and drains its stderr
+    // before panicking. The previous flake gave a bare "EOF while
+    // parsing a value" with no signal about why the client exited.
+    let parsed = match serde_json::from_str::<serde_json::Value>(response.trim()) {
+        Ok(p) => p,
+        Err(e) => {
+            drop(client_stdin);
+            let _ = timeout(Duration::from_secs(2), client.wait()).await;
+            let stderr = match timeout(Duration::from_secs(2), stderr_drain).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(je)) => format!("<stderr task panicked: {je}>"),
+                Err(_) => "<stderr drain timed out>".to_string(),
+            };
+            sigterm(&daemon_b);
+            let _ = timeout(Duration::from_secs(10), daemon_b.wait()).await;
+            panic!(
+                "post-reconnect stats JSON failed to parse ({e}); response={:?}; client stderr was:\n{}",
+                response, stderr
+            );
+        }
+    };
     assert_eq!(parsed["id"], 3);
     assert!(
         parsed["result"]["content"][0]["text"].is_string(),
@@ -491,6 +555,7 @@ async fn client_reconnects_after_daemon_restart() {
     // Cleanup.
     drop(client_stdin);
     let _ = client.wait().await;
+    let _ = stderr_drain.await;
     sigterm(&daemon_b);
     let _ = timeout(Duration::from_secs(10), daemon_b.wait()).await;
 }

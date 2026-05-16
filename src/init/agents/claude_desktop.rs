@@ -207,6 +207,8 @@ fn prune_empty_object(value: &mut serde_json::Value, key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only used by the macOS/Linux-gated assertion helpers below.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use serde_json::Value;
     use tempfile::TempDir;
 

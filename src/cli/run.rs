@@ -43,10 +43,12 @@ use crate::{MnemeError, migrate};
 /// drops on task exit (decrements + logs). Replaces three manual
 /// `fetch_sub` + `tracing::info!` sites that were easy to forget
 /// in an early-return path.
+#[cfg(unix)]
 struct ConnectionGuard {
     counter: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+#[cfg(unix)]
 impl ConnectionGuard {
     fn new(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
         let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -57,6 +59,7 @@ impl ConnectionGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         let n = self
@@ -427,6 +430,12 @@ async fn async_main(
         checkpoint_scheduler,
         active_session,
     } = booted_schedulers;
+    // root / daemon_idle_timeout_minutes / daemon_root are read only
+    // by the #[cfg(unix)] daemon transport arms below; on Windows
+    // they decompose cleanly from the struct but go unused. Allow
+    // here rather than restructuring the destructure into per-cfg
+    // bindings — keeps the field list legible in one place.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let DaemonRuntimeConfig {
         mode,
         root,
@@ -572,6 +581,7 @@ async fn async_main(
             )
             .await?;
         }
+        #[cfg(unix)]
         TransportMode::DaemonAcceptOne => {
             let listener = crate::daemon::bind_listener(&root)
                 .await
@@ -604,6 +614,7 @@ async fn async_main(
             )
             .await?;
         }
+        #[cfg(unix)]
         TransportMode::DaemonServeMany => {
             let listener = crate::daemon::bind_listener(&root)
                 .await
@@ -815,6 +826,17 @@ async fn async_main(
             );
             wait_for_drain(Arc::clone(&active_clients)).await;
         }
+        // Windows fallback for the daemon transports: bind_listener
+        // and its UnixListener-based plumbing are #[cfg(unix)] in
+        // src/daemon/mod.rs (named-pipe port is M4 per ADR-0012 D2).
+        // Surface the gap explicitly rather than letting the Windows
+        // build fail in clippy/test on unresolved symbols.
+        #[cfg(not(unix))]
+        TransportMode::DaemonAcceptOne | TransportMode::DaemonServeMany => {
+            anyhow::bail!(
+                "daemon transport requires Unix domain sockets; Windows named-pipe support is M4 per ADR-0012 D2 (see src/daemon/mod.rs)"
+            );
+        }
     }
 
     // ADR-0009 — emit `session_end` after the run loop returns, before
@@ -894,6 +916,7 @@ fn active_embedder_model_name(config: &Config) -> String {
 /// Counted from "last client disconnected", not "last request
 /// seen": a long HNSW snapshot that blocks requests but not
 /// connections doesn't accidentally trigger shutdown.
+#[cfg(unix)]
 async fn idle_timeout_watcher(
     active_clients: Arc<std::sync::atomic::AtomicUsize>,
     idle_timeout_minutes: u64,
@@ -919,18 +942,21 @@ async fn idle_timeout_watcher(
 /// How often `idle_timeout_watcher` checks the client counter.
 /// 30 s gives ≤ 30 s overshoot on the configured timeout — fine for
 /// the default 30-minute idle and frugal on syscalls.
+#[cfg(unix)]
 const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Maximum time `wait_for_drain` will wait for active connections to
 /// finish before letting the runtime tear them down. 30 s is long
 /// enough for typical MCP exchanges to complete, short enough that a
 /// stuck client doesn't wedge a daemon shutdown for minutes.
+#[cfg(unix)]
 const DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How often `wait_for_drain` polls the counter while draining.
 /// 100 ms is responsive enough that a normal client closing within a
 /// second is barely waited on; rare enough that a stuck-but-large
 /// drain isn't a tight CPU loop.
+#[cfg(unix)]
 const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Wait for the active-client counter to reach zero, capped by
@@ -938,6 +964,7 @@ const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// timeout. Used by `DaemonServeMany` after the accept loop exits
 /// (SIGTERM or idle timeout) to give in-flight MCP exchanges a
 /// chance to complete before the runtime aborts their tasks.
+#[cfg(unix)]
 async fn wait_for_drain(active_clients: Arc<std::sync::atomic::AtomicUsize>) {
     let initial = active_clients.load(std::sync::atomic::Ordering::Relaxed);
     if initial == 0 {
@@ -991,7 +1018,11 @@ async fn shutdown_signal() {
     }
 }
 
-#[cfg(test)]
+// All tests below exercise the daemon's idle-timeout watcher and
+// graceful-drain helpers, both #[cfg(unix)] because the daemon
+// transport is Unix-only until M4. Gate the whole module so the
+// Windows test build doesn't fail on missing symbols.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::Arc;

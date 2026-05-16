@@ -5,7 +5,23 @@ use clap::{Parser, Subcommand};
 
 pub mod auth;
 pub mod backup;
+#[cfg(unix)]
 pub mod client;
+// Windows stub for `mneme client`. The wrapper is a Unix-socket
+// bridge (ADR-0012 D12) that depends on tokio::net::UnixStream plus
+// the Unix-only daemon::listener helpers. Named-pipe support is M4
+// per ADR-0012 D2 — until then the subcommand returns a clear error
+// instead of triggering a Windows compile break.
+#[cfg(not(unix))]
+pub mod client {
+    use crate::{MnemeError, Result};
+    pub fn execute() -> Result<()> {
+        Err(MnemeError::Mcp(
+            "mneme client requires Unix domain sockets; Windows named-pipe support is M4 per ADR-0012 D2 (see src/daemon/mod.rs)"
+                .into(),
+        ))
+    }
+}
 pub mod daemon;
 pub mod demo;
 pub mod export;

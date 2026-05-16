@@ -60,20 +60,40 @@ pub fn socket_path(root: &Path) -> PathBuf {
     root.join("run").join(SOCKET_FILENAME)
 }
 
-/// Wait for a daemon socket to appear, polling with exponential
+/// Wait for a daemon to be ready to serve, polling with exponential
 /// backoff. Used by D12's spawn protocol (`mneme client` auto-spawns
 /// the daemon and waits for it to finish booting).
 ///
 /// Backoff starts at 10 ms and doubles each attempt, capped at 1 s.
-/// Returns `Ok(())` once `path` exists; returns an error after the
-/// total elapsed time exceeds `deadline`.
+/// Returns `Ok(())` once a `UnixStream::connect` to `path` succeeds;
+/// returns an error after the total elapsed time exceeds `deadline`.
+///
+/// Why we probe with `connect` rather than `path.exists()`: the file
+/// can appear well before the daemon's accept loop is ready (e.g.
+/// during a daemon restart where the old socket file is still on
+/// disk, or in the window between bind and the accept task being
+/// spawned). A bare existence check returns true in those cases and
+/// callers downstream get `ECONNREFUSED` or an empty read on their
+/// next operation — exactly the race that broke
+/// `client_reconnects_after_daemon_restart` (tests/daemon_e2e.rs:484
+/// "post-reconnect stats JSON: EOF while parsing a value").
 pub async fn wait_for_socket(path: &Path, deadline: Duration) -> Result<(), ListenerError> {
     let started = std::time::Instant::now();
     let mut delay = Duration::from_millis(10);
     let max_delay = Duration::from_secs(1);
+    // Per-attempt probe timeout — the peer is local, anything slower
+    // than this is functionally "not ready yet" rather than slow.
+    // Matches `STALE_PROBE_TIMEOUT` upstairs so a hung listener
+    // doesn't wedge the wait loop.
+    let probe_timeout = STALE_PROBE_TIMEOUT;
     loop {
-        if path.exists() {
-            return Ok(());
+        match tokio::time::timeout(probe_timeout, tokio::net::UnixStream::connect(path)).await {
+            Ok(Ok(_stream)) => return Ok(()),
+            Ok(Err(_)) | Err(_) => {
+                // Not ready: file missing, ECONNREFUSED (post-stale-
+                // cleanup window or pre-accept), other transient I/O,
+                // or probe timed out. Fall through to the backoff arm.
+            }
         }
         if started.elapsed() + delay > deadline {
             return Err(ListenerError::Io {
@@ -81,7 +101,7 @@ pub async fn wait_for_socket(path: &Path, deadline: Duration) -> Result<(), List
                 source: io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "daemon socket did not appear within {deadline:?} (waited {:?})",
+                        "daemon socket did not accept connections within {deadline:?} (waited {:?})",
                         started.elapsed()
                     ),
                 ),

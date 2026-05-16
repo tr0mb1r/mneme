@@ -323,10 +323,21 @@ async fn run(root: &Path) -> Result<()> {
 /// Try to reconnect a disconnected stream with exponential backoff.
 /// On success the caller should call `reinitialize` before resuming
 /// the byte pipe.
+///
+/// Deadline matches [`SPAWN_WAIT_DEADLINE`] (30 s) on purpose: the
+/// EOF we're recovering from is usually the daemon being restarted
+/// (`mneme stop` + `mneme daemon`), and the replacement's boot is
+/// the same warm-cache scenario the spawn path documents (~5 s
+/// typical, more under model-load or first-boot upgrade audit). A
+/// tighter budget here would have the client exit while the new
+/// daemon is still binding, forcing the MCP host into a manual
+/// `/mcp` reconnect — exactly what D12's reconnect protocol exists
+/// to avoid. Also fixes the `client_reconnects_after_daemon_restart`
+/// flake under CI load on ubuntu (tests/daemon_e2e.rs:484).
 async fn reconnect_loop(socket: &Path, root: &Path, stream: &mut UnixStream) -> Result<()> {
     let mut delay = Duration::from_millis(10);
     let max_delay = Duration::from_secs(1);
-    let deadline = Duration::from_secs(5);
+    let deadline = SPAWN_WAIT_DEADLINE;
     let start = std::time::Instant::now();
 
     loop {

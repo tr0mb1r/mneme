@@ -87,11 +87,16 @@ fn build_file_layer(logging: &LoggingConfig) -> Option<Box<dyn Layer<Registry> +
     // we use file-rotate here.
     let max_bytes = (logging.max_size_mb as usize).saturating_mul(1024 * 1024);
     let max_files = logging.max_files.max(1) as usize;
+    // file-rotate's FileRotate::new takes an extra trailing
+    // `Option<u32>` mode-bits arg on Unix (chmod for new files) that
+    // doesn't exist on Windows. Gate the parameter so the call type-
+    // checks on both platforms.
     let rotator = FileRotate::new(
         path,
         AppendCount::new(max_files),
         ContentLimit::Bytes(max_bytes),
         Compression::None,
+        #[cfg(unix)]
         None,
     );
 
