@@ -42,7 +42,8 @@ pub enum AuthCommand {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Scaffold `~/.mneme/`, or install mneme into a specific
-    /// agent (`claude-code` is fully wired today; the other Tier-1
+    /// agent (`claude-code`, `claude-desktop`, `cursor`, and
+    /// `opencode` are fully wired today; the remaining Tier-1
     /// agents land per release-planning §4.7 B.M3-M4).
     Init {
         /// Target agent. Omit for v1.0 scaffold-only behaviour

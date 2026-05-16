@@ -29,7 +29,7 @@ Pre-1.0 cycle wrapping. Latest published release is `0.2.6` on
 branch is at `1.1.0` (preview — not yet tagged) and accumulates the
 v1.1 cycle work per the release-planning doc: daemon mode + SSE-default
 transport (ADR-0012), per-agent installer (`mneme init <agent>`, fully
-wired for `claude-code` and `claude-desktop`), size guardrails +
+wired for `claude-code`, `claude-desktop`, `cursor`, and `opencode`), size guardrails +
 first-boot audit, and v1.0 → v1.1 migration tests. The v1.0 release is
 calendar-gated on the 30-day soak (Day 0 = 2026-04-29) + one cycle
 without a `schema_version` bump and ships before v1.1. Treat as

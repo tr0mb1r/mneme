@@ -9,15 +9,20 @@
 //!   their wiring in `settings.json.hooks`, and upserts the
 //!   marker block in `CLAUDE.md`.
 //!
-//! - `claude-desktop`, `cursor`, `cline` — stubbed; install lands
-//!   in B.M3 once each agent's path conventions are validated
-//!   end-to-end on a real install.
+//! - `claude-desktop`, `cursor` — fully implemented; ride the same
+//!   `json_config::upsert_file` + standalone-MNEME.md primitives as
+//!   `claude-code` for atomic, idempotent, reversible installs.
+//!
+//! - `cline` — stubbed; install lands in B.M3 once its
+//!   path conventions are validated end-to-end on a real install.
 //!
 //! - `codex`, `gemini-cli` — stubbed; install lands in B.M4.
 //!
-//! - `opencode` — Tier-2 conditional per ADR-0012 / planning
-//!   §4.4; deferred outright until the OpenCode plugin API
-//!   stabilises.
+//! - `opencode` — fully implemented. The original Tier-2 conditional
+//!   gate ("plugin API stabilisation") referred to OpenCode's
+//!   TypeScript plugin convention; this installer doesn't touch
+//!   that surface (only `mcp` + `instructions[]`, both stable per
+//!   OpenCode docs as of 2026-05-16), so the gate was misaligned.
 //!
 //! The stubs return [`AgentError::NotYetImplemented`] with the
 //! tracked task number so a user who tries an unimplemented
@@ -25,6 +30,8 @@
 
 pub mod claude_code;
 pub mod claude_desktop;
+pub mod cursor;
+pub mod opencode;
 
 use std::path::PathBuf;
 
@@ -33,9 +40,9 @@ use thiserror::Error;
 
 use super::{json_config::ConfigError, marker::MarkerError};
 
-/// Tier-1 agents `mneme init` knows about. OpenCode is omitted —
-/// it ships if-and-only-if its plugin API stabilises by the M4
-/// milestone (ADR-0012 / release-planning §4.4 Tier-2 conditional).
+/// Tier-1 agents `mneme init` knows about, plus OpenCode (formerly
+/// Tier-2 conditional, promoted to Tier-1 once the gate was
+/// re-validated against current OpenCode docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Agent {
     /// Claude Code — global `~/.claude/` install per §4.4.
@@ -47,7 +54,8 @@ pub enum Agent {
     /// macOS, platform-equivalent paths elsewhere. B.M3.
     #[value(name = "claude-desktop")]
     ClaudeDesktop,
-    /// Cursor — global `~/.cursor/` or workspace `.cursor/`. B.M3.
+    /// Cursor — global `~/.cursor/mcp.json` install. Daemon-multiplex
+    /// via the `mneme client` bridge, same pattern as Claude Desktop.
     #[value(name = "cursor")]
     Cursor,
     /// Cline — VS Code extension; MCP config path varies. B.M3.
@@ -59,6 +67,11 @@ pub enum Agent {
     /// Gemini CLI — Google. B.M4.
     #[value(name = "gemini-cli")]
     GeminiCli,
+    /// OpenCode — global `~/.config/opencode/opencode.json` install.
+    /// Daemon-multiplex via the `mneme client` bridge; calibration
+    /// guidance auto-loads through opencode.json's `instructions[]`.
+    #[value(name = "opencode")]
+    OpenCode,
 }
 
 /// What `mneme init <agent>` should do — install (the default),
@@ -108,10 +121,7 @@ pub fn run(agent: Agent, mode: InstallMode, home_dir: &std::path::Path) -> Resul
     match agent {
         Agent::ClaudeCode => claude_code::run(mode, home_dir),
         Agent::ClaudeDesktop => claude_desktop::run(mode, home_dir),
-        Agent::Cursor => Err(AgentError::NotYetImplemented(
-            agent,
-            "release-planning §4.7 B.M3",
-        )),
+        Agent::Cursor => cursor::run(mode, home_dir),
         Agent::Cline => Err(AgentError::NotYetImplemented(
             agent,
             "release-planning §4.7 B.M3",
@@ -124,6 +134,7 @@ pub fn run(agent: Agent, mode: InstallMode, home_dir: &std::path::Path) -> Resul
             agent,
             "release-planning §4.7 B.M4",
         )),
+        Agent::OpenCode => opencode::run(mode, home_dir),
     }
 }
 
