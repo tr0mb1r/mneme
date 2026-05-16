@@ -32,6 +32,7 @@ use crate::embed::Embedder;
 use crate::index::hnsw::HnswIndex;
 use crate::index::snapshot;
 use crate::memory::semantic::MemoryItem;
+use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
 use crate::{MnemeError, Result};
 
@@ -39,10 +40,6 @@ use crate::{MnemeError, Result};
 /// compatible — unknown fields are ignored, missing optional fields
 /// default to `None`.
 const SIDECAR_FILE: &str = "embedder.json";
-
-/// Same prefix the semantic store uses for memory metadata. Re-declared
-/// here so this module doesn't depend on `memory::semantic` internals.
-const MEM_KEY_PREFIX: &[u8] = b"mem:";
 
 /// Lightweight on-disk record of which embedder produced the vectors
 /// the semantic layer is currently sitting on.

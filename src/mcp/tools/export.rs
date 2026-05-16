@@ -17,6 +17,7 @@ use super::{Tool, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::MemoryItem;
+use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
 
 const DESCRIPTION: &str = "Export every memory the agent currently \
@@ -28,8 +29,6 @@ CLI command instead.";
 /// Default cap on rows per layer when the caller doesn't pass
 /// `limit`. Picked low enough that an LLM context fits the response.
 const DEFAULT_LIMIT_PER_LAYER: usize = 200;
-
-const MEM_KEY_PREFIX: &[u8] = b"mem:";
 
 pub struct Export {
     procedural: Arc<ProceduralStore>,

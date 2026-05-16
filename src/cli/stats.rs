@@ -15,15 +15,12 @@ use crate::config::Config;
 use crate::index::snapshot;
 use crate::mcp::tools::size_tier;
 use crate::memory::episodic::EpisodicStore;
+use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
 use crate::storage::archive::ColdArchive;
 use crate::storage::layout;
 use crate::storage::redb_impl::RedbStorage;
 use crate::{MnemeError, Result, migrate};
-
-/// Same prefix `memory::semantic` uses. Re-declared so this module
-/// doesn't reach into a private const.
-const MEM_KEY_PREFIX: &[u8] = b"mem:";
 
 /// Same procedural file the live server reads from.
 const PINNED_FILE: &str = "pinned.jsonl";

@@ -24,12 +24,8 @@ use serde_json::{Value, json};
 use crate::Result;
 use crate::ids::MemoryId;
 use crate::memory::semantic::MemoryItem;
+use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
-
-/// Same `mem:` prefix `memory::semantic` and `cli::stats` use.
-/// Re-declared here so this module doesn't reach into a private
-/// const owned by another module.
-const MEM_KEY_PREFIX: &[u8] = b"mem:";
 
 /// Lower bound (inclusive) of the advisory tier — stored, but the
 /// response carries a `length_advisory` annotation suggesting future
