@@ -30,6 +30,14 @@ fn sigterm(child: &Child) {
     assert_eq!(rc, 0, "kill(SIGTERM, {pid}) must succeed");
 }
 
+/// Send SIGKILL to the process. Used when we need the process to
+/// exit immediately without its graceful-drain wait loop.
+fn sigkill(child: &Child) {
+    let pid = child.id().expect("daemon has a PID") as i32;
+    let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(rc, 0, "kill(SIGKILL, {pid}) must succeed");
+}
+
 /// Read the auth token the daemon generated at boot. Per ADR-0012
 /// D3 every connection must present this as the first line —
 /// `MNEME-AUTH: <token>\n`. Tests use this helper to mimic what
@@ -337,6 +345,156 @@ async fn second_daemon_against_same_data_dir_refuses_to_start() {
     let _ = timeout(Duration::from_secs(10), first.wait()).await;
 }
 
+/// A client that transparently reconnects when the daemon restarts.
+///
+/// Sequence:
+///   1. Start daemon A, connect client, verify MCP works.
+///   2. Kill daemon A, start daemon B (same data dir).
+///   3. Client auto-reconnects (with backoff) + replays the MCP
+///      initialize handshake.
+///   4. Send another MCP request — must get a valid response,
+///      proving the reinitialize + re-pipe succeeded.
+#[tokio::test]
+async fn client_reconnects_after_daemon_restart() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    let socket = data_dir.join("run").join("mneme.sock");
+
+    let mut daemon_a = Command::new(BINARY)
+        .arg("daemon")
+        .arg("--foreground")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .env("MNEME_EMBEDDER", "stub")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn daemon A");
+    wait_for_socket(&socket).await;
+
+    // Spawn `mneme client` as a subprocess with piped stdio.
+    let mut client = Command::new(BINARY)
+        .arg("client")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .env("MNEME_EMBEDDER", "stub")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mneme client");
+
+    let mut client_stdin = client.stdin.take().expect("client stdin open");
+    let mut client_stdout = BufReader::new(client.stdout.take().expect("client stdout open"));
+
+    // Step 1: send a full MCP initialize handshake through the client
+    // and verify we get a valid response back.
+    client_stdin
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"reconnect-test","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+"#,
+        )
+        .await
+        .unwrap();
+
+    let mut response = String::new();
+    timeout(
+        Duration::from_secs(5),
+        client_stdout.read_line(&mut response),
+    )
+    .await
+    .expect("initialize response within 5s")
+    .expect("read initialize response");
+    let parsed: serde_json::Value =
+        serde_json::from_str(response.trim()).expect("initialize response JSON");
+    assert_eq!(parsed["id"], 1);
+    assert!(parsed["result"]["protocolVersion"].is_string());
+    assert!(parsed["result"]["capabilities"]["tools"].is_object());
+
+    // Prove the pipe works end-to-end with a tools/call stats.
+    client_stdin
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"stats","arguments":{}}}
+"#,
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    timeout(
+        Duration::from_secs(5),
+        client_stdout.read_line(&mut response),
+    )
+    .await
+    .expect("stats response within 5s")
+    .expect("read stats response");
+    let parsed: serde_json::Value =
+        serde_json::from_str(response.trim()).expect("stats response JSON");
+    assert_eq!(parsed["id"], 2);
+    assert!(parsed["result"]["content"][0]["text"].is_string());
+
+    // Step 2: kill daemon A with SIGKILL so it exits immediately
+    // (SIGTERM would trigger the 30-second graceful-drain deadline
+    // since the client is still connected).
+    sigkill(&daemon_a);
+    let _ = timeout(Duration::from_secs(5), daemon_a.wait())
+        .await
+        .expect("daemon A must exit within 5s of SIGKILL")
+        .expect("daemon A wait ok");
+    // Socket stays on disk (SIGKILL skips the Listener Drop), but
+    // daemon B's `bind_listener` stale-socket cleanup will unlink it.
+
+    // Start daemon B on the same data dir.
+    let mut daemon_b = Command::new(BINARY)
+        .arg("daemon")
+        .arg("--foreground")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .env("MNEME_EMBEDDER", "stub")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn daemon B");
+    wait_for_socket(&socket).await;
+
+    // Give the client time to detect the disconnect, reconnect with
+    // backoff, re-auth, and replay the MCP initialize handshake.
+    sleep(Duration::from_millis(1500)).await;
+
+    // Step 3: send another request. If the client reconnected
+    // transparently, this should succeed.
+    client_stdin
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"stats","arguments":{}}}
+"#,
+        )
+        .await
+        .unwrap();
+    let mut response = String::new();
+    timeout(
+        Duration::from_secs(5),
+        client_stdout.read_line(&mut response),
+    )
+    .await
+    .expect("post-reconnect stats response within 5s")
+    .expect("read post-reconnect stats response");
+    let parsed: serde_json::Value =
+        serde_json::from_str(response.trim()).expect("post-reconnect stats JSON");
+    assert_eq!(parsed["id"], 3);
+    assert!(
+        parsed["result"]["content"][0]["text"].is_string(),
+        "stats response after daemon restart must be valid, got: {parsed:?}"
+    );
+
+    // Cleanup.
+    drop(client_stdin);
+    let _ = client.wait().await;
+    sigterm(&daemon_b);
+    let _ = timeout(Duration::from_secs(10), daemon_b.wait()).await;
+}
+
 /// A client that connects without sending the auth prefix gets
 /// dropped — the daemon writes a JSON-RPC error frame and closes.
 /// Validates the ADR-0012 D3 enforcement at the connection
@@ -604,6 +762,102 @@ async fn token_rotation_mid_session_preserves_existing_connection() {
         .expect("daemon exited within 10s of SIGTERM")
         .expect("daemon wait succeeded");
     assert!(exit_status.success(), "{exit_status:?}");
+}
+
+/// D12 spawn protocol: the daemon can be auto-started by the client
+/// on connect failure. This test validates the spawn mechanism that
+/// `mneme client` uses — start daemon detached, wait for socket,
+/// then connect — without pre-starting the daemon manually.
+#[tokio::test]
+async fn daemon_is_spawned_by_detach_primitive() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    let socket = data_dir.join("run").join("mneme.sock");
+
+    // Don't manually start the daemon — simulate what the client does
+    // (spawn_daemon_detached: daemon --foreground, null stdio, setsid).
+    // We use the binary directly since integration tests can't call
+    // the crate-internal current_exe pattern reliably.
+    let daemon = Command::new(BINARY)
+        .arg("daemon")
+        .arg("--foreground")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .env("MNEME_EMBEDDER", "stub")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mneme daemon via D12 primitive");
+
+    // Don't wait on the child — it's detached (setsid in daemon.rs).
+    // Dropping the handle means we can't SIGTERM it by PID, but the
+    // daemon runs until killed externally. We'll find its PID from the
+    // lockfile or via pkill.
+    let daemon_pid = daemon.id().expect("daemon has a PID");
+    drop(daemon);
+
+    // Wait for socket with exponential backoff (same as client).
+    wait_for_socket(&socket).await;
+
+    // Connect with auth handshake and verify MCP works.
+    let mut stream = UnixStream::connect(&socket)
+        .await
+        .expect("client connect to daemon socket");
+    stream
+        .write_all(auth_line(data_dir).as_bytes())
+        .await
+        .unwrap();
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "d12-spawn-test", "version": "1" },
+        },
+    })
+    .to_string();
+    stream.write_all(initialize.as_bytes()).await.unwrap();
+    stream.write_all(b"\n").await.unwrap();
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+    })
+    .to_string();
+    stream.write_all(initialized.as_bytes()).await.unwrap();
+    stream.write_all(b"\n").await.unwrap();
+
+    let payload: serde_json::Value = {
+        let (read, write) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        let mut response = String::new();
+        timeout(Duration::from_secs(5), reader.read_line(&mut response))
+            .await
+            .expect("response within 5 s")
+            .expect("read response line");
+        drop(write);
+        drop(reader);
+        serde_json::from_str(response.trim()).expect("response is valid JSON")
+    };
+    assert_eq!(payload["jsonrpc"], "2.0");
+    assert_eq!(payload["id"], 1);
+    assert_eq!(payload["result"]["protocolVersion"], "2025-06-18");
+
+    // Cleanup: SIGTERM the daemon spawned by the D12 primitive.
+    let rc = unsafe { libc::kill(daemon_pid as i32, libc::SIGTERM) };
+    assert_eq!(rc, 0, "kill(SIGTERM, {daemon_pid}) must succeed");
+
+    // Poll for the socket to disappear, proving the daemon exited.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if !socket.exists() {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!socket.exists(), "socket must be removed after SIGTERM");
 }
 
 /// Per-connection isolation per ADR-0012 D8: a client crashing

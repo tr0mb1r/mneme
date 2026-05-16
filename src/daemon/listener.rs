@@ -60,6 +60,38 @@ pub fn socket_path(root: &Path) -> PathBuf {
     root.join("run").join(SOCKET_FILENAME)
 }
 
+/// Wait for a daemon socket to appear, polling with exponential
+/// backoff. Used by D12's spawn protocol (`mneme client` auto-spawns
+/// the daemon and waits for it to finish booting).
+///
+/// Backoff starts at 10 ms and doubles each attempt, capped at 1 s.
+/// Returns `Ok(())` once `path` exists; returns an error after the
+/// total elapsed time exceeds `deadline`.
+pub async fn wait_for_socket(path: &Path, deadline: Duration) -> Result<(), ListenerError> {
+    let started = std::time::Instant::now();
+    let mut delay = Duration::from_millis(10);
+    let max_delay = Duration::from_secs(1);
+    loop {
+        if path.exists() {
+            return Ok(());
+        }
+        if started.elapsed() + delay > deadline {
+            return Err(ListenerError::Io {
+                path: path.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "daemon socket did not appear within {deadline:?} (waited {:?})",
+                        started.elapsed()
+                    ),
+                ),
+            });
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(max_delay);
+    }
+}
+
 /// Bind a listener at `<root>/run/mneme.sock` after performing the
 /// stale-cleanup probe. Returns a [`Listener`] RAII guard that
 /// unlinks the socket file on drop (so `mneme stop` followed by a

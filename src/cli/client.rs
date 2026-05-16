@@ -35,15 +35,22 @@
 //! single-writer storage seam; the wrapper has no part in that —
 //! it's just a transport adapter.
 
+use std::io;
 use std::path::Path;
+use std::time::Duration;
 
-use tokio::io::{AsyncWriteExt, copy};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::sync::mpsc;
 
 use crate::daemon::auth::{self, AUTH_HEADER_PREFIX};
 use crate::daemon::socket_path;
+use crate::daemon::wait_for_socket;
 use crate::storage::layout;
 use crate::{MnemeError, Result};
+
+/// MCP protocol version advertised during synthetic reinitialize.
+const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
 pub fn execute() -> Result<()> {
     let root = layout::default_root().ok_or_else(|| {
@@ -62,7 +69,145 @@ pub fn execute() -> Result<()> {
     runtime.block_on(run(&root))
 }
 
+/// True for connect errors that indicate no daemon is listening:
+/// the socket file is missing (ENOENT) or present but no one is
+/// accepting connections (ECONNREFUSED). In both cases D12's
+/// auto-spawn protocol should fire.
+fn is_connect_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// Spawn a detached daemon and wait for its socket to appear.
+/// Exponential backoff: 10 ms initial, 2× per attempt, 1 s cap,
+/// 5 s total budget per ADR-0012 D12.
+async fn spawn_daemon_with_backoff(socket: &Path) -> Result<()> {
+    crate::daemon::spawn_daemon_detached()?;
+    wait_for_socket(socket, Duration::from_secs(5))
+        .await
+        .map_err(|e| MnemeError::Mcp(format!("daemon did not start within 5 s: {e}")))
+}
+
+/// Build an auth-line string `MNEME-AUTH: <token>\n` from raw token bytes.
+fn format_auth_line(token: &[u8]) -> Result<String> {
+    let token_str = std::str::from_utf8(token)
+        .map_err(|e| MnemeError::Config(format!("auth token is not utf-8: {e}")))?;
+    let mut line = String::with_capacity(AUTH_HEADER_PREFIX.len() + token_str.len() + 1);
+    line.push_str(AUTH_HEADER_PREFIX);
+    line.push_str(token_str);
+    line.push('\n');
+    Ok(line)
+}
+
+/// Establish the initial connection (with D12 auto-spawn).
+async fn initial_connect(socket: &Path) -> Result<UnixStream> {
+    match UnixStream::connect(socket).await {
+        Ok(s) => Ok(s),
+        Err(e) if is_connect_error(&e) => {
+            spawn_daemon_with_backoff(socket).await?;
+            UnixStream::connect(socket).await.map_err(|e| {
+                MnemeError::Mcp(format!(
+                    "could not connect to daemon socket at {} after spawning daemon: {e} \
+                     (check ~/.mneme/logs/mneme.log for daemon boot errors)",
+                    socket.display()
+                ))
+            })
+        }
+        Err(e) => Err(MnemeError::Mcp(format!(
+            "could not connect to daemon socket at {}: {e} \
+             (is `mneme daemon` running?)",
+            socket.display()
+        ))),
+    }
+}
+
+/// Write the `MNEME-AUTH: <token>\n` handshake line to a connected stream.
+async fn send_auth_line(stream: &mut UnixStream, auth_line: &str) -> Result<()> {
+    stream
+        .write_all(auth_line.as_bytes())
+        .await
+        .map_err(MnemeError::Io)?;
+    stream.flush().await.map_err(MnemeError::Io)
+}
+
+/// Send synthetic MCP initialize + initialized to a fresh daemon connection
+/// so the agent's subsequent MCP frames are not rejected with `-32002`
+/// ("server not initialized"). This is required because the daemon enforces
+/// the handshake order (server.rs:313-317).
+///
+/// Reads and discards the initialize response before sending the
+/// `notifications/initialized` notification.
+async fn reinitialize(stream: &mut UnixStream) -> io::Result<()> {
+    let init_req = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{MCP_PROTOCOL_VERSION}","capabilities":{{}},"clientInfo":{{"name":"mneme-client","version":"1.0"}}}}}}"#,
+    );
+    stream.write_all(init_req.as_bytes()).await?;
+    stream.write_all(b"\n").await?;
+
+    // Read exactly one newline-terminated line (the initialize response).
+    // We read byte-by-byte so we don't accidentally consume bytes from the
+    // daemon's next response in the same kernel buffer.
+    let mut buf = [0u8; 4096];
+    let mut n = 0;
+    loop {
+        if n >= buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "initialize response exceeded 4 KiB",
+            ));
+        }
+        let b = match stream.read(&mut buf[n..n + 1]).await {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "daemon closed during reinitialize",
+                ));
+            }
+            Ok(_) => buf[n],
+            Err(e) => return Err(e),
+        };
+        n += 1;
+        if b == b'\n' {
+            break;
+        }
+    }
+
+    // Send the initialized notification.
+    stream
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}")
+        .await?;
+    stream.write_all(b"\n").await?;
+    stream.flush().await
+}
+
+/// Background task that reads stdin in a loop and forwards bytes over an
+/// unbounded channel. Sends an empty Vec on EOF to signal the main loop.
+async fn read_stdin_task(tx: mpsc::UnboundedSender<Vec<u8>>) {
+    let mut stdin = tokio::io::stdin();
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let n = match stdin.read(&mut buf).await {
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        if n == 0 {
+            let _ = tx.send(vec![]);
+            return;
+        }
+        if tx.send(buf[..n].to_vec()).is_err() {
+            return;
+        }
+    }
+}
+
 async fn run(root: &Path) -> Result<()> {
+    let socket = socket_path(root);
+
+    // D12: initial connect with auto-spawn.
+    let mut stream = initial_connect(&socket).await?;
+
     let token = auth::read_token(root).map_err(|e| {
         MnemeError::Config(format!(
             "could not read daemon auth token at {}: {e} \
@@ -70,60 +215,118 @@ async fn run(root: &Path) -> Result<()> {
             auth::token_path(root).display()
         ))
     })?;
-    let socket = socket_path(root);
-    let mut stream = UnixStream::connect(&socket).await.map_err(|e| {
-        MnemeError::Mcp(format!(
-            "could not connect to daemon socket at {}: {e} \
-             (is `mneme daemon` running?)",
-            socket.display()
-        ))
-    })?;
 
-    // Auth handshake — write `MNEME-AUTH: <token>\n` before any
-    // MCP frames. The daemon's `auth::handshake` reads the line,
-    // validates against the on-disk token, and drops the connection
-    // on rejection (the JSON-RPC error frame it writes back will
-    // surface to the agent as a one-time message; the agent then
-    // sees EOF and reports "MCP server exited").
-    let token_str = std::str::from_utf8(&token)
-        .map_err(|e| MnemeError::Config(format!("auth token is not utf-8: {e}")))?;
-    let mut auth_line = String::with_capacity(AUTH_HEADER_PREFIX.len() + token_str.len() + 1);
-    auth_line.push_str(AUTH_HEADER_PREFIX);
-    auth_line.push_str(token_str);
-    auth_line.push('\n');
-    stream
-        .write_all(auth_line.as_bytes())
-        .await
-        .map_err(MnemeError::Io)?;
-    stream.flush().await.map_err(MnemeError::Io)?;
+    let auth_line = format_auth_line(&token)?;
+    send_auth_line(&mut stream, &auth_line).await?;
 
-    // Bidirectional pipe. `tokio::io::copy` runs until either side
-    // returns EOF or errors; the `tokio::select!` returns as soon
-    // as one half exits so the wrapper doesn't hang waiting on the
-    // other direction. Use `into_split` so each direction runs in
-    // its own task without sharing the stream borrow.
-    let (mut sock_read, mut sock_write) = stream.into_split();
-    let mut stdin = tokio::io::stdin();
+    // Spawn a background task that relays stdin bytes over a channel so
+    // the main loop can keep reading them even during the reconnect window.
+    let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel();
+    tokio::spawn(read_stdin_task(stdin_tx));
+
     let mut stdout = tokio::io::stdout();
+    let mut sock_buf = vec![0u8; 8192];
 
-    tokio::select! {
-        result = copy(&mut stdin, &mut sock_write) => {
-            // Agent closed its stdin — normal session-end. Best-
-            // effort flush + close on the socket side so the daemon
-            // sees a clean EOF.
-            let _ = sock_write.shutdown().await;
-            result
-                .map(|_| ())
-                .map_err(|e| MnemeError::Mcp(format!("stdin → daemon copy failed: {e}")))
+    // Reconnect flag: after a successful reconnect we need to replay the
+    // MCP initialize handshake before forwarding agent bytes.
+    let mut needs_reinit = false;
+
+    loop {
+        // After reconnecting, reinitialize the MCP session before
+        // resuming the byte pipe.
+        if needs_reinit {
+            reinitialize(&mut stream).await.map_err(|e| {
+                MnemeError::Mcp(format!("MCP reinitialize failed after reconnect: {e}"))
+            })?;
+            needs_reinit = false;
         }
-        result = copy(&mut sock_read, &mut stdout) => {
-            // Daemon closed its half — could be auth rejection,
-            // graceful shutdown, or daemon crash. Close stdout so
-            // the agent sees EOF and exits its MCP loop.
-            let _ = stdout.shutdown().await;
-            result
-                .map(|_| ())
-                .map_err(|e| MnemeError::Mcp(format!("daemon → stdout copy failed: {e}")))
+
+        tokio::select! {
+            result = stream.read(&mut sock_buf) => {
+                match result {
+                    Ok(0) => {
+                        // Daemon closed the connection (EOF). Attempt a
+                        // transparent reconnect with backoff.
+                        if let Err(e) = reconnect_loop(
+                            &socket, root, &mut stream,
+                        ).await {
+                            // Give up — close stdout so the agent sees
+                            // EOF and knows the MCP server is gone.
+                            let _ = stdout.shutdown().await;
+                            return Err(e);
+                        }
+                        needs_reinit = true;
+                    }
+                    Ok(n) => {
+                        stdout.write_all(&sock_buf[..n]).await.map_err(|e| {
+                            MnemeError::Mcp(format!(
+                                "failed to write daemon response to stdout: {e}"
+                            ))
+                        })?;
+                    }
+                    Err(e) => {
+                        return Err(MnemeError::Mcp(format!(
+                            "daemon → stdout read error: {e}"
+                        )));
+                    }
+                }
+            }
+            msg = stdin_rx.recv() => {
+                match msg {
+                    Some(data) if data.is_empty() => {
+                        // Agent closed stdin — normal session end.
+                        let _ = stream.shutdown().await;
+                        return Ok(());
+                    }
+                    Some(data) => {
+                        stream.write_all(&data).await.map_err(|e| {
+                            MnemeError::Mcp(format!(
+                                "failed to write stdin to daemon: {e}"
+                            ))
+                        })?;
+                    }
+                    None => {
+                        // stdin reader task exited.
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Try to reconnect a disconnected stream with exponential backoff.
+/// On success the caller should call `reinitialize` before resuming
+/// the byte pipe.
+async fn reconnect_loop(socket: &Path, root: &Path, stream: &mut UnixStream) -> Result<()> {
+    let mut delay = Duration::from_millis(10);
+    let max_delay = Duration::from_secs(1);
+    let deadline = Duration::from_secs(5);
+    let start = std::time::Instant::now();
+
+    loop {
+        match UnixStream::connect(socket).await {
+            Ok(mut s) => {
+                let token = auth::read_token(root).map_err(|e| {
+                    MnemeError::Config(format!("could not read auth token during reconnect: {e}"))
+                })?;
+                let auth_line = format_auth_line(&token)?;
+                send_auth_line(&mut s, &auth_line).await?;
+                *stream = s;
+                return Ok(());
+            }
+            Err(e) if is_connect_error(&e) => {
+                if start.elapsed() >= deadline {
+                    return Err(MnemeError::Mcp(format!(
+                        "daemon did not restart within {deadline:?} after disconnect"
+                    )));
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(max_delay);
+            }
+            Err(e) => {
+                return Err(MnemeError::Mcp(format!("reconnect error: {e}")));
+            }
         }
     }
 }
@@ -188,29 +391,51 @@ mod tests {
         assert_eq!(observed, auth_line);
     }
 
-    #[tokio::test]
-    async fn client_errors_when_socket_missing() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        std::fs::create_dir_all(root.join("run")).unwrap();
-        auth::ensure_token(&root).unwrap();
-        // No daemon running → connect must fail with a useful error.
-        let result = run(&root).await;
-        assert!(result.is_err(), "client must error when daemon is down");
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("daemon socket")
-                || msg.contains("Connection refused")
-                || msg.contains("No such file"),
-            "error must explain the missing daemon, got: {msg}"
-        );
+    #[test]
+    fn is_connect_error_matches_not_found() {
+        assert!(is_connect_error(&io::Error::new(
+            io::ErrorKind::NotFound,
+            "no file"
+        )));
+    }
+
+    #[test]
+    fn is_connect_error_matches_connection_refused() {
+        assert!(is_connect_error(&io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "refused"
+        )));
+    }
+
+    #[test]
+    fn is_connect_error_does_not_match_other_errors() {
+        assert!(!is_connect_error(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "perms"
+        )));
+        assert!(!is_connect_error(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timeout"
+        )));
+        assert!(!is_connect_error(&io::Error::new(
+            io::ErrorKind::Interrupted,
+            "interrupted"
+        )));
     }
 
     #[tokio::test]
     async fn client_errors_when_token_missing() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
-        // Don't ensure_token — token file absent → read_token fails.
+
+        // Plant a live listener so connect succeeds, then let the
+        // token read fail — this exercises the post-connect error path.
+        let socket = socket_path(&root);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let _listener = UnixListener::bind(&socket).unwrap();
+
+        // Don't ensure_token — token file absent → read_token fails
+        // after the connect succeeds.
         let result = run(&root).await;
         assert!(
             result.is_err(),

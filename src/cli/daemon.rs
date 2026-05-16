@@ -36,9 +36,8 @@
 //! The daemon and stdio paths differ only in the
 //! [`crate::cli::run::TransportMode`] they pass.
 
+use crate::Result;
 use crate::cli::run::{TransportMode, execute_with_mode};
-use crate::{MnemeError, Result};
-use std::process::{Command, Stdio};
 
 pub fn execute(foreground: bool) -> Result<()> {
     if foreground {
@@ -52,59 +51,11 @@ pub fn execute(foreground: bool) -> Result<()> {
 /// it. The child runs the actual daemon loop; the parent exits
 /// immediately so the user's shell prompt returns.
 ///
-/// Detachment is platform-specific: Unix uses `setsid(2)` via
-/// `Command::pre_exec` so the child starts a new session with no
-/// controlling terminal; Windows uses `DETACHED_PROCESS |
-/// CREATE_NEW_PROCESS_GROUP` so the child does not inherit the
-/// parent's console handles. Both paths redirect stdio to
-/// `/dev/null` (or `NUL` on Windows) — the daemon writes its
-/// diagnostics to `~/.mneme/logs/mneme.log` (post-v1.1.x logging
-/// fix) so the user does not need stderr-on-terminal to see what
-/// the daemon is doing.
+/// Delegates the platform-specific detach logic to
+/// [`crate::daemon::spawn_daemon_detached`] so the same primitive is
+/// shared by `mneme client`'s auto-spawn protocol (ADR-0012 D12).
 fn spawn_detached() -> Result<()> {
-    let exe = std::env::current_exe().map_err(MnemeError::Io)?;
-    let mut cmd = Command::new(&exe);
-    cmd.arg("daemon")
-        .arg("--foreground")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: `setsid` is async-signal-safe and is the
-        // canonical Unix idiom for detaching a forked child from
-        // the parent's controlling terminal. `pre_exec` runs after
-        // fork() but before exec(), in the child's address space —
-        // exactly where this call belongs.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // Windows analogues of Unix `setsid` + closed stdio.
-        // DETACHED_PROCESS — child has no console; parent's
-        //   console window does not bind it.
-        // CREATE_NEW_PROCESS_GROUP — Ctrl-C / Ctrl-Break in the
-        //   parent shell does not propagate to the daemon.
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-
-    let child = cmd
-        .spawn()
-        .map_err(|e| MnemeError::Mcp(format!("failed to spawn detached daemon: {e}")))?;
-
+    let child = crate::daemon::spawn_daemon_detached()?;
     // The PID line is the contract `mneme client`'s spawn protocol
     // (ADR-0012 D12) reads to know what it spawned. Keep it as a
     // single line so callers can `cmd.spawn()...read_line()`
