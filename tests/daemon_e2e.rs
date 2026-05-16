@@ -1084,3 +1084,97 @@ async fn client_crash_does_not_affect_other_clients() {
         "daemon must exit cleanly post-client-crash: {exit_status:?}"
     );
 }
+
+/// Regression: with a healthy idle client connected (sitting in
+/// `read_frame.await`), SIGTERM must drain promptly via the
+/// active-drain broadcast — not wait the full `DRAIN_DEADLINE`
+/// (30 s) for an EOF that never comes. Before the broadcast wiring,
+/// this test would time out at ~30+ s; after, the daemon exits in
+/// well under 5 s because the per-connection task observes the
+/// `watch::changed()` notification, drops the socket halves, and the
+/// drain counter falls to zero.
+#[tokio::test]
+async fn daemon_drains_idle_clients_promptly_on_sigterm() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    let socket = data_dir.join("run").join("mneme.sock");
+
+    let mut daemon = Command::new(BINARY)
+        .arg("daemon")
+        .arg("--foreground")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .env("MNEME_EMBEDDER", "stub")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mneme daemon");
+    wait_for_socket(&socket).await;
+
+    let auth = auth_line(data_dir);
+
+    // Connect a client and complete the handshake so it's accounted
+    // for in `active_clients`. Then do nothing — the client sits in
+    // its read loop while the server sits in its read loop. This is
+    // exactly the dogfood scenario (a Claude Code MCP bridge holding
+    // a connection idle between user prompts).
+    let mut client = UnixStream::connect(&socket).await.unwrap();
+    client.write_all(auth.as_bytes()).await.unwrap();
+    client
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"idle-drain-regression","version":"1"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+"#,
+        )
+        .await
+        .unwrap();
+
+    // Drain the initialize response so the daemon-side write
+    // completes cleanly before we SIGTERM; otherwise the abort
+    // could land mid-write and obscure the drain-time signal we
+    // care about.
+    let (read, write) = client.into_split();
+    let mut reader = BufReader::new(read);
+    let mut line = String::new();
+    timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .expect("initialize response within 5 s")
+        .expect("initialize read ok");
+    let init: serde_json::Value = serde_json::from_str(line.trim()).expect("init JSON");
+    assert_eq!(init["id"], 1);
+
+    // Confirm the client is actually connected (active=1 from the
+    // daemon's perspective) before we SIGTERM. We do this by
+    // letting the read half stay parked in `read_line` — if the
+    // daemon disconnected us prematurely it'd EOF immediately, but
+    // we expect it to stay open until SIGTERM.
+
+    let started = std::time::Instant::now();
+    sigterm(&daemon);
+    let exit_status = timeout(Duration::from_secs(5), daemon.wait())
+        .await
+        .expect("daemon must exit within 5 s of SIGTERM (active-drain broadcast)")
+        .expect("daemon wait succeeded");
+    let elapsed = started.elapsed();
+
+    assert!(
+        exit_status.success(),
+        "daemon exited non-zero on SIGTERM: {exit_status:?}"
+    );
+    // Generous upper bound — the broadcast path completes in
+    // ~tens of ms locally, but CI can be slow. Anything under 5 s
+    // proves we're not on the 30 s deadline path.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "drain took {elapsed:?}; expected <5 s with active-drain broadcast"
+    );
+    assert!(
+        !socket.exists(),
+        "socket file {} should be unlinked after daemon exit",
+        socket.display()
+    );
+
+    drop(write);
+    drop(reader);
+}

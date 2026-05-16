@@ -532,6 +532,20 @@ async fn async_main(
             let active_clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let idle_watcher_counter = Arc::clone(&active_clients);
 
+            // Shutdown broadcast. Each per-connection task clones a
+            // `Receiver` and selects its `Server::run()` against
+            // `Receiver::changed()`. When the daemon-level
+            // `tokio::select!` resolves on `shutdown_signal` (or
+            // idle timeout), we `send(true)` and every connected
+            // task drops its server (and the socket halves) — the
+            // client sees EOF and disconnects, and `wait_for_drain`
+            // returns in milliseconds instead of always timing out
+            // at `DRAIN_DEADLINE`. Marking the initial `false` as
+            // seen on the outer receiver means clones inherit that
+            // mark, so `changed()` reliably fires on the `send(true)`.
+            let (shutdown_tx, mut shutdown_rx_outer) = tokio::sync::watch::channel(false);
+            let _ = shutdown_rx_outer.borrow_and_update();
+
             // The spawned per-connection tasks need their futures
             // to be `Send` for `tokio::spawn`. The boxed-trait-object
             // pair we use for stdio doesn't satisfy `Sync` (Stdin
@@ -579,6 +593,7 @@ async fn async_main(
                                 let scope_c = Arc::clone(&scope_state);
                                 let counter = Arc::clone(&active_clients);
                                 let root_for_auth = Arc::clone(&daemon_root);
+                                let mut shutdown_rx = shutdown_rx_outer.clone();
                                 tokio::spawn(async move {
                                     // ADR-0012 D3: read the token
                                     // from disk PER CONNECTION (not
@@ -658,11 +673,33 @@ async fn async_main(
                                         episodic_c,
                                         scope_c,
                                     );
-                                    if let Err(e) = server.run().await {
-                                        tracing::warn!(
-                                            error = %e,
-                                            "client serve loop ended with error"
-                                        );
+                                    // Race the serve loop against the
+                                    // daemon-level shutdown broadcast.
+                                    // `Server::run` blocks in
+                                    // `read_frame.await` between
+                                    // requests; on shutdown, dropping
+                                    // the future drops the socket
+                                    // halves, the client sees EOF, and
+                                    // `wait_for_drain` returns
+                                    // promptly. `biased` is the right
+                                    // preference: a shutdown that
+                                    // races with a fresh inbound frame
+                                    // should still exit.
+                                    tokio::select! {
+                                        biased;
+                                        _ = shutdown_rx.changed() => {
+                                            tracing::info!(
+                                                "transport=daemon-serve-many: client task observed daemon shutdown; closing connection"
+                                            );
+                                        }
+                                        result = server.run() => {
+                                            if let Err(e) = result {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "client serve loop ended with error"
+                                                );
+                                            }
+                                        }
                                     }
                                     let n = counter
                                         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
@@ -695,10 +732,14 @@ async fn async_main(
 
             // Graceful drain: stop accepting (the listener is moved
             // into the select arm and dropped here, so subsequent
-            // connect attempts will see ECONNREFUSED), wait briefly
-            // for in-flight spawned tasks to finish their MCP
-            // exchanges, then return. Bounded by `DRAIN_DEADLINE` so
-            // a stuck client doesn't wedge shutdown.
+            // connect attempts will see ECONNREFUSED), broadcast the
+            // shutdown signal to active per-connection tasks so they
+            // drop their socket halves (client sees EOF, exits its
+            // serve loop, decrements the counter), then poll for the
+            // counter to reach zero. `DRAIN_DEADLINE` is a safety cap
+            // for tasks that are mid-disk-write and don't observe the
+            // broadcast immediately.
+            let _ = shutdown_tx.send(true);
             tracing::info!(
                 exit_reason,
                 active = active_clients.load(std::sync::atomic::Ordering::Relaxed),
