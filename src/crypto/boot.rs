@@ -31,18 +31,36 @@ pub const RECOVERY_PHRASE_ENV: &str = "MNEME_RECOVERY_PHRASE";
 /// KEK is unavailable from both the keyring and the env fallback. The
 /// daemon refuses to bind its socket in that case (P7 gate).
 pub fn open_episodic_storage(root: &Path, keyring: &dyn KekStore) -> Result<Arc<dyn Storage>> {
+    Ok(open_episodic_storage_and_aead(root, keyring)?.0)
+}
+
+/// `(Storage handle, optional AEAD codec)` — wide enough to need a
+/// `type` alias for clippy's complexity lint.
+pub type StorageWithAead = (Arc<dyn Storage>, Option<Arc<crate::crypto::Aead>>);
+
+/// Like [`open_episodic_storage`] but also returns the AEAD codec
+/// that other data surfaces (procedural, sessions, HNSW snapshot,
+/// cold archive) need to encrypt their own writes. `None` means
+/// plaintext mode (legacy v1.0/v1.1 dirs); `Some(aead)` means the
+/// caller should plumb the codec into every other module's
+/// construction site so the post-migration daemon writes encrypted
+/// everywhere.
+pub fn open_episodic_storage_and_aead(
+    root: &Path,
+    keyring: &dyn KekStore,
+) -> Result<StorageWithAead> {
     let episodic = root.join("episodic");
     match Keystore::load(root)? {
         None => {
-            // Plaintext mode — legacy v1.0/v1.1 path.
             let s = RedbStorage::open(&episodic)?;
-            Ok(s as Arc<dyn Storage>)
+            Ok((s as Arc<dyn Storage>, None))
         }
         Some(keystore) => {
             let kek = load_kek(&keystore, keyring)?;
             let dek = keystore.unwrap_dek(&kek)?;
+            let aead = Arc::new(crate::crypto::Aead::new(&dek));
             let s = EncryptedStorage::open_redb(&episodic, &dek)?;
-            Ok(s as Arc<dyn Storage>)
+            Ok((s as Arc<dyn Storage>, Some(aead)))
         }
     }
 }

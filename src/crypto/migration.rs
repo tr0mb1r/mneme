@@ -36,11 +36,21 @@
 //! ~100K records of ~1 KiB each this is ~100 MiB; acceptable. Larger
 //! stores will need a chunked walker — that's a v1.3 improvement.
 
-use crate::crypto::{Aead, Dek, MAGIC};
+use crate::crypto::{AadDomain, Aead, Dek, MAGIC, file_envelope};
 use crate::storage::{EncryptedStorage, Storage, redb_impl::RedbStorage};
 use crate::{MnemeError, Result};
 use std::path::Path;
 use std::sync::Arc;
+
+/// Whole-file AAD position bytes for procedural pinned.jsonl.
+/// Mirrors the constant in `memory::procedural`.
+const PINNED_AAD_POSITION: &[u8] = b"pinned.jsonl/v1";
+
+/// AAD position bytes for HNSW snapshot files.
+const HNSW_AAD_POSITION: &[u8] = b"hnsw.idx/v1";
+
+/// Filename of the procedural pinned-items JSONL.
+const PINNED_FILENAME: &str = "pinned.jsonl";
 
 /// One-shot summary returned by the migration functions. Plumbs all
 /// the way out to the CLI's stderr output so operators see what
@@ -54,9 +64,16 @@ pub struct MigrationReport {
     pub redb_records_skipped: usize,
     /// WAL segment files removed during the WAL-drain step.
     pub wal_segments_dropped: usize,
-    /// `true` if the migration left some surfaces in the source
-    /// format. Callers should print a warning when this is set.
-    pub deferred_surfaces: bool,
+    /// `true` if the procedural pinned.jsonl was re-encoded (or was
+    /// missing/empty, which counts as a no-op success).
+    pub procedural_migrated: bool,
+    /// Number of cold-archive bundles re-encoded.
+    pub cold_bundles_migrated: usize,
+    /// HNSW snapshot files removed so the next daemon boot rebuilds
+    /// (and snapshots) under the new format.
+    pub hnsw_snapshots_wiped: usize,
+    /// Session snapshot files removed.
+    pub session_snapshots_wiped: usize,
 }
 
 /// Migrate `<root>/episodic` from plaintext into the encrypted format
@@ -66,10 +83,7 @@ pub struct MigrationReport {
 /// the migration itself assumes the data dir starts plaintext.
 pub fn migrate_to_encrypted(root: &Path, dek: &Dek) -> Result<MigrationReport> {
     let episodic = root.join("episodic");
-    let mut report = MigrationReport {
-        deferred_surfaces: true, // procedural / sessions / hnsw / cold still pending
-        ..Default::default()
-    };
+    let mut report = MigrationReport::default();
 
     // Step 1: drain WAL via plaintext replay + snapshot every (k, v).
     let collected = drain_plaintext(&episodic)?;
@@ -108,6 +122,24 @@ pub fn migrate_to_encrypted(root: &Path, dek: &Dek) -> Result<MigrationReport> {
     // tools — defeats the purpose of the migration.
     compact_redb(&episodic)?;
 
+    // Step 5: re-encode the procedural pinned-items JSONL as a
+    // whole-file AEAD envelope (P5b).
+    let aead = Arc::new(Aead::new(dek));
+    report.procedural_migrated = migrate_procedural_to_encrypted(root, &aead)?;
+
+    // Step 6: encrypt every cold-archive bundle in place (P5c). The
+    // bundles are already zstd-compressed; we seal the compressed
+    // bytes whole.
+    report.cold_bundles_migrated = migrate_cold_to_encrypted(root, &aead)?;
+
+    // Step 7: HNSW + sessions — encrypt the existing plaintext files
+    // in place using the same DEK-derived AEAD (ADR-0013 P5d). Both
+    // surfaces now support open_with_crypto so the daemon will read
+    // the encrypted files on next boot. If a file is already
+    // encrypted (MNE1 magic) the helper is a no-op for that entry.
+    report.hnsw_snapshots_wiped = migrate_hnsw_to_encrypted(root, &aead)?;
+    report.session_snapshots_wiped = migrate_sessions_to_encrypted(root, &aead)?;
+
     Ok(report)
 }
 
@@ -116,10 +148,7 @@ pub fn migrate_to_encrypted(root: &Path, dek: &Dek) -> Result<MigrationReport> {
 /// the user can roll back without losing their data.
 pub fn migrate_to_plaintext(root: &Path, dek: &Dek) -> Result<MigrationReport> {
     let episodic = root.join("episodic");
-    let mut report = MigrationReport {
-        deferred_surfaces: true,
-        ..Default::default()
-    };
+    let mut report = MigrationReport::default();
 
     // Step 1: drain WAL via encrypted replay + snapshot every (k, v).
     // The wrapper decrypts each value before handing it back.
@@ -155,6 +184,12 @@ pub fn migrate_to_plaintext(root: &Path, dek: &Dek) -> Result<MigrationReport> {
     // the encrypt direction — without this, the file still contains
     // recoverable ciphertext after decrypt.)
     compact_redb(&episodic)?;
+
+    let aead = Arc::new(Aead::new(dek));
+    report.procedural_migrated = migrate_procedural_to_plaintext(root, &aead)?;
+    report.cold_bundles_migrated = migrate_cold_to_plaintext(root, &aead)?;
+    report.hnsw_snapshots_wiped = migrate_hnsw_to_plaintext(root, &aead)?;
+    report.session_snapshots_wiped = migrate_sessions_to_plaintext(root, &aead)?;
 
     Ok(report)
 }
@@ -219,6 +254,237 @@ fn drop_wal_segments(wal_dir: &Path) -> Result<usize> {
     Ok(count)
 }
 
+/// Encrypt `<root>/procedural/pinned.jsonl` whole-file (P5b).
+///
+/// Returns `Ok(true)` if the file existed and was touched; `Ok(false)`
+/// if it was missing or empty (nothing to do). Idempotent: a file
+/// already starting with the MNE1 envelope magic is left as-is.
+fn migrate_procedural_to_encrypted(root: &Path, aead: &Aead) -> Result<bool> {
+    let path = root.join("procedural").join(PINNED_FILENAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(MnemeError::Io(e)),
+    };
+    if bytes.is_empty() {
+        return Ok(false);
+    }
+    if bytes.starts_with(&MAGIC) {
+        return Ok(false); // already encrypted
+    }
+    file_envelope::seal_to_path(&path, AadDomain::Pinned, PINNED_AAD_POSITION, aead, &bytes)?;
+    Ok(true)
+}
+
+/// Reverse of [`migrate_procedural_to_encrypted`]: open the envelope
+/// and write the plaintext JSONL back to disk.
+fn migrate_procedural_to_plaintext(root: &Path, aead: &Aead) -> Result<bool> {
+    let path = root.join("procedural").join(PINNED_FILENAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(MnemeError::Io(e)),
+    };
+    if bytes.is_empty() {
+        return Ok(false);
+    }
+    if !bytes.starts_with(&MAGIC) {
+        return Ok(false); // already plaintext
+    }
+    let plaintext = aead.open(AadDomain::Pinned, PINNED_AAD_POSITION, &bytes)?;
+    write_atomic_simple(&path, &plaintext)?;
+    Ok(true)
+}
+
+/// Encrypt every cold-archive bundle under `<root>/cold/` in place
+/// (P5c). Each `.zst` file becomes a whole-file AEAD envelope whose
+/// AAD position is the bundle's bare filename (the quarter label,
+/// e.g. `2026-Q2.zst`).
+fn migrate_cold_to_encrypted(root: &Path, aead: &Aead) -> Result<usize> {
+    let cold = root.join("cold");
+    if !cold.exists() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for entry in std::fs::read_dir(&cold)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("zst") {
+            continue;
+        }
+        let bytes = std::fs::read(&path)?;
+        if bytes.starts_with(&MAGIC) {
+            continue; // already encrypted
+        }
+        let position = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .as_bytes()
+            .to_vec();
+        file_envelope::seal_to_path(&path, AadDomain::Cold, &position, aead, &bytes)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Reverse of [`migrate_cold_to_encrypted`].
+fn migrate_cold_to_plaintext(root: &Path, aead: &Aead) -> Result<usize> {
+    let cold = root.join("cold");
+    if !cold.exists() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for entry in std::fs::read_dir(&cold)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("zst") {
+            continue;
+        }
+        let bytes = std::fs::read(&path)?;
+        if !bytes.starts_with(&MAGIC) {
+            continue; // already plaintext
+        }
+        let position = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .as_bytes()
+            .to_vec();
+        let plaintext = aead.open(AadDomain::Cold, &position, &bytes)?;
+        write_atomic_simple(&path, &plaintext)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Encrypt the HNSW snapshot file at `<root>/semantic/hnsw.idx`
+/// (note: the actual file in the v1.0 layout is under `semantic/`,
+/// not `index/`; the path here matches `memory::semantic::SNAPSHOT_FILE`).
+/// Idempotent on the MNE1 magic.
+fn migrate_hnsw_to_encrypted(root: &Path, aead: &Aead) -> Result<usize> {
+    encrypt_files_under(
+        root.join("semantic"),
+        AadDomain::Hnsw,
+        aead,
+        true,
+        |fname| fname == crate::memory::semantic::SNAPSHOT_FILE,
+    )
+}
+
+fn migrate_hnsw_to_plaintext(root: &Path, aead: &Aead) -> Result<usize> {
+    encrypt_files_under(
+        root.join("semantic"),
+        AadDomain::Hnsw,
+        aead,
+        false,
+        |fname| fname == crate::memory::semantic::SNAPSHOT_FILE,
+    )
+}
+
+/// Encrypt every session snapshot in `<root>/sessions/`. Idempotent
+/// on the MNE1 magic.
+fn migrate_sessions_to_encrypted(root: &Path, aead: &Aead) -> Result<usize> {
+    encrypt_files_under(
+        root.join("sessions"),
+        AadDomain::Session,
+        aead,
+        true,
+        |fname| fname.ends_with(".snapshot"),
+    )
+}
+
+fn migrate_sessions_to_plaintext(root: &Path, aead: &Aead) -> Result<usize> {
+    encrypt_files_under(
+        root.join("sessions"),
+        AadDomain::Session,
+        aead,
+        false,
+        |fname| fname.ends_with(".snapshot"),
+    )
+}
+
+/// Walk `dir` non-recursively, and for each file matching
+/// `filter(filename)`:
+///
+/// - if `to_encrypted` and the file is plaintext, seal it (AAD =
+///   `domain || file_name_bytes`).
+/// - if `!to_encrypted` and the file is encrypted, open it.
+/// - idempotent otherwise.
+///
+/// Returns the count of files actually re-encoded. AAD position is
+/// the filename bytes, which is the obvious per-file identifier for
+/// session snapshots (UUID) and HNSW (single fixed name); both bind
+/// the ciphertext to its slot.
+fn encrypt_files_under<F: Fn(&str) -> bool>(
+    dir: std::path::PathBuf,
+    domain: AadDomain,
+    aead: &Aead,
+    to_encrypted: bool,
+    filter: F,
+) -> Result<usize> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let fname = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !filter(fname) {
+            continue;
+        }
+        let bytes = std::fs::read(&path)?;
+        let position = fname.as_bytes();
+        if to_encrypted {
+            if bytes.starts_with(&MAGIC) {
+                continue;
+            }
+            file_envelope::seal_to_path(&path, domain, position, aead, &bytes)?;
+        } else {
+            if !bytes.starts_with(&MAGIC) {
+                continue;
+            }
+            let plain = aead.open(domain, position, &bytes)?;
+            write_atomic_simple(&path, &plain)?;
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Write `bytes` atomically to `path` via temp+rename, with 0o600
+/// permissions on unix. Mirrors `file_envelope::seal_to_path` but
+/// without the envelope step — used when we need a plain bytes
+/// write (e.g. the plaintext output of a reverse migration).
+fn write_atomic_simple(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut tmp_buf = path.as_os_str().to_owned();
+    tmp_buf.push(".tmp");
+    let tmp: std::path::PathBuf = tmp_buf.into();
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+// Silence: HNSW_AAD_POSITION is reserved for the P5d wiring of
+// `index/snapshot.rs` — keep the constant available so the AAD
+// surface stays domain-separated when that lands.
+#[allow(dead_code)]
+fn _hnsw_aad_unused() -> &'static [u8] {
+    HNSW_AAD_POSITION
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,7 +522,6 @@ mod tests {
         let report = migrate_to_encrypted(tmp.path(), &dek).unwrap();
         assert_eq!(report.redb_records_migrated, 25);
         assert_eq!(report.redb_records_skipped, 0);
-        assert!(report.deferred_surfaces, "procedural et al. still pending");
 
         // Reads through the encrypted stack return the original plaintext.
         let rt = tokio::runtime::Builder::new_current_thread()

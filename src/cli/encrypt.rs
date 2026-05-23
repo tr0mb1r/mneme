@@ -137,13 +137,26 @@ pub fn encrypt_at(
         "  WAL:  {} stale segments dropped",
         report.wal_segments_dropped
     );
-    if report.deferred_surfaces {
-        eprintln!(
-            "  note: procedural/pinned.jsonl, sessions/, index/, and cold/ \
-             stay plaintext for now (P5b–P5e follow-ups). Re-pin items via \
-             `mneme.pin` to record them through the encrypted stack."
-        );
-    }
+    eprintln!(
+        "  procedural: {}",
+        if report.procedural_migrated {
+            "pinned.jsonl re-encoded encrypted"
+        } else {
+            "(no plaintext file to migrate)"
+        }
+    );
+    eprintln!(
+        "  cold:       {} archive bundles re-encoded encrypted",
+        report.cold_bundles_migrated
+    );
+    eprintln!(
+        "  hnsw:       {} stale snapshots wiped (rebuilds encrypted on next boot)",
+        report.hnsw_snapshots_wiped
+    );
+    eprintln!(
+        "  sessions:   {} stale snapshots wiped",
+        report.session_snapshots_wiped
+    );
 
     eprintln!();
     eprintln!("Encryption enabled. Keystore: {}", ks_path.display());
@@ -262,6 +275,18 @@ pub fn decrypt_at(root: &Path, force: bool, keyring: &dyn KekStore) -> Result<()
     eprintln!(
         "  WAL:  {} stale segments dropped",
         report.wal_segments_dropped
+    );
+    eprintln!(
+        "  procedural: {}",
+        if report.procedural_migrated {
+            "pinned.jsonl decoded back to plaintext"
+        } else {
+            "(no encrypted file to migrate)"
+        }
+    );
+    eprintln!(
+        "  cold:       {} archive bundles decoded back to plaintext",
+        report.cold_bundles_migrated
     );
 
     keyring.delete(&keystore.keyring.account)?;

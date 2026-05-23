@@ -17,8 +17,9 @@
 //! Not a public library API; kept under `examples/` so it doesn't
 //! show up in `cargo install mneme-mcp` artifacts.
 
-use mneme::crypto::OsKeyring;
+use mneme::crypto::{KekStore, OsKeyring};
 use mneme::crypto::boot::open_episodic_storage;
+use mneme::memory::procedural::ProceduralStore;
 use mneme::storage::Storage;
 use mneme::storage::redb_impl::RedbStorage;
 use std::path::PathBuf;
@@ -42,7 +43,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 s.put(&k, &v).await?;
             }
             s.flush().await?;
-            println!("wrote {n} plaintext rows under {}", root.display());
+
+            // Also drop a procedural pinned item so the migration walk
+            // has something visible to encrypt on that surface.
+            let proc = ProceduralStore::open(&root)?;
+            proc.pin(
+                "plaintext-marker-pinned".into(),
+                vec!["demo".into()],
+                "personal".into(),
+            )
+            .await?;
+            drop(proc);
+
+            println!(
+                "wrote {n} plaintext rows + 1 pinned item under {}",
+                root.display()
+            );
         }
         "read" => {
             let keyring = OsKeyring::new();
@@ -55,6 +71,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     String::from_utf8_lossy(&k),
                     String::from_utf8_lossy(&v),
                 );
+            }
+            // Read procedural through whichever mode the dir is in. We
+            // could go through boot helpers, but ProceduralStore's
+            // legacy open() panics on encrypted dirs (no DEK). So we
+            // detect the keystore's presence and pass an Aead.
+            let aead = if mneme::crypto::Keystore::load(&root)?.is_some() {
+                let keystore = mneme::crypto::Keystore::load(&root)?.unwrap();
+                let kek = keyring
+                    .load(&keystore.keyring.account)
+                    .map_err(|e| format!("keyring: {e}"))?
+                    .ok_or("no KEK in keyring")?;
+                let dek = keystore.unwrap_dek(&kek)?;
+                Some(std::sync::Arc::new(mneme::crypto::Aead::new(&dek)))
+            } else {
+                None
+            };
+            let proc = ProceduralStore::open_with_crypto(&root, aead)?;
+            let pinned = proc.list(None)?;
+            println!("pinned items: {}", pinned.len());
+            for p in pinned {
+                println!("  {} {} {:?}", p.id, p.content, p.tags);
             }
         }
         other => return Err(format!("unknown command: {other:?}; use `write N` or `read`").into()),

@@ -67,28 +67,71 @@ impl Session {
 
     /// Persist this session to `{sessions_dir}/{id}.snapshot`.
     pub fn checkpoint(&mut self, sessions_dir: &Path) -> Result<()> {
+        self.checkpoint_with_crypto(sessions_dir, None)
+    }
+
+    /// Variant of [`checkpoint`] that seals the snapshot bytes with
+    /// the supplied AEAD before atomic write (ADR-0013 P5d). The
+    /// AAD position is bound to the session id so a checkpoint blob
+    /// can't be moved between sessions.
+    pub fn checkpoint_with_crypto(
+        &mut self,
+        sessions_dir: &Path,
+        aead: Option<&crate::crypto::Aead>,
+    ) -> Result<()> {
         std::fs::create_dir_all(sessions_dir)?;
         let path = self.snapshot_path(sessions_dir);
         let bytes =
             serde_json::to_vec(self).map_err(|e| MnemeError::Storage(format!("serde: {e}")))?;
-        // Atomic-ish replace: write to .tmp then rename.
-        let tmp = path.with_extension("snapshot.tmp");
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &path)?;
+        let id_bytes = self.id.to_string().into_bytes();
+        if let Some(a) = aead {
+            crate::crypto::file_envelope::seal_to_path(
+                &path,
+                crate::crypto::AadDomain::Session,
+                &id_bytes,
+                a,
+                &bytes,
+            )?;
+        } else {
+            // Atomic-ish replace: write to .tmp then rename.
+            let tmp = path.with_extension("snapshot.tmp");
+            std::fs::write(&tmp, &bytes)?;
+            std::fs::rename(&tmp, &path)?;
+        }
         self.last_checkpoint_at = Some(Utc::now());
         Ok(())
     }
 
     /// Mark a clean shutdown and checkpoint a final time.
     pub fn shutdown(&mut self, sessions_dir: &Path) -> Result<()> {
+        self.shutdown_with_crypto(sessions_dir, None)
+    }
+
+    pub fn shutdown_with_crypto(
+        &mut self,
+        sessions_dir: &Path,
+        aead: Option<&crate::crypto::Aead>,
+    ) -> Result<()> {
         self.clean_shutdown = true;
-        self.checkpoint(sessions_dir)
+        self.checkpoint_with_crypto(sessions_dir, aead)
     }
 
     /// Restore a session previously written via [`checkpoint`].
     pub fn load(sessions_dir: &Path, id: SessionId) -> Result<Self> {
+        Self::load_with_crypto(sessions_dir, id, None)
+    }
+
+    pub fn load_with_crypto(
+        sessions_dir: &Path,
+        id: SessionId,
+        aead: Option<&crate::crypto::Aead>,
+    ) -> Result<Self> {
         let path = sessions_dir.join(format!("{id}.snapshot"));
-        let bytes = std::fs::read(&path)?;
+        let mut bytes = std::fs::read(&path)?;
+        if let Some(a) = aead {
+            let id_bytes = id.to_string().into_bytes();
+            bytes = a.open(crate::crypto::AadDomain::Session, &id_bytes, &bytes)?;
+        }
         serde_json::from_slice(&bytes)
             .map_err(|e| MnemeError::Storage(format!("serde {path:?}: {e}")))
     }
@@ -137,6 +180,10 @@ pub struct ActiveSession {
     /// Total successful checkpoints since boot. Surfaced for
     /// diagnostics + the `mneme://stats` resource.
     checkpoints_total: Arc<AtomicU64>,
+    /// When `Some`, session snapshots are sealed with this AEAD
+    /// before atomic write, and decrypted on load. `None` keeps the
+    /// legacy plaintext path. ADR-0013 P5d.
+    aead: Option<Arc<crate::crypto::Aead>>,
 }
 
 impl ActiveSession {
@@ -145,6 +192,13 @@ impl ActiveSession {
     /// checkpoint — better to refuse to boot if the sessions dir
     /// is unwritable than to discover it 30 seconds in.
     pub fn open(sessions_dir: PathBuf) -> Result<Arc<Self>> {
+        Self::open_with_crypto(sessions_dir, None)
+    }
+
+    pub fn open_with_crypto(
+        sessions_dir: PathBuf,
+        aead: Option<Arc<crate::crypto::Aead>>,
+    ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&sessions_dir).map_err(MnemeError::Io)?;
         Ok(Arc::new(Self {
             inner: Arc::new(RwLock::new(Session::new())),
@@ -152,6 +206,7 @@ impl ActiveSession {
             turn_counter: Arc::new(AtomicU64::new(0)),
             last_flush_turns: Arc::new(AtomicU64::new(0)),
             checkpoints_total: Arc::new(AtomicU64::new(0)),
+            aead,
         }))
     }
 
@@ -219,7 +274,7 @@ impl ActiveSession {
         // covers the whole flush so a concurrent push_turn can't
         // mutate the buffer mid-serialisation.
         let mut s = self.inner.write().expect("session lock poisoned");
-        s.checkpoint(&self.sessions_dir)?;
+        s.checkpoint_with_crypto(&self.sessions_dir, self.aead.as_deref())?;
         // Capture the counter at the moment the flush succeeded so
         // the next-fire threshold is computed from this point. There
         // is a tiny window where push_turn could increment between
@@ -236,7 +291,7 @@ impl ActiveSession {
     /// Idempotent.
     pub fn shutdown(&self) -> Result<()> {
         let mut s = self.inner.write().expect("session lock poisoned");
-        s.shutdown(&self.sessions_dir)?;
+        s.shutdown_with_crypto(&self.sessions_dir, self.aead.as_deref())?;
         let now_turns = self.turn_counter.load(Ordering::SeqCst);
         self.last_flush_turns.store(now_turns, Ordering::SeqCst);
         self.checkpoints_total.fetch_add(1, Ordering::SeqCst);
