@@ -79,7 +79,7 @@ impl Tool for SummarizeSession {
 
         let filters = RecentFilters {
             scope: args.get("scope").and_then(Value::as_str).map(String::from),
-            kind: None,
+            ..Default::default()
         };
         let events = self
             .store
