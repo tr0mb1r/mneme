@@ -41,6 +41,7 @@
 //! See [`AadDomain`] for the canonical prefixes.
 
 mod envelope;
+pub mod file_envelope;
 mod key;
 pub mod keyring;
 pub mod keystore;
