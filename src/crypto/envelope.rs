@@ -21,7 +21,10 @@ use chacha20poly1305::{
 };
 use rand::{TryRngCore, rngs::OsRng};
 
-use crate::{MnemeError, Result, crypto::key::Dek};
+use crate::{
+    MnemeError, Result,
+    crypto::key::{Dek, KEY_LEN, Kek},
+};
 
 /// Magic prefix identifying a mneme encrypted envelope. The four bytes
 /// `MNE1` (0x4D, 0x4E, 0x45, 0x31) discriminate encrypted blobs from
@@ -89,10 +92,39 @@ pub struct Aead {
     cipher: XChaCha20Poly1305,
 }
 
+/// Sealed trait for the two symmetric key types in this module.
+///
+/// Both [`Dek`] and [`Kek`] are 32-byte XChaCha20-Poly1305 keys. The
+/// distinction exists at the type level to keep wrap (KEK) and
+/// record (DEK) paths from accidentally mixing keys — but the AEAD
+/// itself is agnostic and accepts either through this trait.
+pub trait AeadKey: private::Sealed {
+    fn key_bytes(&self) -> &[u8; KEY_LEN];
+}
+
+impl AeadKey for Dek {
+    fn key_bytes(&self) -> &[u8; KEY_LEN] {
+        self.as_bytes()
+    }
+}
+impl AeadKey for Kek {
+    fn key_bytes(&self) -> &[u8; KEY_LEN] {
+        self.as_bytes()
+    }
+}
+
+mod private {
+    pub trait Sealed {}
+    impl Sealed for super::Dek {}
+    impl Sealed for super::Kek {}
+}
+
 impl Aead {
-    /// Construct an [`Aead`] from a [`Dek`].
-    pub fn new(dek: &Dek) -> Self {
-        let cipher = XChaCha20Poly1305::new(dek.as_bytes().into());
+    /// Construct an [`Aead`] from any [`AeadKey`] (i.e. a [`Dek`] for
+    /// per-record encryption, or a [`Kek`] when wrapping the DEK in
+    /// the keystore).
+    pub fn new<K: AeadKey>(key: &K) -> Self {
+        let cipher = XChaCha20Poly1305::new(key.key_bytes().into());
         Self { cipher }
     }
 

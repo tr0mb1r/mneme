@@ -83,6 +83,16 @@ subtle = "2"
 chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 bip39 = { version = "2", default-features = false, features = ["std"] }
+# OS keyring integration for the KEK happy path (ADR-0013 D6). On
+# macOS the `apple-native` backend talks to Keychain Services; on
+# Linux it talks to Secret Service over D-Bus; on Windows it uses
+# DPAPI. Headless deployments (no D-Bus) fall through to the
+# MNEME_RECOVERY_PHRASE env var per the same ADR.
+keyring = { version = "3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
+# Base64 for the wrapped-DEK blob in keystore.json. The crate is
+# already in our transitive tree (tokenizers); declaring it directly
+# lets us pin the version we depend on.
+base64 = "0.22"
 
 # Phase 3 — semantic layer (embedding model + HNSW vector index).
 # `candle-*` is the pure-Rust ML runtime (ADR-0002). MSRV-wise these are 1.83+,

@@ -42,10 +42,14 @@
 
 mod envelope;
 mod key;
+pub mod keyring;
+pub mod keystore;
 mod mnemonic;
 
 pub use envelope::{AadDomain, Aead, ENVELOPE_VERSION, MAGIC};
 pub use key::{Dek, Kek};
+pub use keyring::{KEYRING_SERVICE, KekStore, OsKeyring, account_for};
+pub use keystore::{KEYSTORE_FILENAME, KEYSTORE_VERSION, Keystore, keystore_path};
 pub use mnemonic::{MNEMONIC_WORDS, Mnemonic, VerifyChallenge};
 
 use crate::MnemeError;
