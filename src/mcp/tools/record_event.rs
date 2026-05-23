@@ -34,6 +34,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
 use super::{Tool, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::episodic::{DEFAULT_RETRIEVAL_WEIGHT, EpisodicStore};
 use crate::memory::working::ActiveSession;
@@ -76,6 +77,12 @@ pub struct RecordEvent {
     episodic: Arc<EpisodicStore>,
     scope_state: Arc<ScopeState>,
     active_session: Option<Arc<ActiveSession>>,
+    /// Hard ceiling on the serialised payload's character length;
+    /// writes above this are rejected with `memory_too_large`
+    /// (release-planning v2.1 §5.4, applied to L3 per SEC-002 to
+    /// prevent unbounded episodic exhaustion). Configured via
+    /// `[budgets] max_remember_chars`.
+    max_chars: usize,
 }
 
 impl RecordEvent {
@@ -84,6 +91,7 @@ impl RecordEvent {
             episodic,
             scope_state,
             active_session: None,
+            max_chars: DEFAULT_MAX_CHARS,
         }
     }
 
@@ -92,6 +100,15 @@ impl RecordEvent {
     /// care about L1 mirror can skip this.
     pub fn with_active_session(mut self, session: Arc<ActiveSession>) -> Self {
         self.active_session = Some(session);
+        self
+    }
+
+    /// Override the over-limit ceiling. Mirrors
+    /// `Remember::with_max_chars` / `Update::with_max_chars`. The
+    /// 500 / 2,000-character advisory and warning bounds are fixed
+    /// (per §5.3).
+    pub fn with_max_chars(mut self, max_chars: usize) -> Self {
+        self.max_chars = max_chars;
         self
     }
 }
@@ -153,6 +170,25 @@ impl Tool for RecordEvent {
         let payload_str = serde_json::to_string(&payload_value)
             .map_err(|e| ToolError::Internal(format!("encode payload: {e}")))?;
 
+        // ---------- SEC-002 size gate ----------
+        // Same classifier `remember` / `update` use, applied to the
+        // serialised payload string. Prevents unbounded L3 episodic
+        // exhaustion by an agent writing oversized payloads through
+        // `record_event` (the audit pin SEC-002 captured the gap).
+        let payload_len = size_tier::count_chars(&payload_str);
+        let tier = size_tier::classify(payload_len, self.max_chars);
+        if tier == Tier::OverLimit {
+            let (text, meta) = size_tier::rejection(payload_len, self.max_chars);
+            tracing::warn!(
+                tool = "record_event",
+                kind = kind,
+                payload_chars = payload_len,
+                max_chars = self.max_chars,
+                "rejected: payload over size limit"
+            );
+            return Ok(ToolResult::text(text).with_error().with_meta(meta));
+        }
+
         // ---------- scope (fallback to ScopeState::current) ----------
         let scope = args
             .get("scope")
@@ -212,7 +248,22 @@ impl Tool for RecordEvent {
             }
         }
 
-        Ok(ToolResult::text(format!("recorded event {id}")))
+        if tier == Tier::Warning {
+            tracing::info!(
+                tool = "record_event",
+                kind = kind,
+                payload_chars = payload_len,
+                limit = self.max_chars,
+                event_id = %id,
+                "record_event: large payload stored (warning tier)"
+            );
+        }
+
+        let mut result = ToolResult::text(format!("recorded event {id}"));
+        if let Some(meta) = size_tier::success_meta(tier, payload_len, self.max_chars) {
+            result = result.with_meta(meta);
+        }
+        Ok(result)
     }
 }
 
@@ -450,6 +501,113 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(session.turns_total(), 0);
+    }
+
+    /// SEC-002: payload under 500 chars after JSON-encoding lands in
+    /// the Normal tier — no `_meta` annotation, no `is_error`.
+    #[tokio::test]
+    async fn normal_tier_attaches_no_meta() {
+        let t = fixture_no_session();
+        let res = t
+            .invoke(json!({
+                "kind": "observation",
+                "payload": {"content": "small payload"},
+            }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        assert!(res.meta.is_none(), "Normal tier must not annotate meta");
+    }
+
+    /// SEC-002: payload in [500, 2_000) chars carries
+    /// `length_advisory` meta but is stored.
+    #[tokio::test]
+    async fn advisory_tier_attaches_length_advisory_meta() {
+        let t = fixture_no_session();
+        let content = "a".repeat(700);
+        let res = t
+            .invoke(json!({
+                "kind": "observation",
+                "payload": {"content": content},
+            }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let meta = res.meta.expect("expected length_advisory meta");
+        assert!(meta.get("length_advisory").is_some());
+        assert!(meta.get("length_warning").is_none());
+        assert_eq!(meta["length_advisory"]["limit"], 10_000);
+    }
+
+    /// SEC-002: payload in [2_000, 10_000] chars carries
+    /// `length_warning` meta but is stored.
+    #[tokio::test]
+    async fn warning_tier_attaches_length_warning_meta() {
+        let t = fixture_no_session();
+        let content = "w".repeat(5_000);
+        let res = t
+            .invoke(json!({
+                "kind": "observation",
+                "payload": {"content": content},
+            }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let meta = res.meta.expect("expected length_warning meta");
+        assert!(meta.get("length_warning").is_some());
+        assert!(meta.get("length_advisory").is_none());
+    }
+
+    /// SEC-002: payload over `max_chars` is rejected with structured
+    /// `memory_too_large` meta and `is_error`. Storage is NOT
+    /// touched (the rejection happens before `record_full`).
+    #[tokio::test]
+    async fn over_limit_rejects_with_memory_too_large_and_skips_write() {
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage)));
+        let scope = ScopeState::new("personal");
+        let t = RecordEvent::new(Arc::clone(&episodic), scope);
+        let content = "x".repeat(15_000);
+        let res = t
+            .invoke(json!({
+                "kind": "observation",
+                "payload": {"content": content},
+            }))
+            .await
+            .unwrap();
+        assert!(res.is_error, "over-limit payload must mark is_error");
+        let meta = res.meta.expect("expected error meta");
+        assert_eq!(meta["error"]["code"], "memory_too_large");
+        assert_eq!(meta["error"]["limit"], 10_000);
+        // L3 must not have grown — the rejection precedes `record_full`.
+        let events = episodic
+            .recall_recent(&RecentFilters::default(), 10)
+            .await
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "rejected payload must not have been written to L3"
+        );
+    }
+
+    /// SEC-002: custom ceiling propagates through `with_max_chars`.
+    #[tokio::test]
+    async fn with_max_chars_overrides_default_ceiling() {
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let episodic = Arc::new(EpisodicStore::new(storage));
+        let scope = ScopeState::new("personal");
+        let t = RecordEvent::new(episodic, scope).with_max_chars(100);
+        let content = "z".repeat(200);
+        let res = t
+            .invoke(json!({
+                "kind": "observation",
+                "payload": {"content": content},
+            }))
+            .await
+            .unwrap();
+        assert!(res.is_error);
+        let meta = res.meta.unwrap();
+        assert_eq!(meta["error"]["limit"], 100);
     }
 
     #[tokio::test]
