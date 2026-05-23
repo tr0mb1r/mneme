@@ -23,7 +23,7 @@ device     = "auto"       # "auto" / "cpu" / "cuda" / "metal"
 batch_size = 32
 
 [scopes]
-default = "personal"
+default = "global"
 
 [checkpoints]
 session_interval_secs   = 30
@@ -121,7 +121,7 @@ on this field yet.
 | **Default** | `"bge-m3"` |
 | **Affects** | every L4 `remember` / `recall` / `update`; HNSW dimensionality |
 
-Canonical embedder identity. Two models are supported in v1.0:
+Canonical embedder identity. Two models are supported:
 
 | Short name | Full repo | Dim | Approx size | Languages | Recall | Cold-start |
 |------------|-----------|-----|-------------|-----------|--------|------------|
@@ -159,7 +159,7 @@ to the deterministic `stub` embedder for offline tests; see
 Where the embedder runs.
 
 - `"auto"` *(default)* — pick CPU. Today this is what `auto`
-  resolves to in v1.0; CUDA / Metal acceleration is a future
+  resolves to; CUDA / Metal acceleration is a future
   optimization.
 - `"cpu"` — explicitly CPU. Equivalent to `"auto"` today.
 - `"cuda"` — request the CUDA backend. Currently treated like CPU
@@ -167,7 +167,7 @@ Where the embedder runs.
   flip.
 - `"metal"` — Apple Silicon GPU. Same status as CUDA today.
 
-For v1.0, leave at `"auto"`. The model loaders log the active
+Leave at `"auto"` for now. The model loaders log the active
 backend on boot so you'll see the resolution in
 `~/.mneme/logs/mneme.log`.
 
@@ -193,7 +193,7 @@ peak. The 32 default keeps RAM bounded on small machines.
 | | |
 |---|---|
 | **Type** | string |
-| **Default** | `"personal"` |
+| **Default** | `"global"` |
 | **Affects** | scope arg fallback for `remember` / `pin` |
 
 The session's starting "current scope" — used by write tools when
@@ -201,9 +201,15 @@ the caller omits the `scope` argument. The `switch_scope` tool
 mutates the in-memory cell; this field is only consulted at boot.
 
 The string is free-form. Common conventions:
-- `"personal"` *(default)* — default home for individual use
-- `"work"`, `"home"`, `"<projectname>"` — separate buckets
+- `"global"` *(default)* — cross-project rules, conventions, and
+  preferences that apply regardless of which repo you're in
+- `"<projectname>"` — one scope per project; agents call
+  `switch_scope("<name>")` early in the session
 - `"client-x"`, `"client-y"` — confidentiality boundaries
+
+Existing installs with `default = "personal"` in `~/.mneme/config.toml`
+still work — the change is the default for fresh installs and the
+missing-`config.toml` fallback path.
 
 `list_scopes` shows every distinct scope across the three layers.
 Cross-process semantics: see [switch_scope](./mcp-surface.md#session-helpers).
@@ -311,11 +317,11 @@ hot path — they're for forensics, not auto-context.
 |---|---|
 | **Type** | string |
 | **Default** | `"idle"` |
-| **Valid (v1.0)** | `"idle"` |
+| **Valid** | `"idle"` |
 | **Affects** | when the consolidation scheduler fires |
 
-Drives `ConsolidationScheduler`'s decision policy. v1.0 supports
-`"idle"` only:
+Drives `ConsolidationScheduler`'s decision policy. Current cadence
+options:
 
 - `"idle"` — wakes every 5 minutes; fires the consolidation pass
   iff no `remember` / `forget` / `update` / `record` happened in
@@ -323,8 +329,8 @@ Drives `ConsolidationScheduler`'s decision policy. v1.0 supports
   the next quiet window.
 
 Future modes (`"every_<n>m"`, cron expressions, `"on_demand"`)
-land in v1.1. Anything other than `"idle"` today logs a warning
-and falls back to `"idle"` cadence.
+are tracked for post-v1.1.x. Anything other than `"idle"` today
+logs a warning and falls back to `"idle"` cadence.
 
 ---
 
@@ -402,12 +408,16 @@ threshold.
 |---|---|
 | **Type** | string |
 | **Default** | `"stdio"` |
-| **Valid (v1.0)** | `"stdio"` |
-| **Affects** | how the MCP server speaks |
+| **Valid** | `"stdio"` |
+| **Affects** | how `mneme run` speaks (does NOT affect `mneme daemon`) |
 
-v1.0 ships stdio only — JSON-RPC framed line-delimited JSON over
-stdin/stdout, the standard MCP local-tool transport. SSE / HTTP
-transports (with auth + TLS) are deferred to v1.1.
+`mneme run` ships stdio only — JSON-RPC framed line-delimited JSON
+over stdin/stdout, the standard MCP local-tool transport. `mneme
+daemon` (the v1.1 default entry point) speaks the same line-
+delimited JSON over a Unix domain socket at
+`~/.mneme/run/mneme.sock` and is not configurable via this field.
+SSE event-stream framing for the daemon transport is deferred per
+ADR-0012 amendment A1.
 
 ### `sse_port`
 
@@ -415,9 +425,9 @@ transports (with auth + TLS) are deferred to v1.1.
 |---|---|
 | **Type** | unsigned 16-bit integer |
 | **Default** | `7878` |
-| **Affects** | (unused in v1.0) |
+| **Affects** | (unused) |
 
-Reserved for the future SSE transport. Setting it today is a no-op.
+Reserved for a future SSE transport. Setting it today is a no-op.
 
 ---
 

@@ -7,20 +7,17 @@
 > A standalone, MCP-native memory tool for any LLM or agent.
 > Single binary. Local-first. Rust. Built to last.
 
-**Status:** Pre-1.0 cycle wrapping. Latest published release is `0.2.6`
-on [`mneme-mcp`](https://crates.io/crates/mneme-mcp) (crates.io) and via
-[`tr0mb1r/mneme`](https://github.com/tr0mb1r/homebrew-mneme) (Homebrew).
-The `develop` branch is at `1.1.0` (preview — not yet tagged) and
-accumulates the v1.1 cycle work per `proj_docs/mneme-release-planning-v2.md`:
-daemon mode + SSE-default transport (ADR-0012), per-agent installer
-(`mneme init <agent>`, fully wired for `claude-code` and `claude-desktop`),
-size guardrails + first-boot audit, and v1.0 → v1.1 migration tests. The
-v1.0 release is calendar-gated on the 30-day soak (Day 0 = 2026-04-29) +
-one cycle without a `schema_version` bump and ships before v1.1. Treat
-as production-capable for personal use; the on-disk format is stable
-behind a versioned schema with a migration path. See
+**Status:** v1.1.1 shipped 2026-05-23 (v1.0 tagged 2026-05-18) on
+[`mneme-mcp`](https://crates.io/crates/mneme-mcp) (crates.io) and the
+[Homebrew tap](https://github.com/tr0mb1r/homebrew-mneme). The MCP wire
+surface is the semver-tracked contract from 1.0 onward (see
+[`book/src/mcp-surface.md`](book/src/mcp-surface.md)); the Rust library
+API is private (binary-only crate). The on-disk format is stable behind
+a versioned schema with a migration path. See
+[`book/src/release-notes-v1_1.md`](book/src/release-notes-v1_1.md) for
+what v1.1 added, and
 [`book/src/versioning.md`](book/src/versioning.md) for the versioning
-policy and the five 1.0 gates.
+policy.
 
 ## What it is
 
@@ -63,31 +60,23 @@ work that the agent would otherwise forget.**
 | Auto-context | — | `mneme://context` | All four layers, packed to a token budget |
 | Diagnostics | `stats`, `list_scopes`, `export`, `switch_scope` | `mneme://stats` | — |
 
-`mneme run` speaks JSON-RPC over stdio against MCP protocol `2025-06-18`,
+The mneme MCP server speaks JSON-RPC against MCP protocol `2025-06-18`,
 advertises a focused MCP tool and resource surface (see
 [`book/src/mcp-surface.md`](book/src/mcp-surface.md) for the
 authoritative inventory), and survives malformed JSON, oversize
 frames, and EOF cleanly. Real BGE-M3 / MiniLM embeddings via `candle`,
 HNSW recall via `instant-distance`, atomic snapshots, WAL crash-recovery,
-schema migration from v0, and `mneme backup` / `mneme restore` round-trips
-are all in place. Optional Claude Code lifecycle hooks
+schema migration, and `mneme backup` / `mneme restore` round-trips are
+all in place. v1.1 adds **daemon mode** (`mneme daemon` + `mneme client`
+bridge — one warm process serving multiple MCP hosts concurrently over
+a Unix domain socket), the per-agent installer **`mneme init <agent>`**
+wired for `claude-code`, `claude-desktop`, `cursor`, and `opencode`, and
+**content size guardrails** with a first-boot upgrade audit.
+Optional Claude Code lifecycle hooks
 (`SessionStart`/`PreCompact`/`Stop`) are documented in
 [`docs/CLAUDE_CODE_SETUP.md`](docs/CLAUDE_CODE_SETUP.md) §7 with
 ready-to-copy scripts in
 [`docs/examples/claude-code-hooks/`](docs/examples/claude-code-hooks/).
-
-## Roadmap to 1.0
-
-- 30-day soak on real workloads (Day 0 = 2026-04-29)
-- One full release cycle without bumping `schema_version`
-
-Code-side feature work, release infrastructure (Homebrew tap,
-crates.io publish, tag-driven cross-build pipeline, mdBook-rendered
-user docs at <https://tr0mb1r.github.io/mneme/>), and the MCP-surface
-freeze (see
-[`book/src/mcp-surface.md`](book/src/mcp-surface.md) for the
-authoritative inventory) are complete. The remaining items are
-calendar-bound rather than work-bound.
 
 ## Installing
 

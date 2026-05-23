@@ -1,10 +1,7 @@
 # v1.1 release notes
 
-> **Status: v1.1.1 candidate on `develop`.** This page covers
-> everything in the v1.1 train; the launch tag will be `v1.1.1`
-> (with `v1.0` tagged first per the release plan). The crate
-> version on `develop` is `1.1.1` so dogfood binaries report
-> the version they're being tested against.
+> **Status: v1.1.1 shipped 2026-05-23.** v1.0 tagged 2026-05-18.
+> This page covers everything in the v1.1 train.
 
 The v1.1 cycle's theme is **daily friction, fixed**: install + run
 mneme without spelunking; serve multiple MCP-host sessions from one
@@ -279,9 +276,10 @@ cannot ship without:
    across reboot (catches any accidental schema_version bump).
 3. Explicit `[mcp].transport = "stdio"` is preserved on boot.
 
-The sibling rollback test (`tests/v1_1_to_v1_0_rollback.rs`) ships
-once the v1.0.1 backup-run-exclusion patch lands in a released
-v1.0.1 binary that the rollback CI can boot against.
+The sibling rollback test (`tests/v1_1_to_v1_0_rollback.rs`) will
+ship once a v1.0.1 binary with the backup-run-exclusion patch is
+released — see [§Rollback path](#rollback-path) below for the
+current state of the rollback story.
 
 ---
 
@@ -328,25 +326,26 @@ ceiling.
 ## Rollback path
 
 v1.1 → v1.0 rollback is a hard promise per ADR-0012 (release-
-planning v2.1 §6.1):
+planning v2.1 §6.1) — **memories carry forward identically**:
 
-- v1.1 does NOT bump on-disk `schema_version` (Invariant 1).
-- v1.0.1 (a small patch released alongside v1.1) tolerates the
-  v1.1-managed `~/.mneme/run/` directory cleanly — no warnings,
-  no backup leaks of the auth token.
+- v1.1 does NOT bump on-disk `schema_version` (Invariant 1), so a
+  v1.0 binary boots cleanly against a v1.1-populated `~/.mneme/`.
+- Pinning v1.0.0 from the tap:
+  ```sh
+  brew install tr0mb1r/mneme/mneme  # if not already installed
+  mneme stop                          # if a daemon is running
+  # Rebuild from a checkout of the v1.0.0 tag, or wait for v1.0.1.
+  ```
 
-To roll back:
-
-```sh
-brew install mneme@1.0.1
-mneme stop                                # if a daemon is running
-brew unlink mneme && brew link mneme@1.0.1
-mneme stats                                # confirm v1.0.1 boots clean
-```
-
-Memories carry forward identically. v1.1-only state under
-`~/.mneme/run/` is silently ignored by v1.0.1 (sockets get unlinked
-next time a v1.1.x runs; auth.token is untouched).
+**Known caveat (until v1.0.1 ships).** v1.0.0's `mneme backup`
+walks `~/.mneme/run/` and (a) warns on the live socket file
+(`WARN skipping unsupported file type during backup walk
+path=~/.mneme/run/mneme.sock`) and (b) includes the auth token in
+the resulting tarball. Both are fixed in v1.1 and will be
+backported to v1.0.1 as a hotfix. Until then, if you roll back and
+need a backup, do `rm -rf ~/.mneme/run/` first (the v1.0 binary
+re-creates an empty `run/` on next boot; you lose the auth token,
+not memories).
 
 ---
 

@@ -144,10 +144,10 @@ has never been quiet long enough for the idle gate to close.
 # v1.1 daemon mode
 
 The next sections cover failure modes specific to v1.1's
-[daemon mode](./release-notes-v1_1.md). v1.0 stdio installs
-(`mcpServers.mneme = {"command": "mneme", "args": ["run"]}` —
-which is what `mneme init claude-code` writes today) are
-unaffected.
+[daemon mode](./release-notes-v1_1.md). `mneme init claude-code`
+(and its siblings) writes `args: ["client"]` so the host launches
+the bridge — these sections apply. Manual `args: ["run"]` installs
+that skip the daemon are unaffected.
 
 ## `mneme daemon` exits immediately with "another mneme daemon is already serving"
 
@@ -192,9 +192,9 @@ mneme daemon                  # re-bind cleanly
 By design (ADR-0012 D6 / `[daemon] idle_timeout_minutes`).
 Either:
 
-- Reconnect — the next client connection respawns it via the
-  spawn-and-connect flow (once D12 lands; today
-  `mneme run` is the explicit re-spawn path).
+- Reconnect — the next client connection auto-respawns the daemon
+  via D12's spawn-and-connect flow (transparent to the agent;
+  exponential backoff up to a 30 s budget).
 - Disable: set `[daemon] idle_timeout_minutes = 0` in
   `~/.mneme/config.toml`. Daemon then only stops via
   `mneme stop` / SIGTERM.
@@ -302,8 +302,10 @@ relaunch** Claude Code after `mneme init claude-code`.
 Verify the entry landed:
 
 ```sh
-jq .mcpServers.mneme ~/.claude/settings.json
-# expect: {"command": "mneme", "args": ["run"]}
+jq .mcpServers.mneme ~/.claude.json
+# expect: {"command": "mneme", "args": ["client"]}
+# (older v1.0 installs may show "args": ["run"] — same end state,
+# just the single-host fallback rather than the daemon bridge.)
 ```
 
 Verify the binary is on Claude Code's PATH (matters when
@@ -372,30 +374,30 @@ empty `{}` settings.json — Claude Code writes that on its own).
 # v1.1 → v1.0 rollback
 
 The hard promise: rolling back from v1.1 to v1.0 doesn't lose
-data. Per ADR-0012:
+memories. Per ADR-0012, v1.1 doesn't bump on-disk
+`schema_version` (Invariant 1), so a v1.0 binary boots cleanly
+against a v1.1-populated `~/.mneme/`.
 
-- v1.1 doesn't bump on-disk `schema_version` (Invariant 1).
-- v1.0.1 (a small patch released alongside v1.1) tolerates the
-  v1.1-managed `~/.mneme/run/` directory cleanly.
-
-If you're on a pre-v1.0.1 v1.0 binary and you tried to
-`mneme backup` against a v1.1-populated data dir, you'd see
-this warning:
+**Known caveat (until v1.0.1 ships).** If you `mneme backup`
+under v1.0.0 against a v1.1-populated data dir, you'll see:
 
 ```
 WARN skipping unsupported file type during backup walk path=~/.mneme/run/mneme.sock
 ```
 
-The `auth.token` would also leak into the backup tarball.
-Both are fixed in v1.0.1+. To roll back safely:
+…and the `auth.token` will land in the backup tarball. Both
+are fixed in v1.1 (`mneme backup` skips `~/.mneme/run/`
+entirely) and are queued for backport to v1.0.1.
+
+Until v1.0.1 is released, the safe rollback shape is:
 
 ```sh
-brew install mneme@1.0.1      # pinning the patch release
-mneme stop                     # if a v1.1 daemon was running
-brew unlink mneme && brew link mneme@1.0.1
-mneme stats                    # confirm v1.0.1 boots clean
+mneme stop                          # if a v1.1 daemon is running
+rm -rf ~/.mneme/run/                # one-shot; v1.0 re-creates an empty run/
+# Switch back to v1.0 via your install path (cargo install
+# mneme-mcp@1.0.0, or from a checkout of the v1.0.0 tag).
+mneme stats                          # confirm v1.0 boots clean
 ```
 
-Memories carry forward identically. Subsequent v1.0.1 runs
-see only the data v1.0 understands; the v1.1 `~/.mneme/run/`
-state is silently ignored.
+Memories carry forward identically. You lose the auth token
+(regenerated on next v1.1 boot), not memories.

@@ -23,19 +23,14 @@ work that the agent would otherwise forget.**
 
 ## Status
 
-Pre-1.0 cycle wrapping. Latest published release is `0.2.6` on
-[`mneme-mcp`](https://crates.io/crates/mneme-mcp) (crates.io) and via
-[Homebrew](https://github.com/tr0mb1r/homebrew-mneme). The `develop`
-branch is at `1.1.0` (preview — not yet tagged) and accumulates the
-v1.1 cycle work per the release-planning doc: daemon mode + SSE-default
-transport (ADR-0012), per-agent installer (`mneme init <agent>`, fully
-wired for `claude-code`, `claude-desktop`, `cursor`, and `opencode`), size guardrails +
-first-boot audit, and v1.0 → v1.1 migration tests. The v1.0 release is
-calendar-gated on the 30-day soak (Day 0 = 2026-04-29) + one cycle
-without a `schema_version` bump and ships before v1.1. Treat as
-production-capable for personal use; the on-disk format is stable
-behind a versioned schema with a migration path. See
-[Versioning](./versioning.md) for the policy and 1.0 gates.
+**v1.1.1 shipped 2026-05-23** (v1.0 tagged 2026-05-18). Latest
+release on [`mneme-mcp`](https://crates.io/crates/mneme-mcp)
+(crates.io) and the [Homebrew tap](https://github.com/tr0mb1r/homebrew-mneme).
+The MCP wire surface is the semver-tracked contract from 1.0 onward
+(see [MCP surface](./mcp-surface.md)); the Rust library API is
+private. The on-disk format is stable behind a versioned schema
+with a migration path. See [Versioning](./versioning.md) and
+[v1.1 release notes](./release-notes-v1_1.md) for what's new.
 
 ## What works today
 
@@ -48,10 +43,13 @@ behind a versioned schema with a migration path. See
 | Auto-context | — | `mneme://context` | All four layers, packed to a token budget |
 | Diagnostics | `stats`, `list_scopes`, `export`, `switch_scope` | `mneme://stats` | — |
 
-`mneme run` speaks JSON-RPC over stdio against MCP protocol `2025-06-18`,
-advertises a focused MCP tool and resource surface (see
-[MCP surface](./mcp-surface.md) for the authoritative inventory),
-and survives malformed JSON, oversize frames, and EOF cleanly.
+v1.1 ships **daemon mode** (`mneme daemon` + `mneme client` bridge —
+one warm process, many MCP hosts) over a Unix domain socket, the
+per-agent installer **`mneme init <agent>`** wired for `claude-code`,
+`claude-desktop`, `cursor`, and `opencode`, content **size guardrails**
+with a first-boot upgrade audit, and the v1.0 → v1.1 **migration test**
+as a release gate. `mneme run` is still the single-host stdio fallback.
+MCP protocol version `2025-06-18`.
 
 ## Where to next
 

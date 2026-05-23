@@ -1,6 +1,6 @@
 # CLI surface
 
-`mneme` ships a single binary with eight subcommands. This page is the
+`mneme` ships a single binary with twelve subcommands. This page is the
 canonical inventory.
 
 The MCP server runs under either `mneme daemon` (v1.1 long-lived

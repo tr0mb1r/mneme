@@ -1,7 +1,12 @@
 # MCP surface
 
-`mneme run` speaks MCP `2025-06-18` over stdio and advertises 13 tools
-and 5 resources. This page is the canonical inventory.
+The mneme MCP server speaks MCP `2025-06-18` and advertises 13 tools
+and 5 resources. Two interchangeable entry points serve the same
+surface against the same data dir: `mneme daemon` + `mneme client`
+(v1.1 default — one warm process, many clients) and `mneme run` (single-
+host stdio fallback). See [CLI surface](./cli.md#two-mcp-server-modes-daemon-vs-run)
+for the choice; this page is the canonical inventory of what either
+serves.
 
 ## Tools (13)
 
