@@ -24,6 +24,7 @@ pub mod client {
 }
 pub mod daemon;
 pub mod demo;
+pub mod encrypt;
 pub mod export;
 pub mod init;
 pub mod inspect;
@@ -170,6 +171,51 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Initialise encryption at rest (ADR-0013).
+    ///
+    /// Generates a fresh 12-word BIP39 recovery phrase, derives the
+    /// KEK, wraps a random DEK in `~/.mneme/keystore.json`, and
+    /// stashes the KEK in the OS keyring. The recovery phrase is
+    /// shown ONCE — write it down. Refuses while a `mneme run` /
+    /// `mneme daemon` instance holds the lockfile.
+    Encrypt {
+        /// Replace an existing keystore.json. You must already have
+        /// the current recovery phrase (otherwise existing encrypted
+        /// records become unrecoverable).
+        #[arg(long)]
+        force_reinit: bool,
+        /// Skip the 3-of-12 verification challenge. The keystore is
+        /// marked `mnemonic_verified=false`; useful for scripted /
+        /// CI installs where you'll never need to recover. NOT
+        /// recommended for personal installs.
+        #[arg(long)]
+        no_verify: bool,
+    },
+    /// Recover access on a fresh machine (cleared keyring, new
+    /// laptop, restored backup): re-derive the KEK from the recovery
+    /// phrase and write it to the OS keyring. Verifies that the
+    /// phrase actually unwraps the existing keystore before
+    /// stashing.
+    Recover {
+        /// The 12 BIP39 words, space-separated.
+        #[arg(long)]
+        mnemonic: String,
+    },
+    /// Rotate the recovery phrase: generates a new mnemonic + KEK
+    /// and re-wraps the existing DEK. No on-disk data has to be
+    /// rewritten (O(1)).
+    Rekey {
+        /// Skip the verification challenge for the new phrase.
+        #[arg(long)]
+        no_verify: bool,
+    },
+    /// Remove the keystore and clear the OS-keyring entry. Records
+    /// encrypted under the now-deleted KEK become unrecoverable.
+    /// Gated behind an explicit flag.
+    Decrypt {
+        #[arg(long = "yes-i-really-mean-it")]
+        force: bool,
+    },
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {
@@ -197,5 +243,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             AuthCommand::ShowPath => auth::show_path(),
         },
         Command::Restore { input, force } => restore::execute(input, force),
+        Command::Encrypt {
+            force_reinit,
+            no_verify,
+        } => encrypt::run_encrypt(force_reinit, no_verify),
+        Command::Recover { mnemonic } => encrypt::run_recover(&mnemonic),
+        Command::Rekey { no_verify } => encrypt::run_rekey(no_verify),
+        Command::Decrypt { force } => encrypt::run_decrypt(force),
     }
 }
