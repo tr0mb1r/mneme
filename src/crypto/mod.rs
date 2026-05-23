@@ -46,6 +46,7 @@ pub mod file_envelope;
 mod key;
 pub mod keyring;
 pub mod keystore;
+pub mod migration;
 mod mnemonic;
 
 pub use envelope::{AadDomain, Aead, ENVELOPE_VERSION, MAGIC};

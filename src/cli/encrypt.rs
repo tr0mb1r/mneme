@@ -11,6 +11,7 @@
 
 use crate::crypto::{
     Dek, KekStore, Keystore, Mnemonic, OsKeyring, VerifyChallenge, account_for, keystore_path,
+    migration,
 };
 use crate::{MnemeError, Result};
 use std::io::{BufRead, Write};
@@ -121,6 +122,29 @@ pub fn encrypt_at(
         ))
     })?;
 
+    // Walk existing plaintext data and re-encode through the
+    // encrypted Storage stack. On a fresh / empty data dir this is
+    // a no-op; on an upgrade-in-place against an existing v1.0/v1.1
+    // ~/.mneme/ it migrates the redb-backed L3 events and L4 memories.
+    eprintln!();
+    eprintln!("Migrating existing data to encrypted format...");
+    let report = migration::migrate_to_encrypted(root, &dek)?;
+    eprintln!(
+        "  redb: {} records re-encoded, {} already encrypted",
+        report.redb_records_migrated, report.redb_records_skipped,
+    );
+    eprintln!(
+        "  WAL:  {} stale segments dropped",
+        report.wal_segments_dropped
+    );
+    if report.deferred_surfaces {
+        eprintln!(
+            "  note: procedural/pinned.jsonl, sessions/, index/, and cold/ \
+             stay plaintext for now (P5b–P5e follow-ups). Re-pin items via \
+             `mneme.pin` to record them through the encrypted stack."
+        );
+    }
+
     eprintln!();
     eprintln!("Encryption enabled. Keystore: {}", ks_path.display());
     eprintln!(
@@ -221,14 +245,29 @@ pub fn decrypt_at(root: &Path, force: bool, keyring: &dyn KekStore) -> Result<()
             return Ok(());
         }
     };
+
+    // Walk encrypted data back to plaintext BEFORE we lose the DEK.
+    let current_kek = keyring
+        .load(&keystore.keyring.account)?
+        .ok_or_else(|| MnemeError::Crypto(
+            "current KEK not found in keyring; run `mneme recover --mnemonic ...` first so we can decrypt your data before disabling encryption".into(),
+        ))?;
+    let dek = keystore.unwrap_dek(&current_kek)?;
+    eprintln!("Decrypting existing data...");
+    let report = migration::migrate_to_plaintext(root, &dek)?;
+    eprintln!(
+        "  redb: {} records re-encoded to plaintext, {} already plaintext",
+        report.redb_records_migrated, report.redb_records_skipped,
+    );
+    eprintln!(
+        "  WAL:  {} stale segments dropped",
+        report.wal_segments_dropped
+    );
+
     keyring.delete(&keystore.keyring.account)?;
     let p = keystore_path(root);
     std::fs::remove_file(&p)?;
     eprintln!("Removed {} and cleared keyring entry.", p.display());
-    eprintln!(
-        "WARNING: any record written while encryption was on remains opaque on \
-         disk. Restore from a plaintext backup if you need to read them."
-    );
     Ok(())
 }
 
