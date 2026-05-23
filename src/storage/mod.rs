@@ -12,11 +12,14 @@ use crate::Result;
 use async_trait::async_trait;
 
 pub mod archive;
+pub mod encrypted;
 pub mod layout;
 pub mod lockfile;
 pub mod memory_impl;
 pub mod redb_impl;
 pub mod wal;
+
+pub use encrypted::EncryptedStorage;
 
 /// Key prefix for semantic memory metadata in the KV store.
 /// Memory items live at `MEM_KEY_PREFIX || ulid_bytes`.
