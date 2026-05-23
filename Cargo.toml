@@ -73,6 +73,17 @@ rand = "0.9"
 # (~50 LOC), no transitive bloat.
 subtle = "2"
 
+# v1.2 encryption-at-rest (ADR-0013).
+# `chacha20poly1305` provides XChaCha20-Poly1305 — D3 ratified that
+# choice over AES-GCM-* because random 24-byte nonces are safe and we
+# get identical perf on ARM Mac + x86 Linux without an AES-NI dep.
+# `zeroize` scrubs DEK/KEK material on drop (D9). `bip39` implements
+# the 12-word recovery mnemonic + PBKDF2-HMAC-SHA512 seed derivation
+# (D2). `keyring` arrives in Phase 2 alongside keystore.json.
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+bip39 = { version = "2", default-features = false, features = ["std"] }
+
 # Phase 3 — semantic layer (embedding model + HNSW vector index).
 # `candle-*` is the pure-Rust ML runtime (ADR-0002). MSRV-wise these are 1.83+,
 # so the workspace's pinned stable toolchain (rust-toolchain.toml) covers them.
