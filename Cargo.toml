@@ -164,6 +164,17 @@ name = "auto_context"
 path = "benches/auto_context.rs"
 harness = false
 
+# v1.2 encryption-at-rest overhead bench (ADR-0013 P10). Compares
+# plain MemoryStorage vs EncryptedStorage<MemoryStorage> for put/get,
+# and plaintext-WAL vs encrypted-WAL for append/replay. The gate is
+# ≤15% p95 regression on the redb-backed recall/remember/cold-start
+# benches; this file isolates the pure AEAD overhead so regressions
+# in the crypto layer itself surface immediately.
+[[bench]]
+name = "encryption_overhead"
+path = "benches/encryption_overhead.rs"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
