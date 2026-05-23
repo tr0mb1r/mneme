@@ -49,6 +49,20 @@ impl<S: Storage> EncryptedStorage<S> {
     }
 }
 
+impl EncryptedStorage<crate::storage::redb_impl::RedbStorage> {
+    /// Open a fully-encrypted redb-backed storage stack: record-level
+    /// AEAD (this wrapper, P3) over WAL frame AEAD (P4) over redb.
+    ///
+    /// This is the daemon boot path's call site (P7): one DEK
+    /// initialises both layers, so existing-redb encryption invariants
+    /// hold all the way from MCP tool input to disk bytes.
+    pub fn open_redb(root: &std::path::Path, dek: &Dek) -> crate::Result<Arc<Self>> {
+        let aead = std::sync::Arc::new(Aead::new(dek));
+        let backend = crate::storage::redb_impl::RedbStorage::open_encrypted(root, aead)?;
+        Ok(Self::new(backend, dek))
+    }
+}
+
 #[async_trait]
 impl<S: Storage> Storage for EncryptedStorage<S> {
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {

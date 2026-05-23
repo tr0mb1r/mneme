@@ -18,6 +18,7 @@
 //!   3. Open the `WalWriter` at `max_observed_lsn + 1` so new appends
 //!      continue the LSN sequence.
 
+use crate::crypto::Aead;
 use crate::storage::{
     Storage,
     wal::{self, Applier, ReplayRecord, WalOp, WalWriter},
@@ -49,6 +50,20 @@ impl RedbStorage {
     ///
     /// Per spec §7.3 the caller passes `~/.mneme/episodic`.
     pub fn open(root: &Path) -> Result<Arc<Self>> {
+        Self::open_inner(root, None)
+    }
+
+    /// Open a [`RedbStorage`] backed by an encrypted WAL (ADR-0013 P4).
+    /// The supplied `aead` wraps every frame's postcard payload on
+    /// write and opens it on replay. The redb file itself only stores
+    /// values that the caller has already encrypted at the trait seam
+    /// (P3 / [`super::EncryptedStorage`]), so passing the *same* DEK to
+    /// both layers gives an end-to-end encrypted store.
+    pub fn open_encrypted(root: &Path, aead: Arc<Aead>) -> Result<Arc<Self>> {
+        Self::open_inner(root, Some(aead))
+    }
+
+    fn open_inner(root: &Path, aead: Option<Arc<Aead>>) -> Result<Arc<Self>> {
         let data_dir = root.join("data");
         let wal_dir = root.join("wal");
         std::fs::create_dir_all(&data_dir)?;
@@ -63,7 +78,11 @@ impl RedbStorage {
         // 2. Replay any WAL records past applied_lsn into redb.
         let mut max_observed = applied_lsn;
         let mut to_apply: Vec<ReplayRecord> = Vec::new();
-        for r in wal::replay(&wal_dir)? {
+        let replay = match aead.as_ref() {
+            Some(a) => wal::replay_encrypted(&wal_dir, Arc::clone(a))?,
+            None => wal::replay(&wal_dir)?,
+        };
+        for r in replay {
             let rec = r?;
             if rec.lsn > max_observed {
                 max_observed = rec.lsn;
@@ -81,7 +100,15 @@ impl RedbStorage {
         let applier = RedbApplier {
             db: Arc::clone(&db),
         };
-        let writer = WalWriter::open_with_applier(&wal_dir, max_observed + 1, Box::new(applier))?;
+        let writer = match aead {
+            Some(a) => WalWriter::open_with_applier_encrypted(
+                &wal_dir,
+                max_observed + 1,
+                Box::new(applier),
+                a,
+            )?,
+            None => WalWriter::open_with_applier(&wal_dir, max_observed + 1, Box::new(applier))?,
+        };
 
         Ok(Arc::new(Self {
             db,
