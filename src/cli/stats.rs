@@ -11,17 +11,16 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
+use crate::config::Config;
 use crate::index::snapshot;
+use crate::mcp::tools::size_tier;
 use crate::memory::episodic::EpisodicStore;
+use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
 use crate::storage::archive::ColdArchive;
 use crate::storage::layout;
 use crate::storage::redb_impl::RedbStorage;
 use crate::{MnemeError, Result, migrate};
-
-/// Same prefix `memory::semantic` uses. Re-declared so this module
-/// doesn't reach into a private const.
-const MEM_KEY_PREFIX: &[u8] = b"mem:";
 
 /// Same procedural file the live server reads from.
 const PINNED_FILE: &str = "pinned.jsonl";
@@ -59,6 +58,18 @@ pub fn stats_json(root: &Path) -> Result<Value> {
             .unwrap_or(0)
     });
 
+    // L4 size-tier scan (release-planning v2.1 §5.5). Reads
+    // [budgets].max_remember_chars from the on-disk config so the
+    // CLI matches what `mneme run` enforces. Best-effort: a missing
+    // config falls back to defaults.
+    let max_remember_chars = Config::load(&root.join("config.toml"))
+        .map(|c| c.budgets.max_remember_chars)
+        .unwrap_or(size_tier::DEFAULT_MAX_CHARS);
+    let large_memory_count = runtime
+        .block_on(async { size_tier::count_corpus(&storage, max_remember_chars).await })
+        .map(|s| s.to_json())
+        .unwrap_or(Value::Null);
+
     // L3 episodic — same backing storage, different prefixes.
     let episodic = EpisodicStore::new(Arc::clone(&storage));
     let (hot_count, warm_count) = runtime.block_on(async {
@@ -95,6 +106,7 @@ pub fn stats_json(root: &Path) -> Result<Value> {
                 "cold_quarters": cold_quarters,
             },
             "total_redb": semantic_count + hot_count + warm_count,
+            "large_memory_count": large_memory_count,
         },
         "semantic_index": {
             "applied_lsn": applied_lsn,
@@ -149,8 +161,10 @@ fn on_disk_size(root: &Path) -> u64 {
         for entry in entries.flatten() {
             let p = entry.path();
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            // Top-level skip — only check at depth 1.
-            if dir == root && (name == "models" || name == "logs") {
+            // Top-level skip — only check at depth 1. `run/` holds
+            // daemon runtime state (sockets, auth tokens) that
+            // shouldn't inflate the user-facing on-disk headline.
+            if dir == root && (name == "models" || name == "logs" || name == "run") {
                 continue;
             }
             let meta = match entry.metadata() {
@@ -237,6 +251,19 @@ mod tests {
         assert_eq!(human_bytes(1024), "1.00 KiB");
         assert_eq!(human_bytes(1024 * 1024), "1.00 MiB");
         assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.00 GiB");
+    }
+
+    #[test]
+    fn on_disk_size_excludes_run_dir() {
+        // Regression for v1.0 → v1.1 rollback discovery 2026-05-09:
+        // ~/.mneme/run/ holds daemon runtime state and shouldn't
+        // inflate the user-facing on-disk byte count.
+        let (_tmp, root) = fresh_root();
+        std::fs::create_dir_all(root.join("run")).unwrap();
+        std::fs::write(root.join("run").join("auth.token"), vec![0u8; 4096]).unwrap();
+        std::fs::write(root.join("config.toml"), b"[foo]\n").unwrap();
+        let bytes = on_disk_size(&root);
+        assert!(bytes < 4096, "expected run/ skipped, got {bytes}");
     }
 
     #[test]

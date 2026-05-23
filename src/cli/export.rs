@@ -21,12 +21,11 @@ use serde_json::{Value, json};
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::MemoryItem;
+use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
 use crate::storage::layout;
 use crate::storage::redb_impl::RedbStorage;
 use crate::{MnemeError, Result};
-
-const MEM_KEY_PREFIX: &[u8] = b"mem:";
 
 pub fn execute(scope: Option<String>, format: String) -> Result<()> {
     let format = match format.to_ascii_lowercase().as_str() {

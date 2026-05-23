@@ -79,3 +79,55 @@ impl Resource for Context {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embed::Embedder;
+    use crate::embed::stub::StubEmbedder;
+    use crate::memory::episodic::EpisodicStore;
+    use crate::memory::procedural::ProceduralStore;
+    use crate::memory::semantic::SemanticStore;
+    use crate::orchestrator::TokenBudget;
+    use crate::storage::Storage;
+    use crate::storage::memory_impl::MemoryStorage;
+    use tempfile::TempDir;
+
+    fn fixture() -> (Context, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(backing));
+        let orch = Arc::new(Orchestrator::new(semantic, procedural, episodic));
+        let budget = TokenBudget::for_tests(2000);
+        (Context::new(orch, budget), tmp)
+    }
+
+    #[tokio::test]
+    async fn empty_context_returns_valid_json() {
+        let (ctx, _tmp) = fixture();
+        let c = ctx.read("mneme://context").await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
+        assert!(v["procedural"].as_array().unwrap().is_empty());
+        assert!(v["episodic"].as_array().unwrap().is_empty());
+        assert!(v["semantic"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serialisation_shape_is_correct() {
+        let (ctx, _tmp) = fixture();
+        let c = ctx.read("mneme://context").await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
+        assert!(v.get("procedural").is_some());
+        assert!(v.get("episodic").is_some());
+        assert!(v.get("semantic").is_some());
+        assert!(v.get("total_tokens").is_some());
+        assert!(v.get("max_tokens").is_some());
+        assert_eq!(v["max_tokens"], 2000);
+        assert_eq!(c.mime_type, "application/json");
+        assert_eq!(c.uri, "mneme://context");
+    }
+}

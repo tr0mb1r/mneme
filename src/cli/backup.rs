@@ -1,9 +1,11 @@
 //! `mneme backup <path>` — Phase 6 §11.2 deliverable.
 //!
-//! Tar+gzip the entire `<root>/` tree to `<path>`. Excludes the
+//! Tar+gzip the entire `<root>/` tree to `<path>`. Skips the
 //! embedding-model cache (`<root>/models/`, can be re-downloaded)
-//! and rotating log files (`<root>/logs/`) so the backup stays
-//! small and focused on irreplaceable data.
+//! and rotating log files (`<root>/logs/`) by default — both can be
+//! opted in via `--include-models`. Always excludes
+//! `<root>/run/` (daemon runtime state: sockets, auth tokens) for
+//! privacy and so AF_UNIX sockets don't trip the walker.
 //!
 //! Refuses to run while a `mneme run` instance holds the lockfile —
 //! taking a snapshot of an in-flight WAL/HNSW state could capture
@@ -32,10 +34,18 @@ enum EntryKind {
     Symlink,
 }
 
-/// Subdirectories deliberately excluded from backups. `models/` is
-/// large and re-fetchable from upstream; `logs/` is operational
-/// chatter, not user data.
-const EXCLUDED_SUBDIRS: &[&str] = &["models", "logs"];
+/// Subdirectories skipped by default. `models/` is large and
+/// re-fetchable from upstream; `logs/` is operational chatter, not
+/// user data. Both can be opted back in via `--include-models`.
+const SKIPPABLE_SUBDIRS: &[&str] = &["models", "logs"];
+
+/// Subdirectories ALWAYS excluded, regardless of `--include-models`.
+/// `run/` holds daemon runtime state (sockets, auth tokens, lifecycle
+/// markers) — sockets aren't regular files (would trip walk_dir's
+/// "unsupported file type" branch), and the auth token is sensitive
+/// credential material that has no business landing in
+/// user-distributable backups.
+const ALWAYS_EXCLUDED_SUBDIRS: &[&str] = &["run"];
 
 pub fn execute(output: PathBuf, include_models: bool) -> Result<()> {
     let root = layout::default_root()
@@ -72,7 +82,7 @@ pub fn backup_at(root: &Path, output: &Path, include_models: bool) -> Result<()>
         let rel = abs
             .strip_prefix(root)
             .map_err(|e| MnemeError::Config(format!("path {abs:?} not under {root:?}: {e}")))?;
-        if !include_models && is_excluded(rel) {
+        if is_always_excluded(rel) || (!include_models && is_skippable(rel)) {
             continue;
         }
         match entry.kind {
@@ -114,12 +124,18 @@ fn refuse_if_locked(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn is_excluded(rel: &Path) -> bool {
-    rel.components().next().is_some_and(|c| {
-        c.as_os_str()
-            .to_str()
-            .is_some_and(|s| EXCLUDED_SUBDIRS.contains(&s))
-    })
+fn is_skippable(rel: &Path) -> bool {
+    top_component_in(rel, SKIPPABLE_SUBDIRS)
+}
+
+fn is_always_excluded(rel: &Path) -> bool {
+    top_component_in(rel, ALWAYS_EXCLUDED_SUBDIRS)
+}
+
+fn top_component_in(rel: &Path, set: &[&str]) -> bool {
+    rel.components()
+        .next()
+        .is_some_and(|c| c.as_os_str().to_str().is_some_and(|s| set.contains(&s)))
 }
 
 struct Entry {
@@ -131,7 +147,12 @@ struct Entry {
 /// `tar.append_dir` lands at the right spot. Symlinks are emitted as
 /// `EntryKind::Symlink` and never followed, even when they point at
 /// directories — that's how a `models -> ~/.mneme/models` link gets
-/// preserved without recursing into the target tree.
+/// preserved without recursing into the target tree. Top-level
+/// `ALWAYS_EXCLUDED_SUBDIRS` are skipped here (not just at the
+/// emission stage) so non-regular files like AF_UNIX sockets in
+/// `run/` are never inspected — otherwise their enumeration would
+/// emit "skipping unsupported file type" warnings even though the
+/// archive itself wouldn't include them.
 fn walk_dir(root: &Path) -> Result<Vec<Entry>> {
     let mut out: Vec<Entry> = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -146,6 +167,15 @@ fn walk_dir(root: &Path) -> Result<Vec<Entry>> {
         }
         let mut children: Vec<PathBuf> = std::fs::read_dir(&dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                // At the root, drop always-excluded top-level dirs
+                // before they hit symlink_metadata + the type-classifier.
+                if dir != root {
+                    return true;
+                }
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                !ALWAYS_EXCLUDED_SUBDIRS.contains(&name)
+            })
             .collect();
         // Stable order — sorted ascending — so backups are
         // reproducible across runs at the same DB state.
@@ -225,6 +255,65 @@ mod tests {
             !entries.iter().any(|p| p.starts_with("logs")),
             "logs/ must be excluded"
         );
+    }
+
+    #[test]
+    fn backup_excludes_run_dir() {
+        // Regression for v1.0 → v1.1 rollback discovery 2026-05-09:
+        // ~/.mneme/run/ holds daemon runtime state (auth.token,
+        // sockets, lifecycle markers). Backups must skip it for
+        // privacy (auth.token) and to avoid the
+        // "skipping unsupported file type" warning that AF_UNIX
+        // sockets used to trigger via walk_dir's else branch.
+        let tmp_root = TempDir::new().unwrap();
+        let root = tmp_root.path().join("mneme");
+        write(&root.join("config.toml"), "x = 1");
+        write(&root.join("run/auth.token"), "secret");
+        write(&root.join("run/upgrade-audit.done"), "");
+
+        let out = TempDir::new().unwrap();
+        let archive = out.path().join("backup.tar.gz");
+        backup_at(&root, &archive, false).unwrap();
+
+        let f = std::fs::File::open(&archive).unwrap();
+        let gz = flate2::read::GzDecoder::new(f);
+        let mut tar = tar::Archive::new(gz);
+        let entries: Vec<String> = tar
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().unwrap().display().to_string())
+            .collect();
+        assert!(entries.iter().any(|p| p.ends_with("config.toml")));
+        assert!(
+            !entries.iter().any(|p| p.starts_with("run")),
+            "run/ must be excluded; saw {entries:?}"
+        );
+    }
+
+    // The auth-token contents must not leak even when --include-models
+    // is set: the `run/` exclusion is unconditional, unlike `models/`
+    // which has the include-models opt-in.
+    #[test]
+    fn backup_excludes_run_dir_even_with_include_models() {
+        let tmp_root = TempDir::new().unwrap();
+        let root = tmp_root.path().join("mneme");
+        write(&root.join("run/auth.token"), "secret");
+        let out = TempDir::new().unwrap();
+        let archive = out.path().join("backup.tar.gz");
+        backup_at(&root, &archive, true).unwrap();
+
+        let f = std::fs::File::open(&archive).unwrap();
+        let gz = flate2::read::GzDecoder::new(f);
+        let mut tar = tar::Archive::new(gz);
+        let auth_leaked = tar.entries().unwrap().filter_map(|e| e.ok()).any(|e| {
+            e.path()
+                .unwrap()
+                .display()
+                .to_string()
+                .contains("auth.token")
+        });
+        assert!(!auth_leaked, "auth.token must never appear in backups");
     }
 
     #[test]

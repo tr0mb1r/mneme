@@ -38,12 +38,82 @@ use crate::storage::lockfile::LockGuard;
 use crate::storage::redb_impl::RedbStorage;
 use crate::{MnemeError, migrate};
 
+/// Lightweight RAII guard for the daemon's per-connection
+/// `active_clients` counter. Creates at accept time (increments),
+/// drops on task exit (decrements + logs). Replaces three manual
+/// `fetch_sub` + `tracing::info!` sites that were easy to forget
+/// in an early-return path.
+#[cfg(unix)]
+struct ConnectionGuard {
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(unix)]
+impl ConnectionGuard {
+    fn new(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::info!(active = n, "transport=daemon-serve-many: client accepted");
+        Self {
+            counter: Arc::clone(counter),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        let n = self
+            .counter
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(1);
+        tracing::info!(
+            active = n,
+            "transport=daemon-serve-many: client disconnected"
+        );
+    }
+}
+
 /// Env-var override that swaps the embedder for the deterministic
 /// stub. Set by tests + offline CI runs; logging mentions it loudly so
 /// nobody thinks they're embedding for real.
 const EMBEDDER_OVERRIDE_ENV: &str = "MNEME_EMBEDDER";
 
+/// Which transport the MCP server speaks. The boot path
+/// ([`execute_with_mode`]) is identical for every mode — only the
+/// reader/writer pair fed to `Server::new` differs. The `Daemon*`
+/// variants share registry construction across connections via Arc;
+/// per-connection auth verification (ADR-0012 D3) lands in M4.
+#[derive(Debug)]
+pub enum TransportMode {
+    /// Read JSON-RPC frames from stdin, write replies to stdout.
+    /// v1.0 default, retained as the `--stdio` opt-in per ADR-0012
+    /// D10.
+    Stdio,
+    /// Bind `<root>/run/mneme.sock`, accept exactly one client
+    /// connection, then drop the listener (RAII unlinks the socket
+    /// file). Serve the accepted stream until EOF. Used by M2's
+    /// `daemon_e2e` baseline test and as a debugging aid; production
+    /// `mneme daemon` uses [`Self::DaemonServeMany`].
+    DaemonAcceptOne,
+    /// M3 production daemon mode (ADR-0012 D2/D6/D7). Bind
+    /// `<root>/run/mneme.sock` and run a long-running accept loop:
+    /// every accepted connection is spawned as its own tokio task
+    /// that builds a `Server` wrapping the socket halves and runs
+    /// until EOF. The accept loop terminates only on
+    /// SIGTERM/Ctrl-C or process death. Multiple clients are served
+    /// concurrently; storage writes serialise through the existing
+    /// single-writer seam (ADR-0012 D8). Idle-timeout shutdown
+    /// (D6 — auto-exit after `[daemon] idle_timeout_minutes` with
+    /// no clients) and SSE keepalive (D7) land in following M3
+    /// commits.
+    DaemonServeMany,
+}
+
 pub fn execute() -> Result<()> {
+    execute_with_mode(TransportMode::Stdio)
+}
+
+pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     // Ignore SIGTTIN/SIGTTOU. If the user runs `mneme run &` in an
     // interactive shell, our stdin read would otherwise trigger SIGTTIN
     // → process stopped, and any SIGTERM the user sends afterwards gets
@@ -135,6 +205,64 @@ pub fn execute() -> Result<()> {
     // `[scopes] default`; mutated by the `switch_scope` tool.
     let scope_state = ScopeState::new(&config.scopes.default);
 
+    // `remember` / `update` content ceiling (release-planning v2.1
+    // §5.3). Configured via `[budgets] max_remember_chars`; the
+    // 500/2,000-character advisory and warning bounds inside
+    // `size_tier` are fixed.
+    let max_remember_chars = config.budgets.max_remember_chars;
+
+    // Daemon idle-timeout (ADR-0012 D6). Honored only by
+    // `DaemonServeMany`; stdio + DaemonAcceptOne ignore it. `0`
+    // disables — daemon then only stops via SIGTERM / `mneme stop`.
+    let daemon_idle_timeout_minutes = config.daemon.idle_timeout_minutes;
+
+    // Daemon auth token (ADR-0012 D3). `ensure_token` generates the
+    // file if absent (no-op if present). The handshake helper
+    // reads the token from disk PER CONNECTION — not once at boot —
+    // per D3's explicit "no in-memory caching that would defeat
+    // rotation" requirement. An in-memory snapshot would let stale
+    // `mneme auth rotate`-out tokens still pass the gate (caught by
+    // `tests/daemon_e2e.rs::token_rotation_mid_session_*`). The
+    // disk read is a one-syscall hop on connection establishment,
+    // not the per-request hot path — D3's "once per connection,
+    // not once per request" cost analysis.
+    crate::daemon::auth::ensure_token(&root)
+        .map_err(|e| MnemeError::Config(format!("ensure auth token: {e}")))?;
+    // Share the data-dir root with each spawned connection task so
+    // its handshake can re-read the current token bytes.
+    let daemon_root = Arc::new(root.clone());
+
+    // First-boot upgrade audit (release-planning §5.3, Invariant 7).
+    // Scans L4 once for memories above max_remember_chars and writes
+    // a passive summary to ~/.mneme/diagnostics.log so users
+    // upgrading from v1.0 (which accepted arbitrary-size content)
+    // can find oversized entries without spelunking. Gated by
+    // ~/.mneme/run/upgrade-audit.done — runs at most once per data
+    // dir. Existing memories are NEVER auto-modified (verbatim
+    // principle). Best-effort: log + continue on error rather than
+    // refuse to boot — the audit is informational, not load-bearing.
+    match runtime.block_on(crate::upgrade_audit::run_if_needed(
+        &root,
+        &storage_dyn,
+        max_remember_chars,
+    )) {
+        Ok(crate::upgrade_audit::AuditOutcome::AlreadyDone) => {}
+        Ok(crate::upgrade_audit::AuditOutcome::Ran(stats)) => {
+            tracing::info!(
+                total = stats.total(),
+                normal = stats.normal,
+                advisory = stats.advisory,
+                warning = stats.warning,
+                over_limit = stats.over_limit,
+                log_path = %crate::upgrade_audit::diagnostics_log_path(&root).display(),
+                "v1.1 first-boot upgrade audit complete"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "v1.1 first-boot upgrade audit failed; continuing");
+        }
+    }
+
     // Spawn the L3 consolidation scheduler. Watches the semantic +
     // episodic activity counters for idle windows; fires
     // `consolidation::run` on the configured cadence so hot-tier
@@ -176,20 +304,33 @@ pub fn execute() -> Result<()> {
     let sessions_dir = root.join("sessions");
     let result = runtime
         .block_on(async_main(
-            Arc::clone(&storage_dyn),
-            Arc::clone(&semantic),
-            Arc::clone(&procedural),
-            Arc::clone(&episodic),
-            Arc::clone(&orchestrator),
-            cold,
-            on_disk_version.max(migrate::CURRENT_SCHEMA_VERSION),
-            auto_context_budget,
-            Arc::clone(&consolidation_scheduler),
-            Arc::clone(&active_session),
-            Arc::clone(&checkpoint_scheduler),
-            sessions_dir,
-            scope_state,
-            active_model_name.clone(),
+            BootedStorage {
+                storage: Arc::clone(&storage_dyn),
+                cold,
+            },
+            BootedMemory {
+                semantic: Arc::clone(&semantic),
+                procedural: Arc::clone(&procedural),
+                episodic: Arc::clone(&episodic),
+            },
+            BootedSchedulers {
+                consolidation: Arc::clone(&consolidation_scheduler),
+                checkpoint_scheduler: Arc::clone(&checkpoint_scheduler),
+                active_session: Arc::clone(&active_session),
+            },
+            DaemonRuntimeConfig {
+                mode,
+                root: root.clone(),
+                orchestrator: Arc::clone(&orchestrator),
+                scope_state,
+                sessions_dir,
+                auto_context_budget,
+                schema_version: on_disk_version.max(migrate::CURRENT_SCHEMA_VERSION),
+                active_model_name: active_model_name.clone(),
+                max_remember_chars,
+                daemon_idle_timeout_minutes,
+                daemon_root,
+            },
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
 
@@ -230,23 +371,85 @@ pub fn execute() -> Result<()> {
     result
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn async_main(
+/// Bundles the raw storage layer: the `Storage` trait handle and the
+/// cold-tier archive. Constructed once in `execute_with_mode` and
+/// consumed by `async_main`.
+struct BootedStorage {
     storage: Arc<dyn Storage>,
+    cold: crate::storage::archive::ColdArchive,
+}
+
+/// Bundles the three memory store Arcs: L4 semantic, L0 procedural,
+/// L3 episodic.
+struct BootedMemory {
     semantic: Arc<SemanticStore>,
     procedural: Arc<ProceduralStore>,
     episodic: Arc<EpisodicStore>,
-    orchestrator: Arc<Orchestrator>,
-    cold: crate::storage::archive::ColdArchive,
-    schema_version: u32,
-    auto_context_budget: TokenBudget,
+}
+
+/// Bundles background-task handles: L3 consolidation scheduler, L1
+/// checkpoint scheduler, and the active-session tracker.
+struct BootedSchedulers {
     consolidation: Arc<ConsolidationScheduler>,
-    active_session: Arc<ActiveSession>,
     checkpoint_scheduler: Arc<CheckpointScheduler>,
-    sessions_dir: std::path::PathBuf,
+    active_session: Arc<ActiveSession>,
+}
+
+/// Runtime configuration knobs that don't belong to a single lifecycle
+/// layer: transport mode, paths, scope state, token budget, etc.
+struct DaemonRuntimeConfig {
+    mode: TransportMode,
+    root: std::path::PathBuf,
+    orchestrator: Arc<Orchestrator>,
     scope_state: Arc<ScopeState>,
+    sessions_dir: std::path::PathBuf,
+    auto_context_budget: TokenBudget,
+    schema_version: u32,
     active_model_name: String,
+    max_remember_chars: usize,
+    daemon_idle_timeout_minutes: u64,
+    daemon_root: Arc<std::path::PathBuf>,
+}
+
+async fn async_main(
+    booted_storage: BootedStorage,
+    booted_memory: BootedMemory,
+    booted_schedulers: BootedSchedulers,
+    cfg: DaemonRuntimeConfig,
 ) -> anyhow::Result<()> {
+    // Destructure the bundles so the function body reads identically
+    // to the pre-refactor 19-param version — no body changes needed.
+    let BootedStorage { storage, cold } = booted_storage;
+    let BootedMemory {
+        semantic,
+        procedural,
+        episodic,
+    } = booted_memory;
+    let BootedSchedulers {
+        consolidation,
+        checkpoint_scheduler,
+        active_session,
+    } = booted_schedulers;
+    // root / daemon_idle_timeout_minutes / daemon_root are read only
+    // by the #[cfg(unix)] daemon transport arms below; on Windows
+    // they decompose cleanly from the struct but go unused. Allow
+    // here rather than restructuring the destructure into per-cfg
+    // bindings — keeps the field list legible in one place.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    let DaemonRuntimeConfig {
+        mode,
+        root,
+        orchestrator,
+        scope_state,
+        sessions_dir,
+        auto_context_budget,
+        schema_version,
+        active_model_name,
+        max_remember_chars,
+        daemon_idle_timeout_minutes,
+        daemon_root,
+    } = cfg;
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         protocol = crate::mcp::PROTOCOL_VERSION,
@@ -280,50 +483,359 @@ async fn async_main(
         tracing::warn!(error = %e, "failed to record session_start event");
     }
 
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let transport = StdioTransport::new(stdin, stdout);
-    let mut server = Server::new(
-        transport,
-        Arc::new(ToolRegistry::defaults_with_schedulers(
+    // Boxed trait objects so every transport variant produces the
+    // same concrete `StdioTransport<Box<...>, Box<...>>` type — one
+    // monomorphisation of `Server::new` regardless of mode. Per-
+    // syscall virtual call cost is negligible against JSON-RPC
+    // frame parsing + storage IO.
+    type AsyncReader = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
+    type AsyncWriter = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
+
+    // Build registries ONCE per process. `DaemonServeMany` Arc::clones
+    // them per accepted connection; the single-shot modes also use
+    // the shared instances so the construction cost (cheap, but
+    // not free — every `defaults_with_schedulers` Arc-wraps every
+    // tool/resource) lands once.
+    let tool_registry: Arc<ToolRegistry> = Arc::new(ToolRegistry::defaults_with_schedulers(
+        Arc::clone(&semantic),
+        Arc::clone(&procedural),
+        Arc::clone(&episodic),
+        Arc::clone(&storage),
+        cold.clone(),
+        schema_version,
+        Some(Arc::clone(&consolidation)),
+        Some(Arc::clone(&checkpoint_scheduler)),
+        Arc::clone(&scope_state),
+        Some(Arc::clone(&active_session)),
+        max_remember_chars,
+    ));
+    let resource_registry: Arc<ResourceRegistry> =
+        Arc::new(ResourceRegistry::defaults_with_schedulers(
             Arc::clone(&semantic),
             Arc::clone(&procedural),
             Arc::clone(&episodic),
-            Arc::clone(&storage),
+            orchestrator,
             cold.clone(),
             schema_version,
-            Some(Arc::clone(&consolidation)),
-            Some(Arc::clone(&checkpoint_scheduler)),
-            Arc::clone(&scope_state),
-            Some(Arc::clone(&active_session)),
-        )),
-        Arc::new(ResourceRegistry::defaults_with_schedulers(
-            semantic,
-            procedural,
-            Arc::clone(&episodic),
-            orchestrator,
-            cold,
-            schema_version,
             auto_context_budget,
-            Some(consolidation),
+            Some(Arc::clone(&consolidation)),
             Some(Arc::clone(&checkpoint_scheduler)),
             Some(Arc::clone(&active_session)),
             Some(sessions_dir),
             Some(Arc::clone(&scope_state)),
-        )),
-        storage,
-    )
-    .with_session(
-        Arc::clone(&active_session),
-        checkpoint_scheduler,
-        Arc::clone(&episodic),
-        Arc::clone(&scope_state),
-    );
+            Some((Arc::clone(&storage), max_remember_chars)),
+        ));
 
-    tokio::select! {
-        result = server.run() => result?,
-        _ = shutdown_signal() => {
-            tracing::info!("shutdown signal received");
+    // Per-connection helper: build the Server for a transport pair
+    // and run it until EOF. Used by every mode; the `with_signal`
+    // flag wraps `server.run()` in a `tokio::select!` against
+    // shutdown_signal so single-shot modes can exit on SIGTERM
+    // mid-serve. `DaemonServeMany` passes `false` because the
+    // outer accept loop owns the signal.
+    let serve_one = |reader: AsyncReader,
+                     writer: AsyncWriter,
+                     with_signal: bool,
+                     tool: Arc<ToolRegistry>,
+                     resource: Arc<ResourceRegistry>,
+                     storage: Arc<dyn Storage>,
+                     active_session: Arc<ActiveSession>,
+                     checkpoint_scheduler: Arc<CheckpointScheduler>,
+                     episodic: Arc<EpisodicStore>,
+                     scope_state: Arc<ScopeState>| {
+        async move {
+            let transport = StdioTransport::new(reader, writer);
+            let mut server = Server::new(transport, tool, resource, storage).with_session(
+                active_session,
+                checkpoint_scheduler,
+                episodic,
+                scope_state,
+            );
+            if with_signal {
+                tokio::select! {
+                    result = server.run() => result?,
+                    _ = shutdown_signal() => {
+                        tracing::info!("shutdown signal received");
+                    }
+                }
+            } else {
+                server.run().await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    };
+
+    match mode {
+        TransportMode::Stdio => {
+            tracing::info!("transport=stdio: reading frames from stdin");
+            serve_one(
+                Box::new(tokio::io::stdin()),
+                Box::new(tokio::io::stdout()),
+                true,
+                Arc::clone(&tool_registry),
+                Arc::clone(&resource_registry),
+                Arc::clone(&storage),
+                Arc::clone(&active_session),
+                Arc::clone(&checkpoint_scheduler),
+                Arc::clone(&episodic),
+                Arc::clone(&scope_state),
+            )
+            .await?;
+        }
+        #[cfg(unix)]
+        TransportMode::DaemonAcceptOne => {
+            let listener = crate::daemon::bind_listener(&root)
+                .await
+                .map_err(|e| anyhow::anyhow!("daemon listener bind failed: {e}"))?;
+            tracing::info!(
+                socket = %listener
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                "transport=daemon-accept-one: listener bound; awaiting first client"
+            );
+            let (stream, _addr) = listener.as_inner().accept().await?;
+            tracing::info!(
+                "transport=daemon-accept-one: client accepted; unbinding listener \
+                 so the socket file is gone before serving begins"
+            );
+            drop(listener);
+            let (read, write) = stream.into_split();
+            serve_one(
+                Box::new(read),
+                Box::new(write),
+                true,
+                Arc::clone(&tool_registry),
+                Arc::clone(&resource_registry),
+                Arc::clone(&storage),
+                Arc::clone(&active_session),
+                Arc::clone(&checkpoint_scheduler),
+                Arc::clone(&episodic),
+                Arc::clone(&scope_state),
+            )
+            .await?;
+        }
+        #[cfg(unix)]
+        TransportMode::DaemonServeMany => {
+            let listener = crate::daemon::bind_listener(&root)
+                .await
+                .map_err(|e| anyhow::anyhow!("daemon listener bind failed: {e}"))?;
+            tracing::info!(
+                socket = %listener
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                "transport=daemon-serve-many: listener bound; serving until SIGTERM"
+            );
+
+            // Track in-flight connection count. Read by the
+            // idle-timeout watcher (ADR-0012 D6) below; future
+            // commits will also consult it for graceful-drain on
+            // SIGTERM.
+            let active_clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let idle_watcher_counter = Arc::clone(&active_clients);
+
+            // Shutdown broadcast. Each per-connection task clones a
+            // `Receiver` and selects its `Server::run()` against
+            // `Receiver::changed()`. When the daemon-level
+            // `tokio::select!` resolves on `shutdown_signal` (or
+            // idle timeout), we `send(true)` and every connected
+            // task drops its server (and the socket halves) — the
+            // client sees EOF and disconnects, and `wait_for_drain`
+            // returns in milliseconds instead of always timing out
+            // at `DRAIN_DEADLINE`. Marking the initial `false` as
+            // seen on the outer receiver means clones inherit that
+            // mark, so `changed()` reliably fires on the `send(true)`.
+            let (shutdown_tx, mut shutdown_rx_outer) = tokio::sync::watch::channel(false);
+            let _ = shutdown_rx_outer.borrow_and_update();
+
+            // The spawned per-connection tasks need their futures
+            // to be `Send` for `tokio::spawn`. The boxed-trait-object
+            // pair we use for stdio doesn't satisfy `Sync` (Stdin
+            // isn't Sync), so spawning a `Server<Box<dyn _>, Box<dyn _>>`
+            // future fails the `Sync`-via-Send-of-`&Server` chain.
+            // The Unix socket's owned halves (`OwnedReadHalf` /
+            // `OwnedWriteHalf`) are themselves `Send + Sync` — passing
+            // them through directly skips the boxing problem and
+            // monomorphises a separate `Server` for socket
+            // connections.
+            let exit_reason: &'static str;
+            tokio::select! {
+                _ = shutdown_signal() => {
+                    exit_reason = "shutdown_signal";
+                    tracing::info!(
+                        active = active_clients.load(std::sync::atomic::Ordering::Relaxed),
+                        "transport=daemon-serve-many: shutdown signal received"
+                    );
+                }
+                _ = idle_timeout_watcher(idle_watcher_counter, daemon_idle_timeout_minutes) => {
+                    exit_reason = "idle_timeout";
+                    tracing::info!(
+                        idle_minutes = daemon_idle_timeout_minutes,
+                        "transport=daemon-serve-many: idle timeout reached; shutting down"
+                    );
+                }
+                _ = async {
+                    loop {
+                        match listener.as_inner().accept().await {
+                            Ok((stream, _addr)) => {
+                                let (read, write) = stream.into_split();
+                                let tool = Arc::clone(&tool_registry);
+                                let resource = Arc::clone(&resource_registry);
+                                let storage = Arc::clone(&storage);
+                                let active_session_c = Arc::clone(&active_session);
+                                let checkpoint_c = Arc::clone(&checkpoint_scheduler);
+                                let episodic_c = Arc::clone(&episodic);
+                                let scope_c = Arc::clone(&scope_state);
+                                let counter = Arc::clone(&active_clients);
+                                let root_for_auth = Arc::clone(&daemon_root);
+                                let mut shutdown_rx = shutdown_rx_outer.clone();
+                                tokio::spawn(async move {
+                                    // The guard must live for the
+                                    // SPAWNED task's lifetime, not the
+                                    // accept-arm scope — creating it
+                                    // outside the `async move` would
+                                    // drop it as soon as `tokio::spawn`
+                                    // returns, leaving the counter
+                                    // perpetually at zero and breaking
+                                    // both `wait_for_drain` and the
+                                    // idle-timeout watcher (D6).
+                                    let _guard = ConnectionGuard::new(&counter);
+                                    // ADR-0012 D3: read the token
+                                    // from disk PER CONNECTION (not
+                                    // a cached snapshot) so
+                                    // `mneme auth rotate` takes
+                                    // effect for the next handshake
+                                    // without restarting the daemon.
+                                    let mut write = write;
+                                    let auth_token = match crate::daemon::auth::read_token(
+                                        &root_for_auth,
+                                    ) {
+                                        Ok(t) => t,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "transport=daemon-serve-many: failed to read auth token; dropping connection"
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    // ADR-0012 D3: every connection
+                                    // starts with the auth handshake
+                                    // before any MCP frame is read.
+                                    // `handshake` returns the
+                                    // BufReader subsequent reads
+                                    // share — we hand it to
+                                    // StdioTransport so the same
+                                    // internal buffer carries
+                                    // through.
+                                    let buffered_read = match crate::daemon::auth::handshake(
+                                        read,
+                                        &mut write,
+                                        &auth_token,
+                                    )
+                                    .await
+                                    {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "transport=daemon-serve-many: auth handshake rejected; dropping connection"
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    let transport =
+                                        StdioTransport::new(buffered_read, write);
+                                    let mut server = Server::new(
+                                        transport,
+                                        tool,
+                                        resource,
+                                        storage,
+                                    )
+                                    .with_session(
+                                        active_session_c,
+                                        checkpoint_c,
+                                        episodic_c,
+                                        scope_c,
+                                    );
+                                    // Race the serve loop against the
+                                    // daemon-level shutdown broadcast.
+                                    // `Server::run` blocks in
+                                    // `read_frame.await` between
+                                    // requests; on shutdown, dropping
+                                    // the future drops the socket
+                                    // halves, the client sees EOF, and
+                                    // `wait_for_drain` returns
+                                    // promptly. `biased` is the right
+                                    // preference: a shutdown that
+                                    // races with a fresh inbound frame
+                                    // should still exit.
+                                    tokio::select! {
+                                        biased;
+                                        _ = shutdown_rx.changed() => {
+                                            tracing::info!(
+                                                "transport=daemon-serve-many: client task observed daemon shutdown; closing connection"
+                                            );
+                                        }
+                                        result = server.run() => {
+                                            if let Err(e) = result {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "client serve loop ended with error"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    // guard drops here → counter -= 1
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "accept error; continuing");
+                            }
+                        }
+                    }
+                    // Unreachable, but the future has to type-check.
+                    #[allow(unreachable_code)]
+                    Ok::<(), anyhow::Error>(())
+                } => {
+                    // The accept-loop arm should never resolve;
+                    // surface that as an error so a future change
+                    // that accidentally makes it return doesn't
+                    // exit silently.
+                    exit_reason = "accept_loop_returned_unexpectedly";
+                    tracing::error!(
+                        "transport=daemon-serve-many: accept loop returned unexpectedly"
+                    );
+                }
+            }
+
+            // Graceful drain: stop accepting (the listener is moved
+            // into the select arm and dropped here, so subsequent
+            // connect attempts will see ECONNREFUSED), broadcast the
+            // shutdown signal to active per-connection tasks so they
+            // drop their socket halves (client sees EOF, exits its
+            // serve loop, decrements the counter), then poll for the
+            // counter to reach zero. `DRAIN_DEADLINE` is a safety cap
+            // for tasks that are mid-disk-write and don't observe the
+            // broadcast immediately.
+            let _ = shutdown_tx.send(true);
+            tracing::info!(
+                exit_reason,
+                active = active_clients.load(std::sync::atomic::Ordering::Relaxed),
+                "transport=daemon-serve-many: entering graceful drain"
+            );
+            wait_for_drain(Arc::clone(&active_clients)).await;
+        }
+        // Windows fallback for the daemon transports: bind_listener
+        // and its UnixListener-based plumbing are #[cfg(unix)] in
+        // src/daemon/mod.rs (named-pipe port is M4 per ADR-0012 D2).
+        // Surface the gap explicitly rather than letting the Windows
+        // build fail in clippy/test on unresolved symbols.
+        #[cfg(not(unix))]
+        TransportMode::DaemonAcceptOne | TransportMode::DaemonServeMany => {
+            anyhow::bail!(
+                "daemon transport requires Unix domain sockets; Windows named-pipe support is M4 per ADR-0012 D2 (see src/daemon/mod.rs)"
+            );
         }
     }
 
@@ -391,6 +903,97 @@ fn active_embedder_model_name(config: &Config) -> String {
     }
 }
 
+/// Idle-timeout watcher for `DaemonServeMany` (ADR-0012 D6).
+///
+/// Polls `active_clients` every [`IDLE_POLL_INTERVAL`]; tracks the
+/// most recent moment the count was non-zero. When the count has
+/// been zero for at least `idle_timeout_minutes`, the future
+/// resolves — the caller wires this into a `tokio::select!` arm
+/// next to `shutdown_signal()`. `idle_timeout_minutes == 0` disables
+/// the timeout (the future pends forever) per the config knob's
+/// documented "0 = never" semantics.
+///
+/// Counted from "last client disconnected", not "last request
+/// seen": a long HNSW snapshot that blocks requests but not
+/// connections doesn't accidentally trigger shutdown.
+#[cfg(unix)]
+async fn idle_timeout_watcher(
+    active_clients: Arc<std::sync::atomic::AtomicUsize>,
+    idle_timeout_minutes: u64,
+) {
+    if idle_timeout_minutes == 0 {
+        std::future::pending::<()>().await;
+        return;
+    }
+    let timeout = std::time::Duration::from_secs(idle_timeout_minutes * 60);
+    // First measurement: assume the daemon was just-spawned with no
+    // clients, so the idle clock starts now.
+    let mut last_nonzero = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(IDLE_POLL_INTERVAL).await;
+        if active_clients.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            last_nonzero = tokio::time::Instant::now();
+        } else if last_nonzero.elapsed() >= timeout {
+            return;
+        }
+    }
+}
+
+/// How often `idle_timeout_watcher` checks the client counter.
+/// 30 s gives ≤ 30 s overshoot on the configured timeout — fine for
+/// the default 30-minute idle and frugal on syscalls.
+#[cfg(unix)]
+const IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Maximum time `wait_for_drain` will wait for active connections to
+/// finish before letting the runtime tear them down. 30 s is long
+/// enough for typical MCP exchanges to complete, short enough that a
+/// stuck client doesn't wedge a daemon shutdown for minutes.
+#[cfg(unix)]
+const DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often `wait_for_drain` polls the counter while draining.
+/// 100 ms is responsive enough that a normal client closing within a
+/// second is barely waited on; rare enough that a stuck-but-large
+/// drain isn't a tight CPU loop.
+#[cfg(unix)]
+const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Wait for the active-client counter to reach zero, capped by
+/// [`DRAIN_DEADLINE`]. Logs `info` on clean drain, `warn` on
+/// timeout. Used by `DaemonServeMany` after the accept loop exits
+/// (SIGTERM or idle timeout) to give in-flight MCP exchanges a
+/// chance to complete before the runtime aborts their tasks.
+#[cfg(unix)]
+async fn wait_for_drain(active_clients: Arc<std::sync::atomic::AtomicUsize>) {
+    let initial = active_clients.load(std::sync::atomic::Ordering::Relaxed);
+    if initial == 0 {
+        return;
+    }
+    tracing::info!(active = initial, "draining active clients before exit");
+    let start = tokio::time::Instant::now();
+    loop {
+        let now = active_clients.load(std::sync::atomic::Ordering::Relaxed);
+        if now == 0 {
+            tracing::info!(
+                drained_count = initial,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "all clients drained cleanly"
+            );
+            return;
+        }
+        if start.elapsed() >= DRAIN_DEADLINE {
+            tracing::warn!(
+                active = now,
+                deadline_s = DRAIN_DEADLINE.as_secs(),
+                "drain deadline reached; remaining clients will abort with the runtime"
+            );
+            return;
+        }
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    }
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -412,5 +1015,159 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+// All tests below exercise the daemon's idle-timeout watcher and
+// graceful-drain helpers, both #[cfg(unix)] because the daemon
+// transport is Unix-only until M4. Gate the whole module so the
+// Windows test build doesn't fail on missing symbols.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `idle_timeout_minutes == 0` is the documented "never auto-
+    /// shutdown" sentinel — the future must pend forever so the
+    /// `tokio::select!` arm never fires.
+    #[tokio::test(start_paused = true)]
+    async fn watcher_with_zero_timeout_pends_forever() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let watcher = idle_timeout_watcher(counter, 0);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(86_400), watcher).await;
+        assert!(result.is_err(), "watcher with timeout=0 must never resolve");
+    }
+
+    /// With a non-zero timeout and a counter that stays at zero
+    /// for the full duration, the watcher resolves shortly after
+    /// the timeout elapses (within one poll interval of slack).
+    #[tokio::test(start_paused = true)]
+    async fn watcher_resolves_when_idle_for_timeout() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        // 1 minute timeout — the test-clock advances instantly.
+        let watcher = idle_timeout_watcher(Arc::clone(&counter), 1);
+        let bound = IDLE_POLL_INTERVAL + std::time::Duration::from_secs(60 + 5);
+        tokio::time::timeout(bound, watcher)
+            .await
+            .expect("watcher resolved within timeout + one poll");
+    }
+
+    /// A non-zero counter keeps resetting the idle clock — the
+    /// watcher must NOT resolve while clients are connected, even
+    /// across many timeout-worth of paused time.
+    #[tokio::test(start_paused = true)]
+    async fn watcher_does_not_resolve_while_clients_connected() {
+        let counter = Arc::new(AtomicUsize::new(1));
+        let watcher = idle_timeout_watcher(Arc::clone(&counter), 1);
+        // Advance way past 10 minute-equivalents of paused time.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10 * 60), watcher).await;
+        assert!(
+            result.is_err(),
+            "watcher must NOT resolve while a client is connected"
+        );
+    }
+
+    /// Already-drained counter (count == 0 at entry) returns
+    /// immediately — no syscalls, no log noise. The fast path
+    /// matters because most graceful-shutdown calls happen with
+    /// no clients connected (idle daemon receives SIGTERM).
+    #[tokio::test(start_paused = true)]
+    async fn drain_returns_immediately_when_empty() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let start = tokio::time::Instant::now();
+        wait_for_drain(counter).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(50),
+            "empty drain must be near-instant, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Counter that ticks down to zero before the deadline returns
+    /// cleanly. Drives the counter externally to mimic spawned
+    /// connection tasks finishing their work.
+    #[tokio::test(start_paused = true)]
+    async fn drain_returns_when_clients_finish_before_deadline() {
+        let counter = Arc::new(AtomicUsize::new(3));
+        let drain_counter = Arc::clone(&counter);
+
+        let driver = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            counter.fetch_sub(1, Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            counter.fetch_sub(1, Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            counter.fetch_sub(1, Ordering::Relaxed);
+        };
+
+        // Tokio paused-clock advances both the driver's sleeps and
+        // the drain's poll interval simultaneously.
+        tokio::join!(wait_for_drain(drain_counter), driver);
+    }
+
+    /// Counter that never reaches zero: drain should bail at the
+    /// `DRAIN_DEADLINE` bound rather than wait forever. The bounded
+    /// timeout is the load-bearing safety: a stuck client must not
+    /// wedge daemon shutdown.
+    #[tokio::test(start_paused = true)]
+    async fn drain_bails_at_deadline_on_stuck_clients() {
+        let counter = Arc::new(AtomicUsize::new(2));
+        let start = tokio::time::Instant::now();
+        wait_for_drain(Arc::clone(&counter)).await;
+        let elapsed = start.elapsed();
+        // Should take at least DRAIN_DEADLINE (counter never moves)
+        // but not significantly more.
+        assert!(
+            elapsed >= DRAIN_DEADLINE,
+            "drain must hit deadline, only waited {elapsed:?}"
+        );
+        assert!(
+            elapsed < DRAIN_DEADLINE + std::time::Duration::from_millis(500),
+            "drain ran past deadline + slack, took {elapsed:?}"
+        );
+        // Counter is still at the original 2 (we don't touch it
+        // from the drain) — the spawned tasks abort with the
+        // runtime when async_main returns.
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+    }
+
+    /// Counter goes 1 → 0 → 1 mid-window resets the idle clock —
+    /// the watcher should not resolve based on the earlier zero
+    /// observation. Only a continuous full-timeout zero stretch
+    /// triggers shutdown.
+    #[tokio::test(start_paused = true)]
+    async fn watcher_resets_clock_on_reconnect() {
+        let counter = Arc::new(AtomicUsize::new(1));
+        let watcher_counter = Arc::clone(&counter);
+        let watcher = idle_timeout_watcher(watcher_counter, 1);
+
+        let driver = async move {
+            // Idle for 30 s — not enough to fire.
+            counter.store(0, Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            // Client reconnects — the watcher's poll on next tick
+            // sees > 0 and resets last_nonzero.
+            counter.store(1, Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+            // 75 s elapsed total but the idle stretch was only 30 s
+            // before the reconnect. Watcher should still be pending.
+            counter.store(0, Ordering::Relaxed);
+            // Let the new idle stretch run the full 1-minute
+            // timeout; the watcher should resolve here.
+            tokio::time::sleep(IDLE_POLL_INTERVAL + std::time::Duration::from_secs(60 + 5)).await;
+        };
+
+        tokio::select! {
+            _ = watcher => {
+                // Driver may have exited or still be running; either
+                // is fine. Assertion is that the watcher resolved
+                // ONLY after the second idle stretch.
+            }
+            _ = driver => {
+                panic!("driver finished without watcher firing; \
+                        idle clock didn't reset on reconnect");
+            }
+        }
     }
 }

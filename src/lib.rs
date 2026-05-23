@@ -52,15 +52,18 @@
 
 pub mod cli;
 pub mod config;
+pub mod daemon;
 pub mod embed;
 pub mod error;
 pub mod ids;
 pub mod index;
+pub mod init;
 pub mod mcp;
 pub mod memory;
 pub mod migrate;
 pub mod orchestrator;
 pub mod scope;
 pub mod storage;
+pub mod upgrade_audit;
 
 pub use error::{MnemeError, Result};

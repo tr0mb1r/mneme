@@ -15,7 +15,15 @@ use crate::{MnemeError, Result};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `mneme stop` will wait for the lockfile to disappear
+/// before reporting failure. Must comfortably exceed the daemon's
+/// worst-case shutdown time = `DRAIN_DEADLINE` (30 s, see
+/// `cli::run::DRAIN_DEADLINE`) + scheduler / semantic-snapshot
+/// flush. With the active-drain broadcast (also in `cli::run`),
+/// healthy daemons exit in milliseconds once their clients
+/// disconnect — the 45 s budget only kicks in for stuck clients
+/// or slow snapshot writes on warm data dirs.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub fn execute() -> Result<()> {
     let root = layout::default_root().ok_or_else(|| {

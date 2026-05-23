@@ -17,18 +17,12 @@ use super::{Tool, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
+use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
 
 const DESCRIPTION: &str = "List every distinct scope that currently \
 holds memories. Use this when you need to confirm which buckets exist \
 before calling `recall` / `remember` with a `scope` filter.";
-
-/// Scan-prefix key for semantic memories. Mirrors
-/// `crate::memory::semantic`'s private constant; duplicated here
-/// because the field-by-field decode below only needs the bytes
-/// that come BEFORE the postcard payload (we read `scope` directly
-/// from each row).
-const MEM_KEY_PREFIX: &[u8] = b"mem:";
 
 pub struct ListScopes {
     semantic: Arc<SemanticStore>,

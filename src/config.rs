@@ -21,6 +21,8 @@ pub struct Config {
     #[serde(default)]
     pub mcp: McpConfig,
     #[serde(default)]
+    pub daemon: DaemonConfig,
+    #[serde(default)]
     pub budgets: BudgetsConfig,
     #[serde(default)]
     pub checkpoints: CheckpointsConfig,
@@ -74,12 +76,49 @@ pub struct McpConfig {
     pub sse_port: u16,
 }
 
+/// `[daemon]` — v1.1 daemon-mode tuning per ADR-0012. The daemon
+/// itself isn't fully wired yet (A.M2-M5 of release-planning §3.9
+/// land it in stages); this struct is committed early so the config
+/// surface is stable from the first commit and tests can pin the
+/// defaults end-to-end.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaemonConfig {
+    /// Idle-timeout shutdown threshold (ADR-0012 D6). The daemon
+    /// stops after no clients have been connected for this long. `0`
+    /// disables the timeout — the daemon then only stops via
+    /// `mneme stop` / SIGTERM. Counted from "last client
+    /// disconnected", not "last request seen".
+    #[serde(default = "default_daemon_idle_timeout_minutes")]
+    pub idle_timeout_minutes: u64,
+    /// Path to the auth-token file (ADR-0012 D3). `"default"` resolves
+    /// to `~/.mneme/run/auth.token` at boot. The token value lives in
+    /// exactly one file with mode `0600`; agent configs reference the
+    /// path, never the value. `mneme auth rotate` rewrites only this
+    /// one file.
+    #[serde(default = "default_daemon_auth_token_path")]
+    pub auth_token_path: String,
+    /// Daemon-only log level override. Falls back to the global
+    /// `[logging] level` when set to `"default"`. Lets users turn
+    /// the daemon up to `debug` without making the rest of the
+    /// binary chatty.
+    #[serde(default = "default_daemon_log_level")]
+    pub log_level: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BudgetsConfig {
     #[serde(default = "default_recall_limit")]
     pub default_recall_limit: usize,
     #[serde(default = "default_auto_context_budget")]
     pub auto_context_token_budget: usize,
+    /// Hard ceiling on `remember` / `update` content length, in
+    /// characters. Above this, the tool returns a structured error
+    /// (release-planning v2.1 §5.4) suggesting the agent extract a
+    /// key insight or summarize. Existing oversized memories remain
+    /// readable — the verbatim principle is preserved; only new
+    /// writes/updates are rejected.
+    #[serde(default = "default_max_remember_chars")]
+    pub max_remember_chars: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -141,7 +180,7 @@ fn default_consolidation_schedule() -> String {
     "idle".into()
 }
 fn default_scope() -> String {
-    "personal".into()
+    "global".into()
 }
 fn default_mcp_transport() -> String {
     "stdio".into()
@@ -154,6 +193,18 @@ fn default_recall_limit() -> usize {
 }
 fn default_auto_context_budget() -> usize {
     4000
+}
+fn default_max_remember_chars() -> usize {
+    10_000
+}
+fn default_daemon_idle_timeout_minutes() -> u64 {
+    30
+}
+fn default_daemon_auth_token_path() -> String {
+    "default".into()
+}
+fn default_daemon_log_level() -> String {
+    "default".into()
 }
 fn default_session_interval_secs() -> u64 {
     30
@@ -171,9 +222,13 @@ fn default_log_level() -> String {
     "info".into()
 }
 fn default_log_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".mneme/logs/mneme.log")
+    // Honor MNEME_DATA_DIR by going through layout::default_root —
+    // a tester / power user pointing the data dir elsewhere expects
+    // logs to follow. Falls back to `~/.mneme/logs/mneme.log` only
+    // if the home dir lookup itself fails.
+    crate::storage::layout::default_root()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".mneme"))
+        .join("logs/mneme.log")
 }
 fn default_log_max_size_mb() -> u32 {
     100
@@ -229,6 +284,16 @@ impl Default for BudgetsConfig {
         Self {
             default_recall_limit: default_recall_limit(),
             auto_context_token_budget: default_auto_context_budget(),
+            max_remember_chars: default_max_remember_chars(),
+        }
+    }
+}
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_minutes: default_daemon_idle_timeout_minutes(),
+            auth_token_path: default_daemon_auth_token_path(),
+            log_level: default_daemon_log_level(),
         }
     }
 }
@@ -294,11 +359,15 @@ mod tests {
         assert_eq!(c.embeddings.batch_size, 32);
         assert_eq!(c.consolidation.hot_to_warm_days, 28);
         assert_eq!(c.consolidation.warm_to_cold_days, 180);
-        assert_eq!(c.scopes.default, "personal");
+        assert_eq!(c.scopes.default, "global");
         assert_eq!(c.mcp.transport, "stdio");
         assert_eq!(c.mcp.sse_port, 7878);
         assert_eq!(c.budgets.default_recall_limit, 10);
         assert_eq!(c.budgets.auto_context_token_budget, 4000);
+        assert_eq!(c.budgets.max_remember_chars, 10_000);
+        assert_eq!(c.daemon.idle_timeout_minutes, 30);
+        assert_eq!(c.daemon.auth_token_path, "default");
+        assert_eq!(c.daemon.log_level, "default");
         assert_eq!(c.checkpoints.session_interval_secs, 30);
         assert_eq!(c.checkpoints.session_interval_turns, 5);
         assert_eq!(c.checkpoints.hnsw_snapshot_inserts, 1000);
@@ -334,6 +403,6 @@ mod tests {
         assert_eq!(c.storage.max_size_gb, 50);
         // Other fields fall back to defaults.
         assert_eq!(c.embeddings.model, "bge-m3");
-        assert_eq!(c.scopes.default, "personal");
+        assert_eq!(c.scopes.default, "global");
     }
 }

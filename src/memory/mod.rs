@@ -8,4 +8,5 @@ pub mod consolidation_scheduler;
 pub mod episodic;
 pub mod procedural;
 pub mod semantic;
+pub mod snapshot_scheduler;
 pub mod working;

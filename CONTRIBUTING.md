@@ -33,6 +33,22 @@ Thanks for your interest. This document is short on purpose.
 - Changes that touch the durability path (WAL, redb, HNSW snapshot/delta,
   backup/restore) must pass `scripts/manual_test.sh --stub` end-to-end
   before review.
+- Changes that touch hot-path code (`src/memory/`, `src/index/`,
+  `src/storage/`, `src/orchestrator/`, `src/mcp/`) trip the
+  `.github/workflows/perf.yml` regression gate. Any p95 latency that
+  slips > 10 % vs `benches/baselines/v0_2_6.json` blocks merge per
+  release-planning v2.1 §6.2. Run locally with:
+
+  ```sh
+  cargo bench --bench remember --bench recall \
+              --bench cold_start --bench auto_context -- --quick
+  python3 benches/baselines/extract_baseline.py /tmp/this.json --corpus 1000
+  python3 benches/baselines/compare.py benches/baselines/v0_2_6.json /tmp/this.json
+  ```
+
+  If the regression is justified (e.g. v1.1 daemon-mode network hop),
+  update the baseline JSON in the same commit and explain the trade
+  in the description.
 
 ## Commits
 

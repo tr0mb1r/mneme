@@ -5,7 +5,7 @@
 # post-1.0, we publish under `mneme-mcp` while keeping the user-
 # facing binary, library, and project names as `mneme`.
 name = "mneme-mcp"
-version = "1.0.0"
+version = "1.1.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "MCP-native persistent memory tool for AI agents"
@@ -44,12 +44,19 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
+# Non-blocking writer wrapper for the file appender.
+tracing-appender = "0.2"
+# Size-based file rotation honoring `[logging] max_size_mb` and
+# `max_files` from `~/.mneme/config.toml`. tracing-appender only
+# supports time-based rotation, so we use file-rotate's
+# `FileRotate<Write>` impl behind the non-blocking wrapper.
+file-rotate = "0.7"
 ulid = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "signal", "fs", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "signal", "fs", "time", "net"] }
 async-trait = "0.1"
 redb = "2"
 postcard = { version = "1", features = ["alloc"] }
@@ -57,6 +64,14 @@ crc32c = "0.6"
 fs2 = "0.4"
 dirs = "5"
 toml = "0.8"
+# v1.1 daemon auth-token generation (ADR-0012 D3/D4). Already in the
+# transitive tree via tokio + candle deps; adding direct so the
+# fill_bytes API is reachable without re-exporting through one of those.
+rand = "0.9"
+# Constant-time comparison of auth tokens — guards against timing
+# side-channel leakage on the daemon's verification path. Tiny dep
+# (~50 LOC), no transitive bloat.
+subtle = "2"
 
 # Phase 3 — semantic layer (embedding model + HNSW vector index).
 # `candle-*` is the pure-Rust ML runtime (ADR-0002). MSRV-wise these are 1.83+,
@@ -91,7 +106,7 @@ libc = "0.2"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "process", "time", "sync", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "process", "time", "sync", "fs", "test-util"] }
 # Phase 3 §13 latency benches. Plain (non-async) criterion — bench
 # bodies wrap a single tokio::Runtime created once per bench; we
 # `block_on` per iteration. That avoids pulling the `async_tokio`

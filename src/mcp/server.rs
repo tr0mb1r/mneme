@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::jsonrpc::{Id, Inbound, ParseError, Request, Response, error_codes, parse_inbound};
 use super::resources::{ResourceError, ResourceRegistry, descriptor_to_json as resource_to_json};
-use super::tools::{ToolError, ToolRegistry, descriptor_to_json as tool_to_json};
+use super::tools::{ToolRegistry, descriptor_to_json as tool_to_json};
 use super::transport::stdio::{FrameError, StdioTransport};
 use super::{PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
 use crate::memory::checkpoint_scheduler::CheckpointScheduler;
@@ -30,6 +30,8 @@ use crate::memory::episodic::EpisodicStore;
 use crate::memory::working::ActiveSession;
 use crate::scope::ScopeState;
 use crate::storage::Storage;
+
+pub use super::dispatch::{soft_error_message, tool_call_failed_payload, tool_call_payload};
 
 // Tools consume the SemanticStore directly (Phase 3); the `Storage`
 // handle on `Server` is now mostly informational, kept for future
@@ -45,112 +47,7 @@ const SERVER_NOT_INITIALIZED: i32 = -32002;
 /// payloads. Bounded so a verbose error message doesn't bloat the
 /// L3 hot tier; the full message is still in the JSON-RPC error
 /// response the caller receives.
-const FAILED_MESSAGE_CAP: usize = 500;
-
-/// Build the L3 `tool_call` event payload for a successful invocation.
-/// Per ADR-0009: extract only the per-tool value-bearing arg(s);
-/// **never** the full `arguments` object. The resulting payload feeds
-/// into the L3 hot tier and ages into the cold zstd archive on disk,
-/// so leaking secrets through this path would be a privacy bug.
-///
-/// New tools added to the MCP surface MUST add an entry here in the
-/// same PR. The default for unknown tools is the bare
-/// `{"tool": <name>}` shape — explicit allowlist, not denylist.
-fn tool_call_payload(name: &str, args: &Value) -> Value {
-    let mut p = json!({ "tool": name });
-    let obj = p
-        .as_object_mut()
-        .expect("json!({...}) yields an object literal");
-
-    let pull = |obj: &mut serde_json::Map<String, Value>, args: &Value, key: &str| {
-        if let Some(v) = args.get(key)
-            && !matches!(v, Value::Null)
-        {
-            obj.insert(key.to_owned(), v.clone());
-        }
-    };
-
-    match name {
-        // L4 writers — content carries the user's actual data.
-        "remember" => {
-            pull(obj, args, "content");
-            pull(obj, args, "kind");
-            pull(obj, args, "scope");
-        }
-        // L0 writer — same shape as remember, no embedder involvement.
-        "pin" => {
-            pull(obj, args, "content");
-            pull(obj, args, "scope");
-        }
-        // Mutators — id + new content if provided.
-        "update" => {
-            pull(obj, args, "id");
-            pull(obj, args, "content");
-            pull(obj, args, "kind");
-        }
-        "forget" => {
-            pull(obj, args, "id");
-        }
-        "unpin" => {
-            pull(obj, args, "id");
-        }
-        // Readers — record the search intent.
-        "recall" => {
-            pull(obj, args, "query");
-            pull(obj, args, "k");
-        }
-        "recall_recent" => {
-            pull(obj, args, "limit");
-            pull(obj, args, "kind");
-            pull(obj, args, "scope");
-        }
-        "summarize_session" => {
-            pull(obj, args, "events");
-            pull(obj, args, "scope");
-        }
-        // State change.
-        "switch_scope" => {
-            // Tool's arg is `scope`; expose under `new_scope` so the
-            // L3 stream reads naturally ("we switched to <new>") on
-            // recall_recent.
-            if let Some(v) = args.get("scope") {
-                obj.insert("new_scope".to_owned(), v.clone());
-            }
-        }
-        // L3 producer (this very tool!) — capture the kind only, NOT
-        // the payload. The payload is already being recorded by the
-        // tool itself; double-recording would inflate the hot tier
-        // with duplicate content.
-        "record_event" => {
-            pull(obj, args, "kind");
-            pull(obj, args, "scope");
-        }
-        // Diagnostic / portability — no value-bearing args worth
-        // mirroring. Bare `{"tool": <name>}` is enough.
-        "stats" | "list_scopes" | "export" => {}
-        // Unknown tool — bare payload, intentional default.
-        _ => {}
-    }
-    p
-}
-
-/// Build the L3 `tool_call_failed` event payload. Capped message;
-/// no args (privacy: failed remember/pin still received the args, we
-/// don't re-emit them here).
-fn tool_call_failed_payload(name: &str, error_kind: &str, message: &str) -> Value {
-    let truncated: String = if message.len() > FAILED_MESSAGE_CAP {
-        let mut s = message.chars().take(FAILED_MESSAGE_CAP).collect::<String>();
-        s.push('…');
-        s
-    } else {
-        message.to_owned()
-    };
-    json!({
-        "tool": name,
-        "error_kind": error_kind,
-        "message": truncated,
-    })
-}
+pub(crate) const FAILED_MESSAGE_CAP: usize = 500;
 
 pub struct Server<R, W> {
     transport: StdioTransport<R, W>,
@@ -325,112 +222,16 @@ where
     }
 
     async fn handle_tools_call(&self, id: Id, params: Option<Value>) -> Response {
-        let params = match params {
-            Some(p) => p,
-            None => {
-                return Response::error(id, error_codes::INVALID_PARAMS, "missing params");
-            }
-        };
-        let name = match params.get("name").and_then(Value::as_str) {
-            Some(n) => n.to_string(),
-            None => {
-                return Response::error(id, error_codes::INVALID_PARAMS, "missing `name`");
-            }
-        };
-        let args = params.get("arguments").cloned().unwrap_or(json!({}));
-
-        let tool = match self.tools.get(&name) {
-            Some(t) => t,
-            None => {
-                // Unknown tool — emit a `tool_call_failed` event
-                // (failures often matter most; ADR-0009) and return
-                // the JSON-RPC error.
-                self.emit_tool_call_failed(
-                    &name,
-                    "MethodNotFound",
-                    &format!("unknown tool: {name}"),
-                )
-                .await;
-                return Response::error(
-                    id,
-                    error_codes::METHOD_NOT_FOUND,
-                    format!("unknown tool: {name}"),
-                );
-            }
-        };
-
-        match tool.invoke(args.clone()).await {
-            Ok(result) => {
-                // Record the turn on the active session and poke the
-                // checkpoint scheduler. Two reasons to do it here, not
-                // before the invoke: (1) we don't want failed calls to
-                // count as turns; (2) we don't want to poke the
-                // scheduler if the call ultimately errors out and
-                // produces no observable effect.
-                if let (Some(session), Some(sched)) =
-                    (self.session.as_ref(), self.checkpoint_scheduler.as_ref())
-                {
-                    session.push_turn("tool", &name);
-                    sched.poke();
-                }
-                // Auto-emit the L3 `tool_call` event with a per-tool
-                // payload extracted from `args` (ADR-0009). Never the
-                // full args object — privacy.
-                if let (Some(episodic), Some(scope_state)) =
-                    (self.episodic.as_ref(), self.scope_state.as_ref())
-                {
-                    let scope = scope_state.current();
-                    let payload = tool_call_payload(&name, &args);
-                    if let Err(e) = episodic.record_json("tool_call", &scope, &payload).await {
-                        // Non-fatal: the user already got their tool result;
-                        // a missed L3 event is a degraded-mode signal, not a
-                        // reason to fail the request.
-                        tracing::warn!(
-                            error = %e,
-                            tool = %name,
-                            "failed to record episodic tool_call event"
-                        );
-                    }
-                }
-                Response::success(id, result.to_json())
-            }
-            Err(ToolError::InvalidArguments(msg)) => {
-                self.emit_tool_call_failed(&name, "InvalidArguments", &msg)
-                    .await;
-                Response::error(id, error_codes::INVALID_PARAMS, msg)
-            }
-            Err(ToolError::NotFound(msg)) => {
-                self.emit_tool_call_failed(&name, "NotFound", &msg).await;
-                Response::error(id, error_codes::METHOD_NOT_FOUND, msg)
-            }
-            Err(ToolError::Internal(msg)) => {
-                self.emit_tool_call_failed(&name, "Internal", &msg).await;
-                Response::error(id, error_codes::INTERNAL_ERROR, msg)
-            }
-        }
-    }
-
-    /// Emit a `tool_call_failed` L3 event when a tool dispatch fails.
-    /// Mirrors the success path's emit but skips the L1 turn / checkpoint
-    /// poke (failed calls don't count as turns — same logic that
-    /// protected `turns_total` pre-v0.2.4). Per ADR-0009.
-    async fn emit_tool_call_failed(&self, tool_name: &str, error_kind: &str, message: &str) {
-        if let (Some(episodic), Some(scope_state)) =
-            (self.episodic.as_ref(), self.scope_state.as_ref())
-        {
-            let scope = scope_state.current();
-            let payload = tool_call_failed_payload(tool_name, error_kind, message);
-            if let Err(e) = episodic
-                .record_json("tool_call_failed", &scope, &payload)
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    tool = %tool_name,
-                    "failed to record episodic tool_call_failed event"
-                );
-            }
-        }
+        super::dispatch::handle_tools_call(
+            &self.tools,
+            self.session.as_deref(),
+            self.checkpoint_scheduler.as_deref(),
+            self.episodic.as_deref(),
+            self.scope_state.as_deref(),
+            id,
+            params,
+        )
+        .await
     }
 
     fn handle_resources_list(&self, id: Id) -> Response {
@@ -913,6 +714,133 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("no_such_tool")
+        );
+    }
+
+    /// Soft-error tool calls — `Ok(ToolResult::with_error())` from
+    /// e.g. `remember`'s size-tier rejection — emit
+    /// `kind="tool_call_failed"` with `error_kind="Rejected"`, NOT
+    /// `tool_call`. The L3 mirror skips the args object so rejected
+    /// oversized content never lands in the cold archive (privacy +
+    /// noise). Also verifies the rejection-reason code surfaces in
+    /// the message field for downstream filtering.
+    #[tokio::test]
+    async fn soft_error_tools_call_emits_tool_call_failed_with_rejected_kind() {
+        use crate::embed::Embedder;
+        use crate::embed::stub::StubEmbedder;
+        use crate::memory::checkpoint_scheduler::{CheckpointScheduler, CheckpointSchedulerConfig};
+        use crate::memory::episodic::{EpisodicStore, RecentFilters};
+        use crate::memory::procedural::ProceduralStore;
+        use crate::memory::semantic::SemanticStore;
+        use crate::memory::working::ActiveSession;
+        use crate::orchestrator::{Orchestrator, TokenBudget};
+        use crate::scope::ScopeState;
+        use crate::storage::archive::ColdArchive;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = crate::storage::memory_impl::MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&storage), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage)));
+        let orchestrator = Arc::new(Orchestrator::new(
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+        ));
+        let cold = ColdArchive::new(tmp.path());
+        let active_session = ActiveSession::open(tmp.path().join("sessions")).unwrap();
+        let checkpoint_scheduler = CheckpointScheduler::start(
+            Arc::clone(&active_session),
+            CheckpointSchedulerConfig::disabled(),
+        );
+        let scope_state = ScopeState::new("work");
+
+        // 15k chars is over the default 10k ceiling — triggers the
+        // size-tier rejection path that returns
+        // `Ok(ToolResult::with_error())`.
+        let oversized = "z".repeat(15_000);
+
+        let mut input = String::new();
+        input.push_str(&req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18"}),
+        ));
+        input.push_str(&notif("notifications/initialized"));
+        input.push_str(&req(
+            2,
+            "tools/call",
+            json!({"name": "remember", "arguments": { "content": oversized }}),
+        ));
+
+        let transport = StdioTransport::new(input.as_bytes(), Vec::<u8>::new());
+        let mut server = Server::new(
+            transport,
+            Arc::new(ToolRegistry::defaults(
+                Arc::clone(&semantic),
+                Arc::clone(&procedural),
+                Arc::clone(&episodic),
+                Arc::clone(&storage),
+                cold.clone(),
+                10_000,
+            )),
+            Arc::new(ResourceRegistry::defaults(
+                semantic,
+                procedural,
+                Arc::clone(&episodic),
+                orchestrator,
+                cold,
+                1,
+                TokenBudget::for_tests(2000),
+            )),
+            storage,
+        )
+        .with_session(
+            active_session,
+            checkpoint_scheduler,
+            Arc::clone(&episodic),
+            scope_state,
+        );
+        server.run().await.unwrap();
+
+        let events = episodic
+            .recall_recent(&RecentFilters::default(), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "soft-error rejection must produce exactly one L3 event"
+        );
+        let evt = &events[0];
+        assert_eq!(
+            evt.kind, "tool_call_failed",
+            "soft-error rejection must emit tool_call_failed, not tool_call"
+        );
+        let payload = evt.payload_json().unwrap();
+        assert_eq!(payload["tool"], "remember");
+        assert_eq!(payload["error_kind"], "Rejected");
+        let msg = payload["message"].as_str().unwrap();
+        assert_eq!(
+            msg, "memory_too_large",
+            "message should carry the structured error code (size_tier::rejection sets `_meta.error.code = memory_too_large`)"
+        );
+
+        // Privacy invariant: the rejected 15k-char content must NOT
+        // be mirrored into the L3 payload anywhere. tool_call_failed_payload
+        // explicitly omits args; this test pins that contract for soft
+        // errors.
+        let serialized = serde_json::to_string(&payload).unwrap();
+        assert!(
+            !serialized.contains("zzzz"),
+            "rejected content must not leak into the L3 mirror; got payload {serialized}"
+        );
+        assert!(
+            serialized.len() < 200,
+            "tool_call_failed payload should be compact; got {} chars",
+            serialized.len()
         );
     }
 

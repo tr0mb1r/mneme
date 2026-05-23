@@ -64,3 +64,58 @@ impl Tool for Unpin {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::MemoryId;
+    use crate::mcp::tools::ContentBlock;
+    use tempfile::TempDir;
+
+    fn text(res: ToolResult) -> String {
+        match &res.content[0] {
+            ContentBlock::Text(t) => t.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unpin_existing_item_returns_unpinned() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let id = store.pin("rule".into(), vec![], "s".into()).await.unwrap();
+        let tool = Unpin::new(store);
+        let res = tool.invoke(json!({"id": id.to_string()})).await.unwrap();
+        assert_eq!(text(res), format!("unpinned {id}"));
+    }
+
+    #[tokio::test]
+    async fn unpin_non_existent_id_returns_no_such_pinned() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let tool = Unpin::new(store);
+        let fake_id = MemoryId::new();
+        let res = tool
+            .invoke(json!({"id": fake_id.to_string()}))
+            .await
+            .unwrap();
+        assert_eq!(text(res), format!("no such pinned {fake_id}"));
+    }
+
+    #[tokio::test]
+    async fn missing_id_returns_invalid_arguments() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let tool = Unpin::new(store);
+        let err = tool.invoke(json!({})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_ulid_format_returns_invalid_arguments() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let tool = Unpin::new(store);
+        let err = tool.invoke(json!({"id": "not-a-ulid"})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+}

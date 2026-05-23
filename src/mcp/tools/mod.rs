@@ -31,6 +31,7 @@ pub mod recall;
 pub mod recall_recent;
 pub mod record_event;
 pub mod remember;
+pub mod size_tier;
 pub mod stats;
 pub mod summarize_session;
 pub mod switch_scope;
@@ -56,13 +57,16 @@ pub struct ToolDescriptor {
     pub input_schema: Value,
 }
 
-/// A successful tool invocation produces one or more `ContentBlock`s.
-/// MCP supports text, image, and resource-link blocks; v0.1 only
-/// emits text.
+/// A tool invocation produces one or more `ContentBlock`s. MCP
+/// supports text, image, and resource-link blocks; v0.1 only emits
+/// text. `meta` carries structured tool-defined annotations (size
+/// advisories, etc.) emitted as the MCP `_meta` field on the
+/// tools/call result.
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub content: Vec<ContentBlock>,
     pub is_error: bool,
+    pub meta: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,14 +87,29 @@ impl ToolResult {
         Self {
             content: vec![ContentBlock::Text(s.into())],
             is_error: false,
+            meta: None,
         }
     }
 
+    pub fn with_meta(mut self, meta: Value) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+
+    pub fn with_error(mut self) -> Self {
+        self.is_error = true;
+        self
+    }
+
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "content": self.content.iter().map(ContentBlock::to_json).collect::<Vec<_>>(),
             "isError": self.is_error,
-        })
+        });
+        if let Some(m) = &self.meta {
+            v["_meta"] = m.clone();
+        }
+        v
     }
 }
 
@@ -119,6 +138,10 @@ impl ToolRegistry {
     /// `list_scopes`, `export`) takes the same handles plus the
     /// underlying [`Storage`] (for `b"mem:"` prefix scans) and the
     /// cold-tier [`ColdArchive`].
+    ///
+    /// Uses `size_tier::DEFAULT_MAX_CHARS` for `remember` / `update`
+    /// content size enforcement. Production callers thread the
+    /// configured ceiling via [`defaults_with_schedulers`].
     #[allow(clippy::too_many_arguments)]
     pub fn defaults(
         semantic: Arc<SemanticStore>,
@@ -139,6 +162,7 @@ impl ToolRegistry {
             None,
             ScopeState::new("personal"),
             None,
+            size_tier::DEFAULT_MAX_CHARS,
         )
     }
 
@@ -163,20 +187,23 @@ impl ToolRegistry {
         checkpoints: Option<Arc<CheckpointScheduler>>,
         scope_state: Arc<ScopeState>,
         active_session: Option<Arc<ActiveSession>>,
+        max_remember_chars: usize,
     ) -> Self {
         let mut r = Self::new();
         // L4 — semantic memory.
-        r.register(Arc::new(remember::Remember::new(
-            Arc::clone(&semantic),
-            Arc::clone(&scope_state),
-        )));
+        r.register(Arc::new(
+            remember::Remember::new(Arc::clone(&semantic), Arc::clone(&scope_state))
+                .with_max_chars(max_remember_chars),
+        ));
         r.register(Arc::new(recall::Recall::new(Arc::clone(&semantic))));
         r.register(Arc::new(forget::Forget::new(
             Arc::clone(&semantic),
             Arc::clone(&procedural),
             Arc::clone(&episodic),
         )));
-        r.register(Arc::new(update::Update::new(Arc::clone(&semantic))));
+        r.register(Arc::new(
+            update::Update::new(Arc::clone(&semantic)).with_max_chars(max_remember_chars),
+        ));
         // L0 — procedural memory.
         r.register(Arc::new(pin::Pin::new(
             Arc::clone(&procedural),

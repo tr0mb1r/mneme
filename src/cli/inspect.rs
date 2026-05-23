@@ -18,12 +18,11 @@ use ulid::Ulid;
 use crate::config::Config;
 use crate::ids::MemoryId;
 use crate::memory::semantic::{MemoryItem, RecallFilters, SemanticStore, SnapshotConfig};
+use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
 use crate::storage::layout;
 use crate::storage::redb_impl::RedbStorage;
 use crate::{MnemeError, Result, embed, migrate};
-
-const MEM_KEY_PREFIX: &[u8] = b"mem:";
 const DEFAULT_QUERY_LIMIT: usize = 5;
 
 pub fn execute(id: Option<String>, query: Option<String>) -> Result<()> {

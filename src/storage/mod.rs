@@ -18,6 +18,10 @@ pub mod memory_impl;
 pub mod redb_impl;
 pub mod wal;
 
+/// Key prefix for semantic memory metadata in the KV store.
+/// Memory items live at `MEM_KEY_PREFIX || ulid_bytes`.
+pub(crate) const MEM_KEY_PREFIX: &[u8] = b"mem:";
+
 #[async_trait]
 pub trait Storage: Send + Sync {
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;

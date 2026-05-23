@@ -75,6 +75,8 @@
 //! cold start (full WAL replay) with a clear log line; nothing on
 //! disk is auto-deleted.
 
+use super::snapshot_scheduler;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -91,14 +93,10 @@ use crate::index::delta::{HnswApplier, replay_into};
 use crate::index::hnsw::HnswIndex;
 use crate::index::snapshot;
 use crate::memory::activity::ActivityCounter;
+use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
 use crate::storage::wal::{self, WalOp, WalWriter};
 use crate::{MnemeError, Result};
-
-/// Key prefix for memory metadata in the KV store. Length kept short
-/// so the per-row overhead in redb stays small; the suffix is the
-/// raw 16-byte ULID so prefix scans iterate in creation order.
-const MEM_KEY_PREFIX: &[u8] = b"mem:";
 
 /// How many extra results to over-fetch from HNSW before applying
 /// scope/kind filters. 4× matches `index::hnsw::OVERSHOOT_FACTOR`'s
@@ -246,36 +244,6 @@ impl Default for SnapshotConfig {
     }
 }
 
-/// State shared between the SemanticStore and the scheduler task.
-/// All fields are `Arc` or atomic so cloning into the spawned task
-/// never produces a cycle — the task holds an `Arc<SnapshotState>`
-/// only, never `Arc<SemanticStore>`.
-struct SnapshotState {
-    snapshot_path: PathBuf,
-    wal_dir: PathBuf,
-    inserts_since: AtomicU64,
-    inserts_threshold: u64,
-    interval: Duration,
-    notify: Notify,
-    /// Set by `shutdown()` so the scheduler runs one final snapshot
-    /// and exits cleanly.
-    shutdown: AtomicBool,
-    /// Bumped each time a snapshot completes successfully — handy for
-    /// tests that need to wait for the scheduler to react.
-    snapshot_count: AtomicU64,
-    /// Shared with [`SemanticStore`] and [`HnswApplier`]; `fetch_max`-
-    /// style writes from the applier, plain `load(SeqCst)` from the
-    /// scheduler.
-    applied_lsn: Arc<AtomicU64>,
-    /// Same `Arc<RwLock<HnswIndex>>` the SemanticStore + applier
-    /// share. Scheduler takes write-lock for `rebuild_snapshot`,
-    /// downgrades to read-lock for `save`.
-    index: Arc<RwLock<HnswIndex>>,
-    /// `tokio::Mutex<()>` shared with `SemanticStore::write_lock` so
-    /// the scheduler can serialise itself against `remember`/`forget`.
-    write_lock: Arc<tokio::sync::Mutex<()>>,
-}
-
 /// The Phase 3 §7 owner. Constructed once at startup by
 /// [`crate::cli::run`]; tools hold an `Arc` of it and call its async
 /// methods directly.
@@ -297,7 +265,7 @@ pub struct SemanticStore {
     write_lock: Arc<tokio::sync::Mutex<()>>,
 
     // `None` when `SnapshotConfig::disabled` was passed in.
-    snapshot: Option<Arc<SnapshotState>>,
+    snapshot: Option<Arc<snapshot_scheduler::SnapshotState>>,
     scheduler_join: std::sync::Mutex<Option<JoinHandle<()>>>,
 
     /// Bumped on every user-facing mutation (`remember`, `forget`,
@@ -395,7 +363,7 @@ impl SemanticStore {
 
         // 4. Maybe spawn the scheduler.
         let (snapshot_state, scheduler_join) = if config.enabled {
-            let state = Arc::new(SnapshotState {
+            let state = Arc::new(snapshot_scheduler::SnapshotState {
                 snapshot_path,
                 wal_dir,
                 inserts_since: AtomicU64::new(0),
@@ -410,7 +378,7 @@ impl SemanticStore {
             });
             let task_state = Arc::clone(&state);
             let join = tokio::spawn(async move {
-                scheduler_loop(task_state).await;
+                snapshot_scheduler::scheduler_loop(task_state).await;
             });
             (Some(state), std::sync::Mutex::new(Some(join)))
         } else {
@@ -723,7 +691,7 @@ impl SemanticStore {
             };
             let snapshot_path = semantic_root.join(SNAPSHOT_FILE);
             let wal_dir = semantic_root.join("wal");
-            return run_snapshot_inline(
+            return snapshot_scheduler::run_snapshot_inline(
                 &self.write_lock,
                 &self.index,
                 &self.applied_lsn,
@@ -732,7 +700,7 @@ impl SemanticStore {
             )
             .await;
         };
-        run_snapshot(state).await
+        snapshot_scheduler::run_snapshot(state).await
     }
 
     /// When `SnapshotConfig::disabled` is in play we don't keep the
@@ -794,90 +762,6 @@ impl Drop for SemanticStore {
             state.notify.notify_one();
         }
     }
-}
-
-// ---------- Scheduler ----------
-
-async fn scheduler_loop(state: Arc<SnapshotState>) {
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(state.interval) => {}
-            _ = state.notify.notified() => {}
-        }
-
-        let stopping = state.shutdown.load(Ordering::SeqCst);
-        let due_by_count = state.inserts_since.load(Ordering::SeqCst) >= state.inserts_threshold;
-
-        // On shutdown we always force a final snapshot if there are
-        // pending inserts — that's the whole point of the explicit
-        // `shutdown()` API.
-        let pending = state.inserts_since.load(Ordering::SeqCst) > 0;
-        if stopping {
-            if pending && let Err(e) = run_snapshot(&state).await {
-                tracing::warn!(error = %e, "final snapshot on shutdown failed");
-            }
-            return;
-        }
-
-        if due_by_count && let Err(e) = run_snapshot(&state).await {
-            tracing::warn!(error = %e, "scheduled snapshot failed; will retry next tick");
-        }
-        // Time-based wakeups without count pressure are intentional
-        // no-ops — the scheduler exists to bound the worst-case gap
-        // between snapshots, not to write empty ones.
-    }
-}
-
-async fn run_snapshot(state: &SnapshotState) -> Result<()> {
-    run_snapshot_inline(
-        &state.write_lock,
-        &state.index,
-        &state.applied_lsn,
-        &state.snapshot_path,
-        &state.wal_dir,
-    )
-    .await?;
-    state.inserts_since.store(0, Ordering::SeqCst);
-    state.snapshot_count.fetch_add(1, Ordering::SeqCst);
-    Ok(())
-}
-
-async fn run_snapshot_inline(
-    write_lock: &tokio::sync::Mutex<()>,
-    index: &Arc<RwLock<HnswIndex>>,
-    applied_lsn: &Arc<AtomicU64>,
-    snapshot_path: &Path,
-    wal_dir: &Path,
-) -> Result<()> {
-    let _g = write_lock.lock().await;
-
-    // 1. Rebuild the HNSW so the snapshot has a clean committed
-    //    structure (no pending buffer, no tombstones).
-    let lsn = {
-        let mut idx = index
-            .write()
-            .map_err(|e| MnemeError::Index(format!("hnsw rwlock poisoned: {e}")))?;
-        idx.rebuild_snapshot()?;
-        // Capture applied_lsn under the write lock — the WAL applier
-        // can't be running concurrently because we hold write_lock,
-        // so no record can land between this read and the save below.
-        applied_lsn.load(Ordering::SeqCst)
-    };
-
-    // 2. Save under a read lock — searches stay live, but new
-    //    remember()/forget() callers stay queued on `write_lock`.
-    {
-        let idx = index
-            .read()
-            .map_err(|e| MnemeError::Index(format!("hnsw rwlock poisoned: {e}")))?;
-        snapshot::save(&idx, lsn, snapshot_path)?;
-    }
-
-    // 3. Truncate fully-covered WAL segments. After save() returns
-    //    successfully the snapshot is durable, so the records folded
-    //    into it can be reclaimed.
-    let _removed = wal::truncate_through(wal_dir, lsn)?;
-    Ok(())
 }
 
 fn mem_key(id: &MemoryId) -> Vec<u8> {
