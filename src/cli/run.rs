@@ -35,7 +35,6 @@ use crate::scope::ScopeState;
 use crate::storage::Storage;
 use crate::storage::layout;
 use crate::storage::lockfile::LockGuard;
-use crate::storage::redb_impl::RedbStorage;
 use crate::{MnemeError, migrate};
 
 /// Lightweight RAII guard for the daemon's per-connection
@@ -152,8 +151,17 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
 
     let lock_path = root.join(".lock");
     let lock = LockGuard::acquire(&lock_path)?;
-    let storage = RedbStorage::open(&root.join("episodic"))?;
-    let storage_dyn: Arc<dyn Storage> = Arc::clone(&storage) as Arc<dyn Storage>;
+
+    // ADR-0013 P7: if the data dir has a keystore.json, the daemon
+    // refuses to bind its socket without a KEK (keyring entry OR
+    // MNEME_RECOVERY_PHRASE env). When encryption is off, this is a
+    // single Keystore::load returning None and the legacy plaintext
+    // path is taken — no observable behaviour change for v1.0/v1.1
+    // users. When encryption is on, every byte written below this
+    // line through `storage_dyn` is sealed before it lands on disk.
+    let keyring = crate::crypto::OsKeyring::new();
+    let storage_dyn: Arc<dyn Storage> =
+        crate::crypto::boot::open_episodic_storage(&root, &keyring)?;
 
     let embedder = build_embedder(&config, &root)?;
     let active_model_name = active_embedder_model_name(&config);

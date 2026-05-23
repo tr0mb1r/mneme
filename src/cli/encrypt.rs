@@ -487,5 +487,4 @@ mod tests {
         let ok = verify_mnemonic_loop(&m, &mut prompt).unwrap();
         assert!(ok);
     }
-
 }

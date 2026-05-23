@@ -40,6 +40,7 @@
 //!
 //! See [`AadDomain`] for the canonical prefixes.
 
+pub mod boot;
 mod envelope;
 pub mod file_envelope;
 mod key;
