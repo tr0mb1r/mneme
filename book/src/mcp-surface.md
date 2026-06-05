@@ -26,7 +26,7 @@ serves.
 | Tool | Layer | Use when |
 |------|-------|----------|
 | `recall` | L4 semantic | Semantic similarity search — find memories close to a natural-language query. |
-| `recall_recent` | L3 episodic | "What did we just do?" — time-ordered events (tool calls, lifecycle events, conversation, decisions). |
+| `recall_recent` | L3 episodic | "What did we just do?" — time-ordered events (tool calls, lifecycle events, conversation, decisions). Optional `since` / `until` bound the result to a `[since, until)` window against `created_at` (RFC3339 or 26-char ULID); when either bound is set, `limit` caps at 1000 instead of 200. The server does not parse natural language — convert phrases like "last Tuesday" to RFC3339 client-side before calling. |
 
 ### Session helpers
 

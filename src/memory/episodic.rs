@@ -124,10 +124,18 @@ impl EpisodicEvent {
 }
 
 /// Optional filters for [`EpisodicStore::recall_recent`].
+///
+/// `since` and `until` form a half-open `[since, until)` interval
+/// against `EpisodicEvent::created_at`. Either bound may be omitted.
+/// Time-range filtering is in-memory after the hot-tier prefix scan —
+/// hot-tier cardinality is bounded by consolidation so the cost stays
+/// proportional to the prefix size, not the bounded slice.
 #[derive(Debug, Clone, Default)]
 pub struct RecentFilters {
     pub scope: Option<String>,
     pub kind: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
 }
 
 /// Hot-tier reader/writer against the redb-backed [`Storage`] handle.
@@ -282,6 +290,16 @@ impl EpisodicStore {
             }
             if let Some(ref k) = filters.kind
                 && &event.kind != k
+            {
+                continue;
+            }
+            if let Some(since) = filters.since
+                && event.created_at < since
+            {
+                continue;
+            }
+            if let Some(until) = filters.until
+                && event.created_at >= until
             {
                 continue;
             }
@@ -505,6 +523,7 @@ mod tests {
                 &RecentFilters {
                     scope: Some("work".into()),
                     kind: Some("decision".into()),
+                    ..Default::default()
                 },
                 10,
             )
@@ -512,6 +531,80 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, target);
+    }
+
+    #[tokio::test]
+    async fn recall_recent_since_bound_inclusive_lower() {
+        let s = store();
+        s.record("a", "p", "\"a\"").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        let mid = Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        let later = s.record("b", "p", "\"b\"").await.unwrap();
+
+        let hits = s
+            .recall_recent(
+                &RecentFilters {
+                    since: Some(mid),
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, later);
+    }
+
+    #[tokio::test]
+    async fn recall_recent_until_bound_exclusive_upper() {
+        let s = store();
+        let early = s.record("a", "p", "\"a\"").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        let mid = Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        s.record("b", "p", "\"b\"").await.unwrap();
+
+        let hits = s
+            .recall_recent(
+                &RecentFilters {
+                    until: Some(mid),
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, early);
+    }
+
+    #[tokio::test]
+    async fn recall_recent_since_and_until_window() {
+        let s = store();
+        s.record("a", "p", "\"a\"").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        let lo = Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        let mid = s.record("b", "p", "\"b\"").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        let hi = Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        s.record("c", "p", "\"c\"").await.unwrap();
+
+        let hits = s
+            .recall_recent(
+                &RecentFilters {
+                    since: Some(lo),
+                    until: Some(hi),
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, mid);
     }
 
     #[tokio::test]

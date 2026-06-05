@@ -144,7 +144,10 @@ impl Orchestrator {
         &self,
         scope: Option<String>,
     ) -> Result<Vec<crate::memory::episodic::EpisodicEvent>> {
-        let filters = RecentFilters { scope, kind: None };
+        let filters = RecentFilters {
+            scope,
+            ..Default::default()
+        };
         self.episodic.recall_recent(&filters, EPISODIC_FETCH).await
     }
 
