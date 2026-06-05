@@ -94,8 +94,17 @@ pub fn migrate_to_encrypted(root: &Path, dek: &Dek) -> Result<MigrationReport> {
     // boot needs a clean WAL to write new (encrypted) frames into.
     report.wal_segments_dropped = drop_wal_segments(&episodic.join("wal"))?;
 
-    // Step 3: open the encrypted stack and re-put every value that's
-    // not already encrypted. Idempotent on MNE1 magic.
+    // Step 2.5: delete the plaintext redb file so the encrypted store
+    // is rebuilt from an empty file. Re-encoding values *in place*
+    // leaves the original plaintext in redb's freed copy-on-write
+    // pages, and `Database::compact()` does NOT zero them — a forensic
+    // scan of the live file would recover pre-encryption plaintext.
+    // Rebuilding from the drained snapshot guarantees no plaintext page
+    // ever exists in the encrypted database.
+    remove_redb_file(&episodic)?;
+
+    // Step 3: open the (now empty) encrypted stack and write every
+    // value sealed. The MNE1-magic skip stays for idempotency.
     let s = EncryptedStorage::open_redb(&episodic, dek)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -114,13 +123,6 @@ pub fn migrate_to_encrypted(root: &Path, dek: &Dek) -> Result<MigrationReport> {
         Ok::<(), MnemeError>(())
     })?;
     drop(s);
-
-    // Step 4: compact the redb file so the old plaintext pages are
-    // reclaimed rather than left as garbage. Without this, redb's
-    // copy-on-write writes the new encrypted rows to fresh pages but
-    // leaves the original plaintext bytes recoverable by forensic
-    // tools — defeats the purpose of the migration.
-    compact_redb(&episodic)?;
 
     // Step 5: re-encode the procedural pinned-items JSONL as a
     // whole-file AEAD envelope (P5b).
@@ -157,9 +159,13 @@ pub fn migrate_to_plaintext(root: &Path, dek: &Dek) -> Result<MigrationReport> {
     // Step 2: drop the stale WAL segments.
     report.wal_segments_dropped = drop_wal_segments(&episodic.join("wal"))?;
 
-    // Step 3: open the plain stack and re-put every value that's not
-    // already plaintext. Idempotent: values lacking the MNE1 prefix
-    // are already plaintext.
+    // Step 2.5: delete the encrypted redb file so the plaintext store
+    // is rebuilt from an empty file — the symmetric concern to the
+    // encrypt direction. Re-writing in place would leave the previous
+    // ciphertext in redb's freed COW pages.
+    remove_redb_file(&episodic)?;
+
+    // Step 3: open the (now empty) plain stack and re-put every value.
     let s = RedbStorage::open(&episodic)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -179,12 +185,6 @@ pub fn migrate_to_plaintext(root: &Path, dek: &Dek) -> Result<MigrationReport> {
     })?;
     drop(s);
 
-    // Compact to reclaim COW pages that still hold the encrypted
-    // ciphertext from the previous live state. (Symmetric concern to
-    // the encrypt direction — without this, the file still contains
-    // recoverable ciphertext after decrypt.)
-    compact_redb(&episodic)?;
-
     let aead = Arc::new(Aead::new(dek));
     report.procedural_migrated = migrate_procedural_to_plaintext(root, &aead)?;
     report.cold_bundles_migrated = migrate_cold_to_plaintext(root, &aead)?;
@@ -194,18 +194,20 @@ pub fn migrate_to_plaintext(root: &Path, dek: &Dek) -> Result<MigrationReport> {
     Ok(report)
 }
 
-fn compact_redb(episodic: &Path) -> Result<()> {
+/// Delete the redb file so a migration rebuilds it from an empty file
+/// instead of mutating in place. `Database::compact()` reclaims free
+/// pages but does NOT zero their bytes, so an in-place re-encode leaves
+/// the pre-migration values (plaintext on encrypt, ciphertext on
+/// decrypt) recoverable from the live file's slack space. Starting from
+/// an empty file is the only way to guarantee the live db holds no
+/// pre-migration bytes. Callers must drop every Storage handle (so the
+/// WAL writer thread has joined) before calling this, and the caller's
+/// drained snapshot is the source of truth for the rebuild.
+fn remove_redb_file(episodic: &Path) -> Result<()> {
     let db_path = episodic.join("data").join("mneme.redb");
-    if !db_path.is_file() {
-        return Ok(());
+    if db_path.is_file() {
+        std::fs::remove_file(&db_path)?;
     }
-    // `Database::compact` takes &mut self, so we open a fresh handle
-    // after every other Storage instance has been dropped.
-    let mut db = redb::Database::create(&db_path).map_err(crate::MnemeError::from)?;
-    let _changed = db
-        .compact()
-        .map_err(|e| MnemeError::Storage(format!("redb compact: {e}")))?;
-    drop(db);
     Ok(())
 }
 
@@ -544,6 +546,34 @@ mod tests {
             assert!(
                 !found,
                 "plaintext value {:?} still present in redb after migration",
+                std::str::from_utf8(v).unwrap_or("<binary>")
+            );
+        }
+    }
+
+    #[test]
+    fn migrate_to_encrypted_leaves_no_plaintext_even_for_a_few_rows() {
+        // Regression: the previous implementation re-encoded rows in
+        // place and relied on `Database::compact()` to reclaim the
+        // freed plaintext pages. compact() only rewrites the file when
+        // there is enough free space to be worth it, so for a small
+        // data dir (a realistic incremental encrypt) the old plaintext
+        // values survived in slack space. The 25-row sibling test
+        // happened to trigger compaction and missed this. Three rows is
+        // small enough that the old path left remnants.
+        let tmp = TempDir::new().unwrap();
+        let written = populate_plaintext(&tmp, 3);
+
+        let dek = Dek::generate().unwrap();
+        migrate_to_encrypted(tmp.path(), &dek).unwrap();
+
+        let redb_path = tmp.path().join("episodic").join("data").join("mneme.redb");
+        let on_disk = std::fs::read(&redb_path).unwrap();
+        for (_, v) in &written {
+            let found = on_disk.windows(v.len()).any(|w| w == v.as_slice());
+            assert!(
+                !found,
+                "plaintext value {:?} still present in redb slack after migration",
                 std::str::from_utf8(v).unwrap_or("<binary>")
             );
         }
