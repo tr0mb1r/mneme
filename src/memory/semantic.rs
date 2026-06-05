@@ -106,7 +106,7 @@ const RECALL_OVERFETCH: usize = 4;
 
 /// Snapshot file name under `<root>/semantic/`. Documented here so the
 /// scheduler and the loader can't drift.
-const SNAPSHOT_FILE: &str = "hnsw.idx";
+pub const SNAPSHOT_FILE: &str = "hnsw.idx";
 
 /// Memory item types. Matches the `recall`/`remember` tool input
 /// schemas verbatim so the agent's JSON value can be parsed straight
@@ -304,6 +304,20 @@ impl SemanticStore {
         embedder: Arc<dyn Embedder>,
         config: SnapshotConfig,
     ) -> Result<Arc<Self>> {
+        Self::open_with_crypto(root, storage, embedder, config, None)
+    }
+
+    /// Variant of [`open`] that takes an optional AEAD codec so the
+    /// HNSW snapshot file and the semantic WAL are encrypted at rest
+    /// (ADR-0013 P5d / P4 extended to semantic/wal). `None` is the
+    /// legacy plaintext path.
+    pub fn open_with_crypto(
+        root: &Path,
+        storage: Arc<dyn Storage>,
+        embedder: Arc<dyn Embedder>,
+        config: SnapshotConfig,
+        aead: Option<Arc<crate::crypto::Aead>>,
+    ) -> Result<Arc<Self>> {
         let semantic_root = root.join("semantic");
         let wal_dir = semantic_root.join("wal");
         let snapshot_path = semantic_root.join(SNAPSHOT_FILE);
@@ -313,51 +327,65 @@ impl SemanticStore {
         // (file missing, bad magic, schema mismatch) is non-fatal —
         // we fall back to a cold start so a single corrupted snapshot
         // doesn't lock users out of their data.
-        let (mut idx, mut applied_lsn) = match snapshot::load(&snapshot_path) {
-            Ok((loaded, lsn)) => {
-                if loaded.dim() != embedder.dim() {
+        let (mut idx, mut applied_lsn) =
+            match snapshot::load_with_crypto(&snapshot_path, aead.as_deref()) {
+                Ok((loaded, lsn)) => {
+                    if loaded.dim() != embedder.dim() {
+                        tracing::warn!(
+                            snapshot_dim = loaded.dim(),
+                            embedder_dim = embedder.dim(),
+                            path = %snapshot_path.display(),
+                            "snapshot dim mismatches embedder; ignoring snapshot and starting cold"
+                        );
+                        (HnswIndex::new(embedder.dim()), 0u64)
+                    } else {
+                        tracing::info!(
+                            applied_lsn = lsn,
+                            len = loaded.len(),
+                            path = %snapshot_path.display(),
+                            "loaded HNSW snapshot"
+                        );
+                        (loaded, lsn)
+                    }
+                }
+                Err(e) if !snapshot_path.exists() => {
+                    // Missing file is the common case for fresh installs;
+                    // log at trace, not warn.
+                    tracing::trace!("no snapshot at {}: {e}", snapshot_path.display());
+                    (HnswIndex::new(embedder.dim()), 0u64)
+                }
+                Err(e) => {
                     tracing::warn!(
-                        snapshot_dim = loaded.dim(),
-                        embedder_dim = embedder.dim(),
+                        error = %e,
                         path = %snapshot_path.display(),
-                        "snapshot dim mismatches embedder; ignoring snapshot and starting cold"
+                        "failed to load HNSW snapshot; starting cold"
                     );
                     (HnswIndex::new(embedder.dim()), 0u64)
-                } else {
-                    tracing::info!(
-                        applied_lsn = lsn,
-                        len = loaded.len(),
-                        path = %snapshot_path.display(),
-                        "loaded HNSW snapshot"
-                    );
-                    (loaded, lsn)
                 }
-            }
-            Err(e) if !snapshot_path.exists() => {
-                // Missing file is the common case for fresh installs;
-                // log at trace, not warn.
-                tracing::trace!("no snapshot at {}: {e}", snapshot_path.display());
-                (HnswIndex::new(embedder.dim()), 0u64)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    path = %snapshot_path.display(),
-                    "failed to load HNSW snapshot; starting cold"
-                );
-                (HnswIndex::new(embedder.dim()), 0u64)
-            }
-        };
+            };
 
-        // 2. Replay any WAL records past applied_lsn.
-        let max_lsn = replay_into(&mut idx, wal::replay(&wal_dir)?, applied_lsn)?;
+        // 2. Replay any WAL records past applied_lsn. Use encrypted
+        // replay when an AEAD codec is provided.
+        let replay_iter = match aead.as_ref() {
+            Some(a) => wal::replay_encrypted(&wal_dir, Arc::clone(a))?,
+            None => wal::replay(&wal_dir)?,
+        };
+        let max_lsn = replay_into(&mut idx, replay_iter, applied_lsn)?;
         applied_lsn = applied_lsn.max(max_lsn);
 
         // 3. Open the WAL writer with an applier that shares applied_lsn.
         let index = Arc::new(RwLock::new(idx));
         let applied_lsn_atomic = Arc::new(AtomicU64::new(applied_lsn));
         let applier = HnswApplier::new(Arc::clone(&index), Arc::clone(&applied_lsn_atomic));
-        let wal_writer = WalWriter::open_with_applier(&wal_dir, max_lsn + 1, Box::new(applier))?;
+        let wal_writer = match aead.as_ref() {
+            Some(a) => WalWriter::open_with_applier_encrypted(
+                &wal_dir,
+                max_lsn + 1,
+                Box::new(applier),
+                Arc::clone(a),
+            )?,
+            None => WalWriter::open_with_applier(&wal_dir, max_lsn + 1, Box::new(applier))?,
+        };
 
         let write_lock = Arc::new(tokio::sync::Mutex::new(()));
 
@@ -375,6 +403,7 @@ impl SemanticStore {
                 applied_lsn: Arc::clone(&applied_lsn_atomic),
                 index: Arc::clone(&index),
                 write_lock: Arc::clone(&write_lock),
+                aead: aead.clone(),
             });
             let task_state = Arc::clone(&state);
             let join = tokio::spawn(async move {
@@ -697,6 +726,7 @@ impl SemanticStore {
                 &self.applied_lsn,
                 &snapshot_path,
                 &wal_dir,
+                None,
             )
             .await;
         };

@@ -18,6 +18,7 @@
 
 - [CLI surface](./cli.md)
 - [Configuration](./configuration.md)
+- [Encryption at rest](./encryption.md)
 - [Troubleshooting](./troubleshooting.md)
 - [Versioning](./versioning.md)
 

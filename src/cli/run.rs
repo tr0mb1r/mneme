@@ -35,7 +35,6 @@ use crate::scope::ScopeState;
 use crate::storage::Storage;
 use crate::storage::layout;
 use crate::storage::lockfile::LockGuard;
-use crate::storage::redb_impl::RedbStorage;
 use crate::{MnemeError, migrate};
 
 /// Lightweight RAII guard for the daemon's per-connection
@@ -159,8 +158,18 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
 
     let lock_path = root.join(".lock");
     let lock = LockGuard::acquire(&lock_path)?;
-    let storage = RedbStorage::open(&root.join("episodic"))?;
-    let storage_dyn: Arc<dyn Storage> = Arc::clone(&storage) as Arc<dyn Storage>;
+
+    // ADR-0013 P7: if the data dir has a keystore.json, the daemon
+    // refuses to bind its socket without a KEK (keyring entry OR
+    // MNEME_RECOVERY_PHRASE env). When encryption is off, this is a
+    // single Keystore::load returning None and the legacy plaintext
+    // path is taken — no observable behaviour change for v1.0/v1.1
+    // users. When encryption is on, every byte written below this
+    // line through `storage_dyn`, `procedural`, sessions, semantic
+    // snapshot, and cold archive is sealed before it lands on disk.
+    let keyring = crate::crypto::OsKeyring::new();
+    let (storage_dyn, data_aead) =
+        crate::crypto::boot::open_episodic_storage_and_aead(&root, &keyring)?;
 
     let embedder = build_embedder(&config, &root)?;
     let active_model_name = active_embedder_model_name(&config);
@@ -201,12 +210,18 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
         enabled: true,
     };
     let semantic = runtime.block_on(async {
-        SemanticStore::open(&root, Arc::clone(&storage_dyn), embedder, snap_cfg)
+        SemanticStore::open_with_crypto(
+            &root,
+            Arc::clone(&storage_dyn),
+            embedder,
+            snap_cfg,
+            data_aead.clone(),
+        )
     })?;
-    let procedural = Arc::new(ProceduralStore::open(&root)?);
+    let procedural = Arc::new(ProceduralStore::open_with_crypto(&root, data_aead.clone())?);
     let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage_dyn)));
     let auto_context_budget = TokenBudget::from_config(&config.budgets);
-    let cold = crate::storage::archive::ColdArchive::new(&root);
+    let cold = crate::storage::archive::ColdArchive::new_with_crypto(&root, data_aead.clone());
 
     // Process-lifetime "current scope" cell. Initialised from
     // `[scopes] default`; mutated by the `switch_scope` tool.
@@ -289,7 +304,7 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     // L1 working session + its checkpoint scheduler. One ActiveSession
     // per `mneme run` lifetime; the scheduler flushes on the configured
     // cadence + on shutdown.
-    let active_session = ActiveSession::open(root.join("sessions"))?;
+    let active_session = ActiveSession::open_with_crypto(root.join("sessions"), data_aead.clone())?;
     let checkpoint_scheduler = runtime.block_on(async {
         CheckpointScheduler::start(
             Arc::clone(&active_session),

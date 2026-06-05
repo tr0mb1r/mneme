@@ -34,6 +34,7 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -96,12 +97,29 @@ impl Quarter {
 #[derive(Clone)]
 pub struct ColdArchive {
     dir: PathBuf,
+    /// When `Some`, the compressed zstd bundle is sealed as a
+    /// whole-file AEAD envelope before write (ADR-0013 P5c). Reads
+    /// expect the same envelope. `None` is the legacy plaintext-zstd
+    /// path that v1.0/v1.1 dirs use.
+    aead: Option<Arc<crate::crypto::Aead>>,
 }
 
 impl ColdArchive {
     pub fn new(root: &Path) -> Self {
         Self {
             dir: root.join(COLD_SUBDIR),
+            aead: None,
+        }
+    }
+
+    /// Variant of [`new`] that takes an optional AEAD codec. The
+    /// daemon boot path passes the same codec used for the redb
+    /// stack, so cold archives stay on the same key as the rest of
+    /// the data dir.
+    pub fn new_with_crypto(root: &Path, aead: Option<Arc<crate::crypto::Aead>>) -> Self {
+        Self {
+            dir: root.join(COLD_SUBDIR),
+            aead,
         }
     }
 
@@ -222,45 +240,92 @@ impl ColdArchive {
     }
 
     fn read_bundle(&self, path: &Path) -> Result<ColdBundle> {
-        let f = OpenOptions::new().read(true).open(path)?;
-        let mut decoder =
-            zstd::Decoder::new(f).map_err(|e| MnemeError::Storage(format!("zstd init: {e}")))?;
+        // Encrypted path: read the whole envelope, AEAD-open, then
+        // pass the resulting zstd bytes to the decoder.
+        let zstd_bytes = if let Some(aead) = self.aead.as_deref() {
+            let raw = std::fs::read(path).map_err(MnemeError::Io)?;
+            let position = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .as_bytes();
+            aead.open(crate::crypto::AadDomain::Cold, position, &raw)?
+        } else {
+            let f = OpenOptions::new().read(true).open(path)?;
+            let mut decoder = zstd::Decoder::new(f)
+                .map_err(|e| MnemeError::Storage(format!("zstd init: {e}")))?;
+            let mut buf = Vec::new();
+            decoder
+                .read_to_end(&mut buf)
+                .map_err(|e| MnemeError::Storage(format!("zstd decompress: {e}")))?;
+            return decode_bundle(path, &buf);
+        };
+        // Decrypt path is straight to zstd-decompress the now-plaintext
+        // compressed bytes.
+        let mut decoder = zstd::Decoder::new(zstd_bytes.as_slice())
+            .map_err(|e| MnemeError::Storage(format!("zstd init: {e}")))?;
         let mut buf = Vec::new();
         decoder
             .read_to_end(&mut buf)
             .map_err(|e| MnemeError::Storage(format!("zstd decompress: {e}")))?;
-        let bundle: ColdBundle = postcard::from_bytes(&buf)
-            .map_err(|e| MnemeError::Storage(format!("decode ColdBundle: {e}")))?;
-        if bundle.schema != COLD_BUNDLE_SCHEMA {
-            return Err(MnemeError::Storage(format!(
-                "cold bundle {path:?} schema {} != supported {COLD_BUNDLE_SCHEMA}",
-                bundle.schema
-            )));
-        }
-        Ok(bundle)
+        decode_bundle(path, &buf)
     }
 
     fn write_bundle(&self, path: &Path, bundle: &ColdBundle) -> Result<()> {
         let payload = postcard::to_allocvec(bundle)
             .map_err(|e| MnemeError::Storage(format!("encode ColdBundle: {e}")))?;
+
+        // Always zstd-compress first; encryption wraps the compressed
+        // bytes whole. Order matters: compress-then-encrypt preserves
+        // compressibility (a ciphertext is high-entropy and would not
+        // compress) and keeps the envelope length predictable.
+        let mut compressed: Vec<u8> = Vec::new();
+        let mut enc = zstd::Encoder::new(&mut compressed, ZSTD_LEVEL)
+            .map_err(|e| MnemeError::Storage(format!("zstd encoder init: {e}")))?;
+        enc.write_all(&payload)?;
+        enc.finish()
+            .map_err(|e| MnemeError::Storage(format!("zstd encoder finish: {e}")))?;
+
+        if let Some(aead) = self.aead.as_deref() {
+            let position = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .as_bytes();
+            return crate::crypto::file_envelope::seal_to_path(
+                path,
+                crate::crypto::AadDomain::Cold,
+                position,
+                aead,
+                &compressed,
+            );
+        }
+
         let tmp = tmp_path_for(path);
         {
-            let f = OpenOptions::new()
+            let mut f = OpenOptions::new()
                 .create(true)
                 .truncate(true)
                 .write(true)
                 .open(&tmp)?;
-            let mut enc = zstd::Encoder::new(f, ZSTD_LEVEL)
-                .map_err(|e| MnemeError::Storage(format!("zstd encoder init: {e}")))?;
-            enc.write_all(&payload)?;
-            let f = enc
-                .finish()
-                .map_err(|e| MnemeError::Storage(format!("zstd encoder finish: {e}")))?;
+            f.write_all(&compressed)?;
             f.sync_all()?;
         }
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
+}
+
+fn decode_bundle(path: &Path, buf: &[u8]) -> Result<ColdBundle> {
+    let bundle: ColdBundle = postcard::from_bytes(buf)
+        .map_err(|e| MnemeError::Storage(format!("decode ColdBundle: {e}")))?;
+    if bundle.schema != COLD_BUNDLE_SCHEMA {
+        return Err(MnemeError::Storage(format!(
+            "cold bundle {path:?} schema {} != supported {COLD_BUNDLE_SCHEMA}",
+            bundle.schema
+        )));
+    }
+    Ok(bundle)
 }
 
 fn tmp_path_for(path: &Path) -> PathBuf {

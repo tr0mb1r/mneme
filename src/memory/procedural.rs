@@ -50,8 +50,14 @@ use chrono::{DateTime, Utc};
 use notify::{Config, EventKind, PollWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::{AadDomain, Aead, file_envelope};
 use crate::ids::MemoryId;
 use crate::{MnemeError, Result};
+
+/// AAD position bytes for the whole-file procedural envelope.
+/// Bound to the on-disk format version; bumping this also rolls the
+/// AAD so a future v2 ciphertext cannot be mis-opened by v1 code.
+const PINNED_AAD_POSITION: &[u8] = b"pinned.jsonl/v1";
 
 /// Poll interval for the file watcher.
 ///
@@ -105,16 +111,35 @@ pub struct ProceduralStore {
     /// alive. Wrapped in `Option` only so `Drop` can take it out
     /// before joining; today we let RAII handle it.
     _watcher: Option<PollWatcher>,
+    /// When `Some`, the on-disk `pinned.jsonl` is whole-file
+    /// encrypted under this AEAD (ADR-0013 P5b). All reads decrypt
+    /// to plaintext JSONL; all writes re-encrypt the whole file
+    /// atomically. When `None`, the legacy plaintext path is taken
+    /// for full v1.0/v1.1 backward compatibility.
+    aead: Option<Arc<Aead>>,
 }
 
 impl ProceduralStore {
+    /// Plaintext mode — kept for v1.0/v1.1 callers and for tests that
+    /// don't care about the encryption surface.
+    pub fn open(root: &Path) -> Result<Self> {
+        Self::open_with_crypto(root, None)
+    }
+
     /// Open or create the procedural store rooted at `<root>/procedural/`.
     ///
-    /// Creates the directory + an empty `pinned.jsonl` if neither
-    /// exists. Loading errors (corrupt JSON, partial lines) emit a
-    /// `tracing::warn` and skip the offending entry; the rest of the
-    /// file still loads.
-    pub fn open(root: &Path) -> Result<Self> {
+    /// When `aead` is `Some`, the daemon boot path is in
+    /// encrypted mode: reads expect an `MNE1` envelope over the JSONL
+    /// content, writes re-encrypt the whole file atomically. When
+    /// `None`, the legacy plaintext JSONL format is used.
+    ///
+    /// Loading errors (corrupt JSON, partial lines) in plaintext mode
+    /// emit a `tracing::warn` and skip the offending entry; the rest
+    /// of the file still loads. In encrypted mode the same forgiving
+    /// behaviour applies AFTER the whole-file decrypt — a malformed
+    /// `pinned.jsonl` envelope itself surfaces as a hard error
+    /// because there is no useful partial-read recovery.
+    pub fn open_with_crypto(root: &Path, aead: Option<Arc<Aead>>) -> Result<Self> {
         let dir = root.join("procedural");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(PINNED_FILE);
@@ -122,7 +147,7 @@ impl ProceduralStore {
             std::fs::write(&path, b"")?;
         }
 
-        let initial = read_file(&path)?;
+        let initial = read_file(&path, aead.as_deref())?;
         let cache = Arc::new(Mutex::new(initial));
         let stale = Arc::new(AtomicBool::new(false));
 
@@ -134,6 +159,7 @@ impl ProceduralStore {
             stale,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             _watcher: Some(watcher),
+            aead,
         })
     }
 
@@ -142,7 +168,7 @@ impl ProceduralStore {
     /// cache is rebuilt from disk first.
     pub fn list(&self, scope: Option<&str>) -> Result<Vec<PinnedItem>> {
         if self.stale.swap(false, Ordering::SeqCst) {
-            let fresh = read_file(&self.path)?;
+            let fresh = read_file(&self.path, self.aead.as_deref())?;
             *self
                 .cache
                 .lock()
@@ -171,10 +197,19 @@ impl ProceduralStore {
         let id = item.id;
 
         let _g = self.write_lock.lock().await;
-        // Serialize ONE line, append.
-        let line = serde_json::to_string(&item)
-            .map_err(|e| MnemeError::Storage(format!("encode pinned: {e}")))?;
-        append_line(&self.path, &line)?;
+        if self.aead.is_some() {
+            // Encrypted mode: whole-file rewrite (no useful append
+            // semantics under AEAD, and the file is small enough
+            // that rewriting is cheap).
+            let mut all = read_file(&self.path, self.aead.as_deref())?;
+            all.push(item.clone());
+            rewrite_file(&self.path, &all, self.aead.as_deref())?;
+        } else {
+            // Plaintext mode: single-line append (legacy path).
+            let line = serde_json::to_string(&item)
+                .map_err(|e| MnemeError::Storage(format!("encode pinned: {e}")))?;
+            append_line(&self.path, &line)?;
+        }
 
         // Update the in-memory cache directly so the next list() call
         // doesn't have to re-read the file.
@@ -198,7 +233,7 @@ impl ProceduralStore {
 
         // Re-read from disk to avoid trusting a possibly-stale cache.
         // External edits could have already removed the row.
-        let current = read_file(&self.path)?;
+        let current = read_file(&self.path, self.aead.as_deref())?;
         let mut found = false;
         let kept: Vec<PinnedItem> = current
             .into_iter()
@@ -215,7 +250,7 @@ impl ProceduralStore {
             return Ok(false);
         }
 
-        rewrite_file(&self.path, &kept)?;
+        rewrite_file(&self.path, &kept, self.aead.as_deref())?;
         let mut g = self
             .cache
             .lock()
@@ -234,13 +269,20 @@ impl ProceduralStore {
 
 // ---------- File I/O ----------
 
-fn read_file(path: &Path) -> Result<Vec<PinnedItem>> {
+fn read_file(path: &Path, aead: Option<&Aead>) -> Result<Vec<PinnedItem>> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(MnemeError::Io(e)),
     };
-    let text = match std::str::from_utf8(&bytes) {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let plaintext = match aead {
+        Some(a) => a.open(AadDomain::Pinned, PINNED_AAD_POSITION, &bytes)?,
+        None => bytes,
+    };
+    let text = match std::str::from_utf8(&plaintext) {
         Ok(s) => s,
         Err(e) => {
             return Err(MnemeError::Storage(format!(
@@ -285,12 +327,26 @@ fn append_line(path: &Path, line: &str) -> Result<()> {
     Ok(())
 }
 
-fn rewrite_file(path: &Path, items: &[PinnedItem]) -> Result<()> {
+fn rewrite_file(path: &Path, items: &[PinnedItem], aead: Option<&Aead>) -> Result<()> {
     use std::fs::OpenOptions;
     use std::io::Write;
-    // Atomic temp + rename, mirrors `snapshot::save`. A `kill -9`
-    // mid-rewrite leaves either the old or new file, never a torn
-    // partial.
+
+    // Encrypted path: build the whole JSONL in memory, seal it,
+    // then atomic-write via the file_envelope helper.
+    if let Some(a) = aead {
+        let mut buf: Vec<u8> = Vec::new();
+        for it in items {
+            let line = serde_json::to_string(it)
+                .map_err(|e| MnemeError::Storage(format!("encode pinned: {e}")))?;
+            buf.extend_from_slice(line.as_bytes());
+            buf.push(b'\n');
+        }
+        return file_envelope::seal_to_path(path, AadDomain::Pinned, PINNED_AAD_POSITION, a, &buf);
+    }
+
+    // Plaintext path: atomic temp + rename, mirrors `snapshot::save`.
+    // A `kill -9` mid-rewrite leaves either the old or new file,
+    // never a torn partial.
     let tmp = tmp_path_for(path);
     {
         let mut f = OpenOptions::new()

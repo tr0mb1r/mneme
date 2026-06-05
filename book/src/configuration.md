@@ -102,12 +102,22 @@ data dir crosses this number. Tracked under `Phase 7 polish`.
 |---|---|
 | **Type** | bool |
 | **Default** | `false` |
-| **Affects** | (unused) |
+| **Affects** | (advisory — see below) |
 
-Reserved for at-rest encryption. Setting it to `true` today is a
-no-op; mneme will either implement it via redb's
-upcoming encryption extension or via a wrapping layer. Don't depend
-on this field yet.
+In v1.2+ this field is **advisory only**. The decision of whether
+mneme is running encrypted is made by the presence of
+`~/.mneme/keystore.json`, not by this flag. To enable encryption,
+run `mneme encrypt`; to disable it, run `mneme decrypt
+--yes-i-really-mean-it`. See the [Encryption at rest](./encryption.md)
+chapter for the full workflow, including how to recover on a new
+machine via the 12-word BIP39 mnemonic.
+
+Earlier mneme docs said this flag would be wired to a future opt-in;
+v1.2 ships the feature with `mneme encrypt` as the user-facing
+trigger instead, because tying it to a config field would silently
+re-encrypt or decrypt the data dir on the next daemon boot — a
+foot-gun for users who edit `config.toml` without realising what it
+implies.
 
 ---
 

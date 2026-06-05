@@ -52,6 +52,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod crypto;
 pub mod daemon;
 pub mod embed;
 pub mod error;
