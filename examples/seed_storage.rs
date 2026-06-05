@@ -17,8 +17,8 @@
 //! Not a public library API; kept under `examples/` so it doesn't
 //! show up in `cargo install mneme-mcp` artifacts.
 
-use mneme::crypto::{KekStore, OsKeyring};
 use mneme::crypto::boot::open_episodic_storage;
+use mneme::crypto::{KekStore, OsKeyring};
 use mneme::memory::procedural::ProceduralStore;
 use mneme::storage::Storage;
 use mneme::storage::redb_impl::RedbStorage;
