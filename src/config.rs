@@ -331,6 +331,20 @@ impl Config {
         toml::from_str(&text).map_err(|e| MnemeError::Config(format!("{path:?}: {e}")))
     }
 
+    /// Like [`Config::load`], but also reports whether the file was
+    /// actually present (`true`) or absent (`false` — in which case the
+    /// returned config is all built-in defaults).
+    ///
+    /// The daemon uses the `present` flag to emit a boot-time warning
+    /// when it's silently running on defaults (see the troubleshooting
+    /// note "config.toml is missing"). Plain [`Config::load`] stays
+    /// side-effect-free so the pre-subscriber logging bootstrap
+    /// (`main::load_logging_config`) and `stats` / `inspect` don't warn.
+    pub fn load_reporting(path: &Path) -> Result<(Self, bool)> {
+        let present = path.exists();
+        Ok((Self::load(path)?, present))
+    }
+
     /// Serialize the full config (with all defaults made explicit) to disk.
     /// Used by `mneme init` to drop a starter `config.toml` next to the
     /// user, where they can edit it.
@@ -381,6 +395,25 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("absent.toml");
         let c = Config::load(&p).unwrap();
+        assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn load_reporting_flags_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("absent.toml");
+        let (c, present) = Config::load_reporting(&p).unwrap();
+        assert!(!present, "absent file must report present=false");
+        assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn load_reporting_flags_present_file() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("config.toml");
+        Config::default().write(&p).unwrap();
+        let (c, present) = Config::load_reporting(&p).unwrap();
+        assert!(present, "existing file must report present=true");
         assert_eq!(c, Config::default());
     }
 
