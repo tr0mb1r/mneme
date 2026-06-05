@@ -222,7 +222,8 @@ impl ToolRegistry {
         // tool also pushes a turn to the active session, so L1
         // captures conversation content rather than just tool names.
         let mut record_event_tool =
-            record_event::RecordEvent::new(Arc::clone(&episodic), Arc::clone(&scope_state));
+            record_event::RecordEvent::new(Arc::clone(&episodic), Arc::clone(&scope_state))
+                .with_max_chars(max_remember_chars);
         if let Some(ref session) = active_session {
             record_event_tool = record_event_tool.with_active_session(Arc::clone(session));
         }

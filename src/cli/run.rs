@@ -323,6 +323,7 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
                 root: root.clone(),
                 orchestrator: Arc::clone(&orchestrator),
                 scope_state,
+                default_scope: config.scopes.default.clone(),
                 sessions_dir,
                 auto_context_budget,
                 schema_version: on_disk_version.max(migrate::CURRENT_SCHEMA_VERSION),
@@ -402,6 +403,12 @@ struct DaemonRuntimeConfig {
     root: std::path::PathBuf,
     orchestrator: Arc<Orchestrator>,
     scope_state: Arc<ScopeState>,
+    /// Boot-time `[scopes] default` value. SEC-001: `DaemonServeMany`
+    /// constructs a fresh `ScopeState` cell from this string for every
+    /// accepted connection so `switch_scope` writes can't leak across
+    /// concurrent agents. The shared `scope_state` above is still used
+    /// by the single-client transports (`Stdio`, `DaemonAcceptOne`).
+    default_scope: String,
     sessions_dir: std::path::PathBuf,
     auto_context_budget: TokenBudget,
     schema_version: u32,
@@ -441,6 +448,7 @@ async fn async_main(
         root,
         orchestrator,
         scope_state,
+        default_scope,
         sessions_dir,
         auto_context_budget,
         schema_version,
@@ -514,14 +522,14 @@ async fn async_main(
             Arc::clone(&semantic),
             Arc::clone(&procedural),
             Arc::clone(&episodic),
-            orchestrator,
+            Arc::clone(&orchestrator),
             cold.clone(),
             schema_version,
             auto_context_budget,
             Some(Arc::clone(&consolidation)),
             Some(Arc::clone(&checkpoint_scheduler)),
             Some(Arc::clone(&active_session)),
-            Some(sessions_dir),
+            Some(sessions_dir.clone()),
             Some(Arc::clone(&scope_state)),
             Some((Arc::clone(&storage), max_remember_chars)),
         ));
@@ -679,13 +687,58 @@ async fn async_main(
                         match listener.as_inner().accept().await {
                             Ok((stream, _addr)) => {
                                 let (read, write) = stream.into_split();
-                                let tool = Arc::clone(&tool_registry);
-                                let resource = Arc::clone(&resource_registry);
-                                let storage = Arc::clone(&storage);
+                                // SEC-001: a fresh `ScopeState` cell per
+                                // accepted connection so `switch_scope`
+                                // writes from one agent never leak into
+                                // another agent's stream. The shared
+                                // boot-time `scope_state` (used by the
+                                // single-client transports above) is
+                                // intentionally NOT cloned in here.
+                                let scope_c = ScopeState::new(&default_scope);
+                                // Per-connection registries bind the
+                                // fresh scope cell into every tool that
+                                // reads it (`remember`, `pin`,
+                                // `record_event`, `switch_scope`,
+                                // `stats`) and into the resource layer
+                                // (`mneme://stats` reports the agent's
+                                // current scope). The backing stores
+                                // (semantic / procedural / episodic /
+                                // storage / cold) stay shared via
+                                // Arc — only the `ScopeState` differs.
+                                let tool: Arc<ToolRegistry> =
+                                    Arc::new(ToolRegistry::defaults_with_schedulers(
+                                        Arc::clone(&semantic),
+                                        Arc::clone(&procedural),
+                                        Arc::clone(&episodic),
+                                        Arc::clone(&storage),
+                                        cold.clone(),
+                                        schema_version,
+                                        Some(Arc::clone(&consolidation)),
+                                        Some(Arc::clone(&checkpoint_scheduler)),
+                                        Arc::clone(&scope_c),
+                                        Some(Arc::clone(&active_session)),
+                                        max_remember_chars,
+                                    ));
+                                let resource: Arc<ResourceRegistry> =
+                                    Arc::new(ResourceRegistry::defaults_with_schedulers(
+                                        Arc::clone(&semantic),
+                                        Arc::clone(&procedural),
+                                        Arc::clone(&episodic),
+                                        Arc::clone(&orchestrator),
+                                        cold.clone(),
+                                        schema_version,
+                                        auto_context_budget,
+                                        Some(Arc::clone(&consolidation)),
+                                        Some(Arc::clone(&checkpoint_scheduler)),
+                                        Some(Arc::clone(&active_session)),
+                                        Some(sessions_dir.clone()),
+                                        Some(Arc::clone(&scope_c)),
+                                        Some((Arc::clone(&storage), max_remember_chars)),
+                                    ));
+                                let storage_c = Arc::clone(&storage);
                                 let active_session_c = Arc::clone(&active_session);
                                 let checkpoint_c = Arc::clone(&checkpoint_scheduler);
                                 let episodic_c = Arc::clone(&episodic);
-                                let scope_c = Arc::clone(&scope_state);
                                 let counter = Arc::clone(&active_clients);
                                 let root_for_auth = Arc::clone(&daemon_root);
                                 let mut shutdown_rx = shutdown_rx_outer.clone();
@@ -750,7 +803,7 @@ async fn async_main(
                                         transport,
                                         tool,
                                         resource,
-                                        storage,
+                                        storage_c,
                                     )
                                     .with_session(
                                         active_session_c,
