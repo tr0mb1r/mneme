@@ -20,10 +20,6 @@
 //!    a follow-up A.M2 closing-touch commit; today's behaviour is
 //!    preserve-explicit-stdio + leave-default-stdio).
 //!
-//! `tests/upgrade/v1_1_to_v1_0_rollback.rs` is the sibling test
-//! (Q2, blocked on the v1.0.1 backup-run-exclusion patch landing
-//! upstream; see task #17).
-//!
 //! Linux + macOS only — the Windows daemon-mode integration tests
 //! land in M4 alongside the named-pipe support.
 
