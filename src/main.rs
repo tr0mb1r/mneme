@@ -2,7 +2,7 @@ use clap::Parser;
 use file_rotate::compression::Compression;
 use file_rotate::suffix::AppendCount;
 use file_rotate::{ContentLimit, FileRotate};
-use mneme::cli::{Cli, dispatch};
+use mneme::cli::{Cli, Command, dispatch};
 use mneme::config::{Config, LoggingConfig};
 use mneme::storage::layout;
 use std::path::PathBuf;
@@ -20,14 +20,23 @@ use tracing_subscriber::{EnvFilter, Registry, fmt};
 static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
 fn main() -> anyhow::Result<()> {
-    init_logging();
-    tracing::debug!("mneme {} starting", env!("CARGO_PKG_VERSION"));
     let cli = Cli::parse();
+    // Only the long-running daemon (`run` / `daemon`) honors the
+    // `[daemon] log_level` override, so short-lived CLI commands stay
+    // quiet (see init_logging).
+    let is_daemon = matches!(cli.command, Command::Run | Command::Daemon { .. });
+    init_logging(is_daemon);
+    tracing::debug!("mneme {} starting", env!("CARGO_PKG_VERSION"));
     dispatch(cli).map_err(Into::into)
 }
 
-fn init_logging() {
-    let logging = load_logging_config();
+fn init_logging(is_daemon: bool) {
+    let config = load_config();
+    let logging = &config.logging;
+
+    // `[daemon] log_level` raises (or lowers) the file-log verbosity for
+    // the daemon only; CLI commands keep the global `[logging] level`.
+    let file_level = config.effective_file_log_level(is_daemon);
 
     let stderr_layer = fmt::layer()
         .with_writer(std::io::stderr)
@@ -35,33 +44,34 @@ fn init_logging() {
         .boxed();
 
     let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![stderr_layer];
-    if let Some(file_layer) = build_file_layer(&logging) {
+    if let Some(file_layer) = build_file_layer(logging, file_level) {
         layers.push(file_layer);
     }
 
     tracing_subscriber::registry().with(layers).init();
 }
 
-// Read `<root>/config.toml` for the `[logging]` section. Silently
-// returns defaults on any failure — this runs *before* the tracing
-// subscriber exists (it's what configures it), so a warning here
-// would be dropped anyway. The daemon boot path warns about a missing
-// config once logging is live, via `Config::load_reporting` in
-// `cli::run` (troubleshooting: "config.toml is missing").
-fn load_logging_config() -> LoggingConfig {
+// Read `<root>/config.toml`. Silently returns defaults on any failure —
+// this runs *before* the tracing subscriber exists (it's what configures
+// it), so a warning here would be dropped anyway. The daemon boot path
+// warns about a missing config once logging is live, via
+// `Config::load_reporting` in `cli::run` (troubleshooting: "config.toml
+// is missing").
+fn load_config() -> Config {
     let Some(root) = layout::default_root() else {
-        return LoggingConfig::default();
+        return Config::default();
     };
-    Config::load(&root.join("config.toml"))
-        .map(|c| c.logging)
-        .unwrap_or_default()
+    Config::load(&root.join("config.toml")).unwrap_or_default()
 }
 
 // Build the rotating file-appender layer if the configured log
 // path's parent directory is reachable. Returns `None` on any
 // resolution / mkdir failure so the binary still boots with
 // stderr-only logging instead of crashing.
-fn build_file_layer(logging: &LoggingConfig) -> Option<Box<dyn Layer<Registry> + Send + Sync>> {
+fn build_file_layer(
+    logging: &LoggingConfig,
+    file_level: &str,
+) -> Option<Box<dyn Layer<Registry> + Send + Sync>> {
     // v1.0-shaped configs ship `file = ""` as a "use the default"
     // sentinel (the field was unread pre-v1.1.x logging fix); honor
     // that by falling back to the same path `LoggingConfig::default()`
@@ -107,7 +117,7 @@ fn build_file_layer(logging: &LoggingConfig) -> Option<Box<dyn Layer<Registry> +
         fmt::layer()
             .with_writer(writer)
             .with_ansi(false)
-            .with_filter(file_filter(&logging.level))
+            .with_filter(file_filter(file_level))
             .boxed(),
     )
 }

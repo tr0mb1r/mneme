@@ -47,7 +47,6 @@ sse_port  = 7878
 
 [daemon]
 idle_timeout_minutes = 30
-auth_token_path      = "default"
 log_level            = "default"
 
 [telemetry]
@@ -464,21 +463,10 @@ SIGTERM. Counted from "last client disconnected", not "last request
 seen", so a long HNSW snapshot that blocks requests but not
 connections doesn't accidentally trigger shutdown.
 
-### `auth_token_path`
-
-| | |
-|---|---|
-| **Type** | string (path or `"default"`) |
-| **Default** | `"default"` (resolves to `~/.mneme/run/auth.token`) |
-| **Affects** | daemon authentication (ADR-0012 D3) |
-
-Path to the auth-token file. The token value lives in **exactly one
-file** with mode `0600`; agent configs reference the path, never
-the value. `mneme auth rotate` rewrites only this file (atomically
-via tmpfile + rename per D4); clients pick up the new value on
-next connection. NEVER embed the token value in `settings.json`,
-`claude_desktop_config.json`, `.cursorrules`, or any other agent
-config file.
+The auth-token file is always `~/.mneme/run/auth.token` (mode `0600`);
+agent configs reference that path, never the token value. NEVER embed the
+token value in `settings.json`, `claude_desktop_config.json`,
+`.cursorrules`, or any other agent config file.
 
 ### `log_level`
 
