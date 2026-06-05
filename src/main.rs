@@ -43,10 +43,11 @@ fn init_logging() {
 }
 
 // Read `<root>/config.toml` for the `[logging]` section. Silently
-// returns defaults on any failure — the binary must boot even if
-// the config is missing/malformed (see also the silent-default
-// behaviour of `Config::load` itself, which the troubleshooting
-// docs flag as a known UX gap).
+// returns defaults on any failure — this runs *before* the tracing
+// subscriber exists (it's what configures it), so a warning here
+// would be dropped anyway. The daemon boot path warns about a missing
+// config once logging is live, via `Config::load_reporting` in
+// `cli::run` (troubleshooting: "config.toml is missing").
 fn load_logging_config() -> LoggingConfig {
     let Some(root) = layout::default_root() else {
         return LoggingConfig::default();

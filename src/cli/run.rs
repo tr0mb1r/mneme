@@ -136,7 +136,14 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     layout::scaffold(&root)?;
 
     let config_path = root.join("config.toml");
-    let config = Config::load(&config_path)?;
+    let (config, config_present) = Config::load_reporting(&config_path)?;
+    if !config_present {
+        tracing::warn!(
+            path = %config_path.display(),
+            "config.toml not found; running on built-in defaults — \
+             run `mneme init` to write an editable config"
+        );
+    }
 
     let on_disk_version = migrate::current_version(&root)?;
     if on_disk_version > migrate::CURRENT_SCHEMA_VERSION {
