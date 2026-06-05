@@ -46,7 +46,7 @@ jobs:
     # up). Cap at 20 minutes so a wedged bench doesn't sit forever.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -95,7 +95,7 @@ jobs:
 
       - name: archive criterion report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: criterion-report-${{ github.sha }}
           path: |
