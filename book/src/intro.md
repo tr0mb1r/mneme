@@ -23,14 +23,18 @@ work that the agent would otherwise forget.**
 
 ## Status
 
-**v1.1.1 shipped 2026-05-23** (v1.0 tagged 2026-05-18). Latest
-release on [`mneme-mcp`](https://crates.io/crates/mneme-mcp)
-(crates.io) and the [Homebrew tap](https://github.com/tr0mb1r/homebrew-mneme).
-The MCP wire surface is the semver-tracked contract from 1.0 onward
-(see [MCP surface](./mcp-surface.md)); the Rust library API is
-private. The on-disk format is stable behind a versioned schema
-with a migration path. See [Versioning](./versioning.md) and
-[v1.1 release notes](./release-notes-v1_1.md) for what's new.
+**v1.2.0 shipped 2026-06-06.** Previous: v1.1.1 (2026-05-23), v1.0
+(2026-05-18). Latest release on
+[`mneme-mcp`](https://crates.io/crates/mneme-mcp) (crates.io) and the
+[Homebrew tap](https://github.com/tr0mb1r/homebrew-mneme). The MCP wire
+surface is the semver-tracked contract from 1.0 onward (see [MCP
+surface](./mcp-surface.md)); the Rust library API is private. The
+on-disk format is stable behind a versioned schema with a migration
+path. v1.2 adds **encryption at rest** (opt-in, XChaCha20-Poly1305
+AEAD, OS keyring KEK + BIP39 recovery phrase) and **`recall_recent`
+time-range bounds** (`since`/`until`). See
+[v1.2 release notes](./release-notes-v1_2.md) and
+[Versioning](./versioning.md) for details.
 
 ## What works today
 
