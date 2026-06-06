@@ -633,6 +633,45 @@ fn replay_inner(dir: &Path, aead: Option<Arc<Aead>>) -> Result<Replay> {
     })
 }
 
+/// Sniff whether the segments in `dir` carry sealed (MNE1-enveloped)
+/// frame payloads, by inspecting the first frame of the first segment.
+///
+/// Returns `None` when there are no segments or no complete first
+/// frame to inspect. Sound because a plaintext payload is a postcard
+/// `WalOp` whose first byte is a small varint discriminant — it can
+/// never start with the 4-byte envelope magic — and a WAL directory is
+/// written entirely in one mode (segments are dropped wholesale on an
+/// encrypt/decrypt migration, never mixed).
+///
+/// Used by `crypto::migration` to pick the right replay mode when
+/// folding outstanding semantic-WAL records into the snapshot.
+pub fn segments_look_encrypted(dir: &Path) -> Result<Option<bool>> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let segments = list_segments(dir)?;
+    let Some((_lsn, path)) = segments.first() else {
+        return Ok(None);
+    };
+    let mut reader = BufReader::new(File::open(path).map_err(MnemeError::Io)?);
+    let mut header = [0u8; HEADER_BYTES];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(MnemeError::Io(e)),
+    }
+    let payload_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    if payload_len < crate::crypto::MAGIC.len() || payload_len > MAX_PAYLOAD_BYTES {
+        return Ok(None);
+    }
+    let mut prefix = [0u8; 4];
+    match reader.read_exact(&mut prefix) {
+        Ok(()) => Ok(Some(prefix == crate::crypto::MAGIC)),
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(MnemeError::Io(e)),
+    }
+}
+
 pub struct Replay {
     segments: Vec<(u64, PathBuf)>,
     idx: usize,

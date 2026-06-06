@@ -44,7 +44,11 @@ use std::path::{Path, PathBuf};
 const MAGIC: &[u8; 14] = b"MNEME-HNSW-IDX";
 const CURRENT_SCHEMA: u16 = 2;
 /// AAD position for the whole-file snapshot envelope (ADR-0013 P5d).
-const SNAPSHOT_AAD_POSITION: &[u8] = b"hnsw.idx/v1";
+/// `pub(crate)` so `crypto::migration` seals with the *same* position
+/// this module opens with — the v1.2.0 migration used the bare
+/// filename instead and every encrypted snapshot failed its tag check
+/// on the next boot.
+pub(crate) const SNAPSHOT_AAD_POSITION: &[u8] = b"hnsw.idx/v1";
 
 /// Persist the full index state to `path` atomically.
 ///
@@ -137,6 +141,14 @@ pub fn load_with_crypto(path: &Path, aead: Option<&Aead>) -> Result<(HnswIndex, 
             .open(AadDomain::Hnsw, SNAPSHOT_AAD_POSITION, &bytes)
             .map_err(|e| MnemeError::Index(format!("open snapshot {path:?}: {e}")))?;
     }
+    decode(&bytes, path)
+}
+
+/// Parse the plaintext `MAGIC || schema || lsn || postcard` blob.
+/// Split out of [`load_with_crypto`] so `crypto::migration` can decode
+/// snapshot bytes it has already AEAD-opened (possibly under the
+/// legacy v1.2.0 AAD position) without a second disk round-trip.
+pub(crate) fn decode(bytes: &[u8], path: &Path) -> Result<(HnswIndex, u64)> {
     if bytes.len() < MAGIC.len() + 2 + 8 {
         return Err(MnemeError::Index(format!(
             "snapshot {path:?} too short ({} bytes)",

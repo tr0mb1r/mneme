@@ -107,6 +107,7 @@ pub async fn migrate_if_needed(
     storage: Arc<dyn Storage>,
     embedder: Arc<dyn Embedder>,
     model_name: &str,
+    aead: Option<Arc<crate::crypto::Aead>>,
 ) -> Result<Outcome> {
     let semantic_root = root.join("semantic");
     let sidecar_path = semantic_root.join(SIDECAR_FILE);
@@ -119,7 +120,7 @@ pub async fn migrate_if_needed(
     }
 
     // Mismatch (or first boot after this fix lands). Re-embed.
-    let count = re_embed_all(&semantic_root, &*storage, &*embedder).await?;
+    let count = re_embed_all(&semantic_root, &*storage, &*embedder, aead.as_deref()).await?;
     current.write(&sidecar_path)?;
     Ok(Outcome::Migrated { count })
 }
@@ -128,6 +129,7 @@ async fn re_embed_all(
     semantic_root: &Path,
     storage: &dyn Storage,
     embedder: &dyn Embedder,
+    aead: Option<&crate::crypto::Aead>,
 ) -> Result<usize> {
     // 1. Wipe stale snapshot + WAL. Best-effort: missing files are
     //    fine; permission errors propagate.
@@ -180,9 +182,12 @@ async fn re_embed_all(
     // 3. Build the snapshot directly. Skip if there's nothing to
     //    write: a fresh install has no MemoryItems, and we'd rather
     //    leave hnsw.idx absent than persist an empty placeholder.
+    //    Sealed when the data dir is encrypted — saving plaintext here
+    //    would both leak every vector and fail the next boot's
+    //    `open_with_crypto` tag check.
     if migrated > 0 {
         index.rebuild_snapshot()?;
-        snapshot::save(&index, 0, &snapshot_path)?;
+        snapshot::save_with_crypto(&index, 0, &snapshot_path, aead)?;
     }
     Ok(migrated)
 }
@@ -270,7 +275,7 @@ mod tests {
 
         // Now boot with an 8-dim embedder. No sidecar yet → migrate.
         let new: Arc<dyn Embedder> = Arc::new(FixedDimEmbedder(8));
-        let outcome = migrate_if_needed(tmp.path(), Arc::clone(&storage), new, "fake-8d")
+        let outcome = migrate_if_needed(tmp.path(), Arc::clone(&storage), new, "fake-8d", None)
             .await
             .unwrap();
         match outcome {
@@ -286,6 +291,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn re_embed_on_encrypted_dir_writes_sealed_snapshot() {
+        // Regression: the re-embed path saved the rebuilt snapshot via
+        // the plaintext writer even when the data dir was encrypted —
+        // leaking every vector to disk and failing the next boot's
+        // `open_with_crypto` tag check (silent empty-index cold start).
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        {
+            let prev: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+            let s = SemanticStore::open_disabled(tmp.path(), Arc::clone(&storage), prev).unwrap();
+            s.remember("alpha", MemoryKind::Fact, vec![], "personal".into())
+                .await
+                .unwrap();
+        }
+
+        let dek = crate::crypto::Dek::generate().unwrap();
+        let aead = Arc::new(crate::crypto::Aead::new(&dek));
+        let new: Arc<dyn Embedder> = Arc::new(FixedDimEmbedder(8));
+        let outcome = migrate_if_needed(
+            tmp.path(),
+            Arc::clone(&storage),
+            new,
+            "fake-8d",
+            Some(Arc::clone(&aead)),
+        )
+        .await
+        .unwrap();
+        match outcome {
+            Outcome::Migrated { count } => assert_eq!(count, 1),
+            other => panic!("expected Migrated, got {other:?}"),
+        }
+
+        let snapshot_path = tmp.path().join("semantic").join("hnsw.idx");
+        let bytes = std::fs::read(&snapshot_path).unwrap();
+        assert_eq!(
+            &bytes[..4],
+            &crate::crypto::MAGIC,
+            "snapshot on an encrypted dir must be sealed, not plaintext"
+        );
+        // And it opens under the same AAD position the boot path uses.
+        let (idx, lsn) = snapshot::load_with_crypto(&snapshot_path, Some(&aead)).unwrap();
+        assert_eq!(lsn, 0);
+        assert_eq!(idx.len(), 1);
+    }
+
+    #[tokio::test]
     async fn matching_sidecar_is_no_change() {
         let tmp = TempDir::new().unwrap();
         let storage: Arc<dyn Storage> = MemoryStorage::new();
@@ -297,11 +348,12 @@ mod tests {
             Arc::clone(&storage),
             Arc::clone(&embedder),
             "fake-8d",
+            None,
         )
         .await
         .unwrap();
         // Second run: same identity → NoChange.
-        let outcome = migrate_if_needed(tmp.path(), storage, embedder, "fake-8d")
+        let outcome = migrate_if_needed(tmp.path(), storage, embedder, "fake-8d", None)
             .await
             .unwrap();
         assert!(matches!(outcome, Outcome::NoChange));
@@ -323,7 +375,7 @@ mod tests {
             s.remember("bravo", MemoryKind::Fact, vec![], "personal".into())
                 .await
                 .unwrap();
-            migrate_if_needed(tmp.path(), Arc::clone(&storage), e, "stub-4d")
+            migrate_if_needed(tmp.path(), Arc::clone(&storage), e, "stub-4d", None)
                 .await
                 .unwrap();
         }
@@ -339,7 +391,7 @@ mod tests {
 
         // Boot 2 — 8-dim. Sidecar mismatches → migrate.
         let e2: Arc<dyn Embedder> = Arc::new(FixedDimEmbedder(8));
-        let outcome = migrate_if_needed(tmp.path(), Arc::clone(&storage), e2, "fake-8d")
+        let outcome = migrate_if_needed(tmp.path(), Arc::clone(&storage), e2, "fake-8d", None)
             .await
             .unwrap();
         assert!(matches!(outcome, Outcome::Migrated { count: 2 }));
@@ -361,7 +413,7 @@ mod tests {
         let storage: Arc<dyn Storage> = MemoryStorage::new();
         let embedder: Arc<dyn Embedder> = Arc::new(FixedDimEmbedder(8));
 
-        let outcome = migrate_if_needed(tmp.path(), storage, embedder, "fake-8d")
+        let outcome = migrate_if_needed(tmp.path(), storage, embedder, "fake-8d", None)
             .await
             .unwrap();
         assert!(matches!(outcome, Outcome::Migrated { count: 0 }));
