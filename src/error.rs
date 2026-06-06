@@ -39,6 +39,9 @@ pub enum MnemeError {
 
     #[error("disk full")]
     DiskFull,
+
+    #[error("crypto error: {0}")]
+    Crypto(String),
 }
 
 impl From<redb::Error> for MnemeError {

@@ -47,7 +47,6 @@ sse_port  = 7878
 
 [daemon]
 idle_timeout_minutes = 30
-auth_token_path      = "default"
 log_level            = "default"
 
 [telemetry]
@@ -102,12 +101,22 @@ data dir crosses this number. Tracked under `Phase 7 polish`.
 |---|---|
 | **Type** | bool |
 | **Default** | `false` |
-| **Affects** | (unused) |
+| **Affects** | (advisory — see below) |
 
-Reserved for at-rest encryption. Setting it to `true` today is a
-no-op; mneme will either implement it via redb's
-upcoming encryption extension or via a wrapping layer. Don't depend
-on this field yet.
+In v1.2+ this field is **advisory only**. The decision of whether
+mneme is running encrypted is made by the presence of
+`~/.mneme/keystore.json`, not by this flag. To enable encryption,
+run `mneme encrypt`; to disable it, run `mneme decrypt
+--yes-i-really-mean-it`. See the [Encryption at rest](./encryption.md)
+chapter for the full workflow, including how to recover on a new
+machine via the 12-word BIP39 mnemonic.
+
+Earlier mneme docs said this flag would be wired to a future opt-in;
+v1.2 ships the feature with `mneme encrypt` as the user-facing
+trigger instead, because tying it to a config field would silently
+re-encrypt or decrypt the data dir on the next daemon boot — a
+foot-gun for users who edit `config.toml` without realising what it
+implies.
 
 ---
 
@@ -454,21 +463,10 @@ SIGTERM. Counted from "last client disconnected", not "last request
 seen", so a long HNSW snapshot that blocks requests but not
 connections doesn't accidentally trigger shutdown.
 
-### `auth_token_path`
-
-| | |
-|---|---|
-| **Type** | string (path or `"default"`) |
-| **Default** | `"default"` (resolves to `~/.mneme/run/auth.token`) |
-| **Affects** | daemon authentication (ADR-0012 D3) |
-
-Path to the auth-token file. The token value lives in **exactly one
-file** with mode `0600`; agent configs reference the path, never
-the value. `mneme auth rotate` rewrites only this file (atomically
-via tmpfile + rename per D4); clients pick up the new value on
-next connection. NEVER embed the token value in `settings.json`,
-`claude_desktop_config.json`, `.cursorrules`, or any other agent
-config file.
+The auth-token file is always `~/.mneme/run/auth.token` (mode `0600`);
+agent configs reference that path, never the token value. NEVER embed the
+token value in `settings.json`, `claude_desktop_config.json`,
+`.cursorrules`, or any other agent config file.
 
 ### `log_level`
 

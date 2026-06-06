@@ -32,12 +32,14 @@
 //! variants must be added at the END of the enum to preserve on-disk
 //! compatibility — Phase 3 will add `EmbedInsert`, `HnswInsert`, `HnswDelete`.
 
+use crate::crypto::{AadDomain, Aead};
 use crate::ids::MemoryId;
 use crate::{MnemeError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 /// Header: payload_len(u32) + lsn(u64) + tx_id(u64).
@@ -127,6 +129,23 @@ pub struct WalWriter {
     join: Option<std::thread::JoinHandle<Result<()>>>,
 }
 
+/// Build the position bytes for one WAL frame's AEAD AAD.
+///
+/// Per ADR-0013 D4 the full AAD is `b"wal " || lsn || tx_id`; the
+/// `b"wal "` prefix is supplied by [`Aead::seal`] via [`AadDomain::Wal`],
+/// so this helper returns only the per-frame `lsn || tx_id` suffix
+/// (16 bytes, big-endian). Binding both LSN and tx_id makes a successful
+/// decryption proof that the ciphertext belongs to *this* exact frame
+/// position — CRC32C still covers the on-disk ciphertext for
+/// defence in depth, but AEAD authentication is the real integrity
+/// guard.
+fn frame_aad_position(lsn: u64, tx_id: u64) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&lsn.to_be_bytes());
+    buf[8..16].copy_from_slice(&tx_id.to_be_bytes());
+    buf
+}
+
 struct WalCommand {
     op: WalOp,
     ack: oneshot::Sender<Result<u64>>,
@@ -134,9 +153,16 @@ struct WalCommand {
 
 impl WalWriter {
     /// Open the WAL writer with no applier — every record is durable in the
-    /// WAL only.
+    /// WAL only. Plaintext frame payloads (legacy / opt-out mode).
     pub fn open(dir: &Path, start_lsn: u64) -> Result<Self> {
         Self::open_with_applier(dir, start_lsn, Box::new(NoopApplier))
+    }
+
+    /// Open the WAL writer for an encrypted data dir. The supplied
+    /// AEAD wraps every frame's postcard payload before it hits disk;
+    /// replay must use the same key (ADR-0013 P4).
+    pub fn open_encrypted(dir: &Path, start_lsn: u64, aead: Arc<Aead>) -> Result<Self> {
+        Self::open_inner(dir, start_lsn, Box::new(NoopApplier), Some(aead))
     }
 
     /// Open the WAL writer with a custom applier invoked after each fsync.
@@ -150,10 +176,30 @@ impl WalWriter {
         start_lsn: u64,
         applier: Box<dyn Applier>,
     ) -> Result<Self> {
+        Self::open_inner(dir, start_lsn, applier, None)
+    }
+
+    /// Open the WAL writer with both a custom applier and an AEAD
+    /// codec. Production daemon-boot path on encrypted data dirs.
+    pub fn open_with_applier_encrypted(
+        dir: &Path,
+        start_lsn: u64,
+        applier: Box<dyn Applier>,
+        aead: Arc<Aead>,
+    ) -> Result<Self> {
+        Self::open_inner(dir, start_lsn, applier, Some(aead))
+    }
+
+    fn open_inner(
+        dir: &Path,
+        start_lsn: u64,
+        applier: Box<dyn Applier>,
+        aead: Option<Arc<Aead>>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let segments = list_segments(dir)?;
         let (active_path, segment_start_lsn, mut bytes_in_segment, observed_max_lsn) =
-            prepare_active_segment(dir, &segments, start_lsn)?;
+            prepare_active_segment(dir, &segments, start_lsn, aead.as_deref())?;
 
         if observed_max_lsn + 1 != start_lsn {
             return Err(MnemeError::Wal(format!(
@@ -174,6 +220,7 @@ impl WalWriter {
                 start_lsn,
                 bytes_in_segment,
                 applier,
+                aead,
             );
         }
 
@@ -184,6 +231,7 @@ impl WalWriter {
             start_lsn,
             bytes_in_segment,
             applier,
+            aead,
         )
     }
 
@@ -194,6 +242,7 @@ impl WalWriter {
         next_lsn: u64,
         bytes_in_segment: u64,
         applier: Box<dyn Applier>,
+        aead: Option<Arc<Aead>>,
     ) -> Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::channel(CHANNEL_CAP);
         let dir_owned = dir.to_path_buf();
@@ -206,6 +255,7 @@ impl WalWriter {
                     segment_start_lsn,
                     next_lsn,
                     bytes_in_segment,
+                    aead,
                 )?;
                 writer_loop(state, cmd_rx, applier)
             })
@@ -271,6 +321,10 @@ struct WriterState {
     bytes_in_segment: u64,
     /// `true` once a write has hit ENOSPC; subsequent writes fail fast.
     disk_full: bool,
+    /// When `Some`, every frame's postcard payload is sealed with this
+    /// AEAD before write. The CRC32C still covers the on-disk
+    /// (ciphertext) bytes — defence in depth (ADR-0013 P4).
+    aead: Option<Arc<Aead>>,
 }
 
 impl WriterState {
@@ -280,6 +334,7 @@ impl WriterState {
         segment_start_lsn: u64,
         next_lsn: u64,
         bytes_in_segment: u64,
+        aead: Option<Arc<Aead>>,
     ) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -295,6 +350,7 @@ impl WriterState {
             next_tx_id: next_lsn,
             bytes_in_segment,
             disk_full: false,
+            aead,
         })
     }
 
@@ -302,8 +358,21 @@ impl WriterState {
         if self.disk_full {
             return Err(MnemeError::DiskFull);
         }
-        let payload = postcard::to_allocvec(&op)
+        let postcard_bytes = postcard::to_allocvec(&op)
             .map_err(|e| MnemeError::Wal(format!("postcard encode: {e}")))?;
+
+        let lsn = self.next_lsn;
+        let tx_id = self.next_tx_id;
+
+        // If the WAL is encrypted, seal the postcard bytes before they
+        // hit disk. AAD binds (lsn, tx_id) so a ciphertext can't be
+        // moved to a different frame position.
+        let payload = if let Some(a) = self.aead.as_deref() {
+            let position = frame_aad_position(lsn, tx_id);
+            a.seal(AadDomain::Wal, &position, &postcard_bytes)?
+        } else {
+            postcard_bytes
+        };
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(MnemeError::Wal(format!(
                 "payload {} exceeds MAX_PAYLOAD_BYTES",
@@ -314,9 +383,6 @@ impl WriterState {
         if self.bytes_in_segment > 0 && self.bytes_in_segment + frame_len > SEGMENT_SIZE_BYTES {
             self.rotate()?;
         }
-
-        let lsn = self.next_lsn;
-        let tx_id = self.next_tx_id;
 
         let mut crc_buf = Vec::with_capacity(8 + 8 + payload.len());
         crc_buf.extend_from_slice(&lsn.to_le_bytes());
@@ -542,6 +608,17 @@ fn writer_loop(
 /// committed and must not be applied. Hard errors (bad postcard payload,
 /// oversize record, I/O) surface as `Some(Err(_))`.
 pub fn replay(dir: &Path) -> Result<Replay> {
+    replay_inner(dir, None)
+}
+
+/// Replay an encrypted WAL using `aead` to open every frame's payload.
+/// A decryption failure surfaces as `Some(Err(_))` — distinct from the
+/// torn-tail path, which represents a never-fsynced write.
+pub fn replay_encrypted(dir: &Path, aead: Arc<Aead>) -> Result<Replay> {
+    replay_inner(dir, Some(aead))
+}
+
+fn replay_inner(dir: &Path, aead: Option<Arc<Aead>>) -> Result<Replay> {
     let segments = if dir.exists() {
         list_segments(dir)?
     } else {
@@ -552,6 +629,7 @@ pub fn replay(dir: &Path) -> Result<Replay> {
         idx: 0,
         current: None,
         torn_tail_seen: false,
+        aead,
     })
 }
 
@@ -560,6 +638,7 @@ pub struct Replay {
     idx: usize,
     current: Option<BufReader<File>>,
     torn_tail_seen: bool,
+    aead: Option<Arc<Aead>>,
 }
 
 impl Iterator for Replay {
@@ -582,8 +661,8 @@ impl Iterator for Replay {
                 self.current = Some(BufReader::new(file));
             }
             let reader = self.current.as_mut().unwrap();
-            match read_frame(reader) {
-                Ok(Some(rec)) => return Some(Ok(rec)),
+            match read_frame(reader, self.aead.as_deref()) {
+                Ok(Some((rec, _payload_len))) => return Some(Ok(rec)),
                 Ok(None) => {
                     // clean end of segment — advance to next
                     self.current = None;
@@ -608,6 +687,11 @@ impl Iterator for Replay {
                 Err(FrameReadError::PayloadTooLarge(n)) => {
                     return Some(Err(MnemeError::Wal(format!("payload too large: {n}"))));
                 }
+                Err(FrameReadError::AeadOpen(msg)) => {
+                    return Some(Err(MnemeError::Wal(format!(
+                        "WAL frame decryption failed: {msg}"
+                    ))));
+                }
             }
         }
     }
@@ -620,18 +704,30 @@ enum FrameReadError {
     CrcMismatch,
     PostcardDecode(String),
     PayloadTooLarge(usize),
+    /// AEAD authentication failed when opening the payload. Distinct
+    /// from `CrcMismatch` so the replay loop surfaces a hard error
+    /// (wrong DEK, tampered frame) instead of silently skipping.
+    AeadOpen(String),
 }
 
+/// Read one WAL frame.
+///
+/// Returns `Some((record, on_disk_payload_len))` so callers tracking
+/// offsets know the exact byte count consumed — needed because the
+/// ciphertext is longer than the postcard plaintext when the WAL is
+/// encrypted.
 fn read_frame<R: Read>(
     reader: &mut R,
-) -> std::result::Result<Option<ReplayRecord>, FrameReadError> {
+    aead: Option<&Aead>,
+) -> std::result::Result<Option<(ReplayRecord, u32)>, FrameReadError> {
     let mut header = [0u8; HEADER_BYTES];
     match reader.read_exact(&mut header) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(FrameReadError::Io(e)),
     }
-    let payload_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    let payload_len_u32 = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    let payload_len = payload_len_u32 as usize;
     let lsn = u64::from_le_bytes(header[4..12].try_into().unwrap());
     let tx_id = u64::from_le_bytes(header[12..20].try_into().unwrap());
     if payload_len > MAX_PAYLOAD_BYTES {
@@ -662,9 +758,23 @@ fn read_frame<R: Read>(
     if actual_crc != claimed_crc {
         return Err(FrameReadError::CrcMismatch);
     }
-    let op: WalOp = postcard::from_bytes(&payload)
+
+    // If the WAL is encrypted, open the AEAD envelope to recover the
+    // postcard bytes. The payload bytes on disk are the ciphertext.
+    let postcard_bytes = if let Some(a) = aead {
+        let position = frame_aad_position(lsn, tx_id);
+        a.open(AadDomain::Wal, &position, &payload).map_err(|e| {
+            // Format the error string but keep the AEAD details opaque
+            // — the underlying error already redacts sensitive detail.
+            FrameReadError::AeadOpen(format!("{e}"))
+        })?
+    } else {
+        payload
+    };
+
+    let op: WalOp = postcard::from_bytes(&postcard_bytes)
         .map_err(|e| FrameReadError::PostcardDecode(format!("{e}")))?;
-    Ok(Some(ReplayRecord { lsn, tx_id, op }))
+    Ok(Some((ReplayRecord { lsn, tx_id, op }, payload_len_u32)))
 }
 
 /// Delete WAL segments whose entire LSN range is fully covered by
@@ -743,6 +853,7 @@ fn prepare_active_segment(
     dir: &Path,
     segments: &[(u64, PathBuf)],
     start_lsn: u64,
+    aead: Option<&Aead>,
 ) -> Result<(PathBuf, u64, u64, u64)> {
     let mut observed_max_lsn = start_lsn.saturating_sub(1);
 
@@ -750,8 +861,8 @@ fn prepare_active_segment(
     for (_, path) in segments.iter().take(segments.len().saturating_sub(1)) {
         let mut reader = BufReader::new(File::open(path)?);
         loop {
-            match read_frame(&mut reader) {
-                Ok(Some(rec)) => observed_max_lsn = rec.lsn.max(observed_max_lsn),
+            match read_frame(&mut reader, aead) {
+                Ok(Some((rec, _))) => observed_max_lsn = rec.lsn.max(observed_max_lsn),
                 Ok(None) => break,
                 Err(FrameReadError::TornTail) | Err(FrameReadError::CrcMismatch) => {
                     return Err(MnemeError::Wal(format!(
@@ -769,12 +880,17 @@ fn prepare_active_segment(
                         "oversize payload in {path:?}: {n}"
                     )));
                 }
+                Err(FrameReadError::AeadOpen(msg)) => {
+                    return Err(MnemeError::Wal(format!(
+                        "WAL frame decryption failed in {path:?}: {msg}"
+                    )));
+                }
             }
         }
     }
 
     if let Some((seg_start_lsn, active_path)) = segments.last() {
-        let (valid_offset, max_in_segment) = validate_segment_tail(active_path)?;
+        let (valid_offset, max_in_segment) = validate_segment_tail(active_path, aead)?;
         observed_max_lsn = max_in_segment
             .unwrap_or(observed_max_lsn)
             .max(observed_max_lsn);
@@ -801,15 +917,18 @@ fn prepare_active_segment(
 
 /// Walk a segment and return `(last_good_offset, last_good_lsn_observed)`.
 /// On torn tail or CRC mismatch, returns the offset just before the bad frame.
-fn validate_segment_tail(path: &Path) -> Result<(u64, Option<u64>)> {
+/// AEAD-open failure on an otherwise-CRC-valid frame is hard-fatal —
+/// it means the WAL was either tampered with or opened under the
+/// wrong DEK, both of which we must surface, not paper over.
+fn validate_segment_tail(path: &Path, aead: Option<&Aead>) -> Result<(u64, Option<u64>)> {
     let mut file = File::open(path)?;
     let mut reader = BufReader::new(&mut file);
     let mut good_offset = 0u64;
     let mut max_lsn: Option<u64> = None;
     loop {
-        match read_frame(&mut reader) {
-            Ok(Some(rec)) => {
-                let frame_size = (FRAME_OVERHEAD_BYTES + payload_size_of(&rec.op)?) as u64;
+        match read_frame(&mut reader, aead) {
+            Ok(Some((rec, payload_len))) => {
+                let frame_size = FRAME_OVERHEAD_BYTES as u64 + payload_len as u64;
                 good_offset += frame_size;
                 max_lsn = Some(max_lsn.map_or(rec.lsn, |m| m.max(rec.lsn)));
             }
@@ -828,14 +947,13 @@ fn validate_segment_tail(path: &Path) -> Result<(u64, Option<u64>)> {
                     "oversize payload in {path:?}: {n}"
                 )));
             }
+            Err(FrameReadError::AeadOpen(msg)) => {
+                return Err(MnemeError::Wal(format!(
+                    "WAL frame decryption failed in {path:?}: {msg}"
+                )));
+            }
         }
     }
-}
-
-fn payload_size_of(op: &WalOp) -> Result<usize> {
-    let v =
-        postcard::to_allocvec(op).map_err(|e| MnemeError::Wal(format!("postcard encode: {e}")))?;
-    Ok(v.len())
 }
 
 // ---------- Tests ----------
@@ -1058,6 +1176,212 @@ mod tests {
         }
         let n = truncate_through(dir, 20).unwrap();
         assert_eq!(n, 2);
+    }
+
+    // ===== ADR-0013 P4: encrypted WAL =====
+
+    use crate::crypto::{Aead, Dek};
+
+    fn fresh_aead() -> Arc<Aead> {
+        Arc::new(Aead::new(&Dek::generate().unwrap()))
+    }
+
+    #[test]
+    fn encrypted_round_trip_put_then_replay() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let rt = rt();
+        let aead = fresh_aead();
+
+        rt.block_on(async {
+            let w = WalWriter::open_encrypted(dir, 1, Arc::clone(&aead)).unwrap();
+            for i in 0u32..5 {
+                w.append(WalOp::Put {
+                    key: format!("key-{i}").into_bytes(),
+                    value: format!("value-{i}-with-some-padding").into_bytes(),
+                })
+                .await
+                .unwrap();
+            }
+            w.shutdown().unwrap();
+        });
+
+        let recs: Vec<_> = replay_encrypted(dir, Arc::clone(&aead))
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(recs.len(), 5);
+        for (i, rec) in recs.iter().enumerate() {
+            match &rec.op {
+                WalOp::Put { key, value } => {
+                    assert_eq!(key, format!("key-{i}").as_bytes());
+                    assert_eq!(value, format!("value-{i}-with-some-padding").as_bytes());
+                }
+                _ => panic!("wrong op kind"),
+            }
+        }
+    }
+
+    #[test]
+    fn encrypted_wal_segment_has_no_plaintext_keys_or_values() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let rt = rt();
+        let aead = fresh_aead();
+
+        rt.block_on(async {
+            let w = WalWriter::open_encrypted(dir, 1, Arc::clone(&aead)).unwrap();
+            w.append(WalOp::Put {
+                key: b"secret-key-marker".to_vec(),
+                value: b"secret-value-marker".to_vec(),
+            })
+            .await
+            .unwrap();
+            w.shutdown().unwrap();
+        });
+
+        let segments = list_segments(dir).unwrap();
+        for (_, path) in &segments {
+            let bytes = std::fs::read(path).unwrap();
+            for marker in [
+                b"secret-key-marker" as &[u8],
+                b"secret-value-marker" as &[u8],
+            ] {
+                let found = bytes.windows(marker.len()).any(|w| w == marker);
+                assert!(
+                    !found,
+                    "plaintext {:?} leaked into encrypted WAL segment {:?}",
+                    std::str::from_utf8(marker).unwrap(),
+                    path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replay_with_wrong_key_returns_hard_error_not_silent_skip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let rt = rt();
+        let writer_aead = fresh_aead();
+
+        rt.block_on(async {
+            let w = WalWriter::open_encrypted(dir, 1, Arc::clone(&writer_aead)).unwrap();
+            w.append(WalOp::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            })
+            .await
+            .unwrap();
+            w.shutdown().unwrap();
+        });
+
+        // Different DEK → AEAD-open fails on the first frame. Replay
+        // must surface this as an error, NOT yield zero records
+        // silently (which would let the daemon happily skip data).
+        let other = fresh_aead();
+        let mut iter = replay_encrypted(dir, other).unwrap();
+        let first = iter.next();
+        match first {
+            Some(Err(MnemeError::Wal(msg))) => {
+                assert!(msg.contains("decryption"), "unexpected err: {msg}");
+            }
+            other => panic!("expected Wal decryption error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encrypted_wal_reopen_resumes_lsn() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let rt = rt();
+        let aead = fresh_aead();
+
+        rt.block_on(async {
+            let w = WalWriter::open_encrypted(dir, 1, Arc::clone(&aead)).unwrap();
+            w.append(WalOp::Put {
+                key: vec![1],
+                value: vec![10],
+            })
+            .await
+            .unwrap();
+            w.append(WalOp::Put {
+                key: vec![2],
+                value: vec![20],
+            })
+            .await
+            .unwrap();
+            w.shutdown().unwrap();
+        });
+
+        let max = replay_encrypted(dir, Arc::clone(&aead))
+            .unwrap()
+            .map(|r| r.unwrap().lsn)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(max, 2);
+
+        rt.block_on(async {
+            let w = WalWriter::open_encrypted(dir, max + 1, Arc::clone(&aead)).unwrap();
+            let lsn = w
+                .append(WalOp::Put {
+                    key: vec![3],
+                    value: vec![30],
+                })
+                .await
+                .unwrap();
+            assert_eq!(lsn, 3);
+            w.shutdown().unwrap();
+        });
+
+        let recs: Vec<_> = replay_encrypted(dir, aead)
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(recs.len(), 3);
+    }
+
+    #[test]
+    fn encrypted_wal_torn_tail_still_replays_clean_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let rt = rt();
+        let aead = fresh_aead();
+
+        rt.block_on(async {
+            let w = WalWriter::open_encrypted(dir, 1, Arc::clone(&aead)).unwrap();
+            w.append(WalOp::Put {
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+            })
+            .await
+            .unwrap();
+            w.append(WalOp::Put {
+                key: b"b".to_vec(),
+                value: b"2".to_vec(),
+            })
+            .await
+            .unwrap();
+            w.shutdown().unwrap();
+        });
+
+        // Simulate a torn tail by appending raw garbage bytes.
+        let segs = list_segments(dir).unwrap();
+        let active = &segs[0].1;
+        let mut f = OpenOptions::new().append(true).open(active).unwrap();
+        f.write_all(b"\xff\xff\xff\xff\x00\x00").unwrap();
+        f.sync_data().unwrap();
+
+        // Torn tail → CRC mismatch → iterator stops cleanly. Frames
+        // before the tear are returned. (Compare to the
+        // wrong-key test above: that surfaces a hard error because
+        // every CRC validates first.)
+        let mut count = 0;
+        for r in replay_encrypted(dir, Arc::clone(&aead)).unwrap() {
+            r.unwrap();
+            count += 1;
+        }
+        assert_eq!(count, 2);
     }
 
     #[test]

@@ -78,14 +78,22 @@ fn root_has_data(root: &Path) -> Result<bool> {
     if !root.exists() {
         return Ok(false);
     }
-    // "Has data" ≡ "any non-hidden, non-`.lock`, non-empty entry".
-    // `.lock` shouldn't be present (we refuse_if_locked above) but
-    // ignoring it here keeps the check robust under stale lockfiles.
+    // "Has data" ≡ "any non-hidden, non-`.lock`, non-runtime entry".
+    // We skip transient artifacts the binary creates on its own rather
+    // than user data:
+    //   - `.lock` — refuse_if_locked already handled it; tolerating a
+    //     stale one here keeps the check robust.
+    //   - `logs` / `run` — the file-logger creates `logs/` at process
+    //     startup (in `main::init_tracing`, before this check runs) and
+    //     the daemon creates `run/`; neither is part of a backup. Without
+    //     skipping them, a `mneme restore` into an otherwise-fresh root
+    //     would always trip the non-empty guard just because the running
+    //     binary logged a line.
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let name = entry.file_name();
         let s = name.to_string_lossy();
-        if s == ".lock" || s.starts_with('.') {
+        if s == ".lock" || s == "logs" || s == "run" || s.starts_with('.') {
             continue;
         }
         return Ok(true);
@@ -164,6 +172,27 @@ mod tests {
         }
         // existing.txt still there.
         assert!(dst_root.join("existing.txt").exists());
+    }
+
+    #[test]
+    fn restore_into_root_with_only_logs_succeeds() {
+        // Regression: the file-logger creates `<root>/logs/` at process
+        // startup, before restore's empty-check. A fresh restore must not
+        // be blocked by the binary's own logging (or daemon `run/`) dir.
+        let src_tmp = fixture_with_data();
+        let src_root = src_tmp.path().join("mneme");
+        let out = TempDir::new().unwrap();
+        let archive = out.path().join("backup.tar.gz");
+        super::super::backup::backup_at(&src_root, &archive, false).unwrap();
+
+        let dst_tmp = TempDir::new().unwrap();
+        let dst_root = dst_tmp.path().join("mneme");
+        write(&dst_root.join("logs/mneme.log"), b"startup chatter");
+        std::fs::create_dir_all(dst_root.join("run")).unwrap();
+
+        // No --force, yet it must proceed and land the data.
+        restore_at(&archive, &dst_root, false).unwrap();
+        assert!(dst_root.join("procedural/pinned.jsonl").exists());
     }
 
     #[test]

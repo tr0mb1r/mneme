@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
+use crate::crypto::Aead;
 use crate::index::hnsw::HnswIndex;
 use crate::index::snapshot;
 use crate::storage::wal;
@@ -38,6 +39,10 @@ pub(crate) struct SnapshotState {
     /// `tokio::Mutex<()>` shared with `SemanticStore::write_lock` so
     /// the scheduler can serialise itself against `remember`/`forget`.
     pub(crate) write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// When `Some`, snapshot writes go through the AEAD codec so the
+    /// HNSW `.idx` file is opaque on disk (ADR-0013 P5d). `None` is
+    /// the legacy plaintext path.
+    pub(crate) aead: Option<Arc<Aead>>,
 }
 
 // ---------- Scheduler ----------
@@ -79,6 +84,7 @@ pub(crate) async fn run_snapshot(state: &SnapshotState) -> Result<()> {
         &state.applied_lsn,
         &state.snapshot_path,
         &state.wal_dir,
+        state.aead.as_deref(),
     )
     .await?;
     state.inserts_since.store(0, Ordering::SeqCst);
@@ -92,6 +98,7 @@ pub(crate) async fn run_snapshot_inline(
     applied_lsn: &Arc<AtomicU64>,
     snapshot_path: &Path,
     wal_dir: &Path,
+    aead: Option<&Aead>,
 ) -> Result<()> {
     let _g = write_lock.lock().await;
 
@@ -114,7 +121,7 @@ pub(crate) async fn run_snapshot_inline(
         let idx = index
             .read()
             .map_err(|e| MnemeError::Index(format!("hnsw rwlock poisoned: {e}")))?;
-        snapshot::save(&idx, lsn, snapshot_path)?;
+        snapshot::save_with_crypto(&idx, lsn, snapshot_path, aead)?;
     }
 
     // 3. Truncate fully-covered WAL segments. After save() returns

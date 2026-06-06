@@ -26,19 +26,22 @@ Anything fatal will print before the process exits. Also tail
 
 ## `~/.mneme/config.toml` is missing — what does that mean?
 
-`Config::load` (`src/config.rs::load`) silently returns
-`Config::default()` when the file is absent. The MCP server boots
-on all-default values without a warning — easy to miss after you
-rename or delete the file. Fix:
+When `~/.mneme/config.toml` is absent the daemon boots on all-default
+values rather than failing. Since v1.2 it no longer does so silently —
+the boot path emits a `WARN` to `~/.mneme/logs/mneme.log`:
+
+```text
+WARN config.toml not found; running on built-in defaults — run `mneme init` to write an editable config path=/home/you/.mneme/config.toml
+```
+
+If you see that line after renaming or deleting the file and want your
+settings back:
 
 ```sh
 mneme init                                  # writes a fresh defaults file
 diff ~/.mneme/config.toml ~/.mneme/config.toml.bak  # if you kept a backup
 mneme stop                                  # restart so the new file lands
 ```
-
-(A `WARN` log line at load time when the file is missing is queued
-for a future v1.1.x patch — see the related observation in mneme.)
 
 ## First tool call takes 30+ seconds, then succeeds
 

@@ -63,7 +63,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             cross: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -131,7 +131,7 @@ jobs:
           Remove-Item -Recurse -Force "dist/$stage"
 
       - name: Upload artefacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mneme-${{ matrix.target }}
           path: |
@@ -149,7 +149,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
           fetch-depth: 0
@@ -165,7 +165,7 @@ jobs:
           echo "tag=${ref}" >> "$GITHUB_OUTPUT"
 
       - name: Download artefacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

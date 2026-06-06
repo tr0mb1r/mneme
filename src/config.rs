@@ -38,6 +38,9 @@ pub struct StorageConfig {
     pub data_dir: PathBuf,
     #[serde(default = "default_max_size_gb")]
     pub max_size_gb: u64,
+    /// **Reserved (not yet wired).** Encryption at rest is gated by the
+    /// presence of `keystore.json` (run `mneme encrypt`), not this flag —
+    /// setting it has no effect. Kept for forward compatibility.
     #[serde(default)]
     pub encryption: bool,
 }
@@ -72,6 +75,9 @@ pub struct ScopesConfig {
 pub struct McpConfig {
     #[serde(default = "default_mcp_transport")]
     pub transport: String,
+    /// **Reserved (not yet wired).** Port for the future SSE transport.
+    /// Only `transport = "stdio"` is implemented today; this value is
+    /// ignored until SSE lands.
     #[serde(default = "default_sse_port")]
     pub sse_port: u16,
 }
@@ -90,13 +96,6 @@ pub struct DaemonConfig {
     /// disconnected", not "last request seen".
     #[serde(default = "default_daemon_idle_timeout_minutes")]
     pub idle_timeout_minutes: u64,
-    /// Path to the auth-token file (ADR-0012 D3). `"default"` resolves
-    /// to `~/.mneme/run/auth.token` at boot. The token value lives in
-    /// exactly one file with mode `0600`; agent configs reference the
-    /// path, never the value. `mneme auth rotate` rewrites only this
-    /// one file.
-    #[serde(default = "default_daemon_auth_token_path")]
-    pub auth_token_path: String,
     /// Daemon-only log level override. Falls back to the global
     /// `[logging] level` when set to `"default"`. Lets users turn
     /// the daemon up to `debug` without making the rest of the
@@ -133,6 +132,9 @@ pub struct CheckpointsConfig {
     pub hnsw_snapshot_minutes: u32,
 }
 
+/// `[telemetry]` — **reserved (not yet wired).** No telemetry subsystem
+/// exists yet; these fields are accepted and round-tripped but have no
+/// effect. Kept so the config surface stays stable when telemetry lands.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TelemetryConfig {
     #[serde(default)]
@@ -199,9 +201,6 @@ fn default_max_remember_chars() -> usize {
 }
 fn default_daemon_idle_timeout_minutes() -> u64 {
     30
-}
-fn default_daemon_auth_token_path() -> String {
-    "default".into()
 }
 fn default_daemon_log_level() -> String {
     "default".into()
@@ -292,7 +291,6 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             idle_timeout_minutes: default_daemon_idle_timeout_minutes(),
-            auth_token_path: default_daemon_auth_token_path(),
             log_level: default_daemon_log_level(),
         }
     }
@@ -331,6 +329,35 @@ impl Config {
         toml::from_str(&text).map_err(|e| MnemeError::Config(format!("{path:?}: {e}")))
     }
 
+    /// Like [`Config::load`], but also reports whether the file was
+    /// actually present (`true`) or absent (`false` — in which case the
+    /// returned config is all built-in defaults).
+    ///
+    /// The daemon uses the `present` flag to emit a boot-time warning
+    /// when it's silently running on defaults (see the troubleshooting
+    /// note "config.toml is missing"). Plain [`Config::load`] stays
+    /// side-effect-free so the pre-subscriber logging bootstrap
+    /// (`main::load_logging_config`) and `stats` / `inspect` don't warn.
+    pub fn load_reporting(path: &Path) -> Result<(Self, bool)> {
+        let present = path.exists();
+        Ok((Self::load(path)?, present))
+    }
+
+    /// The effective file-log level. When running the daemon
+    /// (`is_daemon`) and `[daemon] log_level` is set to something other
+    /// than the `"default"` sentinel, that override wins; otherwise the
+    /// global `[logging] level` applies. Lets the daemon run verbose
+    /// without making short-lived CLI commands (`stats`, `inspect`, …)
+    /// chatty.
+    pub fn effective_file_log_level(&self, is_daemon: bool) -> &str {
+        let daemon_level = self.daemon.log_level.trim();
+        if is_daemon && !daemon_level.is_empty() && daemon_level != "default" {
+            daemon_level
+        } else {
+            self.logging.level.as_str()
+        }
+    }
+
     /// Serialize the full config (with all defaults made explicit) to disk.
     /// Used by `mneme init` to drop a starter `config.toml` next to the
     /// user, where they can edit it.
@@ -366,7 +393,6 @@ mod tests {
         assert_eq!(c.budgets.auto_context_token_budget, 4000);
         assert_eq!(c.budgets.max_remember_chars, 10_000);
         assert_eq!(c.daemon.idle_timeout_minutes, 30);
-        assert_eq!(c.daemon.auth_token_path, "default");
         assert_eq!(c.daemon.log_level, "default");
         assert_eq!(c.checkpoints.session_interval_secs, 30);
         assert_eq!(c.checkpoints.session_interval_turns, 5);
@@ -382,6 +408,43 @@ mod tests {
         let p = tmp.path().join("absent.toml");
         let c = Config::load(&p).unwrap();
         assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn load_reporting_flags_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("absent.toml");
+        let (c, present) = Config::load_reporting(&p).unwrap();
+        assert!(!present, "absent file must report present=false");
+        assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn load_reporting_flags_present_file() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("config.toml");
+        Config::default().write(&p).unwrap();
+        let (c, present) = Config::load_reporting(&p).unwrap();
+        assert!(present, "existing file must report present=true");
+        assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn daemon_log_level_overrides_file_level_only_for_daemon() {
+        let mut c = Config::default();
+        c.logging.level = "info".into();
+        c.daemon.log_level = "debug".into();
+        assert_eq!(c.effective_file_log_level(true), "debug");
+        assert_eq!(c.effective_file_log_level(false), "info");
+    }
+
+    #[test]
+    fn daemon_log_level_default_sentinel_inherits_global() {
+        let mut c = Config::default();
+        c.logging.level = "warn".into();
+        c.daemon.log_level = "default".into();
+        assert_eq!(c.effective_file_log_level(true), "warn");
+        assert_eq!(c.effective_file_log_level(false), "warn");
     }
 
     #[test]

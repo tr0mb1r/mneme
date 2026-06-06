@@ -283,10 +283,12 @@ TEXT=$(jq -r '.result.content[0].text' <<<"$RESP")
     && ok "update on unknown id returns no-such-memory" \
     || fail "expected no-such-memory; got: $TEXT"
 
-# forget
+# forget — since v0.2.6 the success string is layer-tagged
+# ("forgot semantic memory <id>" / "forgot procedural memory" /
+# "forgot episodic event"); accept any layer prefix.
 RESP=$(call_tool forget "$(jq -nc --arg id "$MEM_ID" '{id:$id}')")
 TEXT=$(jq -r '.result.content[0].text' <<<"$RESP")
-[[ "$TEXT" == "forgot memory "* ]] && ok "forget removed $MEM_ID" || fail "forget unexpected: $TEXT"
+[[ "$TEXT" == "forgot "* ]] && ok "forget removed $MEM_ID" || fail "forget unexpected: $TEXT"
 
 # ---------- L0 procedural ----------
 
@@ -462,10 +464,18 @@ fi
 # Compare data only — exclude models/ because the script may symlink
 # it, which never round-trips through tar identically.
 hash_data() {
+    # Hash only durable user data. Exclude runtime/diagnostic artifacts
+    # that `backup` never persists (run/ — always excluded; logs/,
+    # models/) or that the restore process regrows on its own startup
+    # (diagnostics.log via the first-boot upgrade audit, .lock). These
+    # are not part of a backup, so including them makes a faithful
+    # round-trip look divergent.
     find "$1" -type f \
         -not -path "*/logs/*" \
         -not -path "*/.lock*" \
         -not -path "*/models/*" \
+        -not -path "*/run/*" \
+        -not -name "diagnostics.log" \
         -exec shasum {} \; 2>/dev/null \
         | awk '{print $1}' | sort | shasum | awk '{print $1}'
 }

@@ -307,6 +307,191 @@ async fn daemon_serves_two_clients_concurrently() {
     assert!(!socket.exists(), "socket should be gone post-exit");
 }
 
+/// SEC-001 regression: in `DaemonServeMany` mode, each accepted
+/// connection MUST have its own `ScopeState` cell. A `switch_scope`
+/// call on one connection must not leak into another concurrent
+/// connection's tool calls — the routing decision belongs to the
+/// agent issuing the request, not to the daemon process.
+///
+/// Test shape: two long-lived connections, each switches to its own
+/// scope, both call `stats`, and we assert each sees its own scope
+/// in the `working.current_scope` field. If the daemon shares the
+/// `ScopeState` cell across connections (pre-fix behaviour), the
+/// second `switch_scope` would clobber the first and both would
+/// report the same scope.
+#[tokio::test]
+async fn switch_scope_on_one_connection_does_not_leak_to_another() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    let socket = data_dir.join("run").join("mneme.sock");
+
+    let mut daemon = Command::new(BINARY)
+        .arg("daemon")
+        .arg("--foreground")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .env("MNEME_EMBEDDER", "stub")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mneme daemon");
+    wait_for_socket(&socket).await;
+    let auth = auth_line(data_dir);
+
+    /// Authenticate + initialize a single connection. Returns the
+    /// owned write half and a `BufReader` over the read half, both
+    /// ready to drive `tools/call` frames.
+    async fn open_session(
+        socket: &Path,
+        auth: &str,
+        label: &str,
+    ) -> (
+        tokio::net::unix::OwnedWriteHalf,
+        BufReader<tokio::net::unix::OwnedReadHalf>,
+    ) {
+        let stream = UnixStream::connect(socket)
+            .await
+            .unwrap_or_else(|_| panic!("{label}: connect"));
+        let (read, mut write) = stream.into_split();
+        write
+            .write_all(auth.as_bytes())
+            .await
+            .unwrap_or_else(|_| panic!("{label}: auth write"));
+        let init = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": label, "version": "1" },
+            },
+        })
+        .to_string();
+        write.write_all(init.as_bytes()).await.unwrap();
+        write.write_all(b"\n").await.unwrap();
+        let initialized = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        })
+        .to_string();
+        write.write_all(initialized.as_bytes()).await.unwrap();
+        write.write_all(b"\n").await.unwrap();
+        let mut reader = BufReader::new(read);
+        let mut response = String::new();
+        timeout(Duration::from_secs(5), reader.read_line(&mut response))
+            .await
+            .unwrap_or_else(|_| panic!("{label}: initialize timeout"))
+            .unwrap_or_else(|_| panic!("{label}: initialize read err"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(response.trim()).expect("initialize JSON");
+        assert_eq!(parsed["id"], 1, "{label}: initialize id mismatch");
+        (write, reader)
+    }
+
+    async fn call_tool(
+        write: &mut tokio::net::unix::OwnedWriteHalf,
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        id: u64,
+        name: &str,
+        arguments: serde_json::Value,
+        label: &str,
+    ) -> serde_json::Value {
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments },
+        })
+        .to_string();
+        write.write_all(frame.as_bytes()).await.unwrap();
+        write.write_all(b"\n").await.unwrap();
+        let mut line = String::new();
+        timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .unwrap_or_else(|_| panic!("{label}: {name} timeout"))
+            .unwrap_or_else(|_| panic!("{label}: {name} read err"));
+        serde_json::from_str(line.trim())
+            .unwrap_or_else(|_| panic!("{label}: {name} response JSON"))
+    }
+
+    /// Extract `working.current_scope` from a `stats` response.
+    fn current_scope_from_stats(resp: &serde_json::Value, label: &str) -> String {
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: stats text missing: {resp}"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(text).unwrap_or_else(|_| panic!("{label}: stats JSON"));
+        parsed["working"]["current_scope"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: working.current_scope missing in {parsed}"))
+            .to_string()
+    }
+
+    let (mut wa, mut ra) = open_session(&socket, &auth, "client-A").await;
+    let (mut wb, mut rb) = open_session(&socket, &auth, "client-B").await;
+
+    // Boot default is "global" (per `Config::default()` /
+    // src/config.rs::defaults_match_spec). Confirm both sessions
+    // start there before either switches.
+    let stats0_a = call_tool(&mut wa, &mut ra, 2, "stats", serde_json::json!({}), "A").await;
+    assert_eq!(current_scope_from_stats(&stats0_a, "A"), "global");
+    let stats0_b = call_tool(&mut wb, &mut rb, 2, "stats", serde_json::json!({}), "B").await;
+    assert_eq!(current_scope_from_stats(&stats0_b, "B"), "global");
+
+    // A switches to "agent_a". With per-connection ScopeState, this
+    // only affects A's cell — B continues to see "global".
+    call_tool(
+        &mut wa,
+        &mut ra,
+        3,
+        "switch_scope",
+        serde_json::json!({ "scope": "agent_a" }),
+        "A",
+    )
+    .await;
+    let stats1_a = call_tool(&mut wa, &mut ra, 4, "stats", serde_json::json!({}), "A").await;
+    assert_eq!(current_scope_from_stats(&stats1_a, "A"), "agent_a");
+    let stats1_b = call_tool(&mut wb, &mut rb, 3, "stats", serde_json::json!({}), "B").await;
+    assert_eq!(
+        current_scope_from_stats(&stats1_b, "B"),
+        "global",
+        "SEC-001 regression: A's switch_scope leaked into B's session"
+    );
+
+    // B switches to "agent_b". A's "agent_a" must stay put.
+    call_tool(
+        &mut wb,
+        &mut rb,
+        4,
+        "switch_scope",
+        serde_json::json!({ "scope": "agent_b" }),
+        "B",
+    )
+    .await;
+    let stats2_b = call_tool(&mut wb, &mut rb, 5, "stats", serde_json::json!({}), "B").await;
+    assert_eq!(current_scope_from_stats(&stats2_b, "B"), "agent_b");
+    let stats2_a = call_tool(&mut wa, &mut ra, 5, "stats", serde_json::json!({}), "A").await;
+    assert_eq!(
+        current_scope_from_stats(&stats2_a, "A"),
+        "agent_a",
+        "SEC-001 regression: B's switch_scope clobbered A's scope"
+    );
+
+    drop(wa);
+    drop(ra);
+    drop(wb);
+    drop(rb);
+
+    sigterm(&daemon);
+    let exit = timeout(Duration::from_secs(10), daemon.wait())
+        .await
+        .expect("daemon exits within 10 s")
+        .expect("wait ok");
+    assert!(exit.success(), "{exit:?}");
+}
+
 #[tokio::test]
 async fn second_daemon_against_same_data_dir_refuses_to_start() {
     let tmp = TempDir::new().unwrap();

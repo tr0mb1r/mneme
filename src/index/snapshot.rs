@@ -34,6 +34,7 @@
 //! mid-save leaves either the previous good file or the new one — never
 //! a half-written `<path>`.
 
+use crate::crypto::{AadDomain, Aead, file_envelope};
 use crate::index::hnsw::HnswIndex;
 use crate::{MnemeError, Result};
 use std::fs::OpenOptions;
@@ -42,6 +43,8 @@ use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 14] = b"MNEME-HNSW-IDX";
 const CURRENT_SCHEMA: u16 = 2;
+/// AAD position for the whole-file snapshot envelope (ADR-0013 P5d).
+const SNAPSHOT_AAD_POSITION: &[u8] = b"hnsw.idx/v1";
 
 /// Persist the full index state to `path` atomically.
 ///
@@ -57,12 +60,43 @@ const CURRENT_SCHEMA: u16 = 2;
 /// duration of this call — typically the orchestrator holds a read
 /// lock on `Arc<RwLock<HnswIndex>>` while invoking `save`.
 pub fn save(index: &HnswIndex, applied_lsn: u64, path: &Path) -> Result<()> {
+    save_with_crypto(index, applied_lsn, path, None)
+}
+
+/// Variant of [`save`] that takes an optional [`Aead`]. When `Some`,
+/// the entire `MNEME-HNSW-IDX || schema || lsn || payload` blob is
+/// sealed as one AEAD envelope and the on-disk file contains only
+/// the ciphertext — the inner magic / schema / lsn are no longer
+/// visible without the key.
+pub fn save_with_crypto(
+    index: &HnswIndex,
+    applied_lsn: u64,
+    path: &Path,
+    aead: Option<&Aead>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| MnemeError::Index(format!("create snapshot parent: {e}")))?;
     }
     let payload = postcard::to_allocvec(index)
         .map_err(|e| MnemeError::Index(format!("postcard encode snapshot: {e}")))?;
+
+    let mut plaintext: Vec<u8> = Vec::with_capacity(MAGIC.len() + 2 + 8 + payload.len());
+    plaintext.extend_from_slice(MAGIC);
+    plaintext.extend_from_slice(&CURRENT_SCHEMA.to_le_bytes());
+    plaintext.extend_from_slice(&applied_lsn.to_le_bytes());
+    plaintext.extend_from_slice(&payload);
+
+    if let Some(a) = aead {
+        return file_envelope::seal_to_path(
+            path,
+            AadDomain::Hnsw,
+            SNAPSHOT_AAD_POSITION,
+            a,
+            &plaintext,
+        )
+        .map_err(|e| MnemeError::Index(format!("seal snapshot: {e}")));
+    }
 
     let tmp_path = tmp_path_for(path);
     {
@@ -72,14 +106,8 @@ pub fn save(index: &HnswIndex, applied_lsn: u64, path: &Path) -> Result<()> {
             .write(true)
             .open(&tmp_path)
             .map_err(|e| MnemeError::Index(format!("open snapshot tmp: {e}")))?;
-        f.write_all(MAGIC)
-            .map_err(|e| MnemeError::Index(format!("write magic: {e}")))?;
-        f.write_all(&CURRENT_SCHEMA.to_le_bytes())
-            .map_err(|e| MnemeError::Index(format!("write schema: {e}")))?;
-        f.write_all(&applied_lsn.to_le_bytes())
-            .map_err(|e| MnemeError::Index(format!("write applied_lsn: {e}")))?;
-        f.write_all(&payload)
-            .map_err(|e| MnemeError::Index(format!("write payload: {e}")))?;
+        f.write_all(&plaintext)
+            .map_err(|e| MnemeError::Index(format!("write snapshot body: {e}")))?;
         // sync_all also covers the inode; needed before rename or the
         // rename can outlive the data on some filesystems (xfs, ext4
         // without data=ordered).
@@ -95,8 +123,20 @@ pub fn save(index: &HnswIndex, applied_lsn: u64, path: &Path) -> Result<()> {
 /// mismatch, schema mismatch, or malformed postcard. Returns the
 /// loaded index alongside the `applied_lsn` it corresponds to.
 pub fn load(path: &Path) -> Result<(HnswIndex, u64)> {
-    let bytes = std::fs::read(path)
+    load_with_crypto(path, None)
+}
+
+/// Variant of [`load`] that takes an optional [`Aead`]. When `Some`,
+/// the on-disk file is expected to be a single AEAD envelope
+/// containing the magic / schema / lsn / payload concatenation.
+pub fn load_with_crypto(path: &Path, aead: Option<&Aead>) -> Result<(HnswIndex, u64)> {
+    let mut bytes = std::fs::read(path)
         .map_err(|e| MnemeError::Index(format!("read snapshot {path:?}: {e}")))?;
+    if let Some(a) = aead {
+        bytes = a
+            .open(AadDomain::Hnsw, SNAPSHOT_AAD_POSITION, &bytes)
+            .map_err(|e| MnemeError::Index(format!("open snapshot {path:?}: {e}")))?;
+    }
     if bytes.len() < MAGIC.len() + 2 + 8 {
         return Err(MnemeError::Index(format!(
             "snapshot {path:?} too short ({} bytes)",
