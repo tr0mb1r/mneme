@@ -125,6 +125,28 @@ actually wrote the phrase down. Don't use this on personal installs
 — most "I lost my data" support tickets in wallet ecosystems start
 with "I skipped the verification."
 
+### Re-running `mneme encrypt` (repair pass)
+
+*Since v1.2.1.* Running `mneme encrypt` when a keystore already
+exists is **not** an error and does **not** mint new keys. It loads
+the existing DEK (OS keyring, or `MNEME_RECOVERY_PHRASE` on headless
+boxes) and re-runs the data migration as an idempotent repair:
+
+- files already sealed in the current format are left untouched,
+- files sealed under the legacy v1.2.0 AAD positions are re-sealed
+  so the daemon can read them again,
+- plaintext semantic-WAL segments left behind by the v1.2.0
+  migration are folded into the HNSW snapshot and dropped.
+
+This is the documented recovery path for data dirs broken by the
+v1.2.0 migration (daemon failing to boot, clients seeing `-32000`).
+Your recovery phrase stays the same.
+
+To actually replace the keys, pass `--force-reinit` — that generates
+a fresh DEK + phrase and is destructive for data sealed under the
+old keys unless you still hold the old phrase. Take a `mneme backup`
+first.
+
 ## Recovering on a new machine
 
 Scenarios where the OS keyring entry is gone:

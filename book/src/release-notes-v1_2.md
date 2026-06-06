@@ -1,12 +1,92 @@
 # v1.2 release notes
 
-> **Status: v1.2.0 shipped 2026-06-06.** Previous: v1.1.1 (2026-05-23).
+> **Status: v1.2.1 shipped 2026-06-06** (same-day hotfix for the
+> v1.2.0 encryption migration — see below). v1.2.0 shipped
+> 2026-06-06. Previous: v1.1.1 (2026-05-23).
 > This page covers everything in the v1.2 train.
 
 The v1.2 cycle's theme is **data you can trust at rest**: every byte
 mneme writes to disk can now be sealed with authenticated encryption,
 opt-in, without touching the schema or breaking any existing install.
 Three security hardening fixes land alongside it.
+
+---
+
+## v1.2.1 — encryption migration hotfix
+
+**If you ran `mneme encrypt` on v1.2.0 and your daemon stopped
+starting** (MCP clients report `-32000`): upgrade to v1.2.1 and run
+`mneme encrypt` again. The re-run is a repair pass — it keeps your
+existing keys and recovery phrase, re-seals the broken files, and
+your data comes back intact. Nothing was lost.
+
+```sh
+brew upgrade mneme
+mneme stop          # if a daemon is somehow still running
+mneme encrypt       # repair pass under the existing keystore
+mneme daemon        # or let your MCP host start it
+```
+
+If you already rolled back with `mneme decrypt
+--yes-i-really-mean-it`, your data dir is plaintext and healthy —
+upgrade and run `mneme encrypt` whenever you want encryption back
+(this generates a new recovery phrase, since decrypt deleted the old
+keystore).
+
+### What was broken
+
+The v1.2.0 `mneme encrypt` migration sealed three surfaces in a way
+the runtime could not read back, and the failure killed every
+subsequent daemon boot:
+
+- **HNSW snapshot AAD mismatch.** The migration sealed
+  `semantic/hnsw.idx` under the bare-filename AAD position; the boot
+  loader opens with the versioned `hnsw.idx/v1` position. The tag
+  check failed and the boot fell back to a cold start — recoverable
+  by itself, but then:
+- **The semantic WAL was never migrated.** Plaintext
+  `semantic/wal/*.log` segments survived the migration, and the
+  encrypted boot's WAL replay died on them. This is the bug that
+  actually killed the daemon. The migration now folds outstanding
+  WAL records into the snapshot and drops the segments, in both
+  directions.
+- **Session snapshot AAD mismatch.** Sessions were sealed under the
+  full `<id>.snapshot` filename; the runtime opens with the bare
+  session id. Every migrated session failed to restore.
+
+Two more latent bugs are fixed in the same patch:
+
+- **Re-embed on an encrypted dir wrote a plaintext snapshot.** The
+  embedder-change migration (model swap) saved the rebuilt HNSW
+  snapshot through the plaintext writer even when the data dir was
+  encrypted — leaking every vector to disk and silently cold-starting
+  the index on the next boot. The AEAD is now threaded through.
+- **An encrypt re-run silently dropped every episodic record.** The
+  re-run drained the WAL with a plaintext replay (dying on sealed
+  frames), and rows already carrying the envelope magic were skipped
+  *after* the rebuild-from-empty had deleted the database file.
+  Sealed rows are now written through the raw backend byte-for-byte.
+
+### Repair semantics
+
+`mneme encrypt` on an already-initialised dir is no longer an error.
+It loads the existing DEK (OS keyring or `MNEME_RECOVERY_PHRASE`) and
+re-runs the full migration as an idempotent repair: files sealed
+under the legacy v1.2.0 AAD positions are detected and re-sealed,
+plaintext semantic-WAL segments are folded and dropped, and rows
+already in the target format are preserved untouched.
+`--force-reinit` keeps its old meaning — fresh keys, destructive
+without the old phrase.
+
+### Why the tests missed it
+
+Each surface's seal and open sides were unit-tested with the same
+helper, so a mismatch between the *migration's* seal call and the
+*runtime's* open call was invisible. v1.2.1 adds the missing test
+class: run the real migration over a populated data dir, then open
+the result with the actual boot-path loaders — plus a fixture that
+reproduces the exact broken v1.2.0 on-disk layout and proves the
+repair pass fixes it.
 
 ---
 
@@ -187,7 +267,7 @@ data directory as-is.
 
 ```sh
 brew upgrade mneme
-mneme --version   # confirm v1.2.0
+mneme --version   # confirm v1.2.1
 ```
 
 Encryption is off by default. To enable it:

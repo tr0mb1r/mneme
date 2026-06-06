@@ -23,7 +23,11 @@ work that the agent would otherwise forget.**
 
 ## Status
 
-**v1.2.0 shipped 2026-06-06.** Previous: v1.1.1 (2026-05-23), v1.0
+**v1.2.1 shipped 2026-06-06** — a same-day hotfix for the v1.2.0
+encryption migration (upgrade and re-run `mneme encrypt` if v1.2.0
+left your daemon unable to start; see the
+[v1.2 release notes](./release-notes-v1_2.md#v121--encryption-migration-hotfix)).
+Previous: v1.2.0 (2026-06-06), v1.1.1 (2026-05-23), v1.0
 (2026-05-18). Latest release on
 [`mneme-mcp`](https://crates.io/crates/mneme-mcp) (crates.io) and the
 [Homebrew tap](https://github.com/tr0mb1r/homebrew-mneme). The MCP wire

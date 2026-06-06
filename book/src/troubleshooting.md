@@ -152,6 +152,35 @@ The next sections cover failure modes specific to v1.1's
 the bridge — these sections apply. Manual `args: ["run"]` installs
 that skip the daemon are unaffected.
 
+## Daemon dies on boot after `mneme encrypt`; clients report `-32000`
+
+Symptom: you ran `mneme encrypt` on **v1.2.0**, and since then every
+daemon start dies before binding its socket. MCP hosts show
+`Failed to reconnect to mneme: -32000`. The log
+(`~/.mneme/logs/mneme.log`) shows
+`failed to load HNSW snapshot; starting cold ... AEAD operation
+failed` as the last line of each boot attempt.
+
+Cause: the v1.2.0 migration sealed the HNSW and session snapshots
+under AAD positions the runtime doesn't open with, and left the
+semantic WAL in plaintext — the encrypted boot's WAL replay then
+aborted the startup. Fixed in v1.2.1.
+
+Fix — upgrade and re-run the migration as a repair pass (your keys
+and data are intact; see
+[Re-running `mneme encrypt`](./encryption.md#re-running-mneme-encrypt-repair-pass)):
+
+```sh
+brew upgrade mneme       # >= 1.2.1
+mneme encrypt            # repair pass under the existing keystore
+mneme daemon             # or let the MCP host respawn it
+```
+
+If you already ran `mneme decrypt --yes-i-really-mean-it` to get
+unblocked: that worked (the broken seal/open pair was symmetric), your
+data dir is plaintext and healthy. Upgrade, then run `mneme encrypt`
+when you want encryption back — it will print a new recovery phrase.
+
 ## `mneme daemon` exits immediately with "another mneme daemon is already serving"
 
 A previous daemon is alive. The stale-cleanup probe in
