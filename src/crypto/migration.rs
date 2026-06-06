@@ -1,21 +1,28 @@
 //! In-place data-dir migration between plaintext and encrypted formats
-//! (ADR-0013 §D8, P5a).
+//! (ADR-0013 §D8, P5a–P5e).
 //!
-//! Today's scope: **redb only**. Walks every key in `episodic/data/mneme.redb`
-//! and re-encodes the value through (or out of) the encrypted Storage stack.
-//! Existing WAL segments are dropped at the start — they're already applied
-//! to redb (the migration triggers a final WAL replay first), so deletion is
-//! safe and gives the new encrypted-mode boot a clean WAL to start from.
+//! Covers every data surface, in step order:
 //!
-//! Deferred to subsequent commits:
+//! - `episodic/data/mneme.redb` (P5a) — drained through the source
+//!   Storage stack, the file rebuilt from empty, every value re-encoded
+//!   through the target stack. Episodic WAL segments are dropped after
+//!   the drain (already applied to redb).
+//! - `procedural/pinned.jsonl` (P5b) — whole-file envelope.
+//! - `cold/<YYYY-Qn>.zst` (P5e) — sealed compressed bundles.
+//! - `semantic/hnsw.idx` + `semantic/wal/` (P5d) — outstanding WAL
+//!   records are folded into the snapshot, the snapshot re-encoded
+//!   under the same AAD position the runtime loader uses, and the
+//!   segments dropped. Snapshot and WAL move together: the boot path
+//!   replays the WAL in the same mode it opens the snapshot, so
+//!   leaving segments behind in the source format kills the next boot.
+//! - `sessions/<id>.snapshot` (P5c) — sealed with the bare session id
+//!   as AAD position, matching `Session::load_with_crypto`.
 //!
-//! - `procedural/pinned.jsonl` (P5b) — needs the procedural module rewired
-//!   to read/write whole-file encrypted format. Pinned items remain
-//!   plaintext after `mneme encrypt`; users should re-pin to record them
-//!   encrypted, or wait for the P5b commit.
-//! - `sessions/<id>.snapshot` (P5c) — short-lived working-session state.
-//! - `index/hnsw.idx` (P5d) — regenerable from records.
-//! - `cold/<YYYY-Qn>.zst` (P5e) — quarterly archives.
+//! Re-runs are repairing: rows/files already in the target format are
+//! preserved, and artifacts sealed under the **legacy v1.2.0 AAD
+//! positions** (bare `hnsw.idx` filename, full `<id>.snapshot`
+//! filename) are detected and re-sealed under the positions the
+//! runtime actually opens with.
 //!
 //! ## Crash recovery
 //!
@@ -37,6 +44,8 @@
 //! stores will need a chunked walker — that's a v1.3 improvement.
 
 use crate::crypto::{AadDomain, Aead, Dek, MAGIC, file_envelope};
+use crate::index::hnsw::HnswIndex;
+use crate::storage::wal::{self, ReplayRecord, WalOp};
 use crate::storage::{EncryptedStorage, Storage, redb_impl::RedbStorage};
 use crate::{MnemeError, Result};
 use std::path::Path;
@@ -46,8 +55,12 @@ use std::sync::Arc;
 /// Mirrors the constant in `memory::procedural`.
 const PINNED_AAD_POSITION: &[u8] = b"pinned.jsonl/v1";
 
-/// AAD position bytes for HNSW snapshot files.
-const HNSW_AAD_POSITION: &[u8] = b"hnsw.idx/v1";
+/// AAD position the **broken v1.2.0 migration** sealed `hnsw.idx`
+/// under: the bare filename, instead of the
+/// [`crate::index::snapshot::SNAPSHOT_AAD_POSITION`] (`hnsw.idx/v1`)
+/// the runtime loader opens with. Kept only so re-runs of
+/// `mneme encrypt` can detect and repair snapshots sealed under it.
+const HNSW_LEGACY_AAD_POSITION: &[u8] = b"hnsw.idx";
 
 /// Filename of the procedural pinned-items JSONL.
 const PINNED_FILENAME: &str = "pinned.jsonl";
@@ -59,8 +72,8 @@ const PINNED_FILENAME: &str = "pinned.jsonl";
 pub struct MigrationReport {
     /// Number of redb rows whose value was re-encoded.
     pub redb_records_migrated: usize,
-    /// Number of redb rows we skipped because they were already in the
-    /// target format (idempotent re-run).
+    /// Number of redb rows already in the target format, preserved
+    /// byte-for-byte instead of re-encoded (idempotent re-run).
     pub redb_records_skipped: usize,
     /// WAL segment files removed during the WAL-drain step.
     pub wal_segments_dropped: usize,
@@ -69,11 +82,14 @@ pub struct MigrationReport {
     pub procedural_migrated: bool,
     /// Number of cold-archive bundles re-encoded.
     pub cold_bundles_migrated: usize,
-    /// HNSW snapshot files removed so the next daemon boot rebuilds
-    /// (and snapshots) under the new format.
-    pub hnsw_snapshots_wiped: usize,
-    /// Session snapshot files removed.
-    pub session_snapshots_wiped: usize,
+    /// `true` if the HNSW snapshot was re-encoded into the target
+    /// format (folding any outstanding semantic-WAL records first).
+    pub hnsw_snapshot_migrated: bool,
+    /// Semantic-WAL segment files dropped after their records were
+    /// folded into the re-encoded snapshot.
+    pub semantic_wal_segments_dropped: usize,
+    /// Session snapshot files re-encoded into the target format.
+    pub session_snapshots_migrated: usize,
 }
 
 /// Migrate `<root>/episodic` from plaintext into the encrypted format
@@ -85,8 +101,17 @@ pub fn migrate_to_encrypted(root: &Path, dek: &Dek) -> Result<MigrationReport> {
     let episodic = root.join("episodic");
     let mut report = MigrationReport::default();
 
-    // Step 1: drain WAL via plaintext replay + snapshot every (k, v).
-    let collected = drain_plaintext(&episodic)?;
+    // Step 1: drain WAL + snapshot every (k, v). On a fresh encrypt
+    // the WAL frames are plaintext; on a re-run over an already (or
+    // partially) encrypted dir they are sealed and must be replayed
+    // through the encrypted reader — a plaintext replay would die on
+    // the postcard decode. Either way the *values* come back exactly
+    // as stored (sealed values stay sealed); step 3 decides per row
+    // whether to seal or preserve.
+    let collected = match wal::segments_look_encrypted(&episodic.join("wal"))? {
+        Some(true) => drain_raw_encrypted(&episodic, dek)?,
+        _ => drain_plaintext(&episodic)?,
+    };
 
     // Step 2: drop the stale WAL segments. Safe because step 1's
     // replay folded everything into the redb materialized view; the
@@ -104,8 +129,14 @@ pub fn migrate_to_encrypted(root: &Path, dek: &Dek) -> Result<MigrationReport> {
     remove_redb_file(&episodic)?;
 
     // Step 3: open the (now empty) encrypted stack and write every
-    // value sealed. The MNE1-magic skip stays for idempotency.
-    let s = EncryptedStorage::open_redb(&episodic, dek)?;
+    // value sealed. Values that already carry the MNE1 magic (a
+    // re-run over a partially/previously encrypted dir) MUST still be
+    // written — through the *raw* backend, byte-for-byte: re-putting
+    // them through the encrypting wrapper would double-seal, and
+    // skipping them would silently drop the row from the
+    // rebuilt-from-empty redb (step 2.5 deleted the old file).
+    let raw = RedbStorage::open_encrypted(&episodic, Arc::new(Aead::new(dek)))?;
+    let s = EncryptedStorage::new(Arc::clone(&raw), dek);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -113,6 +144,7 @@ pub fn migrate_to_encrypted(root: &Path, dek: &Dek) -> Result<MigrationReport> {
     rt.block_on(async {
         for (key, value) in &collected {
             if value.starts_with(&MAGIC) {
+                raw.put(key, value).await?;
                 report.redb_records_skipped += 1;
                 continue;
             }
@@ -123,6 +155,7 @@ pub fn migrate_to_encrypted(root: &Path, dek: &Dek) -> Result<MigrationReport> {
         Ok::<(), MnemeError>(())
     })?;
     drop(s);
+    drop(raw);
 
     // Step 5: re-encode the procedural pinned-items JSONL as a
     // whole-file AEAD envelope (P5b).
@@ -134,13 +167,18 @@ pub fn migrate_to_encrypted(root: &Path, dek: &Dek) -> Result<MigrationReport> {
     // bytes whole.
     report.cold_bundles_migrated = migrate_cold_to_encrypted(root, &aead)?;
 
-    // Step 7: HNSW + sessions — encrypt the existing plaintext files
-    // in place using the same DEK-derived AEAD (ADR-0013 P5d). Both
-    // surfaces now support open_with_crypto so the daemon will read
-    // the encrypted files on next boot. If a file is already
-    // encrypted (MNE1 magic) the helper is a no-op for that entry.
-    report.hnsw_snapshots_wiped = migrate_hnsw_to_encrypted(root, &aead)?;
-    report.session_snapshots_wiped = migrate_sessions_to_encrypted(root, &aead)?;
+    // Step 7: HNSW + sessions — re-encode the semantic surface
+    // (snapshot *and* WAL) and every session snapshot into the
+    // encrypted format (ADR-0013 P5d). Idempotent: files already
+    // sealed under the correct AAD are left alone; files sealed under
+    // the legacy v1.2.0 AAD are repaired in place; outstanding
+    // semantic-WAL records are folded into the snapshot and the
+    // segments dropped, so the encrypted boot never replays a
+    // plaintext WAL.
+    let (hnsw_migrated, wal_dropped) = migrate_semantic(root, &aead, true)?;
+    report.hnsw_snapshot_migrated = hnsw_migrated;
+    report.semantic_wal_segments_dropped = wal_dropped;
+    report.session_snapshots_migrated = migrate_sessions_to_encrypted(root, &aead)?;
 
     Ok(report)
 }
@@ -188,8 +226,10 @@ pub fn migrate_to_plaintext(root: &Path, dek: &Dek) -> Result<MigrationReport> {
     let aead = Arc::new(Aead::new(dek));
     report.procedural_migrated = migrate_procedural_to_plaintext(root, &aead)?;
     report.cold_bundles_migrated = migrate_cold_to_plaintext(root, &aead)?;
-    report.hnsw_snapshots_wiped = migrate_hnsw_to_plaintext(root, &aead)?;
-    report.session_snapshots_wiped = migrate_sessions_to_plaintext(root, &aead)?;
+    let (hnsw_migrated, wal_dropped) = migrate_semantic(root, &aead, false)?;
+    report.hnsw_snapshot_migrated = hnsw_migrated;
+    report.semantic_wal_segments_dropped = wal_dropped;
+    report.session_snapshots_migrated = migrate_sessions_to_plaintext(root, &aead)?;
 
     Ok(report)
 }
@@ -220,6 +260,22 @@ fn drain_plaintext(episodic: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         .build()
         .map_err(MnemeError::Io)?;
     let s = RedbStorage::open(episodic)?;
+    let collected = rt.block_on(async { s.scan_prefix(b"").await })?;
+    drop(s);
+    Ok(collected)
+}
+
+/// Like [`drain_plaintext`] but with the encrypted *backend* only —
+/// WAL frames are AEAD-opened during replay, while the values come
+/// back raw (still sealed). Used by encrypt re-runs, where the rows
+/// must be preserved byte-for-byte rather than decrypted.
+fn drain_raw_encrypted(episodic: &Path, dek: &Dek) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(MnemeError::Io)?;
+    let aead = Arc::new(Aead::new(dek));
+    let s = RedbStorage::open_encrypted(episodic, aead)?;
     let collected = rt.block_on(async { s.scan_prefix(b"").await })?;
     drop(s);
     Ok(collected)
@@ -360,102 +416,205 @@ fn migrate_cold_to_plaintext(root: &Path, aead: &Aead) -> Result<usize> {
     Ok(count)
 }
 
-/// Encrypt the HNSW snapshot file at `<root>/semantic/hnsw.idx`
-/// (note: the actual file in the v1.0 layout is under `semantic/`,
-/// not `index/`; the path here matches `memory::semantic::SNAPSHOT_FILE`).
-/// Idempotent on the MNE1 magic.
-fn migrate_hnsw_to_encrypted(root: &Path, aead: &Aead) -> Result<usize> {
-    encrypt_files_under(
-        root.join("semantic"),
-        AadDomain::Hnsw,
-        aead,
-        true,
-        |fname| fname == crate::memory::semantic::SNAPSHOT_FILE,
-    )
+/// How the HNSW snapshot currently sits on disk. The encrypt
+/// migration has to accept all three non-missing states because a
+/// re-run may find the output of a v1.0/v1.1 daemon (plaintext), a
+/// fixed migration (sealed, correct AAD), or the broken v1.2.0
+/// migration (sealed, legacy filename AAD).
+enum SnapshotOnDisk {
+    Missing,
+    Plaintext(HnswIndex, u64),
+    /// Sealed under [`crate::index::snapshot::SNAPSHOT_AAD_POSITION`].
+    Sealed(HnswIndex, u64),
+    /// Sealed under [`HNSW_LEGACY_AAD_POSITION`] — needs repair.
+    SealedLegacy(HnswIndex, u64),
 }
 
-fn migrate_hnsw_to_plaintext(root: &Path, aead: &Aead) -> Result<usize> {
-    encrypt_files_under(
-        root.join("semantic"),
-        AadDomain::Hnsw,
-        aead,
-        false,
-        |fname| fname == crate::memory::semantic::SNAPSHOT_FILE,
-    )
-}
-
-/// Encrypt every session snapshot in `<root>/sessions/`. Idempotent
-/// on the MNE1 magic.
-fn migrate_sessions_to_encrypted(root: &Path, aead: &Aead) -> Result<usize> {
-    encrypt_files_under(
-        root.join("sessions"),
-        AadDomain::Session,
-        aead,
-        true,
-        |fname| fname.ends_with(".snapshot"),
-    )
-}
-
-fn migrate_sessions_to_plaintext(root: &Path, aead: &Aead) -> Result<usize> {
-    encrypt_files_under(
-        root.join("sessions"),
-        AadDomain::Session,
-        aead,
-        false,
-        |fname| fname.ends_with(".snapshot"),
-    )
-}
-
-/// Walk `dir` non-recursively, and for each file matching
-/// `filter(filename)`:
+/// Migrate the semantic surface — `<root>/semantic/hnsw.idx` *and*
+/// `<root>/semantic/wal/` — into the target format. The two move
+/// together: the boot path replays the WAL in the same mode it opens
+/// the snapshot, so leaving WAL segments behind in the *source*
+/// format kills the next daemon boot (the v1.2.0 `-32000` bug).
 ///
-/// - if `to_encrypted` and the file is plaintext, seal it (AAD =
-///   `domain || file_name_bytes`).
-/// - if `!to_encrypted` and the file is encrypted, open it.
-/// - idempotent otherwise.
+/// Mirrors the episodic drain: fold every outstanding WAL record into
+/// the snapshot, write the snapshot in the target format (AAD =
+/// [`crate::index::snapshot::SNAPSHOT_AAD_POSITION`], matching the
+/// runtime loader), then drop the now-redundant segments.
 ///
-/// Returns the count of files actually re-encoded. AAD position is
-/// the filename bytes, which is the obvious per-file identifier for
-/// session snapshots (UUID) and HNSW (single fixed name); both bind
-/// the ciphertext to its slot.
-fn encrypt_files_under<F: Fn(&str) -> bool>(
-    dir: std::path::PathBuf,
-    domain: AadDomain,
-    aead: &Aead,
-    to_encrypted: bool,
-    filter: F,
-) -> Result<usize> {
-    if !dir.exists() {
-        return Ok(0);
-    }
-    let mut count = 0;
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let fname = match path.file_name().and_then(|s| s.to_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-        if !filter(fname) {
-            continue;
+/// Returns `(snapshot_migrated, wal_segments_dropped)`. Idempotent: a
+/// snapshot already in the target format with no outstanding WAL is
+/// left untouched.
+fn migrate_semantic(root: &Path, aead: &Aead, to_encrypted: bool) -> Result<(bool, usize)> {
+    use crate::index::{delta, snapshot};
+
+    let semantic = root.join("semantic");
+    let snapshot_path = semantic.join(crate::memory::semantic::SNAPSHOT_FILE);
+    let wal_dir = semantic.join("wal");
+
+    let records = collect_semantic_wal(&wal_dir, aead)?;
+    let state = load_snapshot_any(&snapshot_path, aead)?;
+
+    let already_target = match &state {
+        SnapshotOnDisk::Sealed(..) => to_encrypted,
+        SnapshotOnDisk::Plaintext(..) => !to_encrypted,
+        SnapshotOnDisk::SealedLegacy(..) | SnapshotOnDisk::Missing => false,
+    };
+
+    let (mut idx, applied_lsn) = match state {
+        SnapshotOnDisk::Plaintext(i, l)
+        | SnapshotOnDisk::Sealed(i, l)
+        | SnapshotOnDisk::SealedLegacy(i, l) => (i, l),
+        SnapshotOnDisk::Missing => {
+            // No snapshot. If the WAL carries vector records we can
+            // still preserve them — infer the dim from the first one.
+            // A WAL with no vector ops (or no WAL at all) has nothing
+            // worth folding; just clear the segments.
+            let dim = records.iter().find_map(|r| match &r.op {
+                WalOp::VectorInsert { vec, .. } | WalOp::VectorReplace { vec, .. } => {
+                    Some(vec.len())
+                }
+                _ => None,
+            });
+            match dim {
+                Some(d) => (HnswIndex::new(d), 0u64),
+                None => return Ok((false, drop_wal_segments(&wal_dir)?)),
+            }
         }
-        let bytes = std::fs::read(&path)?;
-        let position = fname.as_bytes();
-        if to_encrypted {
-            if bytes.starts_with(&MAGIC) {
-                continue;
+    };
+
+    if already_target && records.is_empty() {
+        return Ok((false, 0));
+    }
+
+    let max_lsn = delta::replay_into(&mut idx, records.into_iter().map(Ok), applied_lsn)?;
+    snapshot::save_with_crypto(
+        &idx,
+        max_lsn.max(applied_lsn),
+        &snapshot_path,
+        to_encrypted.then_some(aead),
+    )?;
+    let dropped = drop_wal_segments(&wal_dir)?;
+    Ok((true, dropped))
+}
+
+/// Read the HNSW snapshot in whatever state it is on disk. Sealed
+/// files are tried under the correct AAD first, then the legacy
+/// v1.2.0 filename AAD; failing both is a hard error (wrong DEK or
+/// tampered file) — we never silently wipe the index.
+fn load_snapshot_any(path: &Path, aead: &Aead) -> Result<SnapshotOnDisk> {
+    use crate::index::snapshot;
+
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SnapshotOnDisk::Missing),
+        Err(e) => return Err(MnemeError::Io(e)),
+    };
+    if !bytes.starts_with(&MAGIC) {
+        let (idx, lsn) = snapshot::decode(&bytes, path)?;
+        return Ok(SnapshotOnDisk::Plaintext(idx, lsn));
+    }
+    if let Ok(plain) = aead.open(AadDomain::Hnsw, snapshot::SNAPSHOT_AAD_POSITION, &bytes) {
+        let (idx, lsn) = snapshot::decode(&plain, path)?;
+        return Ok(SnapshotOnDisk::Sealed(idx, lsn));
+    }
+    let plain = aead
+        .open(AadDomain::Hnsw, HNSW_LEGACY_AAD_POSITION, &bytes)
+        .map_err(|e| {
+            MnemeError::Crypto(format!(
+                "snapshot {path:?} is sealed but opens under neither the current \
+                 nor the legacy v1.2.0 AAD — wrong DEK or corrupted file: {e}"
+            ))
+        })?;
+    let (idx, lsn) = snapshot::decode(&plain, path)?;
+    Ok(SnapshotOnDisk::SealedLegacy(idx, lsn))
+}
+
+/// Collect every semantic-WAL record, sniffing whether the segments
+/// carry sealed or plaintext frame payloads. A torn tail terminates
+/// the collection cleanly (same semantics as boot replay); any other
+/// error aborts the migration loudly.
+fn collect_semantic_wal(wal_dir: &Path, aead: &Aead) -> Result<Vec<ReplayRecord>> {
+    let iter = match wal::segments_look_encrypted(wal_dir)? {
+        Some(true) => wal::replay_encrypted(wal_dir, Arc::new(aead.clone()))?,
+        _ => wal::replay(wal_dir)?,
+    };
+    iter.collect()
+}
+
+/// Encrypt every session snapshot in `<root>/sessions/`. The AAD
+/// position is the **bare session id** — the same bytes
+/// `Session::load_with_crypto` opens with. (The v1.2.0 migration used
+/// the full `<id>.snapshot` filename, so every migrated session
+/// failed to load; files found in that state are re-sealed here.)
+fn migrate_sessions_to_encrypted(root: &Path, aead: &Aead) -> Result<usize> {
+    let mut count = 0;
+    for (path, id, bytes) in session_snapshots(root)? {
+        if bytes.starts_with(&MAGIC) {
+            if aead.open(AadDomain::Session, id.as_bytes(), &bytes).is_ok() {
+                continue; // already sealed under the correct AAD
             }
-            file_envelope::seal_to_path(&path, domain, position, aead, &bytes)?;
+            let plain = open_session_legacy(aead, &path, &id, &bytes)?;
+            file_envelope::seal_to_path(&path, AadDomain::Session, id.as_bytes(), aead, &plain)?;
         } else {
-            if !bytes.starts_with(&MAGIC) {
-                continue;
-            }
-            let plain = aead.open(domain, position, &bytes)?;
-            write_atomic_simple(&path, &plain)?;
+            file_envelope::seal_to_path(&path, AadDomain::Session, id.as_bytes(), aead, &bytes)?;
         }
         count += 1;
     }
     Ok(count)
+}
+
+fn migrate_sessions_to_plaintext(root: &Path, aead: &Aead) -> Result<usize> {
+    let mut count = 0;
+    for (path, id, bytes) in session_snapshots(root)? {
+        if !bytes.starts_with(&MAGIC) {
+            continue; // already plaintext
+        }
+        let plain = match aead.open(AadDomain::Session, id.as_bytes(), &bytes) {
+            Ok(p) => p,
+            Err(_) => open_session_legacy(aead, &path, &id, &bytes)?,
+        };
+        write_atomic_simple(&path, &plain)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Open a sealed session snapshot under the legacy v1.2.0 AAD (the
+/// full filename). Failing this too is a hard error.
+fn open_session_legacy(aead: &Aead, path: &Path, id: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+    let legacy_position = format!("{id}.snapshot");
+    aead.open(AadDomain::Session, legacy_position.as_bytes(), bytes)
+        .map_err(|e| {
+            MnemeError::Crypto(format!(
+                "session snapshot {path:?} is sealed but opens under neither the \
+                 current nor the legacy v1.2.0 AAD — wrong DEK or corrupted file: {e}"
+            ))
+        })
+}
+
+/// Yield `(path, bare session id, file bytes)` for every
+/// `<root>/sessions/<id>.snapshot`.
+fn session_snapshots(root: &Path) -> Result<Vec<(std::path::PathBuf, String, Vec<u8>)>> {
+    let dir = root.join("sessions");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let id = match path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|n| n.strip_suffix(".snapshot"))
+        {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        let bytes = std::fs::read(&path)?;
+        out.push((path, id, bytes));
+    }
+    Ok(out)
 }
 
 /// Write `bytes` atomically to `path` via temp+rename, with 0o600
@@ -477,14 +636,6 @@ fn write_atomic_simple(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
-}
-
-// Silence: HNSW_AAD_POSITION is reserved for the P5d wiring of
-// `index/snapshot.rs` — keep the constant available so the AAD
-// surface stays domain-separated when that lands.
-#[allow(dead_code)]
-fn _hnsw_aad_unused() -> &'static [u8] {
-    HNSW_AAD_POSITION
 }
 
 #[cfg(test)]
@@ -631,5 +782,270 @@ mod tests {
         let dek = Dek::generate().unwrap();
         let report = migrate_to_encrypted(tmp.path(), &dek).unwrap();
         assert!(report.wal_segments_dropped >= 1);
+    }
+
+    #[test]
+    fn encrypt_rerun_preserves_already_encrypted_redb_rows() {
+        // Regression: step 2.5 rebuilds redb from an empty file, so a
+        // re-run that *skips* already-MNE1 values (instead of writing
+        // them through the raw backend) silently drops every row.
+        let tmp = TempDir::new().unwrap();
+        let written = populate_plaintext(&tmp, 8);
+        let dek = Dek::generate().unwrap();
+
+        migrate_to_encrypted(tmp.path(), &dek).unwrap();
+        let rerun = migrate_to_encrypted(tmp.path(), &dek).unwrap();
+        assert_eq!(rerun.redb_records_migrated, 0);
+        assert_eq!(rerun.redb_records_skipped, 8);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let s = EncryptedStorage::open_redb(&tmp.path().join("episodic"), &dek).unwrap();
+            for (k, v) in &written {
+                assert_eq!(
+                    s.get(k).await.unwrap().as_deref(),
+                    Some(v.as_slice()),
+                    "row lost or double-sealed by the encrypt re-run"
+                );
+            }
+        });
+    }
+
+    // ---------- semantic surface (hnsw.idx + semantic/wal) ----------
+
+    use crate::ids::{MemoryId, SessionId};
+    use crate::index::snapshot;
+    use crate::memory::working::Session;
+    use crate::storage::wal::WalWriter;
+
+    fn unit_vec(seed: f32) -> Vec<f32> {
+        let raw = [
+            (seed * 0.91).sin(),
+            (seed * 0.91).cos(),
+            (seed * 1.73).sin(),
+            (seed * 1.73).cos(),
+        ];
+        let n: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        raw.iter().map(|x| x / n).collect()
+    }
+
+    /// Plaintext semantic fixture exactly as a v1.0/v1.1 daemon leaves
+    /// it: a 2-vector snapshot at `applied_lsn = 2` plus one
+    /// outstanding `VectorInsert` (lsn 3) in the WAL. Returns the id
+    /// of the WAL-only vector so tests can prove the fold happened.
+    fn populate_semantic_plaintext(root: &Path) -> MemoryId {
+        let semantic = root.join("semantic");
+        let mut idx = HnswIndex::new(4);
+        idx.insert(MemoryId::new(), &unit_vec(1.0)).unwrap();
+        idx.insert(MemoryId::new(), &unit_vec(2.0)).unwrap();
+        snapshot::save(&idx, 2, &semantic.join("hnsw.idx")).unwrap();
+
+        let wal_only = MemoryId::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let w = WalWriter::open(&semantic.join("wal"), 3).unwrap();
+            w.append(WalOp::VectorInsert {
+                id: wal_only,
+                vec: unit_vec(3.0),
+            })
+            .await
+            .unwrap();
+        });
+        wal_only
+    }
+
+    fn populate_session_plaintext(root: &Path) -> SessionId {
+        let mut session = Session::new();
+        session.push_turn("user", "hello mneme");
+        session.checkpoint(&root.join("sessions")).unwrap();
+        session.id
+    }
+
+    fn semantic_wal_segments(root: &Path) -> usize {
+        let dir = root.join("semantic").join("wal");
+        if !dir.exists() {
+            return 0;
+        }
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .flat_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("log"))
+            .count()
+    }
+
+    /// The test class whose absence shipped the v1.2.0 `-32000` bug:
+    /// the migration's seal side checked against the *runtime's* open
+    /// side, not against its own helpers.
+    #[test]
+    fn encrypt_migration_output_opens_with_the_runtime_loaders() {
+        let tmp = TempDir::new().unwrap();
+        populate_plaintext(&tmp, 3);
+        let wal_only = populate_semantic_plaintext(tmp.path());
+        let sid = populate_session_plaintext(tmp.path());
+
+        let dek = Dek::generate().unwrap();
+        let report = migrate_to_encrypted(tmp.path(), &dek).unwrap();
+        assert!(report.hnsw_snapshot_migrated);
+        assert!(report.semantic_wal_segments_dropped >= 1);
+        assert_eq!(report.session_snapshots_migrated, 1);
+
+        let aead = Aead::new(&dek);
+        // Exactly what SemanticStore::open_with_crypto reads at boot.
+        let snapshot_path = tmp.path().join("semantic").join("hnsw.idx");
+        let (idx, lsn) = snapshot::load_with_crypto(&snapshot_path, Some(&aead))
+            .expect("sealed snapshot must open under the runtime AAD position");
+        assert_eq!(lsn, 3);
+        assert_eq!(idx.len(), 3);
+        let hits = idx.search(&unit_vec(3.0), 1).unwrap();
+        assert_eq!(
+            hits[0].0, wal_only,
+            "outstanding WAL record must be folded into the sealed snapshot"
+        );
+        assert_eq!(
+            semantic_wal_segments(tmp.path()),
+            0,
+            "encrypted boot must not find leftover plaintext segments"
+        );
+        // Exactly what the session restore path reads at boot.
+        let loaded = Session::load_with_crypto(&tmp.path().join("sessions"), sid, Some(&aead))
+            .expect("sealed session must open under the bare-id AAD position");
+        assert_eq!(loaded.turns.len(), 1);
+    }
+
+    /// Hand-craft the on-disk state the broken v1.2.0 migration left
+    /// behind — snapshot sealed under the bare-filename AAD, WAL still
+    /// plaintext, session sealed under the full-filename AAD — and
+    /// prove a re-run repairs all three.
+    #[test]
+    fn encrypt_rerun_repairs_broken_v120_layout() {
+        let tmp = TempDir::new().unwrap();
+        populate_plaintext(&tmp, 2);
+        let wal_only = populate_semantic_plaintext(tmp.path());
+        let sid = populate_session_plaintext(tmp.path());
+
+        let dek = Dek::generate().unwrap();
+        let aead = Aead::new(&dek);
+
+        // Seal the snapshot the way v1.2.0 did: legacy filename AAD,
+        // WAL left alone.
+        let snapshot_path = tmp.path().join("semantic").join("hnsw.idx");
+        let bytes = std::fs::read(&snapshot_path).unwrap();
+        file_envelope::seal_to_path(
+            &snapshot_path,
+            AadDomain::Hnsw,
+            HNSW_LEGACY_AAD_POSITION,
+            &aead,
+            &bytes,
+        )
+        .unwrap();
+        // Session sealed under the full filename.
+        let session_path = tmp.path().join("sessions").join(format!("{sid}.snapshot"));
+        let sbytes = std::fs::read(&session_path).unwrap();
+        file_envelope::seal_to_path(
+            &session_path,
+            AadDomain::Session,
+            format!("{sid}.snapshot").as_bytes(),
+            &aead,
+            &sbytes,
+        )
+        .unwrap();
+
+        // Sanity: this is the state that killed the daemon.
+        assert!(snapshot::load_with_crypto(&snapshot_path, Some(&aead)).is_err());
+        assert!(Session::load_with_crypto(&tmp.path().join("sessions"), sid, Some(&aead)).is_err());
+
+        let report = migrate_to_encrypted(tmp.path(), &dek).unwrap();
+        assert!(report.hnsw_snapshot_migrated, "legacy AAD must be repaired");
+        assert_eq!(report.session_snapshots_migrated, 1);
+
+        let (idx, lsn) = snapshot::load_with_crypto(&snapshot_path, Some(&aead)).unwrap();
+        assert_eq!(lsn, 3);
+        assert_eq!(idx.len(), 3);
+        assert_eq!(idx.search(&unit_vec(3.0), 1).unwrap()[0].0, wal_only);
+        assert_eq!(semantic_wal_segments(tmp.path()), 0);
+        Session::load_with_crypto(&tmp.path().join("sessions"), sid, Some(&aead)).unwrap();
+    }
+
+    #[test]
+    fn decrypt_migration_returns_semantic_surface_to_plaintext() {
+        let tmp = TempDir::new().unwrap();
+        populate_plaintext(&tmp, 2);
+        let wal_only = populate_semantic_plaintext(tmp.path());
+        let sid = populate_session_plaintext(tmp.path());
+
+        let dek = Dek::generate().unwrap();
+        migrate_to_encrypted(tmp.path(), &dek).unwrap();
+        let report = migrate_to_plaintext(tmp.path(), &dek).unwrap();
+        assert!(report.hnsw_snapshot_migrated);
+        assert_eq!(report.session_snapshots_migrated, 1);
+
+        // Plaintext loaders — what a post-decrypt boot uses.
+        let snapshot_path = tmp.path().join("semantic").join("hnsw.idx");
+        let (idx, lsn) = snapshot::load(&snapshot_path).unwrap();
+        assert_eq!(lsn, 3);
+        assert_eq!(idx.len(), 3);
+        assert_eq!(idx.search(&unit_vec(3.0), 1).unwrap()[0].0, wal_only);
+        assert_eq!(semantic_wal_segments(tmp.path()), 0);
+        let loaded = Session::load(&tmp.path().join("sessions"), sid).unwrap();
+        assert_eq!(loaded.turns.len(), 1);
+    }
+
+    #[test]
+    fn semantic_migration_is_idempotent_when_already_in_target_format() {
+        let tmp = TempDir::new().unwrap();
+        populate_plaintext(&tmp, 2);
+        populate_semantic_plaintext(tmp.path());
+        populate_session_plaintext(tmp.path());
+
+        let dek = Dek::generate().unwrap();
+        migrate_to_encrypted(tmp.path(), &dek).unwrap();
+        let rerun = migrate_to_encrypted(tmp.path(), &dek).unwrap();
+        assert!(!rerun.hnsw_snapshot_migrated);
+        assert_eq!(rerun.semantic_wal_segments_dropped, 0);
+        assert_eq!(rerun.session_snapshots_migrated, 0);
+    }
+
+    #[test]
+    fn encrypt_migration_with_wal_but_no_snapshot_still_folds_records() {
+        // A daemon younger than its first snapshot tick has WAL
+        // segments but no hnsw.idx. The migration must still preserve
+        // those vectors (dim inferred from the first record) — and
+        // must NOT leave plaintext segments behind for the encrypted
+        // boot to choke on.
+        let tmp = TempDir::new().unwrap();
+        populate_plaintext(&tmp, 1);
+        let id = MemoryId::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let w = WalWriter::open(&tmp.path().join("semantic").join("wal"), 1).unwrap();
+            w.append(WalOp::VectorInsert {
+                id,
+                vec: unit_vec(7.0),
+            })
+            .await
+            .unwrap();
+        });
+
+        let dek = Dek::generate().unwrap();
+        let report = migrate_to_encrypted(tmp.path(), &dek).unwrap();
+        assert!(report.hnsw_snapshot_migrated);
+        assert_eq!(semantic_wal_segments(tmp.path()), 0);
+
+        let aead = Aead::new(&dek);
+        let (idx, lsn) =
+            snapshot::load_with_crypto(&tmp.path().join("semantic").join("hnsw.idx"), Some(&aead))
+                .unwrap();
+        assert_eq!(lsn, 1);
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.search(&unit_vec(7.0), 1).unwrap()[0].0, id);
     }
 }

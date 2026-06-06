@@ -88,6 +88,7 @@ impl AadDomain {
 /// The cipher itself is cheap to clone (a couple of register-sized
 /// fields), but we hold one instance per [`Aead`] to avoid re-running
 /// the key schedule on every call.
+#[derive(Clone)]
 pub struct Aead {
     cipher: XChaCha20Poly1305,
 }

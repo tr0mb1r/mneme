@@ -75,7 +75,10 @@ pub fn open_episodic_storage_and_aead(
 ///
 /// Returns a structured error if neither source has the key,
 /// pointing at `mneme recover --mnemonic ...` as the next step.
-fn load_kek(keystore: &Keystore, keyring: &dyn KekStore) -> Result<crate::crypto::Kek> {
+///
+/// `pub(crate)` so `cli::encrypt` can resolve the existing DEK when a
+/// re-run of `mneme encrypt` repairs an already-initialised data dir.
+pub(crate) fn load_kek(keystore: &Keystore, keyring: &dyn KekStore) -> Result<crate::crypto::Kek> {
     if let Some(k) = keyring.load(&keystore.keyring.account)? {
         return Ok(k);
     }

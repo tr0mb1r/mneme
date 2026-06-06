@@ -187,6 +187,7 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
         Arc::clone(&storage_dyn),
         Arc::clone(&embedder),
         &active_model_name,
+        data_aead.clone(),
     ))? {
         crate::embed::migrate::Outcome::NoChange => {}
         crate::embed::migrate::Outcome::Migrated { count } => {

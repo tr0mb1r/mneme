@@ -2,12 +2,14 @@
 //! — encryption-at-rest CLI (ADR-0013 D10, P6).
 //!
 //! All four subcommands refuse to run while the daemon's lockfile is
-//! held. They operate on the keystore + keyring layer only — full
-//! data-dir migration (P5a–P5d wire-up of HNSW, procedural, sessions,
-//! and cold archive) is a follow-up. For now `mneme encrypt` is the
-//! one-time init on a fresh or already-encrypted data dir; data
-//! written *after* the keystore lands goes through the encrypted
-//! Storage stack (P3 + P4) and is opaque on disk.
+//! held. `mneme encrypt` initialises the keystore + keyring on a fresh
+//! dir and migrates every existing data surface (redb, both WALs,
+//! procedural, cold, HNSW snapshot, sessions) in place; re-running it
+//! on an already-initialised dir keeps the existing keys and performs
+//! a repair pass over the same migration (the recovery path for dirs
+//! the broken v1.2.0 migration left mixed-state). Data written after
+//! the keystore lands goes through the encrypted Storage stack
+//! (P3 + P4) and is opaque on disk.
 
 use crate::crypto::{
     Dek, KekStore, Keystore, Mnemonic, OsKeyring, VerifyChallenge, account_for, keystore_path,
@@ -88,12 +90,33 @@ pub fn encrypt_at(
     refuse_if_locked(root)?;
     let ks_path = keystore_path(root);
     if ks_path.exists() && !force_reinit {
-        return Err(MnemeError::Config(format!(
-            "keystore already exists at {} (pass --force-reinit to replace it; \
-             you will lose access to any existing encrypted data unless you keep \
-             the current recovery mnemonic)",
+        // Re-run on an already-initialised dir: keep the existing DEK
+        // and run the (idempotent, repairing) data migration under it.
+        // This is the upgrade path for dirs the v1.2.0 migration left
+        // in a mixed state — wrong-AAD hnsw/session snapshots and a
+        // plaintext semantic WAL that killed every daemon boot.
+        let keystore = Keystore::load(root)?.ok_or_else(|| {
+            MnemeError::Crypto(format!(
+                "keystore at {} exists but failed to load",
+                ks_path.display()
+            ))
+        })?;
+        let kek = crate::crypto::boot::load_kek(&keystore, keyring)?;
+        let dek = keystore.unwrap_dek(&kek)?;
+        eprintln!(
+            "Keystore already present at {} — keeping the existing keys and \
+             running a repair pass over the data dir. (Pass --force-reinit to \
+             generate fresh keys instead; that abandons data sealed under the \
+             current ones.)",
             ks_path.display()
-        )));
+        );
+        eprintln!();
+        eprintln!("Migrating existing data to encrypted format...");
+        let report = migration::migrate_to_encrypted(root, &dek)?;
+        print_encrypt_report(&report);
+        eprintln!();
+        eprintln!("Repair pass complete. Run `mneme run` or `mneme daemon` to start the server.");
+        return Ok(());
     }
 
     let mnemonic = Mnemonic::generate()?;
@@ -129,34 +152,7 @@ pub fn encrypt_at(
     eprintln!();
     eprintln!("Migrating existing data to encrypted format...");
     let report = migration::migrate_to_encrypted(root, &dek)?;
-    eprintln!(
-        "  redb: {} records re-encoded, {} already encrypted",
-        report.redb_records_migrated, report.redb_records_skipped,
-    );
-    eprintln!(
-        "  WAL:  {} stale segments dropped",
-        report.wal_segments_dropped
-    );
-    eprintln!(
-        "  procedural: {}",
-        if report.procedural_migrated {
-            "pinned.jsonl re-encoded encrypted"
-        } else {
-            "(no plaintext file to migrate)"
-        }
-    );
-    eprintln!(
-        "  cold:       {} archive bundles re-encoded encrypted",
-        report.cold_bundles_migrated
-    );
-    eprintln!(
-        "  hnsw:       {} stale snapshots wiped (rebuilds encrypted on next boot)",
-        report.hnsw_snapshots_wiped
-    );
-    eprintln!(
-        "  sessions:   {} stale snapshots wiped",
-        report.session_snapshots_wiped
-    );
+    print_encrypt_report(&report);
 
     eprintln!();
     eprintln!("Encryption enabled. Keystore: {}", ks_path.display());
@@ -288,6 +284,19 @@ pub fn decrypt_at(root: &Path, force: bool, keyring: &dyn KekStore) -> Result<()
         "  cold:       {} archive bundles decoded back to plaintext",
         report.cold_bundles_migrated
     );
+    eprintln!(
+        "  hnsw:       {} ({} semantic-WAL segments folded in and dropped)",
+        if report.hnsw_snapshot_migrated {
+            "snapshot decoded back to plaintext"
+        } else {
+            "(already plaintext or absent)"
+        },
+        report.semantic_wal_segments_dropped
+    );
+    eprintln!(
+        "  sessions:   {} snapshots decoded back to plaintext",
+        report.session_snapshots_migrated
+    );
 
     keyring.delete(&keystore.keyring.account)?;
     let p = keystore_path(root);
@@ -297,6 +306,42 @@ pub fn decrypt_at(root: &Path, force: bool, keyring: &dyn KekStore) -> Result<()
 }
 
 // ---------- helpers ----------
+
+fn print_encrypt_report(report: &migration::MigrationReport) {
+    eprintln!(
+        "  redb: {} records re-encoded, {} already encrypted",
+        report.redb_records_migrated, report.redb_records_skipped,
+    );
+    eprintln!(
+        "  WAL:  {} stale segments dropped",
+        report.wal_segments_dropped
+    );
+    eprintln!(
+        "  procedural: {}",
+        if report.procedural_migrated {
+            "pinned.jsonl re-encoded encrypted"
+        } else {
+            "(no plaintext file to migrate)"
+        }
+    );
+    eprintln!(
+        "  cold:       {} archive bundles re-encoded encrypted",
+        report.cold_bundles_migrated
+    );
+    eprintln!(
+        "  hnsw:       {} ({} semantic-WAL segments folded in and dropped)",
+        if report.hnsw_snapshot_migrated {
+            "snapshot re-encoded encrypted"
+        } else {
+            "(already encrypted or absent)"
+        },
+        report.semantic_wal_segments_dropped
+    );
+    eprintln!(
+        "  sessions:   {} snapshots re-encoded encrypted",
+        report.session_snapshots_migrated
+    );
+}
 
 fn data_root() -> Result<std::path::PathBuf> {
     crate::storage::layout::default_root()
@@ -417,10 +462,31 @@ mod tests {
     }
 
     #[test]
-    fn encrypt_at_refuses_if_keystore_exists() {
+    fn encrypt_at_rerun_repairs_under_existing_keys() {
+        // A second `mneme encrypt` is the documented repair path for
+        // dirs the v1.2.0 migration broke: it must keep the keystore
+        // (same wrapped DEK) and re-run the migration, not refuse and
+        // not mint fresh keys.
         let tmp = TempDir::new().unwrap();
         let keyring = InMemoryKekStore::new();
         encrypt_at(tmp.path(), false, true, &keyring, &mut BadPrompt).unwrap();
+        let before = Keystore::load(tmp.path()).unwrap().unwrap().wrapped_dek;
+        encrypt_at(tmp.path(), false, true, &keyring, &mut BadPrompt).unwrap();
+        let after = Keystore::load(tmp.path()).unwrap().unwrap().wrapped_dek;
+        assert_eq!(before, after, "repair pass must not rotate keys");
+    }
+
+    #[test]
+    fn encrypt_at_rerun_without_kek_fails_clean() {
+        // Keystore present but the keyring entry is gone (fresh
+        // machine before `mneme recover`): the repair pass must refuse
+        // rather than reinitialise over data it cannot read.
+        let tmp = TempDir::new().unwrap();
+        let keyring = InMemoryKekStore::new();
+        encrypt_at(tmp.path(), false, true, &keyring, &mut BadPrompt).unwrap();
+        keyring.delete(&account_for(tmp.path())).unwrap();
+        // SAFETY: env mutation in tests
+        unsafe { std::env::remove_var(crate::crypto::boot::RECOVERY_PHRASE_ENV) };
         let err = encrypt_at(tmp.path(), false, true, &keyring, &mut BadPrompt);
         assert!(err.is_err());
     }
