@@ -1,7 +1,7 @@
 # CLI surface
 
-`mneme` ships a single binary with twelve subcommands. This page is the
-canonical inventory.
+`mneme` ships a single binary. This page is the canonical inventory of
+its subcommands.
 
 The MCP server runs under either `mneme daemon` (v1.1 long-lived
 process; default after `mneme init claude-code`) or `mneme run`
@@ -119,7 +119,7 @@ end-to-end without needing a daemon to be up.
 | `claude mcp add … mneme client` (manual, daemon mode) | `["client"]` | Same shape, hand-rolled. |
 | `claude mcp add … mneme run` (manual, fallback) | `["run"]` | Single-host stdio. No daemon, no socket, no token file. |
 
-## Subcommands (12)
+## Subcommands (17)
 
 ### Lifecycle
 
@@ -148,6 +148,25 @@ end-to-end without needing a daemon to be up.
 |------------|--------------|
 | `mneme backup <output> [--include-models]` | Tar+gzip the data directory to `<output>`. Excludes `~/.mneme/models/` (re-downloadable) and `~/.mneme/logs/` by default. Pass `--include-models` to ship a self-contained archive (~1–2 GB depending on the model). Symlinks are preserved as symlinks rather than followed. Refuses while the lockfile is held — a snapshot of in-flight WAL state would capture a torn write. |
 | `mneme restore <input> [--force]` | Extract a `mneme backup`-produced archive back into the data directory. Atomic (temp+rename); refuses to overwrite an already-populated directory unless `--force` is given. Refuses while the lockfile is held. |
+
+### Encryption
+
+Encryption at rest is **opt-in** and gated by the presence of
+`~/.mneme/keystore.json`. When the keystore exists, the daemon
+refuses to bind without a valid KEK in the OS keyring (or the
+`MNEME_RECOVERY_PHRASE` environment variable on headless hosts).
+All four subcommands below refuse while a `mneme daemon` or
+`mneme run` instance holds the lock — stop the server first.
+
+| Subcommand | What it does |
+|------------|--------------|
+| `mneme encrypt [--force-reinit] [--no-verify]` | **Turn on encryption.** Generates `~/.mneme/keystore.json` and a DEK, derives the KEK from a freshly-generated 12-word BIP39 recovery phrase (printed once — write it down), stashes the KEK in the OS keyring, then migrates the existing data dir to encrypted in place (rebuilds the redb file from an empty file so no pre-encryption plaintext survives in freed pages). `--force-reinit` replaces an existing keystore; without the current phrase, records encrypted under the old KEK become unrecoverable. `--no-verify` skips the 3-of-12 recovery-phrase verification challenge (`mnemonic_verified = false`; for scripted/CI installs; not recommended for personal use). |
+| `mneme recover --mnemonic "<12 words>"` | **Restore the KEK on a new or wiped machine.** Re-derives the KEK from the recovery phrase and writes it to the OS keyring. Verifies the phrase actually unwraps the existing keystore before stashing — fails fast rather than silently overwriting with a wrong key. |
+| `mneme rekey [--no-verify]` | **Rotate the recovery phrase.** Generates a new mnemonic + KEK and re-wraps the existing DEK. O(1) — no on-disk data is rewritten. The old phrase is invalidated immediately. |
+| `mneme decrypt --yes-i-really-mean-it` | **Turn off encryption.** Removes `~/.mneme/keystore.json` and clears the OS-keyring entry. Records encrypted under the now-deleted KEK become unrecoverable. Run `mneme backup` first if you want to keep the data. |
+
+See [Encryption at rest](./encryption.md) for the full setup guide,
+key-custody model, and headless configuration.
 
 ## Lockfile contract
 
