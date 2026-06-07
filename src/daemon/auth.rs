@@ -334,7 +334,7 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), AuthError> {
 
     let tmp = path.with_extension("token.tmp");
     {
-        let mut f = std::fs::File::create(&tmp).map_err(|source| AuthError::Io {
+        let mut f = create_secure(&tmp).map_err(|source| AuthError::Io {
             path: tmp.clone(),
             source,
         })?;
@@ -362,6 +362,26 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), AuthError> {
         tracing::warn!(error = %source, parent = %parent.display(), "auth token parent dir fsync failed");
     }
     Ok(())
+}
+
+/// Create the token file with `0o600` permissions from the moment it
+/// exists (Unix), closing the window where the temp token would
+/// otherwise sit at the umask default before [`set_token_perms`]
+/// tightens it.
+#[cfg(unix)]
+fn create_secure(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(AUTH_TOKEN_MODE)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_secure(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::File::create(path)
 }
 
 #[cfg(unix)]

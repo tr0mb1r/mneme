@@ -85,6 +85,10 @@ pub(crate) fn load_kek(keystore: &Keystore, keyring: &dyn KekStore) -> Result<cr
     if let Ok(phrase) = std::env::var(RECOVERY_PHRASE_ENV)
         && !phrase.is_empty()
     {
+        // The phrase is the root secret — wipe our heap copy on every
+        // exit path. (The process environment itself is out of our hands;
+        // load it from a secrets manager, not a shell rcfile.)
+        let phrase = zeroize::Zeroizing::new(phrase);
         let mnemonic = Mnemonic::parse(phrase.trim())?;
         let derived = mnemonic.derive_kek("");
         // Verify against the keystore before returning — guards
