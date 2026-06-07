@@ -23,12 +23,14 @@ work that the agent would otherwise forget.**
 
 ## Status
 
-**v1.2.1 shipped 2026-06-06** — a same-day hotfix for the v1.2.0
-encryption migration (upgrade and re-run `mneme encrypt` if v1.2.0
-left your daemon unable to start; see the
-[v1.2 release notes](./release-notes-v1_2.md#v121--encryption-migration-hotfix)).
-Previous: v1.2.0 (2026-06-06), v1.1.1 (2026-05-23), v1.0
-(2026-05-18). Latest release on
+**v1.2.2 shipped 2026-06-07** — a security hardening release:
+`mneme restore` refuses archives that try to escape the data dir
+through planted symlinks (CWE-22), the recovery phrase is wiped from
+heap after key derivation, and secret temp files are `0600` from
+creation (see the
+[v1.2 release notes](./release-notes-v1_2.md#v122--restore-hardening--secret-hygiene)).
+Previous: v1.2.1 (2026-06-06), v1.2.0 (2026-06-06), v1.1.1
+(2026-05-23), v1.0 (2026-05-18). Latest release on
 [`mneme-mcp`](https://crates.io/crates/mneme-mcp) (crates.io) and the
 [Homebrew tap](https://github.com/tr0mb1r/homebrew-mneme). The MCP wire
 surface is the semver-tracked contract from 1.0 onward (see [MCP

@@ -7,14 +7,14 @@
 > A standalone, MCP-native memory tool for any LLM or agent.
 > Single binary. Local-first. Rust. Built to last.
 
-**Status:** v1.2.1 shipped 2026-06-06 on
+**Status:** v1.2.2 shipped 2026-06-07 on
 [`mneme-mcp`](https://crates.io/crates/mneme-mcp) (crates.io) and the
-[Homebrew tap](https://github.com/tr0mb1r/homebrew-mneme) — a same-day
-hotfix for the v1.2.0 encryption migration (if `mneme encrypt` on
-v1.2.0 left your daemon unable to start, upgrade and re-run
-`mneme encrypt`; it repairs in place, nothing is lost). Previous
-releases: v1.2.0 (2026-06-06), v1.1.1 (2026-05-23), v1.0
-(2026-05-18). The MCP wire
+[Homebrew tap](https://github.com/tr0mb1r/homebrew-mneme) — a security
+hardening release: `mneme restore` now refuses archives that try to
+escape the data dir through planted symlinks (CWE-22), the recovery
+phrase is wiped from heap after key derivation, and secret temp files
+are `0600` from creation. Previous releases: v1.2.1 (2026-06-06),
+v1.2.0 (2026-06-06), v1.1.1 (2026-05-23), v1.0 (2026-05-18). The MCP wire
 surface is the semver-tracked contract from 1.0 onward (see
 [`book/src/mcp-surface.md`](book/src/mcp-surface.md)); the Rust library
 API is private (binary-only crate). The on-disk format is stable behind

@@ -1,14 +1,45 @@
 # v1.2 release notes
 
-> **Status: v1.2.1 shipped 2026-06-06** (same-day hotfix for the
-> v1.2.0 encryption migration — see below). v1.2.0 shipped
-> 2026-06-06. Previous: v1.1.1 (2026-05-23).
+> **Status: v1.2.2 shipped 2026-06-07** (restore hardening + secret
+> hygiene — see below). v1.2.1 shipped 2026-06-06 (same-day hotfix
+> for the v1.2.0 encryption migration). v1.2.0 shipped 2026-06-06.
+> Previous: v1.1.1 (2026-05-23).
 > This page covers everything in the v1.2 train.
 
 The v1.2 cycle's theme is **data you can trust at rest**: every byte
 mneme writes to disk can now be sealed with authenticated encryption,
 opt-in, without touching the schema or breaking any existing install.
 Three security hardening fixes land alongside it.
+
+---
+
+## v1.2.2 — restore hardening + secret hygiene
+
+Three security-review remediations; no behaviour change for
+well-formed backups, no schema or config impact.
+
+**`mneme restore` symlink escape (CWE-22).** The unpack loop only
+validated entry *names* for `..` and absolute paths, and
+`tar::Entry::unpack` on its own does not enforce containment — so a
+crafted `.tar.gz` could plant a symlink pointing outside the data dir
+and then write a child file *through* it: an arbitrary file write as
+the restoring user. Restore now canonicalizes each entry's nearest
+existing ancestor and refuses anything that resolves outside the
+restore root, and unlinks any pre-existing symlink at a destination
+before unpacking so it never follows one out of root. Legitimate
+backups containing symlinks still round-trip; a regression test pins
+the contract. Only restore archives you made yourself regardless —
+but a malicious archive can no longer write outside the data dir.
+
+**Recovery-phrase hygiene.** The `MNEME_RECOVERY_PHRASE` heap copy is
+wiped (`zeroize`) after KEK derivation on every exit path. The process
+environment itself is outside mneme's control — load the phrase from a
+secrets manager, not a shell rcfile.
+
+**Secret temp-file perms.** `keystore.json.tmp` and `auth.token.tmp`
+are now created at mode `0600` rather than written at the umask
+default and chmod-ed after — closing the brief window where another
+local user could have opened them.
 
 ---
 
