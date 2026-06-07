@@ -38,24 +38,66 @@ pub fn restore_at(input: &Path, root: &Path, force: bool) -> Result<()> {
     }
 
     std::fs::create_dir_all(root)?;
+    // Canonical root for the containment checks below. `root` was just
+    // created, so this resolves.
+    let canon_root = std::fs::canonicalize(root)?;
     let f = File::open(input)?;
     let gz = GzDecoder::new(f);
     let mut tar = tar::Archive::new(gz);
-    // Don't trust archive paths blindly — `tar` 0.4 already refuses
-    // entries that escape the unpack directory, but we belt-and-
-    // suspenders by walking the entries one at a time.
+    // Don't trust archive paths. We reject entry *names* that are
+    // absolute or contain `..`, and — because `Entry::unpack` follows a
+    // pre-existing symlink at the destination — we also refuse to unpack
+    // *through* any symlink an earlier entry may have planted that
+    // resolves outside the data dir (the classic "symlink then
+    // write-through" tar escape, CWE-22). `Entry::unpack` on its own does
+    // NOT enforce containment; only the checks in this loop do.
     let mut count = 0usize;
     for entry in tar.entries()? {
         let mut entry = entry?;
-        let path = entry.path()?;
-        if path.is_absolute() || path.components().any(|c| c.as_os_str() == "..") {
+        // Own the path so the immutable borrow of `entry` ends here,
+        // leaving `entry` free for the `unpack` mutable borrow below.
+        let rel = entry.path()?.into_owned();
+        if rel.is_absolute() || rel.components().any(|c| c.as_os_str() == "..") {
             return Err(MnemeError::Config(format!(
                 "archive entry {} has an unsafe path; refusing to restore",
-                path.display()
+                rel.display()
             )));
         }
-        let dest = root.join(&path);
-        // tar::Entry::unpack handles dir/file/symlink polymorphism.
+        let dest = root.join(&rel);
+
+        // The nearest already-existing ancestor of `dest` must resolve
+        // (symlinks included) to a location inside the data dir. If an
+        // earlier entry planted a symlink pointing outside `root`, a
+        // child written through it canonicalizes outside `canon_root` —
+        // refuse rather than escape.
+        let mut ancestor = dest.parent();
+        while let Some(a) = ancestor {
+            if a.exists() {
+                let canon = std::fs::canonicalize(a)?;
+                if !canon.starts_with(&canon_root) {
+                    return Err(MnemeError::Config(format!(
+                        "archive entry {} resolves outside the data directory \
+                         (via a symlink); refusing to restore",
+                        rel.display()
+                    )));
+                }
+                break;
+            }
+            ancestor = a.parent();
+        }
+
+        // Never write *onto* an existing symlink/hardlink: unlink it so
+        // `unpack` writes a fresh inode instead of following the link to
+        // a target outside `root`. A well-formed backup never lists the
+        // same path twice, so this only fires on `--force` re-restores
+        // and crafted archives.
+        if let Ok(meta) = std::fs::symlink_metadata(&dest)
+            && !meta.is_dir()
+        {
+            let _ = std::fs::remove_file(&dest);
+        }
+
+        // `Entry::unpack` handles dir/file/symlink polymorphism.
         entry.unpack(&dest)?;
         count += 1;
     }
@@ -240,5 +282,59 @@ mod tests {
             Err(MnemeError::Config(msg)) => assert!(msg.contains("does not exist")),
             other => panic!("expected Config error, got {other:?}"),
         }
+    }
+
+    /// Security regression: a crafted archive that plants a symlink
+    /// pointing outside the data dir, then writes a file *through* it,
+    /// must be refused — and must not write anything outside `root`.
+    /// Guards the CWE-22 symlink-escape fix in `restore_at`.
+    #[cfg(unix)]
+    #[test]
+    fn restore_refuses_symlink_escape() {
+        // The "victim" location an attacker wants to write into, well
+        // outside the restore root.
+        let victim = TempDir::new().unwrap();
+        let victim_dir = victim.path().to_path_buf();
+
+        // Build the malicious .tar.gz in memory:
+        //   entry 1: symlink  `pwn`      -> <victim_dir>  (absolute target)
+        //   entry 2: regular  `pwn/loot` -> attacker bytes
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+            let mut builder = tar::Builder::new(enc);
+
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_mode(0o777);
+            builder.append_link(&mut link, "pwn", &victim_dir).unwrap();
+
+            let loot = b"pwned";
+            let mut fh = tar::Header::new_gnu();
+            fh.set_entry_type(tar::EntryType::Regular);
+            fh.set_size(loot.len() as u64);
+            fh.set_mode(0o644);
+            builder.append_data(&mut fh, "pwn/loot", &loot[..]).unwrap();
+
+            let enc = builder.into_inner().unwrap();
+            enc.finish().unwrap();
+        }
+
+        let archive_dir = TempDir::new().unwrap();
+        let archive = archive_dir.path().join("evil.tar.gz");
+        std::fs::write(&archive, &buf).unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let root = dst.path().join("mneme");
+
+        let result = restore_at(&archive, &root, false);
+        assert!(result.is_err(), "symlink-escape archive must be refused");
+        // The crucial invariant: nothing was written into the victim dir.
+        assert!(
+            !victim_dir.join("loot").exists(),
+            "restore wrote through a symlink into {}",
+            victim_dir.display()
+        );
     }
 }

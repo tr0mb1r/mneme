@@ -177,7 +177,7 @@ impl Keystore {
         let tmp = path.with_extension("json.tmp");
         let body = serde_json::to_vec_pretty(self)
             .map_err(|e| MnemeError::Crypto(format!("keystore serialise: {e}")))?;
-        std::fs::write(&tmp, &body)?;
+        write_new_0600(&tmp, &body)?;
         set_keystore_perms(&tmp)?;
         std::fs::rename(&tmp, &path)?;
         // fsync the parent dir so the rename is crash-durable; matches
@@ -223,6 +223,30 @@ fn set_keystore_perms(_path: &Path) -> Result<()> {
     // Windows: keystore.json inherits the user-profile ACL of the
     // data directory (already user-owned + non-world-readable on a
     // default install). Matches the auth.token handling.
+    Ok(())
+}
+
+/// Write `bytes` to a freshly-created file that is `0o600` from the
+/// moment it exists (Unix) — closing the window where the temp
+/// keystore would otherwise sit at the umask default before
+/// [`set_keystore_perms`] tightens it.
+#[cfg(unix)]
+fn write_new_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(KEYSTORE_MODE)
+        .open(path)?;
+    f.write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_new_0600(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes)?;
     Ok(())
 }
 
