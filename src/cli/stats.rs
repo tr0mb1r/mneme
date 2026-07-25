@@ -12,18 +12,15 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::config::Config;
+use crate::crypto::{KekStore, OsKeyring};
 use crate::index::snapshot;
 use crate::mcp::tools::size_tier;
 use crate::memory::episodic::EpisodicStore;
+use crate::memory::procedural::ProceduralStore;
 use crate::storage::MEM_KEY_PREFIX;
-use crate::storage::Storage;
 use crate::storage::archive::ColdArchive;
 use crate::storage::layout;
-use crate::storage::redb_impl::RedbStorage;
 use crate::{MnemeError, Result, migrate};
-
-/// Same procedural file the live server reads from.
-const PINNED_FILE: &str = "pinned.jsonl";
 
 pub fn execute() -> Result<()> {
     let root = layout::default_root().ok_or_else(|| {
@@ -36,15 +33,33 @@ pub fn execute() -> Result<()> {
     Ok(())
 }
 
-/// Build the stats payload for `root`. Pulled out for testability so
-/// we don't have to fork the binary in tests.
+/// Build the stats payload for `root` using the OS keyring for KEK
+/// custody. Pulled out for testability so we don't have to fork the
+/// binary in tests.
+///
+/// On a plaintext (non-encrypted) data dir the keyring is never
+/// touched — [`crate::crypto::boot`] only consults it when
+/// `keystore.json` is present.
 pub fn stats_json(root: &Path) -> Result<Value> {
+    stats_json_with_keyring(root, &OsKeyring::new())
+}
+
+/// Build the stats payload for `root`, resolving the KEK through
+/// `keyring`.
+///
+/// Every on-disk surface read here goes through the crypto-aware
+/// constructor. Reading an encrypted data dir with the plaintext
+/// readers is not a graceful degradation — the redb WAL replay hands
+/// AEAD ciphertext to postcard and the open fails with
+/// `write-ahead log error: postcard decode: ...` before any count is
+/// produced (regression fixed 2026-07-25).
+pub fn stats_json_with_keyring(root: &Path, keyring: &dyn KekStore) -> Result<Value> {
     refuse_if_locked(root)?;
 
     let schema_version = migrate::current_version(root).unwrap_or(0);
 
     // L4 semantic — count mem: rows and read snapshot metadata.
-    let storage: Arc<dyn Storage> = RedbStorage::open(&root.join("episodic"))?;
+    let (storage, aead) = crate::crypto::boot::open_episodic_storage_and_aead(root, keyring)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -78,16 +93,21 @@ pub fn stats_json(root: &Path) -> Result<Value> {
         (hot, warm)
     });
 
-    // L0 procedural — count non-blank, non-comment lines in pinned.jsonl.
-    let procedural_count = count_pinned(&root.join("procedural").join(PINNED_FILE));
+    // L0 procedural — count live pinned items. Counts through
+    // `ProceduralStore` rather than by line, so the count is right in
+    // encrypted mode too (the whole JSONL is one MNE1 envelope there,
+    // which a line count reads as a single item).
+    let procedural_count = ProceduralStore::open_with_crypto(root, aead.clone())
+        .and_then(|p| p.list(None).map(|v| v.len()))
+        .unwrap_or(0);
 
     // Cold tier — count quarterly archives.
-    let cold = ColdArchive::new(root);
+    let cold = ColdArchive::new_with_crypto(root, aead.clone());
     let cold_quarters = cold.list_quarters().map(|v| v.len()).unwrap_or(0);
 
     // Snapshot metadata. Absent file is fine (cold start).
     let snap_path = root.join("semantic").join("hnsw.idx");
-    let (applied_lsn, embed_dim) = match snapshot::load(&snap_path) {
+    let (applied_lsn, embed_dim) = match snapshot::load_with_crypto(&snap_path, aead.as_deref()) {
         Ok((idx, lsn)) => (lsn, idx.dim()),
         Err(_) => (0u64, 0usize),
     };
@@ -131,20 +151,6 @@ fn refuse_if_locked(root: &Path) -> Result<()> {
     } else {
         Ok(())
     }
-}
-
-fn count_pinned(path: &Path) -> usize {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(_) => return 0,
-    };
-    String::from_utf8_lossy(&bytes)
-        .lines()
-        .filter(|l| {
-            let t = l.trim();
-            !t.is_empty() && !t.starts_with('#')
-        })
-        .count()
 }
 
 /// Sum of file sizes under `root`, skipping the model cache (we
@@ -231,17 +237,87 @@ mod tests {
         assert!(matches!(err, MnemeError::Lock(_)));
     }
 
+    fn pinned_line(id: &str, scope: &str) -> String {
+        format!(
+            "{{\"id\":\"{id}\",\"content\":\"rule\",\"tags\":[],\"scope\":\"{scope}\",\
+             \"created_at\":\"2026-07-25T12:00:00Z\"}}"
+        )
+    }
+
     #[test]
     fn counts_pinned_jsonl_skipping_blanks_and_comments() {
         let (_tmp, root) = fresh_root();
-        let pinned = root.join("procedural").join(PINNED_FILE);
-        std::fs::write(
-            &pinned,
-            b"{\"id\":\"01H...\"}\n# a comment\n\n{\"id\":\"01J...\"}\n",
-        )
-        .unwrap();
+        let pinned = root
+            .join("procedural")
+            .join(crate::memory::procedural::PINNED_FILE);
+        let body = format!(
+            "{}\n# a comment\n\n{}\n",
+            pinned_line("01KYCZXK68X0JZFWCX9QMR4VGJ", "global"),
+            pinned_line("01KYCZXK68X0JZFWCX9QMR4VGK", "mneme"),
+        );
+        std::fs::write(&pinned, body.as_bytes()).unwrap();
         let v = stats_json(&root).unwrap();
         assert_eq!(v["memories"]["procedural"], 2);
+    }
+
+    /// Regression, 2026-07-25: `mneme stats` opened `<root>/episodic`
+    /// with the plaintext `RedbStorage::open`, ignoring
+    /// `keystore.json`. On an encrypted data dir the redb WAL replay
+    /// then fed AEAD ciphertext to postcard and the whole command
+    /// died with `write-ahead log error: postcard decode: Serde
+    /// Deserialization Error` — while `mneme run`/`mneme daemon`,
+    /// which go through `crypto::boot`, read the exact same bytes
+    /// fine.
+    #[test]
+    fn stats_reads_an_encrypted_data_dir() {
+        use crate::cli::encrypt::MnemonicPrompt;
+        use crate::crypto::keyring::InMemoryKekStore;
+
+        // `no_verify = true` below means the prompt is never called.
+        struct UnusedPrompt;
+        impl MnemonicPrompt for UnusedPrompt {
+            fn confirm_written(&mut self) -> Result<()> {
+                unreachable!("no_verify=true must not prompt")
+            }
+            fn answer_position(&mut self, _: usize) -> Result<String> {
+                unreachable!("no_verify=true must not prompt")
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let keyring = InMemoryKekStore::new();
+        // `encrypt_at` scaffolds, writes keystore.json, seeds the
+        // keyring and migrates the (empty) tree to encrypted form.
+        crate::cli::encrypt::encrypt_at(&root, false, true, &keyring, &mut UnusedPrompt).unwrap();
+
+        // Write through the encrypted stack so the WAL carries real
+        // sealed frames — an empty WAL would pass even unfixed.
+        let (storage, aead) =
+            crate::crypto::boot::open_episodic_storage_and_aead(&root, &keyring).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for i in 0..8 {
+                storage
+                    .put(
+                        format!("mem:{i:020}").into_bytes().as_slice(),
+                        format!("value-{i}").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            storage.flush().await.unwrap();
+        });
+        drop(storage);
+        drop(aead);
+        drop(rt);
+
+        let v = stats_json_with_keyring(&root, &keyring)
+            .expect("stats must read an encrypted data dir");
+        assert_eq!(v["memories"]["semantic"], 8);
     }
 
     #[test]
