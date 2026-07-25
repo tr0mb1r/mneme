@@ -18,13 +18,13 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
+use crate::crypto::{KekStore, OsKeyring};
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::MemoryItem;
 use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
 use crate::storage::layout;
-use crate::storage::redb_impl::RedbStorage;
 use crate::{MnemeError, Result};
 
 pub fn execute(scope: Option<String>, format: String) -> Result<()> {
@@ -41,20 +41,12 @@ pub fn execute(scope: Option<String>, format: String) -> Result<()> {
     let root = layout::default_root().ok_or_else(|| {
         MnemeError::Config("could not resolve home directory for ~/.mneme".into())
     })?;
-    refuse_if_locked(&root)?;
 
-    let storage: Arc<dyn Storage> = RedbStorage::open(&root.join("episodic"))?;
-    let procedural = ProceduralStore::open(&root)?;
-    let episodic = EpisodicStore::new(Arc::clone(&storage));
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(MnemeError::Io)?;
-
-    let proc_json = collect_procedural(&procedural, scope.as_deref())?;
-    let epi_json = runtime.block_on(collect_episodic(&episodic, scope.as_deref()))?;
-    let sem_json = runtime.block_on(collect_semantic(&storage, scope.as_deref()))?;
+    let Layers {
+        proc_json,
+        epi_json,
+        sem_json,
+    } = collect_all(&root, scope.as_deref(), &OsKeyring::new())?;
 
     match format {
         Format::Json => {
@@ -81,6 +73,40 @@ pub fn execute(scope: Option<String>, format: String) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The three layer payloads, in export order.
+pub struct Layers {
+    pub proc_json: Vec<Value>,
+    pub epi_json: Vec<Value>,
+    pub sem_json: Vec<Value>,
+}
+
+/// Open the data dir and pull every layer. Split out of [`execute`]
+/// so tests can drive it against a temp root without forking the
+/// binary or touching `~/.mneme`.
+///
+/// Both storage surfaces are opened crypto-aware: on an encrypted
+/// data dir the plaintext readers hand AEAD ciphertext to postcard
+/// and the export dies before emitting a byte (regression fixed
+/// 2026-07-25).
+pub fn collect_all(root: &Path, scope: Option<&str>, keyring: &dyn KekStore) -> Result<Layers> {
+    refuse_if_locked(root)?;
+
+    let (storage, aead) = crate::crypto::boot::open_episodic_storage_and_aead(root, keyring)?;
+    let procedural = ProceduralStore::open_with_crypto(root, aead.clone())?;
+    let episodic = EpisodicStore::new(Arc::clone(&storage));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(MnemeError::Io)?;
+
+    Ok(Layers {
+        proc_json: collect_procedural(&procedural, scope)?,
+        epi_json: runtime.block_on(collect_episodic(&episodic, scope))?,
+        sem_json: runtime.block_on(collect_semantic(&storage, scope))?,
+    })
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -250,6 +276,81 @@ mod tests {
         let sem_json = collect_semantic(&storage, None).await.unwrap();
         assert_eq!(sem_json.len(), 1);
         assert_eq!(sem_json[0]["content"], "ci runs ruff and pytest");
+    }
+
+    /// Regression, 2026-07-25: `export` opened `<root>/episodic` with
+    /// the plaintext `RedbStorage::open` and `pinned.jsonl` with the
+    /// plaintext `ProceduralStore::open`. On an encrypted data dir the
+    /// redb WAL replay fed AEAD ciphertext to postcard and the whole
+    /// export died with `write-ahead log error: postcard decode: ...`
+    /// — i.e. the backup path was broken for every encrypted install.
+    #[test]
+    fn export_reads_an_encrypted_data_dir() {
+        use crate::cli::encrypt::MnemonicPrompt;
+        use crate::crypto::keyring::InMemoryKekStore;
+
+        struct UnusedPrompt;
+        impl MnemonicPrompt for UnusedPrompt {
+            fn confirm_written(&mut self) -> Result<()> {
+                unreachable!("no_verify=true must not prompt")
+            }
+            fn answer_position(&mut self, _: usize) -> Result<String> {
+                unreachable!("no_verify=true must not prompt")
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let keyring = InMemoryKekStore::new();
+        crate::cli::encrypt::encrypt_at(&root, false, true, &keyring, &mut UnusedPrompt).unwrap();
+
+        // Seed one row in each layer through the encrypted stack, then
+        // drop the handles so `collect_all` can take the redb lock.
+        {
+            let (storage, aead) =
+                crate::crypto::boot::open_episodic_storage_and_aead(&root, &keyring).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let item = MemoryItem {
+                    id: crate::ids::MemoryId::new(),
+                    content: "sealed semantic row".into(),
+                    kind: MemoryKind::Fact,
+                    tags: vec!["ci".into()],
+                    scope: "work".into(),
+                    created_at: Utc::now(),
+                };
+                let bytes = postcard::to_allocvec(&item).unwrap();
+                storage.put(&semantic_key(&item.id), &bytes).await.unwrap();
+
+                EpisodicStore::new(Arc::clone(&storage))
+                    .record_json(
+                        "tool_call",
+                        "work",
+                        &serde_json::json!({"tool": "remember"}),
+                    )
+                    .await
+                    .unwrap();
+
+                ProceduralStore::open_with_crypto(&root, aead.clone())
+                    .unwrap()
+                    .pin("sealed rule".into(), vec!["ops".into()], "work".into())
+                    .await
+                    .unwrap();
+
+                storage.flush().await.unwrap();
+            });
+        }
+
+        let layers =
+            collect_all(&root, None, &keyring).expect("export must read an encrypted data dir");
+        assert_eq!(layers.sem_json.len(), 1);
+        assert_eq!(layers.sem_json[0]["content"], "sealed semantic row");
+        assert_eq!(layers.epi_json.len(), 1);
+        assert_eq!(layers.proc_json.len(), 1);
+        assert_eq!(layers.proc_json[0]["content"], "sealed rule");
     }
 
     #[tokio::test]

@@ -16,12 +16,11 @@ use serde_json::{Value, json};
 use ulid::Ulid;
 
 use crate::config::Config;
+use crate::crypto::{KekStore, OsKeyring};
 use crate::ids::MemoryId;
 use crate::memory::semantic::{MemoryItem, RecallFilters, SemanticStore, SnapshotConfig};
 use crate::storage::MEM_KEY_PREFIX;
-use crate::storage::Storage;
 use crate::storage::layout;
-use crate::storage::redb_impl::RedbStorage;
 use crate::{MnemeError, Result, embed, migrate};
 const DEFAULT_QUERY_LIMIT: usize = 5;
 
@@ -29,9 +28,10 @@ pub fn execute(id: Option<String>, query: Option<String>) -> Result<()> {
     let root = layout::default_root().ok_or_else(|| {
         MnemeError::Config("could not resolve home directory for ~/.mneme".into())
     })?;
+    let keyring = OsKeyring::new();
     let payload = match (id, query) {
-        (Some(id), None) => inspect_by_id(&root, &id)?,
-        (None, Some(q)) => inspect_by_query(&root, &q)?,
+        (Some(id), None) => inspect_by_id_with_keyring(&root, &id, &keyring)?,
+        (None, Some(q)) => inspect_by_query_with_keyring(&root, &q, &keyring)?,
         (Some(_), Some(_)) => {
             return Err(MnemeError::Config(
                 "pass exactly one of <ID> or --query".into(),
@@ -62,13 +62,24 @@ fn refuse_if_locked(root: &Path) -> Result<()> {
 }
 
 /// Fast path: open redb, fetch one row, decode. No embedder needed.
+/// Resolves the KEK through the OS keyring when the data dir is
+/// encrypted.
 pub fn inspect_by_id(root: &Path, id_str: &str) -> Result<Value> {
+    inspect_by_id_with_keyring(root, id_str, &OsKeyring::new())
+}
+
+/// As [`inspect_by_id`], with the KEK custody backend injected.
+pub fn inspect_by_id_with_keyring(
+    root: &Path,
+    id_str: &str,
+    keyring: &dyn KekStore,
+) -> Result<Value> {
     refuse_if_locked(root)?;
     let ulid = Ulid::from_string(id_str)
         .map_err(|e| MnemeError::Config(format!("`{id_str}` is not a valid ULID: {e}")))?;
     let memory_id = MemoryId(ulid);
 
-    let storage: Arc<dyn Storage> = RedbStorage::open(&root.join("episodic"))?;
+    let storage = crate::crypto::boot::open_episodic_storage(root, keyring)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -94,7 +105,18 @@ pub fn inspect_by_id(root: &Path, id_str: &str) -> Result<Value> {
 
 /// Slow path: build the embedder, open the semantic store with the
 /// snapshot scheduler disabled, run one recall, drop everything.
+/// Resolves the KEK through the OS keyring when the data dir is
+/// encrypted.
 pub fn inspect_by_query(root: &Path, query: &str) -> Result<Value> {
+    inspect_by_query_with_keyring(root, query, &OsKeyring::new())
+}
+
+/// As [`inspect_by_query`], with the KEK custody backend injected.
+pub fn inspect_by_query_with_keyring(
+    root: &Path,
+    query: &str,
+    keyring: &dyn KekStore,
+) -> Result<Value> {
     refuse_if_locked(root)?;
     if query.trim().is_empty() {
         return Err(MnemeError::Config("--query must not be empty".into()));
@@ -116,18 +138,19 @@ pub fn inspect_by_query(root: &Path, query: &str) -> Result<Value> {
         ))
     })?;
 
-    let storage: Arc<dyn Storage> = RedbStorage::open(&root.join("episodic"))?;
+    let (storage, aead) = crate::crypto::boot::open_episodic_storage_and_aead(root, keyring)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(MnemeError::Io)?;
 
     let payload = runtime.block_on(async {
-        let semantic = SemanticStore::open(
+        let semantic = SemanticStore::open_with_crypto(
             root,
             Arc::clone(&storage),
             Arc::clone(&embedder),
             SnapshotConfig::disabled(),
+            aead.clone(),
         )?;
         let hits = semantic
             .recall(query, DEFAULT_QUERY_LIMIT, &RecallFilters::default())
@@ -170,6 +193,8 @@ mod tests {
     use crate::embed::Embedder;
     use crate::embed::stub::StubEmbedder;
     use crate::memory::semantic::MemoryKind;
+    use crate::storage::Storage;
+    use crate::storage::redb_impl::RedbStorage;
     use tempfile::TempDir;
 
     fn fresh_root() -> (TempDir, std::path::PathBuf) {
@@ -229,6 +254,85 @@ mod tests {
         drop(RedbStorage::open(&root.join("episodic")).unwrap());
         let v = inspect_by_id(&root, "01H0000000000000000000000Z").unwrap();
         assert_eq!(v["found"], false);
+    }
+
+    /// Regression, 2026-07-25: `inspect` opened `<root>/episodic`
+    /// with the plaintext `RedbStorage::open`, so on an encrypted data
+    /// dir the redb WAL replay fed AEAD ciphertext to postcard and the
+    /// command died with `write-ahead log error: postcard decode: ...`.
+    /// Same defect as `stats` and `export`; `run`/`daemon` were always
+    /// correct because they boot through `crypto::boot`.
+    #[test]
+    fn inspect_by_id_reads_an_encrypted_data_dir() {
+        use crate::cli::encrypt::MnemonicPrompt;
+        use crate::crypto::keyring::InMemoryKekStore;
+
+        struct UnusedPrompt;
+        impl MnemonicPrompt for UnusedPrompt {
+            fn confirm_written(&mut self) -> Result<()> {
+                unreachable!("no_verify=true must not prompt")
+            }
+            fn answer_position(&mut self, _: usize) -> Result<String> {
+                unreachable!("no_verify=true must not prompt")
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let keyring = InMemoryKekStore::new();
+        crate::cli::encrypt::encrypt_at(&root, false, true, &keyring, &mut UnusedPrompt).unwrap();
+
+        // Seed through the encrypted stack on its own thread so the
+        // redb lock is released before we inspect.
+        let id = {
+            let root = root.clone();
+            let kek = keyring
+                .load(&crate::crypto::account_for(&root))
+                .unwrap()
+                .unwrap();
+            std::thread::spawn(move || {
+                let ks = crate::crypto::Keystore::load(&root).unwrap().unwrap();
+                let dek = ks.unwrap_dek(&kek).unwrap();
+                let aead = Arc::new(crate::crypto::Aead::new(&dek));
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let storage: Arc<dyn Storage> =
+                        crate::storage::EncryptedStorage::open_redb(&root.join("episodic"), &dek)
+                            .unwrap();
+                    let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+                    let s = SemanticStore::open_with_crypto(
+                        &root,
+                        Arc::clone(&storage),
+                        embedder,
+                        SnapshotConfig::disabled(),
+                        Some(aead),
+                    )
+                    .unwrap();
+                    let id = s
+                        .remember(
+                            "sealed inspect",
+                            MemoryKind::Fact,
+                            vec!["t1".into()],
+                            "personal".into(),
+                        )
+                        .await
+                        .unwrap();
+                    drop(s);
+                    drop(storage);
+                    id
+                })
+            })
+            .join()
+            .unwrap()
+        };
+
+        let v = inspect_by_id_with_keyring(&root, &id.to_string(), &keyring)
+            .expect("inspect must read an encrypted data dir");
+        assert_eq!(v["found"], true);
+        assert_eq!(v["memory"]["content"], "sealed inspect");
     }
 
     #[test]
