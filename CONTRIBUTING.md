@@ -6,8 +6,11 @@ Thanks for your interest. This document is short on purpose.
 
 1. Read [`docs/MEMORY_LAYERS.md`](docs/MEMORY_LAYERS.md) for a per-layer
    walkthrough — what each layer holds, where it lives on disk, and what
-   runs vs. what's deferred.
-2. Skim [`docs/CLAUDE_CODE_SETUP.md`](docs/CLAUDE_CODE_SETUP.md) for the
+   schedules move data between tiers.
+2. Read [`book/src/roadmap.md`](book/src/roadmap.md) for what is
+   deliberately *not* built yet. It's the canonical list; if you're
+   picking up work, start there rather than grepping for `TODO`.
+3. Skim [`docs/CLAUDE_CODE_SETUP.md`](docs/CLAUDE_CODE_SETUP.md) for the
    end-user setup flow; understanding the install/configure path keeps
    reviewer-focused changes from breaking it.
 
@@ -76,7 +79,12 @@ shape:
   `Architecture decisions`, `Documentation`, `Tests`.
 - Multi-line bullets where the *what* + *why* + *how to verify* don't
   fit on one line.
-- Cross-link to ADRs in `proj_docs/decisions/` when the change is one.
+- Cross-link to the relevant in-repo doc when the change is an
+  architectural one — `book/src/mcp-surface.md` for wire-surface
+  changes, `docs/MEMORY_LAYERS.md` for layer behaviour,
+  `book/src/roadmap.md` for anything deferred. (ADRs are referenced by
+  number in older entries; those live in the maintainer's working notes
+  and are not published, so don't link to them.)
 
 If the change is genuinely small (a typo fix, a CI tweak, a single
 docs update), the auto-generated entry is fine — release-plz will

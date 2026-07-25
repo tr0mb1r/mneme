@@ -45,6 +45,20 @@ pub struct ResourceDescriptor {
     pub mime_type: &'static str,
 }
 
+/// A parameterised resource, advertised through MCP's
+/// `resources/templates/list`. Distinct from [`ResourceDescriptor`]
+/// because the spec puts templates on their own endpoint with a
+/// `uriTemplate` key instead of `uri` — a client that only reads
+/// `resources/list` cannot discover them.
+#[derive(Debug, Clone)]
+pub struct ResourceTemplateDescriptor {
+    /// RFC 6570 form, e.g. `mneme://session/{id}`.
+    pub uri_template: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub mime_type: &'static str,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResourceContent {
     pub uri: String,
@@ -74,17 +88,35 @@ pub trait Resource: Send + Sync {
     async fn read(&self, uri: &str) -> Result<ResourceContent, ResourceError>;
 }
 
+/// One registered template: the dispatch prefix, the RFC 6570 form to
+/// advertise, and whether the same handler is also reachable at a
+/// fixed URI.
+struct TemplateEntry {
+    /// Matched with `starts_with` at dispatch time.
+    prefix: String,
+    /// What `resources/templates/list` advertises.
+    uri_template: &'static str,
+    resource: Arc<dyn Resource>,
+    /// `true` when this handler already appears in `resources/list`
+    /// under a fixed URI, so listing it again would duplicate the
+    /// entry. `mneme://context` is both a fixed resource and a
+    /// template (`mneme://context{?q,scope,limit}`);
+    /// `mneme://session/{id}` is template-only.
+    also_fixed: bool,
+}
+
 /// Registry that supports both fixed and *template* URIs. Fixed URIs
 /// (`mneme://stats`, `mneme://procedural`, etc.) match by equality
 /// in the BTreeMap. Template URIs are stored as a prefix string —
 /// any incoming `read` URI starting with that prefix routes to the
 /// template's handler. This is the simplest URI-template scheme that
-/// covers the v1.0 surface (just `mneme://session/{id}`); a real
-/// RFC 6570 parser would be overkill until we add more templates.
+/// covers the v1 surface (`mneme://session/{id}` and the query form of
+/// `mneme://context`); a real RFC 6570 parser would be overkill until
+/// a template needs mid-path variables.
 #[derive(Default)]
 pub struct ResourceRegistry {
     resources: BTreeMap<&'static str, Arc<dyn Resource>>,
-    templates: Vec<(String, Arc<dyn Resource>)>,
+    templates: Vec<TemplateEntry>,
 }
 
 impl ResourceRegistry {
@@ -92,9 +124,12 @@ impl ResourceRegistry {
         Self::default()
     }
 
-    /// v0.1 default resource set. `mneme://session/{id}` is still
-    /// deferred — sessions live in `memory::working` but their
-    /// per-id resource surface is not wired yet.
+    /// The default resource set with no schedulers or session state
+    /// attached: `mneme://stats`, `mneme://procedural`,
+    /// `mneme://recent`, and `mneme://context` (both its bare and
+    /// parameterised forms). `mneme://session/{id}` needs a sessions
+    /// directory, so it registers only via
+    /// [`defaults_with_schedulers`](Self::defaults_with_schedulers).
     pub fn defaults(
         semantic_store: Arc<SemanticStore>,
         procedural_store: Arc<ProceduralStore>,
@@ -170,7 +205,20 @@ impl ResourceRegistry {
             &procedural_store,
         ))));
         r.register(Arc::new(recent::Recent::new(Arc::clone(&episodic_store))));
-        r.register(Arc::new(context::Context::new(orchestrator, budget)));
+
+        // `mneme://context` is registered twice against one handler:
+        // once as the fixed bare URI (what `resources/list` shows and
+        // what an unparameterised read hits), and once as a prefix so
+        // `mneme://context?q=…&scope=…` routes to the same place.
+        // Without the second registration a parameterised read would
+        // 404 on the exact-match lookup.
+        let context_resource = Arc::new(context::Context::new(orchestrator, budget));
+        r.register(Arc::clone(&context_resource) as Arc<dyn Resource>);
+        r.register_query_template(
+            context::URI_QUERY_PREFIX,
+            context::URI_TEMPLATE,
+            context_resource,
+        );
 
         // Register `mneme://session/{id}` as a template resource. The
         // sessions_dir is required for past-session disk loads;
@@ -192,11 +240,37 @@ impl ResourceRegistry {
 
     /// Register a template resource that handles every URI sharing
     /// the given prefix. The resource's own `descriptor().uri` is
-    /// reported in `tools/list` (typically the RFC 6570 form like
+    /// reported in `resources/list` (typically the RFC 6570 form like
     /// `mneme://session/{id}`); the prefix is what's matched at
     /// dispatch time.
     pub fn register_template(&mut self, prefix: impl Into<String>, resource: Arc<dyn Resource>) {
-        self.templates.push((prefix.into(), resource));
+        let prefix = prefix.into();
+        let uri_template = resource.descriptor().uri;
+        self.templates.push(TemplateEntry {
+            prefix,
+            uri_template,
+            resource,
+            also_fixed: false,
+        });
+    }
+
+    /// Register an additional *parameterised* route to a resource that
+    /// is already registered at a fixed URI. Used for
+    /// `mneme://context?…`: the bare URI keeps its `resources/list`
+    /// entry while the query form gets its own `uriTemplate` in
+    /// `resources/templates/list`, both served by the same handler.
+    pub fn register_query_template(
+        &mut self,
+        prefix: impl Into<String>,
+        uri_template: &'static str,
+        resource: Arc<dyn Resource>,
+    ) {
+        self.templates.push(TemplateEntry {
+            prefix: prefix.into(),
+            uri_template,
+            resource,
+            also_fixed: true,
+        });
     }
 
     /// Look up the resource for a specific URI. Tries exact match
@@ -207,8 +281,8 @@ impl ResourceRegistry {
         }
         self.templates
             .iter()
-            .find(|(prefix, _)| uri.starts_with(prefix.as_str()))
-            .map(|(_, r)| Arc::clone(r))
+            .find(|t| uri.starts_with(t.prefix.as_str()))
+            .map(|t| Arc::clone(&t.resource))
     }
 
     /// Convenience for the (legacy) exact-URI lookup. Kept so
@@ -221,7 +295,29 @@ impl ResourceRegistry {
         self.resources
             .values()
             .map(|r| r.descriptor())
-            .chain(self.templates.iter().map(|(_, r)| r.descriptor()))
+            .chain(
+                self.templates
+                    .iter()
+                    .filter(|t| !t.also_fixed)
+                    .map(|t| t.resource.descriptor()),
+            )
+            .collect()
+    }
+
+    /// Every parameterised route, for MCP's `resources/templates/list`.
+    /// Includes the query form of resources that also have a fixed URI.
+    pub fn list_templates(&self) -> Vec<ResourceTemplateDescriptor> {
+        self.templates
+            .iter()
+            .map(|t| {
+                let d = t.resource.descriptor();
+                ResourceTemplateDescriptor {
+                    uri_template: t.uri_template,
+                    name: d.name,
+                    description: d.description,
+                    mime_type: d.mime_type,
+                }
+            })
             .collect()
     }
 }
@@ -229,6 +325,15 @@ impl ResourceRegistry {
 pub fn descriptor_to_json(d: &ResourceDescriptor) -> Value {
     json!({
         "uri": d.uri,
+        "name": d.name,
+        "description": d.description,
+        "mimeType": d.mime_type,
+    })
+}
+
+pub fn template_descriptor_to_json(d: &ResourceTemplateDescriptor) -> Value {
+    json!({
+        "uriTemplate": d.uri_template,
         "name": d.name,
         "description": d.description,
         "mimeType": d.mime_type,
@@ -276,7 +381,9 @@ mod tests {
     fn defaults_register_phase_5_resources() {
         let (r, _tmp) = fresh_registry();
         let uris: Vec<_> = r.list().iter().map(|d| d.uri).collect();
-        // BTreeMap ordering.
+        // BTreeMap ordering. `mneme://context` appears exactly once
+        // even though it is registered both as a fixed URI and as a
+        // query template.
         assert_eq!(
             uris,
             vec![
@@ -286,5 +393,78 @@ mod tests {
                 "mneme://stats",
             ]
         );
+    }
+
+    /// A parameterised context read must resolve. The exact-match
+    /// lookup misses it, so this exercises the prefix fallback.
+    #[test]
+    fn parameterised_context_uri_routes_to_the_context_resource() {
+        let (r, _tmp) = fresh_registry();
+        let found = r
+            .find("mneme://context?q=deploy&scope=work")
+            .expect("query form must route");
+        assert_eq!(found.descriptor().uri, "mneme://context");
+    }
+
+    #[test]
+    fn list_templates_advertises_the_context_query_form() {
+        let (r, _tmp) = fresh_registry();
+        let templates: Vec<_> = r.list_templates().iter().map(|t| t.uri_template).collect();
+        assert!(
+            templates.contains(&"mneme://context{?q,scope,limit}"),
+            "templates were {templates:?}"
+        );
+    }
+
+    /// With a sessions dir attached, both templates are advertised and
+    /// `mneme://session/{id}` still appears in `resources/list` (it has
+    /// no fixed-URI counterpart to duplicate).
+    #[test]
+    fn session_template_is_listed_in_both_places() {
+        use crate::embed::Embedder;
+        use crate::embed::stub::StubEmbedder;
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let pstore = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let estore = Arc::new(EpisodicStore::new(Arc::clone(&backing)));
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let orch = Arc::new(Orchestrator::new(
+            Arc::clone(&semantic),
+            Arc::clone(&pstore),
+            Arc::clone(&estore),
+        ));
+        let cold = ColdArchive::new(tmp.path());
+        let r = ResourceRegistry::defaults_with_schedulers(
+            semantic,
+            pstore,
+            estore,
+            orch,
+            cold,
+            1,
+            TokenBudget::for_tests(2000),
+            None,
+            None,
+            None,
+            Some(tmp.path().join("sessions")),
+            None,
+            None,
+        );
+
+        let uris: Vec<_> = r.list().iter().map(|d| d.uri).collect();
+        assert!(uris.contains(&"mneme://session/{id}"), "got {uris:?}");
+        assert_eq!(
+            uris.iter().filter(|u| **u == "mneme://context").count(),
+            1,
+            "context must not be listed twice: {uris:?}"
+        );
+
+        let templates: Vec<_> = r.list_templates().iter().map(|t| t.uri_template).collect();
+        assert!(
+            templates.contains(&"mneme://session/{id}"),
+            "got {templates:?}"
+        );
+        assert!(templates.contains(&"mneme://context{?q,scope,limit}"));
     }
 }

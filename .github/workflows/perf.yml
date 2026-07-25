@@ -59,12 +59,19 @@ jobs:
           python-version: '3.x'
 
       - name: cargo bench (hot path, n=${{ env.MNEME_BENCH_N }})
-        # Run the four hot-path benches. `criterion` writes per-bench
-        # JSON under target/criterion/<group>/<id>/new/. The next step
-        # extracts a single comparable JSON from those.
+        # Run the four hot-path benches plus the encryption-overhead
+        # bench. `criterion` writes per-bench JSON under
+        # target/criterion/<group>/<id>/new/. The next step extracts a
+        # single comparable JSON from those.
+        #
+        # `encryption_overhead` was written for v1.2 but never wired in
+        # here, so the AEAD layer had no CI signal at all. It is gated
+        # by ratio rather than against the frozen baseline — see the
+        # dedicated step below.
         run: |
           cargo bench --bench remember --bench recall \
                       --bench cold_start --bench auto_context \
+                      --bench encryption_overhead \
                       -- --quick
 
       - name: extract baseline JSON for this run
@@ -88,10 +95,49 @@ jobs:
         # that legitimately need to regress perf (rare) should
         # update the baseline JSON in the same commit and explain
         # in the description per release-planning §6.2.
+        #
+        # The crypto benches are excluded here and gated by ratio in the
+        # next step: the frozen baseline predates them, and absolute
+        # sub-microsecond numbers do not transfer between the Apple
+        # Silicon capture host and this runner. `compare.py` reports
+        # them under "benches added since baseline" either way.
         run: |
           python3 benches/baselines/compare.py \
                   benches/baselines/v0_2_6.json \
-                  /tmp/perf/this-run.json
+                  /tmp/perf/this-run.json \
+                  --exclude encrypted_
+
+      - name: informational compare against the platform-matched baseline
+        # NON-BLOCKING on purpose.
+        #
+        # The blocking gate above uses `v0_2_6.json`, captured on Apple
+        # Silicon, while this job runs on x86_64 Linux. That mismatch is
+        # not cosmetic: `auto_context/no_query` measures ~216 µs on the
+        # capture host and ~235-245 µs here, so it sits permanently near
+        # the 10 % threshold for reasons that have nothing to do with the
+        # diff under test.
+        #
+        # `v1_2_2_linux_x86_64.json` is a median-of-3 capture on x86_64
+        # Linux — same platform as this runner, though not the same
+        # machine. It is reported but not enforced until a maintainer has
+        # watched a few runs and confirmed it is stable on GitHub's
+        # runners; see benches/baselines/README.md for the promotion
+        # procedure.
+        continue-on-error: true
+        run: |
+          python3 benches/baselines/compare.py \
+                  benches/baselines/v1_2_2_linux_x86_64.json \
+                  /tmp/perf/this-run.json \
+                  --exclude encrypted_
+
+      - name: encryption overhead ratio gate
+        # Compares encrypted vs plain *within this run*, so it is
+        # machine-independent. Catches the crypto layer itself
+        # regressing (e.g. a per-record key derivation creeping in)
+        # without pretending absolute nanoseconds are portable.
+        run: |
+          python3 benches/baselines/check_crypto_overhead.py \
+                  --baseline /tmp/perf/this-run.json
 
       - name: archive criterion report
         if: always()

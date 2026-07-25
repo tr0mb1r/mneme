@@ -16,9 +16,18 @@
 //!   └────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! L1 (working session) and L5 (reflections) live in `memory::working`
-//! / future modules; they are not yet folded in. The plumbing here is
-//! deliberately layer-agnostic so dropping them in is a small change.
+//! L1 (working session) is folded in when an [`ActiveSession`] is
+//! attached via [`Orchestrator::with_active_session`] — production
+//! always attaches one; fixtures that only exercise L0/L3/L4 skip it.
+//! L5 (reflections) does not exist yet; the plumbing here is
+//! deliberately layer-agnostic so dropping it in is a small change.
+//!
+//! ## Semantic seeding
+//!
+//! L4 participates only when the caller supplies a query — a vector
+//! search needs something to be similar to. `mneme://context` takes
+//! that query off its URI (`mneme://context?q=…`), so a caller who
+//! reads the bare `mneme://context` still gets L0 + L1 + L3 only.
 //!
 //! ## Determinism
 //!
@@ -59,6 +68,31 @@ const SEMANTIC_FETCH: usize = 32;
 /// Working turns are session-local so the cardinality is bounded;
 /// the budget pass trims further.
 const WORKING_FETCH: usize = 32;
+
+/// Ceiling on a caller-supplied semantic over-fetch. Guards against a
+/// `mneme://context?limit=100000` read turning into an index walk plus
+/// 100 000 storage gets; the token budget would discard nearly all of
+/// it anyway.
+const MAX_SEMANTIC_FETCH: usize = 100;
+
+/// What to assemble into one auto-context read.
+///
+/// `Default` (all `None`) reproduces the pre-v1.3 behaviour exactly:
+/// no semantic seed, no scope filter, built-in over-fetch caps.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextRequest {
+    /// Natural-language seed for the L4 semantic layer. `None` (or
+    /// blank) leaves the semantic section empty — a static read with
+    /// no query has nothing to be similar *to*.
+    pub query: Option<String>,
+    /// Restrict L0 / L3 / L4 to a single scope. Working-session turns
+    /// (L1) are session-local and always included.
+    pub scope: Option<String>,
+    /// How many semantic candidates to over-fetch before the budget
+    /// pass trims. Defaults to [`SEMANTIC_FETCH`]; clamped to
+    /// [`MAX_SEMANTIC_FETCH`].
+    pub semantic_limit: Option<usize>,
+}
 
 /// Phase 5 §3 owner. Holds an `Arc` to each memory store so it can
 /// be cheaply cloned into background tasks (the snapshot scheduler,
@@ -103,21 +137,43 @@ impl Orchestrator {
     /// `scope` filters every layer to a single scope (e.g.
     /// `"personal"`, `"work"`).
     ///
-    /// Per spec §5.3, layers are fetched in parallel via
-    /// `tokio::join!`; total wall time is the slowest layer plus a
-    /// small amount of scoring/assembly overhead. The Phase 5 exit
-    /// gate is `mneme://context` p95 < 200 ms.
+    /// Thin wrapper over [`Orchestrator::build_context_with`] for the
+    /// common two-argument case.
     pub async fn build_context(
         &self,
         query: Option<&str>,
         scope: Option<&str>,
         budget: TokenBudget,
     ) -> Result<AssembledContext> {
-        let scope_owned = scope.map(|s| s.to_owned());
+        let req = ContextRequest {
+            query: query.map(|q| q.to_owned()),
+            scope: scope.map(|s| s.to_owned()),
+            semantic_limit: None,
+        };
+        self.build_context_with(&req, budget).await
+    }
+
+    /// Assemble a structured context from a full [`ContextRequest`].
+    ///
+    /// Per spec §5.3, layers are fetched in parallel via
+    /// `tokio::join!`; total wall time is the slowest layer plus a
+    /// small amount of scoring/assembly overhead. The Phase 5 exit
+    /// gate is `mneme://context` p95 < 200 ms.
+    pub async fn build_context_with(
+        &self,
+        req: &ContextRequest,
+        budget: TokenBudget,
+    ) -> Result<AssembledContext> {
+        let scope_owned = req.scope.clone();
+        let semantic_limit = req
+            .semantic_limit
+            .unwrap_or(SEMANTIC_FETCH)
+            .min(MAX_SEMANTIC_FETCH);
 
         let proc_fut = self.fetch_procedural(scope_owned.clone());
         let epi_fut = self.fetch_episodic(scope_owned.clone());
-        let sem_fut = self.fetch_semantic(query, scope_owned.clone());
+        let sem_fut =
+            self.fetch_semantic(req.query.as_deref(), scope_owned.clone(), semantic_limit);
         let work_fut = self.fetch_working();
 
         let (proc_res, epi_res, sem_res, work_res) =
@@ -155,12 +211,17 @@ impl Orchestrator {
         &self,
         query: Option<&str>,
         scope: Option<String>,
+        limit: usize,
     ) -> Result<Vec<RecallHit>> {
         match query {
             None => Ok(Vec::new()),
+            Some(q) if q.trim().is_empty() => Ok(Vec::new()),
             Some(q) => {
-                let filters = RecallFilters { scope, kind: None };
-                self.semantic.recall(q, SEMANTIC_FETCH, &filters).await
+                let filters = RecallFilters {
+                    scope,
+                    ..Default::default()
+                };
+                self.semantic.recall(q, limit, &filters).await
             }
         }
     }

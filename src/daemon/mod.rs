@@ -4,9 +4,10 @@
 //! per-platform listener, detecting + cleaning up orphaned sockets
 //! from prior crashed daemons, applying owner-only file permissions,
 //! and unbinding cleanly on shutdown. The MCP-over-socket serve loop
-//! that consumes the listener lands in a follow-up A.M2 commit (it
-//! requires extracting `cli::run::async_main`'s server build into a
-//! transport-generic helper).
+//! that consumes the listener lives in
+//! [`crate::cli::run::execute_with_mode`] under
+//! [`TransportMode::DaemonServeMany`](crate::cli::run::TransportMode),
+//! which shares its entire boot path with `mneme run`.
 //!
 //! Cross-platform note: today only Unix domain sockets are
 //! implemented (`#[cfg(unix)]`). Windows named-pipe support is M4

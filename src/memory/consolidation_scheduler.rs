@@ -61,6 +61,7 @@ use crate::Result;
 use crate::config::ConsolidationConfig;
 use crate::memory::activity::ActivityCounter;
 use crate::memory::consolidation::{ConsolidationParams, run as run_consolidation};
+use crate::memory::semantic::SemanticStore;
 use crate::storage::Storage;
 use crate::storage::archive::ColdArchive;
 
@@ -127,6 +128,11 @@ pub struct SchedulerMetrics {
     pub last_promoted_to_warm: u64,
     /// Archived-to-cold count from the most recent pass.
     pub last_archived_to_cold: u64,
+    /// Orphan L4 vectors tombstoned by the most recent pass. Always
+    /// `0` when no [`SemanticStore`] is attached. A persistently
+    /// non-zero value means something is interrupting `forget`
+    /// mid-write — worth investigating rather than just reclaiming.
+    pub last_orphans_reclaimed: u64,
 }
 
 struct SchedulerState {
@@ -135,6 +141,9 @@ struct SchedulerState {
     params: ConsolidationParams,
     tick_interval: Duration,
     activity: Vec<Arc<ActivityCounter>>,
+    /// L4 handle for the orphan-vector sweep. `None` in fixtures that
+    /// exercise only L3 tiering, which skips the sweep entirely.
+    semantic: Option<Arc<SemanticStore>>,
 
     shutdown: AtomicBool,
     notify: Notify,
@@ -145,6 +154,7 @@ struct SchedulerState {
     errors_total: AtomicU64,
     last_promoted: AtomicU64,
     last_archived: AtomicU64,
+    last_orphans_reclaimed: AtomicU64,
 }
 
 impl SchedulerState {
@@ -161,6 +171,7 @@ impl SchedulerState {
             errors_total: self.errors_total.load(Ordering::SeqCst),
             last_promoted_to_warm: self.last_promoted.load(Ordering::SeqCst),
             last_archived_to_cold: self.last_archived.load(Ordering::SeqCst),
+            last_orphans_reclaimed: self.last_orphans_reclaimed.load(Ordering::SeqCst),
         }
     }
 
@@ -192,12 +203,31 @@ impl ConsolidationScheduler {
         config: SchedulerConfig,
         activity: Vec<Arc<ActivityCounter>>,
     ) -> Arc<Self> {
+        Self::start_with_orphan_gc(storage, archive, params, config, activity, None)
+    }
+
+    /// Like [`start`](Self::start), plus an L4 handle so each pass also
+    /// sweeps orphan vectors (see
+    /// [`SemanticStore::gc_orphan_vectors`]).
+    ///
+    /// Split from `start` rather than adding a parameter so the many
+    /// test fixtures that only care about L3 tiering stay untouched.
+    /// Production (`cli::run`) always passes `Some`.
+    pub fn start_with_orphan_gc(
+        storage: Arc<dyn Storage>,
+        archive: ColdArchive,
+        params: ConsolidationParams,
+        config: SchedulerConfig,
+        activity: Vec<Arc<ActivityCounter>>,
+        semantic: Option<Arc<SemanticStore>>,
+    ) -> Arc<Self> {
         let state = Arc::new(SchedulerState {
             storage,
             archive,
             params,
             tick_interval: config.tick_interval,
             activity,
+            semantic,
             shutdown: AtomicBool::new(false),
             notify: Notify::new(),
             last_consolidation_unix_ms: AtomicI64::new(0),
@@ -205,6 +235,7 @@ impl ConsolidationScheduler {
             errors_total: AtomicU64::new(0),
             last_promoted: AtomicU64::new(0),
             last_archived: AtomicU64::new(0),
+            last_orphans_reclaimed: AtomicU64::new(0),
         });
 
         let join = if config.enabled {
@@ -311,6 +342,24 @@ async fn do_one_pass(state: &SchedulerState) -> Result<()> {
                     "consolidation pass moved events"
                 );
             }
+
+            // L4 orphan sweep. Runs after tiering and is deliberately
+            // non-fatal: reclaiming orphan vectors is housekeeping, and
+            // failing the whole pass over it would also stop L3 tiering
+            // from making progress.
+            if let Some(semantic) = state.semantic.as_ref() {
+                match semantic.gc_orphan_vectors().await {
+                    Ok(n) => state
+                        .last_orphans_reclaimed
+                        .store(n as u64, Ordering::SeqCst),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "orphan-vector sweep failed; tiering still succeeded"
+                        );
+                    }
+                }
+            }
             Ok(())
         }
         Err(e) => {
@@ -341,6 +390,78 @@ mod tests {
             tick_interval: Duration::from_millis(50),
             enabled: true,
         }
+    }
+
+    /// A pass with an L4 handle attached also reclaims orphan vectors,
+    /// and reports how many on `metrics()`.
+    #[tokio::test]
+    async fn pass_sweeps_orphan_vectors_when_semantic_attached() {
+        use crate::embed::Embedder;
+        use crate::embed::stub::StubEmbedder;
+        use crate::memory::semantic::MemoryKind;
+        use crate::storage::MEM_KEY_PREFIX;
+
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let tmp = TempDir::new().unwrap();
+        let archive = ColdArchive::new(tmp.path());
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic = crate::memory::semantic::SemanticStore::open_disabled(
+            tmp.path(),
+            Arc::clone(&storage),
+            embedder,
+        )
+        .unwrap();
+
+        let orphan = semantic
+            .remember("doomed", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        semantic
+            .remember("survivor", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+
+        // Rip the metadata row out from under the index, the way an
+        // interrupted `forget` would.
+        let mut key = MEM_KEY_PREFIX.to_vec();
+        key.extend_from_slice(&orphan.0.to_bytes());
+        storage.delete(&key).await.unwrap();
+
+        let sched = ConsolidationScheduler::start_with_orphan_gc(
+            Arc::clone(&storage),
+            archive,
+            params(),
+            SchedulerConfig::disabled(),
+            vec![],
+            Some(Arc::clone(&semantic)),
+        );
+        sched.force_run().await.unwrap();
+
+        assert_eq!(
+            sched.metrics().last_orphans_reclaimed,
+            1,
+            "orphan sweep did not run or reclaimed the wrong count"
+        );
+        sched.shutdown().await;
+    }
+
+    /// Without an L4 handle the sweep is skipped and the counter stays
+    /// at zero — the many L3-only fixtures rely on this.
+    #[tokio::test]
+    async fn pass_skips_orphan_sweep_without_semantic() {
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let tmp = TempDir::new().unwrap();
+        let archive = ColdArchive::new(tmp.path());
+        let sched = ConsolidationScheduler::start(
+            Arc::clone(&storage),
+            archive,
+            params(),
+            SchedulerConfig::disabled(),
+            vec![],
+        );
+        sched.force_run().await.unwrap();
+        assert_eq!(sched.metrics().last_orphans_reclaimed, 0);
+        sched.shutdown().await;
     }
 
     /// Disabled config builds the scheduler with no spawned task —

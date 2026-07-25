@@ -65,7 +65,7 @@ pub fn init_at(root: &Path) -> Result<()> {
     migrate::migrate_to(root, migrate::CURRENT_SCHEMA_VERSION)?;
     let config_path = root.join("config.toml");
     if !config_path.exists() {
-        Config::default().write(&config_path)?;
+        Config::default().write_starter(&config_path)?;
         eprintln!("wrote default config to {}", config_path.display());
     } else {
         eprintln!("config already present at {}", config_path.display());

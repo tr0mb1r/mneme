@@ -31,7 +31,7 @@ The rest of the doc is layer-by-layer detail.
 | **L1 Working session** | The current session's turns (tool, user, assistant), scratch state | No | `~/.mneme/sessions/<session_id>.snapshot` (atomic temp+rename per flush) | Checkpoint scheduler running; conversation mirror wired — `record_event(kind="user_message"/"assistant_message")` pushes a matching turn to L1 | Same |
 | **L3 Episodic** | Time-ordered events: tool calls, lifecycle events, conversation turns, curated semantic events | No (lexical only) | `~/.mneme/episodic/` (redb), three prefixes: `epi:` hot, `wepi:` warm, `cold/` zstd | Auto-emit running — `tool_call` (per-tool enriched payload), `tool_call_failed`, `session_start`, `session_end`. Agent-driven — `record_event` writes any kind. `ConsolidationScheduler` fires every 5 min when idle | Idle-time pass: hot → warm at age ≥ 28 d, warm → cold at age ≥ 180 d |
 | **L4 Semantic** | Long-term facts, decisions, preferences, conversations | **Yes** — every `remember` / `update` re-embeds | `~/.mneme/episodic/` (redb), prefix `mem:` + `~/.mneme/index/hnsw.idx` snapshot + `~/.mneme/wal/` deltas | Live writes; **HNSW snapshot scheduler runs**: every 1000 inserts OR every 60 min, whichever first | Same |
-| **Auto-context resource** | Pinned + recent, packed to a token budget | Reads only | (assembled on demand) | On read of `mneme://context` | Same |
+| **Auto-context resource** | Pinned + working turns + recent events, packed to a token budget; plus L4 hits when the read carries `?q=` | Reads only (embeds the `?q=` seed) | (assembled on demand) | On read of `mneme://context` | Same |
 | **Cold archive** | Quarter-bundled JSON, zstd-compressed | No | `~/.mneme/cold/<YYYY-Q>.zst` | Written only when L3 consolidation runs | Same as L3 |
 
 The defaults in the table come from `~/.mneme/config.toml`; every
@@ -79,7 +79,7 @@ survive crashes by checkpointing to disk on a schedule.
 
 **Embedding.** None.
 
-**Storage.** `~/.mneme/sessions/<session_id>.json` (atomic
+**Storage.** `~/.mneme/sessions/<session_id>.snapshot` (atomic
 temp+rename per checkpoint). Single file per session.
 
 **Designed schedule.** Per spec §8.3 and `[checkpoints]` in
@@ -262,10 +262,26 @@ temp+rename); WAL replay covers the gap. Verified by
 
 **Surfaced via:**
 - Tools: `remember`, `recall`, `update`, `forget`.
-- No L4-specific resource; semantic results are available through
-  `mneme://context` (auto-context).
+- No L4-specific resource; semantic results reach auto-context through
+  `mneme://context?q=<text>` (see §6).
+
+**Filters and how they're satisfied.** `recall` accepts `scope`,
+`type`, `tags` (all must match), and `min_similarity` (a cosine-
+similarity floor, `1.0` = identical). The HNSW indexes vectors only, so
+these are applied *after* the search — and because a selective filter
+would otherwise leave the result short, `recall` widens its index probe
+geometrically until it has `limit` survivors or the index is exhausted.
+Unfiltered recall still issues exactly one probe.
 
 **What runs today:** All of the above.
+
+> **Changed in v1.3.** `tags` and `min_similarity` are new, results now
+> carry a `similarity` field alongside the raw cosine `score`, and the
+> widening probe replaced a fixed `limit × 4` fetch that silently
+> underfilled whenever the requested scope or kind was a minority of the
+> corpus. `remember` also now reports a `duplicate_advisory` in `_meta`
+> when new content closely restates an existing memory — advisory only;
+> the write still lands.
 
 ---
 
@@ -274,15 +290,36 @@ temp+rename); WAL replay covers the gap. Verified by
 **What it is.** A pre-assembled context blob the agent can read at
 session start. Combines:
 - All pinned items from L0 (every one — they're a small set).
+- The most recent turns from L1, the active working session.
 - The most recent N events from L3 (recency-ordered).
-- Optionally seeded by an L4 query if the agent passes one.
+- L4 semantic hits, **when the read carries a `?q=` seed** (see
+  Parameters below).
 
 Packed to a token budget (`[budgets] auto_context_token_budget =
 4000` by default), with a per-layer floor so no single layer can
 crowd the others out.
 
-**Embedding.** Reads-only — already-embedded L4 results are mixed in
-when an L4 seed is provided.
+**Parameters.** `resources/read` hands the server a URI and nothing
+else, so parameters ride on the URI's query string:
+
+| Param | Effect |
+|---|---|
+| `q` (or `query`) | Natural-language seed for L4. Without it the `semantic` array is empty — a vector search needs something to be similar *to*. Percent-encoded. |
+| `scope` | Restricts L0 / L3 / L4 to one scope. L1 turns are session-local and always included. |
+| `limit` | Semantic over-fetch before the budget pass trims. Clamped server-side. |
+
+```
+mneme://context                                  → L0 + L1 + L3
+mneme://context?q=how%20do%20we%20deploy          → + L4 hits
+mneme://context?q=deploy&scope=work               → all four layers, work only
+```
+
+Unknown parameters and malformed values are ignored rather than
+rejected: auto-context is read unattended, and failing it closed would
+strand the session with no memory at all.
+
+**Embedding.** Reads-only, except that a `?q=` seed embeds the query
+string (once) before the HNSW search.
 
 **Schedule.** None. The resource is **assembled on demand** when the
 agent reads `mneme://context`. Latency budget per spec §13:
@@ -291,9 +328,17 @@ agent reads `mneme://context`. Latency budget per spec §13:
 **Determinism.** Given the same DB state, the assembly is
 deterministic. Verified by `orchestrator::tests::build_context_is_deterministic`.
 
-**Surfaced via:** Resource `mneme://context` only.
+**Surfaced via:** Resource `mneme://context` (fixed form) and
+`mneme://context{?q,scope,limit}` (advertised via
+`resources/templates/list`).
 
 **What runs today:** All of the above.
+
+> **Changed in v1.3.** Before v1.3 this resource passed no query and
+> emitted a hardcoded empty `semantic` array, so no `remember`ed memory
+> could ever reach auto-context, and the `working` section was omitted
+> from the response body entirely even though its turns were charged
+> against the token budget. Both are fixed; `?q=` and `?scope=` are new.
 
 ---
 
@@ -368,8 +413,8 @@ adds the query-embed step + the HNSW search.
 ├── procedural/
 │   └── pinned.jsonl                # L0; watched every 500 ms
 │
-├── sessions/                       # L1; written when wired (see §3)
-│   └── <session_id>.json
+├── sessions/                       # L1; one snapshot per session
+│   └── <session_id>.snapshot
 │
 ├── episodic/                       # redb file shared by L3 + L4
 │                                   #   epi:<ulid>  → hot L3

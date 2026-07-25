@@ -130,6 +130,26 @@ impl HnswIndex {
         self.corpus.len() - self.committed_len
     }
 
+    /// Every live (non-tombstoned) id, deduplicated and sorted.
+    ///
+    /// Used by [`SemanticStore::gc_orphan_vectors`] to find vectors
+    /// whose metadata row is gone. Sorted so the sweep is deterministic
+    /// and diffable; duplicates are collapsed because `insert` allows
+    /// two corpus rows under one id (see the note on `insert`).
+    ///
+    /// [`SemanticStore::gc_orphan_vectors`]: crate::memory::semantic::SemanticStore::gc_orphan_vectors
+    pub fn live_ids(&self) -> Vec<MemoryId> {
+        let mut ids: Vec<MemoryId> = self
+            .corpus
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| !self.tombstones.contains(id))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Append a vector. Idempotent on `(id, vec)` only at the corpus
     /// level — calling `insert` twice with the same `id` yields two
     /// rows, which means the higher layer (`memory::semantic`) is

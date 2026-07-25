@@ -13,7 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
@@ -52,6 +52,8 @@ impl Tool for ListScopes {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "list_scopes",
+            title: "List scopes",
+            annotations: ToolAnnotations::read_only(),
             description: DESCRIPTION,
             input_schema: json!({
                 "type": "object",

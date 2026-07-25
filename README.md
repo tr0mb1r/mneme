@@ -53,8 +53,13 @@ work that the agent would otherwise forget.**
   [Smoke-testing the MCP server](#smoke-testing-the-mcp-server) below.
 - **Understanding what mneme actually stores** — see
   [`docs/MEMORY_LAYERS.md`](docs/MEMORY_LAYERS.md) for a per-layer
-  walkthrough of hot/warm/cold tiers, embedding cadence, snapshot
-  schedules, and what's wired vs. deferred today.
+  walkthrough of hot/warm/cold tiers, embedding cadence, and snapshot
+  schedules.
+- **What isn't built yet** — see
+  [`book/src/roadmap.md`](book/src/roadmap.md). Notably: **on Windows
+  only `mneme run` works** — `mneme daemon`, `mneme client`, and
+  `mneme stop` need Unix domain sockets, so configure your MCP host
+  with `args: ["run"]` there.
 
 ## What works today
 
@@ -212,8 +217,11 @@ cargo build --release
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Spec is canonical; if reality
-diverges from the spec, update the spec in the same commit.
+See [CONTRIBUTING.md](CONTRIBUTING.md). The published docs are the
+contract: if behaviour and docs disagree, that's a bug in one of them,
+and the fix belongs in the same commit as the change that caused it.
+[`book/src/roadmap.md`](book/src/roadmap.md) lists what's deliberately
+not built yet.
 
 ## License
 

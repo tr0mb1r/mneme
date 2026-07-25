@@ -21,7 +21,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::jsonrpc::{Id, Inbound, ParseError, Request, Response, error_codes, parse_inbound};
-use super::resources::{ResourceError, ResourceRegistry, descriptor_to_json as resource_to_json};
+use super::resources::{
+    ResourceError, ResourceRegistry, descriptor_to_json as resource_to_json,
+    template_descriptor_to_json as resource_template_to_json,
+};
 use super::tools::{ToolRegistry, descriptor_to_json as tool_to_json};
 use super::transport::stdio::{FrameError, StdioTransport};
 use super::{PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
@@ -75,6 +78,10 @@ pub struct Server<R, W> {
     /// matching `remember`/`pin` behaviour when the caller omits an
     /// explicit `scope` argument.
     scope_state: Option<Arc<ScopeState>>,
+    /// Honour `roots` from the `initialize` params as the connection's
+    /// default scope. Mirrors `[scopes] derive_from_roots`; off unless
+    /// the user opted in, because it changes where writes land.
+    derive_scope_from_roots: bool,
     initialized: AtomicBool,
 }
 
@@ -98,8 +105,17 @@ where
             checkpoint_scheduler: None,
             episodic: None,
             scope_state: None,
+            derive_scope_from_roots: false,
             initialized: AtomicBool::new(false),
         }
+    }
+
+    /// Builder hook: opt this connection into deriving its default
+    /// scope from the client's `initialize` roots. `cli::run` passes
+    /// `[scopes] derive_from_roots`.
+    pub fn with_scope_from_roots(mut self, enabled: bool) -> Self {
+        self.derive_scope_from_roots = enabled;
+        self
     }
 
     /// Builder hook: attach the production runtime wiring so each
@@ -187,6 +203,7 @@ where
             "tools/list" => self.handle_tools_list(id),
             "tools/call" => self.handle_tools_call(id, req.params).await,
             "resources/list" => self.handle_resources_list(id),
+            "resources/templates/list" => self.handle_resource_templates_list(id),
             "resources/read" => self.handle_resources_read(id, req.params).await,
             "prompts/list" => Response::success(id, json!({ "prompts": [] })),
             method => Response::error(
@@ -197,7 +214,9 @@ where
         }
     }
 
-    async fn handle_initialize(&self, id: Id, _params: Option<Value>) -> Response {
+    async fn handle_initialize(&self, id: Id, params: Option<Value>) -> Response {
+        self.apply_roots_scope(params.as_ref());
+
         // We accept whatever protocolVersion the client requested — but
         // we always advertise our own. Per spec the client decides
         // whether to proceed if mismatched.
@@ -214,6 +233,52 @@ where
             }
         });
         Response::success(id, result)
+    }
+
+    /// Set this connection's default scope from the client's declared
+    /// workspace roots, when `[scopes] derive_from_roots` is on.
+    ///
+    /// Per-connection matters: in daemon mode one process serves many
+    /// hosts, each with its own `Server` and its own `ScopeState`
+    /// (see the SEC-001 note in `cli::run`), so a Claude Code session
+    /// in repo A and a Cursor session in repo B land in different
+    /// scopes off the same daemon.
+    ///
+    /// Silent no-op when the feature is off, the client sent no roots,
+    /// or nothing survives sanitisation — the configured default stands.
+    fn apply_roots_scope(&self, params: Option<&Value>) {
+        if !self.derive_scope_from_roots {
+            return;
+        }
+        let Some(state) = self.scope_state.as_ref() else {
+            return;
+        };
+        // An explicit environment override is a deliberate choice by
+        // whoever wrote the MCP config; inferred roots must not silently
+        // beat it.
+        if std::env::var(crate::scope::SCOPE_ENV_VAR)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        {
+            tracing::debug!(
+                "roots-derived scope skipped: {} is set explicitly",
+                crate::scope::SCOPE_ENV_VAR
+            );
+            return;
+        }
+
+        let Some(roots) = params.and_then(|p| p.get("roots")) else {
+            tracing::debug!("scopes.derive_from_roots is on but the client sent no roots");
+            return;
+        };
+        let Some(derived) = crate::scope::scope_from_roots(roots) else {
+            tracing::debug!("client roots yielded no usable scope name");
+            return;
+        };
+        match state.set(&derived) {
+            Ok(()) => tracing::info!(scope = %derived, "default scope derived from client roots"),
+            Err(e) => tracing::warn!(error = e, scope = %derived, "rejected roots-derived scope"),
+        }
     }
 
     fn handle_tools_list(&self, id: Id) -> Response {
@@ -237,6 +302,23 @@ where
     fn handle_resources_list(&self, id: Id) -> Response {
         let resources: Vec<Value> = self.resources.list().iter().map(resource_to_json).collect();
         Response::success(id, json!({ "resources": resources }))
+    }
+
+    /// `resources/templates/list` — the parameterised routes.
+    ///
+    /// Separate from `resources/list` per the MCP spec: templates
+    /// carry a `uriTemplate` rather than a `uri`, and a client that
+    /// only reads `resources/list` has no way to discover them. Before
+    /// v1.3 mneme never implemented this method, so
+    /// `mneme://session/{id}` was effectively undiscoverable.
+    fn handle_resource_templates_list(&self, id: Id) -> Response {
+        let templates: Vec<Value> = self
+            .resources
+            .list_templates()
+            .iter()
+            .map(resource_template_to_json)
+            .collect();
+        Response::success(id, json!({ "resourceTemplates": templates }))
     }
 
     async fn handle_resources_read(&self, id: Id, params: Option<Value>) -> Response {
@@ -335,6 +417,57 @@ mod tests {
         let out = parse_lines(&bytes);
         drop(tmp);
         out
+    }
+
+    /// Registries over throwaway stores, for tests that need to poke
+    /// `Server`'s private fields (scope derivation) rather than drive it
+    /// through [`drive`]. The `TempDir` must outlive the server.
+    #[allow(clippy::type_complexity)]
+    fn bare_registries() -> (
+        Arc<ToolRegistry>,
+        Arc<ResourceRegistry>,
+        Arc<dyn Storage>,
+        tempfile::TempDir,
+    ) {
+        use crate::embed::Embedder;
+        use crate::embed::stub::StubEmbedder;
+        use crate::memory::episodic::EpisodicStore;
+        use crate::memory::procedural::ProceduralStore;
+        use crate::memory::semantic::SemanticStore;
+        use crate::orchestrator::{Orchestrator, TokenBudget};
+        use crate::storage::archive::ColdArchive;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = crate::storage::memory_impl::MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&storage), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage)));
+        let orchestrator = Arc::new(Orchestrator::new(
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+        ));
+        let cold = ColdArchive::new(tmp.path());
+        let tools = Arc::new(ToolRegistry::defaults(
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+            Arc::clone(&storage),
+            cold.clone(),
+            1,
+        ));
+        let resources = Arc::new(ResourceRegistry::defaults(
+            semantic,
+            procedural,
+            episodic,
+            orchestrator,
+            cold,
+            1,
+            TokenBudget::for_tests(2000),
+        ));
+        (tools, resources, storage, tmp)
     }
 
     fn parse_lines(bytes: &[u8]) -> Vec<Value> {
@@ -518,6 +651,110 @@ mod tests {
     #[allow(dead_code)]
     fn _ensure_id_used() {
         let _ = Id::Number(0);
+    }
+
+    /// v1.3 `resources/templates/list`. Before this the method was
+    /// `method not found`, so `mneme://session/{id}` was undiscoverable
+    /// to a spec-compliant client.
+    #[tokio::test]
+    async fn resource_templates_list_returns_the_context_template() {
+        let mut input = String::new();
+        input.push_str(&req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18"}),
+        ));
+        input.push_str(&notif("notifications/initialized"));
+        input.push_str(&req_no_params(2, "resources/templates/list"));
+        let out = drive(input.as_bytes()).await;
+
+        let templates = out[1]["result"]["resourceTemplates"]
+            .as_array()
+            .expect("resourceTemplates must be an array");
+        let uris: Vec<&str> = templates
+            .iter()
+            .map(|t| t["uriTemplate"].as_str().unwrap())
+            .collect();
+        assert!(
+            uris.contains(&"mneme://context{?q,scope,limit}"),
+            "got {uris:?}"
+        );
+        // Templates carry `uriTemplate`, never `uri` — a client keying
+        // on `uri` would try to read the literal template string.
+        assert!(templates[0].get("uri").is_none());
+    }
+
+    /// Roots-derived scope, the daemon-mode path to per-project memory.
+    /// `initialize` is per-connection, so each host gets its own scope
+    /// off one shared daemon.
+    #[tokio::test]
+    async fn roots_derive_the_default_scope_when_enabled() {
+        let scope_state = crate::scope::ScopeState::new("global");
+        let mut input = String::new();
+        input.push_str(&req(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "roots": [{ "uri": "file:///home/user/code/billing-api" }]
+            }),
+        ));
+
+        let transport = StdioTransport::new(input.as_bytes(), Vec::<u8>::new());
+        let (tools, resources, storage, _tmp) = bare_registries();
+        let mut server = Server::new(transport, tools, resources, storage);
+        server.scope_state = Some(Arc::clone(&scope_state));
+        server.derive_scope_from_roots = true;
+        server.run().await.unwrap();
+
+        assert_eq!(scope_state.current(), "billing-api");
+    }
+
+    /// Off by default: enabling derivation changes where writes land,
+    /// so a user who never opted in must see no change.
+    #[tokio::test]
+    async fn roots_are_ignored_when_derivation_is_disabled() {
+        let scope_state = crate::scope::ScopeState::new("global");
+        let mut input = String::new();
+        input.push_str(&req(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "roots": [{ "uri": "file:///home/user/code/billing-api" }]
+            }),
+        ));
+
+        let transport = StdioTransport::new(input.as_bytes(), Vec::<u8>::new());
+        let (tools, resources, storage, _tmp) = bare_registries();
+        let mut server = Server::new(transport, tools, resources, storage);
+        server.scope_state = Some(Arc::clone(&scope_state));
+        // derive_scope_from_roots left at its default of false.
+        server.run().await.unwrap();
+
+        assert_eq!(scope_state.current(), "global");
+    }
+
+    /// Derivation enabled but the client sent no roots: the configured
+    /// default must survive rather than becoming empty.
+    #[tokio::test]
+    async fn missing_roots_leave_the_default_scope_intact() {
+        let scope_state = crate::scope::ScopeState::new("global");
+        let mut input = String::new();
+        input.push_str(&req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18"}),
+        ));
+
+        let transport = StdioTransport::new(input.as_bytes(), Vec::<u8>::new());
+        let (tools, resources, storage, _tmp) = bare_registries();
+        let mut server = Server::new(transport, tools, resources, storage);
+        server.scope_state = Some(Arc::clone(&scope_state));
+        server.derive_scope_from_roots = true;
+        server.run().await.unwrap();
+
+        assert_eq!(scope_state.current(), "global");
     }
 
     /// Closes the L3 producer gap. Until v0.2.3 the episodic hot

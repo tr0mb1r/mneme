@@ -59,10 +59,22 @@ def per_iter_ns(sample: dict) -> list[float]:
 
 
 def find_new_dirs(corpus: int | None) -> list[Path]:
-    """Walk target/criterion for `*/new/` dirs holding both jsons."""
+    """Walk target/criterion for `*/new/` dirs holding both jsons.
+
+    `corpus` filters *corpus-parameterised* benches to a single size so
+    one baseline file describes one corpus. Benches whose id carries no
+    `n=` marker are corpus-independent (the `encryption_overhead` group
+    measures pure AEAD cost on a fixed payload) and are always kept —
+    dropping them is how the crypto bench stayed invisible to CI even
+    after it was written.
+
+    What the filter excluded is printed to stderr rather than silently
+    dropped, so a surprising bench count in the output is traceable.
+    """
     if not CRITERION_ROOT.is_dir():
         sys.exit(f"no criterion output at {CRITERION_ROOT} — run cargo bench first")
     found: list[Path] = []
+    skipped: list[str] = []
     for sample in CRITERION_ROOT.rglob("new/sample.json"):
         new_dir = sample.parent
         if not (new_dir / "estimates.json").is_file():
@@ -71,9 +83,16 @@ def find_new_dirs(corpus: int | None) -> list[Path]:
             # Bench id is the directory two levels up from `new/`:
             #   target/criterion/<group>/<id>/new/
             bench_id = new_dir.parent.name
-            if f"n={corpus}" not in bench_id:
+            if "n=" in bench_id and f"n={corpus}" not in bench_id:
+                skipped.append(bench_label(new_dir))
                 continue
         found.append(new_dir)
+    if skipped:
+        print(
+            f"note: excluded {len(skipped)} bench(es) from other corpus sizes: "
+            + ", ".join(sorted(skipped)),
+            file=sys.stderr,
+        )
     return sorted(found)
 
 

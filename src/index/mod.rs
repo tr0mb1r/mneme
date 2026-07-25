@@ -5,9 +5,11 @@
 //! immutable post-build, so we layer mutation on top). Phase 3 §6 adds
 //! `snapshot` + `delta` files for crash-safe persistence.
 //!
-//! The [`VectorIndex`] trait still defines the abstract surface used
-//! by [`crate::memory::semantic`] in §7. `HnswIndex` will grow to
-//! satisfy it once §6 wires snapshot/load.
+//! The [`VectorIndex`] trait defines the abstract surface
+//! [`crate::memory::semantic`] codes against, so swapping
+//! `instant-distance` for another HNSW stays local to this module.
+//! `HnswIndex` satisfies it, and [`snapshot`] / [`delta`] provide the
+//! crash-safe persistence behind it.
 
 use crate::Result;
 use crate::ids::MemoryId;

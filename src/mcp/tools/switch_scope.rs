@@ -18,7 +18,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::scope::ScopeState;
 
 const DESCRIPTION: &str = "Set the session's default scope. After this \
@@ -43,6 +43,8 @@ impl Tool for SwitchScope {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "switch_scope",
+            title: "Switch the default scope",
+            annotations: ToolAnnotations::session_state(),
             description: DESCRIPTION,
             input_schema: json!({
                 "type": "object",

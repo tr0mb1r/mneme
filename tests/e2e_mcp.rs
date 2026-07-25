@@ -317,3 +317,247 @@ async fn pre_initialize_request_returns_not_initialized() {
     drop(client.stdin);
     let _ = timeout(Duration::from_secs(5), child.wait()).await.unwrap();
 }
+
+/// v1.3 auto-context surface, end to end against the real binary.
+///
+/// Three things this pins that unit tests cannot:
+///   1. `resources/templates/list` is answered at all (it was
+///      `method not found` before v1.3, so `mneme://session/{id}` was
+///      undiscoverable to a spec-compliant client).
+///   2. A parameterised `mneme://context?q=…` read routes through the
+///      registry's prefix fallback rather than 404-ing.
+///   3. A memory written with `remember` actually surfaces in that
+///      read — the end of the chain the docs promised and the code
+///      did not deliver.
+#[tokio::test]
+async fn auto_context_folds_in_remembered_memories() {
+    let (mut child, _tmp) = spawn_isolated();
+
+    let mut client = Client {
+        stdin: child.stdin.take().unwrap(),
+        stdout: BufReader::new(child.stdout.take().unwrap()),
+        line_buf: String::new(),
+    };
+
+    client
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "e2e", "version": "0.0.1" }
+            }
+        }))
+        .await;
+    let _ = client.recv().await;
+    client
+        .send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+        .await;
+
+    // resources/templates/list must advertise both templates.
+    client
+        .send(&json!({ "jsonrpc": "2.0", "id": 2, "method": "resources/templates/list" }))
+        .await;
+    let templates = client.recv().await;
+    let listed: Vec<&str> = templates["result"]["resourceTemplates"]
+        .as_array()
+        .expect("resourceTemplates array")
+        .iter()
+        .map(|t| t["uriTemplate"].as_str().unwrap())
+        .collect();
+    assert!(
+        listed.contains(&"mneme://session/{id}"),
+        "session template missing: {listed:?}"
+    );
+    assert!(
+        listed.contains(&"mneme://context{?q,scope,limit}"),
+        "context template missing: {listed:?}"
+    );
+
+    // Write a memory.
+    client
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "remember",
+                "arguments": { "content": "we deploy with flyctl, never docker push" }
+            }
+        }))
+        .await;
+    let remembered = client.recv().await;
+    assert_eq!(
+        remembered["result"]["isError"], false,
+        "remember failed: {remembered}"
+    );
+
+    // A bare context read must leave semantic empty…
+    client
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "resources/read",
+            "params": { "uri": "mneme://context" }
+        }))
+        .await;
+    let bare = client.recv().await;
+    let bare_body: Value =
+        serde_json::from_str(bare["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(
+        bare_body["semantic"].as_array().unwrap().is_empty(),
+        "a query-less read has nothing to be similar to"
+    );
+    assert!(
+        bare_body.get("working").is_some(),
+        "the L1 section must be emitted"
+    );
+
+    // …and a seeded read must surface the memory.
+    client
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "resources/read",
+            "params": { "uri": "mneme://context?q=how%20do%20we%20deploy" }
+        }))
+        .await;
+    let seeded = client.recv().await;
+    assert_eq!(
+        seeded["result"]["contents"][0]["uri"], "mneme://context?q=how%20do%20we%20deploy",
+        "the reply must echo the requested URI so clients can correlate"
+    );
+    let seeded_body: Value =
+        serde_json::from_str(seeded["result"]["contents"][0]["text"].as_str().unwrap()).unwrap();
+    let hits = seeded_body["semantic"].as_array().unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "auto-context dropped the memory: {seeded_body}"
+    );
+    assert_eq!(
+        hits[0]["content"],
+        "we deploy with flyctl, never docker push"
+    );
+    assert!(hits[0]["similarity"].is_number());
+
+    drop(client.stdin);
+    let _ = timeout(Duration::from_secs(5), child.wait()).await.unwrap();
+}
+
+/// `recall` gained a `tags` filter and a `min_similarity` floor in
+/// v1.3. Both are wire-visible, so pin them here.
+#[tokio::test]
+async fn recall_honours_tags_and_similarity_floor() {
+    let (mut child, _tmp) = spawn_isolated();
+
+    let mut client = Client {
+        stdin: child.stdin.take().unwrap(),
+        stdout: BufReader::new(child.stdout.take().unwrap()),
+        line_buf: String::new(),
+    };
+
+    client
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "e2e", "version": "0.0.1" }
+            }
+        }))
+        .await;
+    let _ = client.recv().await;
+    client
+        .send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+        .await;
+
+    for (id, content, tags) in [
+        (10, "postgres runs on port 5432", vec!["db", "prod"]),
+        (11, "postgres runs on port 5433 in staging", vec!["db"]),
+    ] {
+        client
+            .send(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "remember",
+                    "arguments": { "content": content, "tags": tags }
+                }
+            }))
+            .await;
+        let r = client.recv().await;
+        assert_eq!(r["result"]["isError"], false, "remember failed: {r}");
+    }
+
+    // Both tags required ⇒ one hit.
+    client
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {
+                "name": "recall",
+                "arguments": { "query": "postgres port", "tags": ["db", "prod"] }
+            }
+        }))
+        .await;
+    let resp = client.recv().await;
+    let rows: Value =
+        serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        rows.as_array().unwrap().len(),
+        1,
+        "tag filter ignored: {rows}"
+    );
+    assert!(
+        rows[0]["similarity"].is_number(),
+        "missing similarity field"
+    );
+
+    // An unreachable similarity floor filters everything out.
+    client
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {
+                "name": "recall",
+                "arguments": { "query": "postgres port", "min_similarity": 1.0 }
+            }
+        }))
+        .await;
+    let resp = client.recv().await;
+    let rows: Value =
+        serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(
+        rows.as_array().unwrap().len() <= 1,
+        "similarity floor of 1.0 should admit only an exact match: {rows}"
+    );
+
+    // Out-of-range floor is a clean argument error, not a panic.
+    client
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "recall",
+                "arguments": { "query": "postgres port", "min_similarity": 5.0 }
+            }
+        }))
+        .await;
+    let resp = client.recv().await;
+    assert!(
+        resp["error"].is_object() || resp["result"]["isError"] == true,
+        "out-of-range min_similarity should be rejected: {resp}"
+    );
+
+    drop(client.stdin);
+    let _ = timeout(Duration::from_secs(5), child.wait()).await.unwrap();
+}

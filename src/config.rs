@@ -38,9 +38,11 @@ pub struct StorageConfig {
     pub data_dir: PathBuf,
     #[serde(default = "default_max_size_gb")]
     pub max_size_gb: u64,
-    /// **Reserved (not yet wired).** Encryption at rest is gated by the
-    /// presence of `keystore.json` (run `mneme encrypt`), not this flag —
-    /// setting it has no effect. Kept for forward compatibility.
+    /// **Reserved — has no effect.** Encryption at rest is gated by the
+    /// presence of `keystore.json` (run `mneme encrypt`), not by this
+    /// flag. Accepted so existing `config.toml` files keep loading;
+    /// `mneme init` no longer writes it. Tracked in
+    /// `book/src/roadmap.md`.
     #[serde(default)]
     pub encryption: bool,
 }
@@ -69,24 +71,42 @@ pub struct ConsolidationConfig {
 pub struct ScopesConfig {
     #[serde(default = "default_scope")]
     pub default: String,
+    /// Derive the per-connection default scope from the MCP client's
+    /// declared workspace roots (see [`crate::scope::scope_from_roots`]),
+    /// so a host opened on `~/code/myproj` writes into scope `myproj`
+    /// without the agent calling `switch_scope`.
+    ///
+    /// **Defaults to `false`**, and deliberately so: turning it on
+    /// changes where new memories land, which means facts stored before
+    /// the switch stop appearing in a default-scoped `recall`. That is
+    /// the right behaviour for someone who wants project isolation and a
+    /// nasty surprise for someone who doesn't, so it is opt-in.
+    ///
+    /// An explicit `MNEME_SCOPE` in the environment wins over
+    /// derivation — explicit beats inferred.
+    #[serde(default)]
+    pub derive_from_roots: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct McpConfig {
     #[serde(default = "default_mcp_transport")]
     pub transport: String,
-    /// **Reserved (not yet wired).** Port for the future SSE transport.
-    /// Only `transport = "stdio"` is implemented today; this value is
-    /// ignored until SSE lands.
+    /// **Reserved — has no effect.** Port for a future SSE / Streamable
+    /// HTTP transport. Only `transport = "stdio"` is implemented, and
+    /// `transport` itself is not consulted. Accepted so existing
+    /// `config.toml` files keep loading; `mneme init` no longer writes
+    /// it. Tracked in `book/src/roadmap.md`.
     #[serde(default = "default_sse_port")]
     pub sse_port: u16,
 }
 
-/// `[daemon]` — v1.1 daemon-mode tuning per ADR-0012. The daemon
-/// itself isn't fully wired yet (A.M2-M5 of release-planning §3.9
-/// land it in stages); this struct is committed early so the config
-/// surface is stable from the first commit and tests can pin the
-/// defaults end-to-end.
+/// `[daemon]` — daemon-mode tuning per ADR-0012. Fully wired since
+/// v1.1.1: `mneme daemon` binds a Unix socket, gates each connection on
+/// the auth handshake, serves many clients concurrently, drains on
+/// SIGTERM, and auto-stops after `idle_timeout_minutes`. Windows
+/// named-pipe support is still outstanding (see
+/// `book/src/roadmap.md`), so on Windows only `mneme run` works.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DaemonConfig {
     /// Idle-timeout shutdown threshold (ADR-0012 D6). The daemon
@@ -132,9 +152,11 @@ pub struct CheckpointsConfig {
     pub hnsw_snapshot_minutes: u32,
 }
 
-/// `[telemetry]` — **reserved (not yet wired).** No telemetry subsystem
-/// exists yet; these fields are accepted and round-tripped but have no
-/// effect. Kept so the config surface stays stable when telemetry lands.
+/// `[telemetry]` — **reserved, has no effect.** No telemetry subsystem
+/// exists; these fields are accepted and round-tripped but nothing reads
+/// them, and mneme makes no network calls on any code path. Accepted so
+/// existing `config.toml` files keep loading; `mneme init` no longer
+/// writes the section. Tracked in `book/src/roadmap.md`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TelemetryConfig {
     #[serde(default)]
@@ -267,6 +289,7 @@ impl Default for ScopesConfig {
     fn default() -> Self {
         Self {
             default: default_scope(),
+            derive_from_roots: false,
         }
     }
 }
@@ -316,6 +339,18 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Render `s` as a correctly-quoted TOML string value, quotes included.
+///
+/// Delegates to `toml::Value`'s own writer rather than wrapping the text
+/// in `"` by hand, because the right *form* depends on the content:
+/// `toml` emits a literal string (`'C:\Users\me\.mneme'`) when the value
+/// contains backslashes, a multi-line literal when it also contains an
+/// apostrophe, and a basic string otherwise. Hand-quoting produced a
+/// `config.toml` that mneme could not read back on Windows.
+fn toml_value(s: &str) -> String {
+    toml::Value::String(s.to_owned()).to_string()
+}
+
 // ---------- I/O ----------
 
 impl Config {
@@ -359,8 +394,11 @@ impl Config {
     }
 
     /// Serialize the full config (with all defaults made explicit) to disk.
-    /// Used by `mneme init` to drop a starter `config.toml` next to the
-    /// user, where they can edit it.
+    ///
+    /// Emits *every* field, including the reserved ones that have no
+    /// effect. Kept for round-tripping and programmatic use; `mneme init`
+    /// uses [`write_starter`](Self::write_starter) instead so users don't
+    /// get handed live-looking settings that do nothing.
     pub fn write(&self, path: &Path) -> Result<()> {
         let text = toml::to_string_pretty(self)
             .map_err(|e| MnemeError::Config(format!("serialize: {e}")))?;
@@ -369,6 +407,154 @@ impl Config {
         }
         std::fs::write(path, text)?;
         Ok(())
+    }
+
+    /// Write the commented starter `config.toml` that `mneme init` drops
+    /// for a new user.
+    ///
+    /// Differs from [`write`](Self::write) in two ways that matter:
+    ///
+    /// 1. **Reserved keys are omitted.** `[telemetry]`,
+    ///    `[mcp] sse_port`, and `[storage] encryption` are accepted on
+    ///    load but do nothing, and shipping them in every user's config
+    ///    invited "I set `telemetry.enabled = false` and it still…"
+    ///    reports. Deserialization still accepts them, so existing files
+    ///    keep working untouched.
+    /// 2. **It carries comments.** A serialized struct cannot; a
+    ///    hand-written template can say what each knob does.
+    ///
+    /// Values are interpolated from `self` rather than hardcoded, so the
+    /// template cannot drift from the real defaults — and
+    /// `starter_template_matches_defaults` fails the build if the shape
+    /// ever does.
+    pub fn write_starter(&self, path: &Path) -> Result<()> {
+        let text = self.starter_toml();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, text)?;
+        Ok(())
+    }
+
+    fn starter_toml(&self) -> String {
+        // Every string value goes through `toml_value`, never a bare
+        // `format!("\"{x}\"")`. A Windows `data_dir` such as
+        // `C:\Users\me\.mneme` inside a TOML *basic* string makes
+        // `\U` an 8-digit unicode escape, so the file mneme itself just
+        // wrote fails to parse on the next boot. Caught by
+        // `starter_template_survives_windows_style_paths`.
+        let data_dir = toml_value(&self.storage.data_dir.display().to_string());
+        let log_file = toml_value(&self.logging.file.display().to_string());
+        let embed_model = toml_value(&self.embeddings.model);
+        let embed_device = toml_value(&self.embeddings.device);
+        let scope_default = toml_value(&self.scopes.default);
+        let schedule = toml_value(&self.consolidation.schedule);
+        let transport = toml_value(&self.mcp.transport);
+        let daemon_log_level = toml_value(&self.daemon.log_level);
+        let log_level = toml_value(&self.logging.level);
+        format!(
+            r#"# mneme configuration. Every value below is the built-in
+# default, written out so you can see and edit it.
+#
+# Settings that are accepted but have NO EFFECT in this release are
+# deliberately not listed here; see book/src/roadmap.md for what is
+# reserved and why.
+
+[storage]
+# Where mneme keeps everything. Override with $MNEME_DATA_DIR to point
+# a test or a second profile elsewhere.
+data_dir = {data_dir}
+# Soft ceiling, in GiB, reported by `mneme stats`.
+max_size_gb = {max_size_gb}
+
+[embeddings]
+# "bge-m3" (~1.5 GB, multilingual, best recall) or "minilm-l6"
+# (~80 MB, English, sub-second cold start). Changing this re-embeds
+# every stored memory on the next boot.
+model = {embed_model}
+# "auto" | "cpu" | "metal" | "cuda".
+device = {embed_device}
+batch_size = {batch_size}
+
+[scopes]
+# Scope that write tools use when the agent passes none.
+default = {scope_default}
+# Derive the default scope per connection from the MCP client's
+# workspace roots, so a host opened on ~/code/myproj writes into scope
+# "myproj". Off by default: turning it on changes where new memories
+# land, so facts stored beforehand stop showing up in a default-scoped
+# recall. $MNEME_SCOPE overrides both.
+derive_from_roots = {derive_from_roots}
+
+[consolidation]
+# L3 episodic tier transitions, in days.
+hot_to_warm_days = {hot_to_warm_days}
+warm_to_cold_days = {warm_to_cold_days}
+# Only "idle" is implemented: the scheduler wakes every 5 minutes and
+# fires only if nothing was written in the previous window.
+schedule = {schedule}
+
+[checkpoints]
+# L1 working-session flush cadence: whichever trigger fires first.
+session_interval_secs = {session_interval_secs}
+session_interval_turns = {session_interval_turns}
+# L4 HNSW snapshot cadence: whichever fires first. Snapshots bound how
+# much WAL the next boot has to replay.
+hnsw_snapshot_inserts = {hnsw_snapshot_inserts}
+hnsw_snapshot_minutes = {hnsw_snapshot_minutes}
+
+[budgets]
+# Default `limit` for the recall tool.
+default_recall_limit = {default_recall_limit}
+# Token ceiling for the mneme://context resource.
+auto_context_token_budget = {auto_context_token_budget}
+# Hard ceiling on remember/update content length, in characters.
+# Writes above this are rejected; existing longer memories stay
+# readable.
+max_remember_chars = {max_remember_chars}
+
+[mcp]
+# Only "stdio" is implemented.
+transport = {transport}
+
+[daemon]
+# Stop after this many minutes with no clients connected. 0 disables.
+idle_timeout_minutes = {idle_timeout_minutes}
+# "default" inherits [logging] level; set to e.g. "debug" to make just
+# the daemon verbose.
+log_level = {daemon_log_level}
+
+[logging]
+level = {log_level}
+file = {log_file}
+max_size_mb = {max_size_mb}
+max_files = {max_files}
+"#,
+            data_dir = data_dir,
+            max_size_gb = self.storage.max_size_gb,
+            embed_model = embed_model,
+            embed_device = embed_device,
+            batch_size = self.embeddings.batch_size,
+            scope_default = scope_default,
+            derive_from_roots = self.scopes.derive_from_roots,
+            hot_to_warm_days = self.consolidation.hot_to_warm_days,
+            warm_to_cold_days = self.consolidation.warm_to_cold_days,
+            schedule = schedule,
+            session_interval_secs = self.checkpoints.session_interval_secs,
+            session_interval_turns = self.checkpoints.session_interval_turns,
+            hnsw_snapshot_inserts = self.checkpoints.hnsw_snapshot_inserts,
+            hnsw_snapshot_minutes = self.checkpoints.hnsw_snapshot_minutes,
+            default_recall_limit = self.budgets.default_recall_limit,
+            auto_context_token_budget = self.budgets.auto_context_token_budget,
+            max_remember_chars = self.budgets.max_remember_chars,
+            transport = transport,
+            idle_timeout_minutes = self.daemon.idle_timeout_minutes,
+            daemon_log_level = daemon_log_level,
+            log_level = log_level,
+            log_file = log_file,
+            max_size_mb = self.logging.max_size_mb,
+            max_files = self.logging.max_files,
+        )
     }
 }
 
@@ -455,6 +641,121 @@ mod tests {
         c.write(&p).unwrap();
         let loaded = Config::load(&p).unwrap();
         assert_eq!(loaded, c);
+    }
+
+    /// The starter template is hand-written, so it could drift from the
+    /// real defaults. This makes drift a build failure: parse the
+    /// template and demand it round-trips to `Config::default()`.
+    #[test]
+    fn starter_template_matches_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("config.toml");
+        let defaults = Config::default();
+        defaults.write_starter(&p).unwrap();
+        let loaded = Config::load(&p).unwrap();
+        assert_eq!(
+            loaded, defaults,
+            "the starter config.toml no longer parses back to Config::default() — \
+             a field was added, renamed, or given a new default without updating \
+             Config::starter_toml"
+        );
+    }
+
+    /// Regression: the starter template must survive a Windows path.
+    ///
+    /// `starter_toml` interpolated paths into TOML *basic* strings, where
+    /// `\U` in `C:\Users\...` is an 8-digit unicode escape — so
+    /// `mneme init` on Windows wrote a `config.toml` that the next
+    /// `mneme run` refused to parse ("invalid unicode 8-digit hex code").
+    ///
+    /// Injects the backslash paths explicitly instead of relying on the
+    /// host's real defaults, so this fails on Linux and macOS too. The
+    /// original `starter_template_matches_defaults` only caught it on a
+    /// Windows runner, which is a whole CI round-trip too late.
+    #[test]
+    fn starter_template_survives_windows_style_paths() {
+        let mut c = Config::default();
+        c.storage.data_dir = PathBuf::from(r"C:\Users\runneradmin\.mneme");
+        c.logging.file = PathBuf::from(r"C:\Users\runneradmin\.mneme\logs\mneme.log");
+
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("config.toml");
+        c.write_starter(&p).unwrap();
+        let loaded = Config::load(&p).expect("starter config must parse back");
+
+        assert_eq!(loaded.storage.data_dir, c.storage.data_dir);
+        assert_eq!(loaded.logging.file, c.logging.file);
+        assert_eq!(loaded, c);
+    }
+
+    /// Same hazard, nastier input: an apostrophe rules out a plain TOML
+    /// literal string, so the writer has to reach for a multi-line
+    /// literal. A user called `O'Brien` is not a hypothetical.
+    #[test]
+    fn starter_template_survives_paths_with_quotes_and_backslashes() {
+        let mut c = Config::default();
+        c.storage.data_dir = PathBuf::from(r"C:\Users\O'Brien\.mneme");
+        c.logging.file = PathBuf::from(r"C:\Users\O'Brien\.mneme\logs\mneme.log");
+
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("config.toml");
+        c.write_starter(&p).unwrap();
+        let loaded = Config::load(&p).expect("starter config must parse back");
+        assert_eq!(loaded, c);
+    }
+
+    #[test]
+    fn toml_value_picks_a_form_that_round_trips() {
+        for raw in [
+            r"C:\Users\runneradmin\.mneme",
+            r"C:\Users\O'Brien\.mneme",
+            "/home/user/.mneme",
+            "has \"double quotes\"",
+            "has\ttab",
+        ] {
+            let rendered = toml_value(raw);
+            let doc = format!("v = {rendered}");
+            let parsed: toml::Value =
+                toml::from_str(&doc).unwrap_or_else(|e| panic!("{raw:?} → {rendered} → {e}"));
+            assert_eq!(
+                parsed["v"].as_str().unwrap(),
+                raw,
+                "{raw:?} did not round-trip through {rendered}"
+            );
+        }
+    }
+
+    /// Reserved settings must not appear in what `mneme init` writes —
+    /// handing a user a knob that does nothing is worse than omitting it.
+    #[test]
+    fn starter_template_omits_reserved_settings() {
+        let text = Config::default().starter_toml();
+        for reserved in ["[telemetry]", "sse_port", "encryption ="] {
+            assert!(
+                !text.contains(reserved),
+                "starter config leaks reserved setting `{reserved}`"
+            );
+        }
+    }
+
+    /// …but they must still *load*, so an existing config.toml written
+    /// by v1.0-v1.2 keeps working untouched.
+    #[test]
+    fn reserved_settings_still_deserialize() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("legacy.toml");
+        std::fs::write(
+            &p,
+            "[storage]\nencryption = true\n\n[mcp]\nsse_port = 9999\n\n\
+             [telemetry]\nenabled = true\nendpoint = \"https://example.invalid\"\n",
+        )
+        .unwrap();
+        let c = Config::load(&p).unwrap();
+        assert!(c.storage.encryption);
+        assert_eq!(c.mcp.sse_port, 9999);
+        assert!(c.telemetry.enabled);
+        // And unrelated fields still fall back to defaults.
+        assert_eq!(c.embeddings.model, "bge-m3");
     }
 
     #[test]

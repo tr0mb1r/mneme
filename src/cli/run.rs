@@ -225,8 +225,20 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     let cold = crate::storage::archive::ColdArchive::new_with_crypto(&root, data_aead.clone());
 
     // Process-lifetime "current scope" cell. Initialised from
-    // `[scopes] default`; mutated by the `switch_scope` tool.
-    let scope_state = ScopeState::new(&config.scopes.default);
+    // `MNEME_SCOPE` if the environment sets it, else `[scopes] default`;
+    // overridden per-connection by roots derivation when
+    // `[scopes] derive_from_roots` is on; mutated by `switch_scope`.
+    let default_scope = crate::scope::boot_default_scope(&config.scopes.default);
+    if default_scope != config.scopes.default {
+        tracing::info!(
+            scope = %default_scope,
+            configured = %config.scopes.default,
+            "default scope overridden by {}",
+            crate::scope::SCOPE_ENV_VAR
+        );
+    }
+    let scope_state = ScopeState::new(&default_scope);
+    let derive_scope_from_roots = config.scopes.derive_from_roots;
 
     // `remember` / `update` content ceiling (release-planning v2.1
     // §5.3). Configured via `[budgets] max_remember_chars`; the
@@ -292,13 +304,17 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     // growth is bounded without the agent having to ask for it.
     // Construction must happen inside the runtime context (it
     // `tokio::spawn`s).
+    // The L4 handle also lets each pass sweep orphan vectors — index
+    // entries whose metadata row is gone because a `forget` was
+    // interrupted between the two writes.
     let consolidation_scheduler = runtime.block_on(async {
-        ConsolidationScheduler::start(
+        ConsolidationScheduler::start_with_orphan_gc(
             Arc::clone(&storage_dyn),
             cold.clone(),
             ConsolidationParams::from_config(&config.consolidation),
             SchedulerConfig::from_config(&config.consolidation),
             vec![semantic.activity_counter(), episodic.activity_counter()],
+            Some(Arc::clone(&semantic)),
         )
     });
 
@@ -346,7 +362,12 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
                 root: root.clone(),
                 orchestrator: Arc::clone(&orchestrator),
                 scope_state,
-                default_scope: config.scopes.default.clone(),
+                // The resolved boot scope, not the raw config value —
+                // otherwise `MNEME_SCOPE` would apply to the shared cell
+                // but not to the fresh per-connection cells that
+                // `DaemonServeMany` mints.
+                default_scope: default_scope.clone(),
+                derive_scope_from_roots,
                 sessions_dir,
                 auto_context_budget,
                 schema_version: on_disk_version.max(migrate::CURRENT_SCHEMA_VERSION),
@@ -432,6 +453,10 @@ struct DaemonRuntimeConfig {
     /// concurrent agents. The shared `scope_state` above is still used
     /// by the single-client transports (`Stdio`, `DaemonAcceptOne`).
     default_scope: String,
+    /// `[scopes] derive_from_roots` — whether each connection may
+    /// replace its default scope with one derived from the client's
+    /// `initialize` roots.
+    derive_scope_from_roots: bool,
     sessions_dir: std::path::PathBuf,
     auto_context_budget: TokenBudget,
     schema_version: u32,
@@ -472,6 +497,7 @@ async fn async_main(
         orchestrator,
         scope_state,
         default_scope,
+        derive_scope_from_roots,
         sessions_dir,
         auto_context_budget,
         schema_version,
@@ -575,12 +601,9 @@ async fn async_main(
                      scope_state: Arc<ScopeState>| {
         async move {
             let transport = StdioTransport::new(reader, writer);
-            let mut server = Server::new(transport, tool, resource, storage).with_session(
-                active_session,
-                checkpoint_scheduler,
-                episodic,
-                scope_state,
-            );
+            let mut server = Server::new(transport, tool, resource, storage)
+                .with_session(active_session, checkpoint_scheduler, episodic, scope_state)
+                .with_scope_from_roots(derive_scope_from_roots);
             if with_signal {
                 tokio::select! {
                     result = server.run() => result?,
@@ -833,7 +856,8 @@ async fn async_main(
                                         checkpoint_c,
                                         episodic_c,
                                         scope_c,
-                                    );
+                                    )
+                                    .with_scope_from_roots(derive_scope_from_roots);
                                     // Race the serve loop against the
                                     // daemon-level shutdown broadcast.
                                     // `Server::run` blocks in

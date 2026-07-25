@@ -273,9 +273,11 @@ Some files in `~/.mneme/` stay plaintext on purpose:
 - redb *keys* (ULIDs, table prefixes like `mem:` / `epi:`) — required
   for range-scan correctness; identifiers, not content.
 
-The full inventory is in
-[ADR-0013](https://github.com/tr0mb1r/mneme/blob/main/proj_docs/decisions/0013-encryption-at-rest.md)
-§D7.
+The list above *is* the inventory. It derives from ADR-0013 §D7,
+which lives in the maintainer's working notes (`proj_docs/`, not
+published) — so if you need to verify the claim, read
+`src/crypto/migration.rs`, which is what actually seals each surface,
+rather than chasing the ADR.
 
 ## Threat model boundaries (what we don't promise)
 
