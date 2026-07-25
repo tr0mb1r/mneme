@@ -339,6 +339,18 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Render `s` as a correctly-quoted TOML string value, quotes included.
+///
+/// Delegates to `toml::Value`'s own writer rather than wrapping the text
+/// in `"` by hand, because the right *form* depends on the content:
+/// `toml` emits a literal string (`'C:\Users\me\.mneme'`) when the value
+/// contains backslashes, a multi-line literal when it also contains an
+/// apostrophe, and a basic string otherwise. Hand-quoting produced a
+/// `config.toml` that mneme could not read back on Windows.
+fn toml_value(s: &str) -> String {
+    toml::Value::String(s.to_owned()).to_string()
+}
+
 // ---------- I/O ----------
 
 impl Config {
@@ -425,8 +437,21 @@ impl Config {
     }
 
     fn starter_toml(&self) -> String {
-        let data_dir = self.storage.data_dir.display();
-        let log_file = self.logging.file.display();
+        // Every string value goes through `toml_value`, never a bare
+        // `format!("\"{x}\"")`. A Windows `data_dir` such as
+        // `C:\Users\me\.mneme` inside a TOML *basic* string makes
+        // `\U` an 8-digit unicode escape, so the file mneme itself just
+        // wrote fails to parse on the next boot. Caught by
+        // `starter_template_survives_windows_style_paths`.
+        let data_dir = toml_value(&self.storage.data_dir.display().to_string());
+        let log_file = toml_value(&self.logging.file.display().to_string());
+        let embed_model = toml_value(&self.embeddings.model);
+        let embed_device = toml_value(&self.embeddings.device);
+        let scope_default = toml_value(&self.scopes.default);
+        let schedule = toml_value(&self.consolidation.schedule);
+        let transport = toml_value(&self.mcp.transport);
+        let daemon_log_level = toml_value(&self.daemon.log_level);
+        let log_level = toml_value(&self.logging.level);
         format!(
             r#"# mneme configuration. Every value below is the built-in
 # default, written out so you can see and edit it.
@@ -438,7 +463,7 @@ impl Config {
 [storage]
 # Where mneme keeps everything. Override with $MNEME_DATA_DIR to point
 # a test or a second profile elsewhere.
-data_dir = "{data_dir}"
+data_dir = {data_dir}
 # Soft ceiling, in GiB, reported by `mneme stats`.
 max_size_gb = {max_size_gb}
 
@@ -446,14 +471,14 @@ max_size_gb = {max_size_gb}
 # "bge-m3" (~1.5 GB, multilingual, best recall) or "minilm-l6"
 # (~80 MB, English, sub-second cold start). Changing this re-embeds
 # every stored memory on the next boot.
-model = "{embed_model}"
+model = {embed_model}
 # "auto" | "cpu" | "metal" | "cuda".
-device = "{embed_device}"
+device = {embed_device}
 batch_size = {batch_size}
 
 [scopes]
 # Scope that write tools use when the agent passes none.
-default = "{scope_default}"
+default = {scope_default}
 # Derive the default scope per connection from the MCP client's
 # workspace roots, so a host opened on ~/code/myproj writes into scope
 # "myproj". Off by default: turning it on changes where new memories
@@ -467,7 +492,7 @@ hot_to_warm_days = {hot_to_warm_days}
 warm_to_cold_days = {warm_to_cold_days}
 # Only "idle" is implemented: the scheduler wakes every 5 minutes and
 # fires only if nothing was written in the previous window.
-schedule = "{schedule}"
+schedule = {schedule}
 
 [checkpoints]
 # L1 working-session flush cadence: whichever trigger fires first.
@@ -490,31 +515,31 @@ max_remember_chars = {max_remember_chars}
 
 [mcp]
 # Only "stdio" is implemented.
-transport = "{transport}"
+transport = {transport}
 
 [daemon]
 # Stop after this many minutes with no clients connected. 0 disables.
 idle_timeout_minutes = {idle_timeout_minutes}
 # "default" inherits [logging] level; set to e.g. "debug" to make just
 # the daemon verbose.
-log_level = "{daemon_log_level}"
+log_level = {daemon_log_level}
 
 [logging]
-level = "{log_level}"
-file = "{log_file}"
+level = {log_level}
+file = {log_file}
 max_size_mb = {max_size_mb}
 max_files = {max_files}
 "#,
             data_dir = data_dir,
             max_size_gb = self.storage.max_size_gb,
-            embed_model = self.embeddings.model,
-            embed_device = self.embeddings.device,
+            embed_model = embed_model,
+            embed_device = embed_device,
             batch_size = self.embeddings.batch_size,
-            scope_default = self.scopes.default,
+            scope_default = scope_default,
             derive_from_roots = self.scopes.derive_from_roots,
             hot_to_warm_days = self.consolidation.hot_to_warm_days,
             warm_to_cold_days = self.consolidation.warm_to_cold_days,
-            schedule = self.consolidation.schedule,
+            schedule = schedule,
             session_interval_secs = self.checkpoints.session_interval_secs,
             session_interval_turns = self.checkpoints.session_interval_turns,
             hnsw_snapshot_inserts = self.checkpoints.hnsw_snapshot_inserts,
@@ -522,10 +547,10 @@ max_files = {max_files}
             default_recall_limit = self.budgets.default_recall_limit,
             auto_context_token_budget = self.budgets.auto_context_token_budget,
             max_remember_chars = self.budgets.max_remember_chars,
-            transport = self.mcp.transport,
+            transport = transport,
             idle_timeout_minutes = self.daemon.idle_timeout_minutes,
-            daemon_log_level = self.daemon.log_level,
-            log_level = self.logging.level,
+            daemon_log_level = daemon_log_level,
+            log_level = log_level,
             log_file = log_file,
             max_size_mb = self.logging.max_size_mb,
             max_files = self.logging.max_files,
@@ -634,6 +659,70 @@ mod tests {
              a field was added, renamed, or given a new default without updating \
              Config::starter_toml"
         );
+    }
+
+    /// Regression: the starter template must survive a Windows path.
+    ///
+    /// `starter_toml` interpolated paths into TOML *basic* strings, where
+    /// `\U` in `C:\Users\...` is an 8-digit unicode escape — so
+    /// `mneme init` on Windows wrote a `config.toml` that the next
+    /// `mneme run` refused to parse ("invalid unicode 8-digit hex code").
+    ///
+    /// Injects the backslash paths explicitly instead of relying on the
+    /// host's real defaults, so this fails on Linux and macOS too. The
+    /// original `starter_template_matches_defaults` only caught it on a
+    /// Windows runner, which is a whole CI round-trip too late.
+    #[test]
+    fn starter_template_survives_windows_style_paths() {
+        let mut c = Config::default();
+        c.storage.data_dir = PathBuf::from(r"C:\Users\runneradmin\.mneme");
+        c.logging.file = PathBuf::from(r"C:\Users\runneradmin\.mneme\logs\mneme.log");
+
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("config.toml");
+        c.write_starter(&p).unwrap();
+        let loaded = Config::load(&p).expect("starter config must parse back");
+
+        assert_eq!(loaded.storage.data_dir, c.storage.data_dir);
+        assert_eq!(loaded.logging.file, c.logging.file);
+        assert_eq!(loaded, c);
+    }
+
+    /// Same hazard, nastier input: an apostrophe rules out a plain TOML
+    /// literal string, so the writer has to reach for a multi-line
+    /// literal. A user called `O'Brien` is not a hypothetical.
+    #[test]
+    fn starter_template_survives_paths_with_quotes_and_backslashes() {
+        let mut c = Config::default();
+        c.storage.data_dir = PathBuf::from(r"C:\Users\O'Brien\.mneme");
+        c.logging.file = PathBuf::from(r"C:\Users\O'Brien\.mneme\logs\mneme.log");
+
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("config.toml");
+        c.write_starter(&p).unwrap();
+        let loaded = Config::load(&p).expect("starter config must parse back");
+        assert_eq!(loaded, c);
+    }
+
+    #[test]
+    fn toml_value_picks_a_form_that_round_trips() {
+        for raw in [
+            r"C:\Users\runneradmin\.mneme",
+            r"C:\Users\O'Brien\.mneme",
+            "/home/user/.mneme",
+            "has \"double quotes\"",
+            "has\ttab",
+        ] {
+            let rendered = toml_value(raw);
+            let doc = format!("v = {rendered}");
+            let parsed: toml::Value =
+                toml::from_str(&doc).unwrap_or_else(|e| panic!("{raw:?} → {rendered} → {e}"));
+            assert_eq!(
+                parsed["v"].as_str().unwrap(),
+                raw,
+                "{raw:?} did not round-trip through {rendered}"
+            );
+        }
     }
 
     /// Reserved settings must not appear in what `mneme init` writes —
