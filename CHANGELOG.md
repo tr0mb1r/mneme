@@ -12,6 +12,16 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+## [1.3.1](https://github.com/tr0mb1r/mneme/compare/v1.3.0...v1.3.1) - 2026-07-25
+
+### Documentation
+
+- *(book)* add the v1.3 release-notes page
+
+### Fixed
+
+- *(cli)* read encrypted data dirs crypto-aware in stats/inspect/export ([#32](https://github.com/tr0mb1r/mneme/pull/32))
+
 ## [1.3.0](https://github.com/tr0mb1r/mneme/compare/v1.2.2...v1.3.0) - 2026-07-25
 
 > A retrieval-quality release, plus a documentation-truth pass. It came
