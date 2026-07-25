@@ -12,6 +12,17 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+## [1.3.0](https://github.com/tr0mb1r/mneme/compare/v1.2.2...v1.3.0) - 2026-07-25
+
+### Added
+
+- *(retrieval)* make auto-context reach L4, fix filtered-recall underfill
+
+### Fixed
+
+- *(deps)* bump quinn-proto and memmap2 past two more advisories
+- *(config)* escape TOML string values; bump three advisory-flagged deps
+
 > A retrieval-quality release, plus a documentation-truth pass. It came
 > out of a full review of the tree against its own docs, which turned up
 > several places where `book/src/mcp-surface.md` promised behaviour the
