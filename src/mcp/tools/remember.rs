@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
-use super::{Tool, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::semantic::{MemoryKind, SemanticStore};
 use crate::scope::ScopeState;
 
@@ -66,6 +66,8 @@ impl Tool for Remember {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "remember",
+            title: "Remember a fact",
+            annotations: ToolAnnotations::additive(),
             description: DESCRIPTION,
             input_schema: json!({
                 "type": "object",
@@ -132,16 +134,19 @@ impl Tool for Remember {
             .map(|s| s.to_owned())
             .unwrap_or_else(|| self.scope_state.current());
 
-        // `pinned` is recognised by the schema but not yet wired to the
-        // procedural layer (Phase 4). Surface that explicitly so callers
-        // who set it know it's been observed-but-deferred.
+        // `pinned` is recognised by the schema but not wired to the
+        // procedural layer. Warn loudly rather than silently dropping it,
+        // so a caller who set it learns the flag does nothing. Tracked in
+        // book/src/roadmap.md; call `pin` for an L0 rule.
         if args.get("pinned").and_then(Value::as_bool) == Some(true) {
-            tracing::warn!("remember: `pinned=true` ignored — procedural layer lands in Phase 4");
+            tracing::warn!(
+                "remember: `pinned=true` ignored — call the `pin` tool to add an L0 rule"
+            );
         }
 
-        let id = self
+        let (id, duplicate) = self
             .store
-            .remember(content, kind, tags, scope)
+            .remember_checked(content, kind, tags, scope, true)
             .await
             .map_err(|e| ToolError::Internal(format!("remember failed: {e}")))?;
 
@@ -155,8 +160,39 @@ impl Tool for Remember {
         }
 
         let mut result = ToolResult::text(format!("stored memory {id}"));
-        if let Some(meta) = size_tier::success_meta(tier, len, self.max_chars) {
-            result = result.with_meta(meta);
+
+        // Merge the size advisory (if any) and the duplicate advisory
+        // (if any) into a single `_meta` object. They are independent —
+        // a long restatement trips both.
+        let mut meta = size_tier::success_meta(tier, len, self.max_chars)
+            .and_then(|m| m.as_object().cloned())
+            .unwrap_or_default();
+        if let Some(dup) = duplicate {
+            tracing::info!(
+                memory_id = %id,
+                duplicate_of = %dup.id,
+                similarity = dup.similarity,
+                "remember: stored a near-duplicate of an existing memory"
+            );
+            meta.insert(
+                "duplicate_advisory".into(),
+                json!({
+                    "existing_id": dup.id.to_string(),
+                    "existing_content": dup.content,
+                    "existing_scope": dup.scope,
+                    "similarity": dup.similarity,
+                    "message": format!(
+                        "This closely restates memory {} (similarity {:.2}). It was stored \
+                         anyway — mneme never discards what you gave it. If the new wording \
+                         supersedes the old, call `update` on {} instead and `forget` this \
+                         one; if both are worth keeping, ignore this.",
+                        dup.id, dup.similarity, dup.id
+                    ),
+                }),
+            );
+        }
+        if !meta.is_empty() {
+            result = result.with_meta(Value::Object(meta));
         }
         Ok(result)
     }
@@ -194,6 +230,76 @@ mod tests {
             .nth(2)
             .expect("expected `stored memory <ULID>`");
         Ulid::from_string(id_str).expect("expected valid ULID");
+    }
+
+    /// Storing the same fact twice must still succeed, but the second
+    /// call carries a `duplicate_advisory` so the agent can choose to
+    /// `update` instead of growing the corpus forever.
+    #[tokio::test]
+    async fn second_identical_write_carries_a_duplicate_advisory() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r = Remember::new(Arc::clone(&store), make_scope());
+
+        let first = r
+            .invoke(json!({ "content": "CI runs on ubuntu-latest only" }))
+            .await
+            .unwrap();
+        assert!(first.meta.is_none(), "first write should carry no advisory");
+
+        let second = r
+            .invoke(json!({ "content": "CI runs on ubuntu-latest only" }))
+            .await
+            .unwrap();
+        assert!(!second.is_error, "the duplicate must still be stored");
+        let meta = second.meta.expect("expected a duplicate advisory");
+        let adv = &meta["duplicate_advisory"];
+        assert!(adv.is_object(), "meta was {meta}");
+        assert_eq!(adv["existing_content"], "CI runs on ubuntu-latest only");
+        assert!(adv["existing_id"].is_string());
+        assert!(adv["similarity"].as_f64().unwrap() >= 0.95);
+    }
+
+    #[tokio::test]
+    async fn unrelated_writes_carry_no_duplicate_advisory() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r = Remember::new(Arc::clone(&store), make_scope());
+        r.invoke(json!({ "content": "CI runs on ubuntu-latest only" }))
+            .await
+            .unwrap();
+        let res = r
+            .invoke(json!({ "content": "the office wifi password rotates monthly" }))
+            .await
+            .unwrap();
+        let has_dup = res
+            .meta
+            .as_ref()
+            .map(|m| m.get("duplicate_advisory").is_some())
+            .unwrap_or(false);
+        assert!(!has_dup, "unrelated content flagged: {:?}", res.meta);
+    }
+
+    /// A long restatement trips both advisories; they must coexist in
+    /// one `_meta` object rather than one clobbering the other.
+    #[tokio::test]
+    async fn size_and_duplicate_advisories_coexist() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r = Remember::new(Arc::clone(&store), make_scope());
+        // 600 chars lands in the advisory tier (500-2,000).
+        let long = "x".repeat(600);
+        r.invoke(json!({ "content": long })).await.unwrap();
+        let second = r.invoke(json!({ "content": long })).await.unwrap();
+        let meta = second.meta.expect("expected both advisories");
+        assert!(
+            meta.get("length_advisory").is_some(),
+            "size advisory lost: {meta}"
+        );
+        assert!(
+            meta.get("duplicate_advisory").is_some(),
+            "duplicate advisory lost: {meta}"
+        );
     }
 
     #[tokio::test]

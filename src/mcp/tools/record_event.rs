@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
-use super::{Tool, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::episodic::{DEFAULT_RETRIEVAL_WEIGHT, EpisodicStore};
 use crate::memory::working::ActiveSession;
 use crate::scope::ScopeState;
@@ -118,6 +118,8 @@ impl Tool for RecordEvent {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "record_event",
+            title: "Record an event",
+            annotations: ToolAnnotations::additive(),
             description: DESCRIPTION,
             input_schema: json!({
                 "type": "object",

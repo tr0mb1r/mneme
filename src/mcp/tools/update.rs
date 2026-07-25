@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use ulid::Ulid;
 
 use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
-use super::{Tool, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::ids::MemoryId;
 use crate::memory::semantic::{MemoryKind, SemanticStore, UpdatePatch};
 
@@ -53,6 +53,8 @@ impl Tool for Update {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "update",
+            title: "Update a memory",
+            annotations: ToolAnnotations::destructive(),
             description: DESCRIPTION,
             input_schema: json!({
                 "type": "object",

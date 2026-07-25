@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use ulid::Ulid;
 
-use super::{Tool, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::episodic::{EpisodicStore, RecentFilters};
 
 const DESCRIPTION: &str = "Retrieve the most recent episodic events \
@@ -69,6 +69,8 @@ impl Tool for RecallRecent {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "recall_recent",
+            title: "Recall recent events",
+            annotations: ToolAnnotations::read_only(),
             description: DESCRIPTION,
             input_schema: json!({
                 "type": "object",

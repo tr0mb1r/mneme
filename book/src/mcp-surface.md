@@ -1,7 +1,7 @@
 # MCP surface
 
-The mneme MCP server speaks MCP `2025-06-18` and advertises 13 tools
-and 5 resources. Two interchangeable entry points serve the same
+The mneme MCP server speaks MCP `2025-06-18` and advertises 13 tools,
+5 resources, and 2 resource templates. Two interchangeable entry points serve the same
 surface against the same data dir: `mneme daemon` + `mneme client`
 (v1.1 default — one warm process, many clients) and `mneme run` (single-
 host stdio fallback). See [CLI surface](./cli.md#two-mcp-server-modes-daemon-vs-run)
@@ -25,7 +25,7 @@ serves.
 
 | Tool | Layer | Use when |
 |------|-------|----------|
-| `recall` | L4 semantic | Semantic similarity search — find memories close to a natural-language query. |
+| `recall` | L4 semantic | Semantic similarity search — find memories close to a natural-language query. Filter with `scope`, `type`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). |
 | `recall_recent` | L3 episodic | "What did we just do?" — time-ordered events (tool calls, lifecycle events, conversation, decisions). Optional `since` / `until` bound the result to a `[since, until)` window against `created_at` (RFC3339 or 26-char ULID); when either bound is set, `limit` caps at 1000 instead of 200. The server does not parse natural language — convert phrases like "last Tuesday" to RFC3339 client-side before calling. |
 
 ### Session helpers
@@ -83,8 +83,74 @@ between events travel inside the JSON payload (e.g. `"references":
 | `mneme://stats` | JSON: per-layer counts, schema version, HNSW applied LSN, scheduler observability counters (consolidation + working blocks), and `memories.large_memory_count` (per-tier size distribution + IDs of over-limit entries — see [§Size guardrails](#size-guardrails)). | Diagnostics; first thing to read on any "mneme misbehaving" report. |
 | `mneme://procedural` | JSON: every pinned item. | On session start — these are the binding rules. |
 | `mneme://recent` | JSON: most recent episodic events, newest-first. | "What was the last thing on this branch?" |
-| `mneme://context` | Pre-assembled prompt context: pinned rules + recent events + working-session turns + (optional) semantic-recall hits, packed against a token budget. | On session start — single-call replacement for reading procedural + recent + recall separately. |
+| `mneme://context` | Pre-assembled prompt context: pinned rules + working-session turns + recent events, packed against a token budget. Append `?q=<text>` to fold in semantically-similar long-term memories and `?scope=<name>` to restrict to one scope — see [§Auto-context parameters](#auto-context-parameters). | On session start — single-call replacement for reading procedural + recent + recall separately. |
 | `mneme://session/{id}` | JSON: a session's full state (turns + checkpoint metadata). The active session is served from in-memory state; past sessions load from disk. | Reviewing a prior session's turn log. |
+
+## Resource templates (2)
+
+Parameterised resources, advertised through `resources/templates/list`.
+A client that only reads `resources/list` will not see them.
+
+| URI template | What it returns |
+|---|---|
+| `mneme://context{?q,scope,limit}` | Auto-context, optionally seeded with a semantic query and/or restricted to a scope. |
+| `mneme://session/{id}` | A single session's full state. Substitute a session ULID. |
+
+## Auto-context parameters
+
+`resources/read` hands the server a URI and nothing else, so
+`mneme://context` takes its parameters from the URI's query string:
+
+| Param | Effect |
+|---|---|
+| `q` (alias `query`) | Natural-language seed for the L4 semantic layer. Percent-encoded; `+` is accepted for space. Without it the `semantic` array is empty — a vector search needs something to be similar *to*. |
+| `scope` | Restricts L0 / L3 / L4 to one scope. L1 working turns are session-local and always included. |
+| `limit` | How many semantic candidates to over-fetch before the token-budget pass trims. Clamped server-side. |
+
+```
+mneme://context                             → L0 + L1 + L3
+mneme://context?q=how%20do%20we%20deploy     → + L4 semantic hits
+mneme://context?q=deploy&scope=work          → all four layers, work scope only
+```
+
+The response body has one array per layer (`procedural`, `working`,
+`episodic`, `semantic`), a `request` block echoing how the URI was
+interpreted (so "no hits" is distinguishable from "no query supplied"),
+and `total_tokens` / `max_tokens`. The reply's `uri` echoes exactly what
+was requested, parameters included, so a client can correlate it.
+
+Parsing is deliberately lenient — an unknown key, a malformed `limit`,
+or a stray `&` yields a request that still assembles something useful.
+Auto-context is read unattended; failing it closed would leave the
+session with no memory at all.
+
+> **Changed in v1.3.** Before v1.3 the resource passed no query and
+> emitted a hardcoded empty `semantic` array, so nothing written with
+> `remember` could reach auto-context. The `working` section was also
+> missing from the body while its turns were still charged against the
+> token budget. Both fixed; the query parameters are new.
+
+## Tool annotations
+
+Every entry in `tools/list` carries a `title` and an `annotations`
+object with all four MCP behaviour hints stated explicitly (the spec's
+defaults for `destructiveHint` and `openWorldHint` are both `true`,
+which is wrong for most of this surface):
+
+| Tools | `readOnlyHint` | `destructiveHint` | `idempotentHint` |
+|---|---|---|---|
+| `recall`, `recall_recent`, `summarize_session`, `stats`, `list_scopes`, `export` | `true` | `false` | `true` |
+| `remember`, `pin`, `record_event` | `false` | `false` | `false` |
+| `update`, `forget`, `unpin` | `false` | `true` | `true` |
+| `switch_scope` | `false` | `false` | `true` |
+
+`openWorldHint` is `false` everywhere: no tool path makes a network
+call. The additive writes are non-idempotent because each call mints a
+new ULID — calling `remember` twice stores two memories.
+
+Hosts use these to decide what needs a confirmation prompt. Before v1.3
+mneme emitted no annotations at all, so a host could not tell `forget`
+from `stats`.
 
 ## Scoring weights (auto-context)
 
@@ -100,6 +166,9 @@ When the orchestrator assembles `mneme://context`, it scores items as
 
 Recency decay is a 14-day half-life. The per-layer reservation in the
 budget pass guarantees no single layer is starved by another.
+
+L4's weight applies only when the read carries a `?q=` seed; without one
+the layer contributes nothing to score against.
 
 ## Size guardrails
 

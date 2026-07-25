@@ -17,19 +17,18 @@
 //! (systemd / launchd) pass `--foreground` to skip the detach step
 //! and keep mneme attached to the manager's lifecycle.
 //!
-//! Pending M3 follow-ups:
+//! Shipped since: idle-timeout shutdown (D6 — auto-exit after
+//! `[daemon].idle_timeout_minutes` with no clients), graceful drain on
+//! SIGTERM, and per-connection auth-token verification (D3), all in
+//! v1.1.1.
 //!
-//! - Idle-timeout shutdown (D6) — auto-exit after
-//!   `[daemon].idle_timeout_minutes` with no clients.
+//! Still outstanding, tracked in `book/src/roadmap.md`:
+//!
+//! - Windows named-pipe support (D2/D9). Until it lands, `mneme daemon`
+//!   and `mneme client` are Unix-only and Windows users run
+//!   `mneme run`.
 //! - SSE keepalive frames (D7) — periodic comments + dead-peer
-//!   detection.
-//! - Graceful shutdown drain (currently SIGTERM aborts in-flight
-//!   spawned tasks with the runtime).
-//!
-//! After M3:
-//!
-//! - M4: auth-token verification on every connection (D3) +
-//!   Windows named-pipe support (D2/D9).
+//!   detection. Deferred at the close of A.M3 per ADR-0012 A1.
 //!
 //! All boot work (storage, embedder, schedulers, registries) is
 //! shared with `mneme run` via [`crate::cli::run::execute_with_mode`].

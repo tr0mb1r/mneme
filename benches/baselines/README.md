@@ -12,7 +12,52 @@ explicitly justified.
 2026-05-09 against `develop` HEAD (which is identical to `main`
 HEAD on hot-path code; the two diverging commits — backup `run/`
 exclusion and `remember` description revision — touch neither
-embedding nor storage paths).
+embedding nor storage paths). Captured on **Apple Silicon**. This is
+still the blocking reference in `perf.yml`.
+
+`v1_2_2_linux_x86_64.json` — median of 3 `--quick` runs on **x86_64
+Linux**, the platform `perf.yml` actually runs on. Reported but *not*
+enforced; see [Platform mismatch](#platform-mismatch) below.
+
+## Platform mismatch
+
+`perf.yml` runs on `ubuntu-latest` and gates against a baseline
+captured on Apple Silicon. That is not a cosmetic difference:
+
+| Bench | Apple Silicon p95 | x86_64 Linux p95 |
+|---|---|---|
+| `auto_context/no_query_n=1000` | 216.61 µs | ~244 µs |
+| `remember/after_prefill_n=1000` | 4108.62 µs | ~856 µs |
+| `recall/k=10_n=1000_pending` | 167.32 µs | ~138 µs |
+
+`auto_context/no_query` therefore sits permanently within a few points
+of the 10 % failure threshold for reasons unrelated to any diff under
+test, while `remember` has ~4.8x of slack and would hide a real
+regression completely.
+
+**Runner noise compounds it.** Three consecutive runs of *identical*
+code on one Linux VM produced 233, 236 and 422 µs for
+`auto_context/no_query` — an 80 % swing from a co-tenant stall. Any
+single-run capture is an unsuitable reference, which is why
+`merge_baselines.py` exists.
+
+### Promotion procedure
+
+To make the gate meaningful, the reference must come from the same
+runner class that enforces it:
+
+1. Let `perf.yml` run on `main` a few times and read the
+   "informational compare" step's output. Confirm the deltas against
+   `v1_2_2_linux_x86_64.json` stay inside ±10 % across runs.
+2. If they do, make it the blocking reference: point the "compare
+   against frozen baseline" step at `v1_2_2_linux_x86_64.json` and
+   drop the informational step.
+3. If they don't, re-capture on a GitHub runner (a `workflow_dispatch`
+   job that runs the capture procedure below three times and uploads
+   the merged JSON as an artifact) and commit that instead.
+
+Keep `v0_2_6.json` either way — it is the historical record of the
+v1.0 numbers and the reference for manual release-hardware sweeps.
 
 Per bench, the JSON records:
 
@@ -45,24 +90,40 @@ All times are in nanoseconds; divide by 1000 for µs, by 1e6 for ms.
 
 ## Capture procedure
 
+Capture at least three runs and merge them — see
+[Platform mismatch](#platform-mismatch) for why one run is not enough.
+
 ```bash
-# 1. Clean criterion's stale output so the JSON only contains the
-#    canonical sample count for each bench id.
-rm -rf target/criterion/
+# 1-3. Three independent runs, each into its own JSON.
+for i in 1 2 3; do
+  # Clean criterion's stale output so the JSON only contains the
+  # canonical sample count for each bench id.
+  rm -rf target/criterion/
+  cargo bench --bench remember --bench recall \
+              --bench cold_start --bench auto_context \
+              --bench encryption_overhead
+  python3 benches/baselines/extract_baseline.py \
+          /tmp/perf/run$i.json --corpus 1000
+done
 
-# 2. Run the four hot-path benches at the default corpus.
-cargo bench --bench remember --bench recall \
-            --bench cold_start --bench auto_context
+# 4. Median-merge into the committed baseline.
+python3 benches/baselines/merge_baselines.py \
+        benches/baselines/<release>.json \
+        /tmp/perf/run1.json /tmp/perf/run2.json /tmp/perf/run3.json
 
-# 3. Extract the n=1000 baseline JSON.
-python3 benches/baselines/extract_baseline.py \
-        benches/baselines/<release>.json --corpus 1000
-
-# 4. (Optional pre-release) Capture larger corpora alongside.
+# 5. (Optional pre-release) Capture larger corpora alongside.
 MNEME_BENCH_N=10000 cargo bench --bench recall --bench auto_context
 python3 benches/baselines/extract_baseline.py \
         benches/baselines/<release>_n10k.json --corpus 10000
 ```
+
+Match the `--quick` flag to whatever `perf.yml` uses, or the sample
+counts won't be comparable.
+
+Include `--bench encryption_overhead`: its ids carry no `n=` marker, so
+`--corpus` keeps them (corpus-independent benches are never filtered
+out — that behaviour is why the crypto bench was invisible to CI
+through all of v1.2).
 
 The extractor records the git branch + sha + describe in the JSON's
 `git` block so the baseline is traceable to a specific commit. Re-run
@@ -112,6 +173,42 @@ input. The comparator is intentionally Python (not Rust) so it can
 run in CI without rebuilding the workspace and so the threshold
 logic stays trivial to audit.
 
+Benches present on only one side are reported under "benches added
+since baseline" / "benches removed since baseline" rather than silently
+skipped, so a shrinking comparison set is visible.
+
+## Encryption overhead
+
+`encryption_overhead` is gated differently, by
+**`check_crypto_overhead.py`**. The bench measures each operation twice
+in one process — plain wrapper vs encrypted wrapper — so the *ratio*
+between them is machine-independent even though the absolute numbers are
+not. That makes it the one gate that transfers cleanly between the
+capture host and CI.
+
+```sh
+# Against fresh target/criterion output:
+python3 benches/baselines/check_crypto_overhead.py
+
+# Or against an already-extracted baseline JSON:
+python3 benches/baselines/check_crypto_overhead.py --baseline /tmp/perf/this-run.json
+```
+
+Per-group ceilings live in `CEILINGS` at the top of that script.
+They are deliberately loose (5-20x) because the isolated AEAD cost is a
+large *relative* multiple of a sub-microsecond in-memory operation while
+being invisible end-to-end — `encrypted_storage_get` goes from ~0.30 µs
+to ~2.16 µs next to a ~70 ms BGE-M3 forward pass. The ceilings exist to
+catch the crypto layer itself becoming dramatically slower (a
+per-record key derivation creeping in, a syscall appearing on the AEAD
+path), not to police microseconds.
+
+Note what the ratios say about where encryption actually costs
+something: `encrypted_wal_append` is 1.02x because `fdatasync`
+dominates, while `encrypted_wal_replay` is ~12x because replay is pure
+CPU with no I/O to hide behind. Cold-start time on an encrypted dir is
+the number to watch.
+
 ## v0.2.6 reference numbers
 
 Captured 2026-05-09 on Apple Silicon (arm64, Darwin 25.4.0). All
@@ -132,3 +229,29 @@ All well under spec §13 budgets — the storage path has substantial
 headroom. v1.1's daemon work (network hop + auth check + multi-client
 coordination) consumes some of this headroom; the regression gate is
 the budget on how much.
+
+## v1.2.2 x86_64 Linux reference numbers
+
+Median of 3 `--quick` runs, 2026-07, Linux 6.18.5 / x86_64. Same
+platform family as `perf.yml`'s runner. p95, microseconds.
+
+| Bench | p95 µs |
+|---|---|
+| `recall/k=10_n=1000_pending` | 138.12 |
+| `recall/k=10_n=1000_committed` | 160.76 |
+| `auto_context/no_query_n=1000` | 244.20 |
+| `auto_context/with_query_n=1000` | 415.85 |
+| `remember/after_prefill_n=1000` | 855.79 |
+| `cold_start/from_wal_replay_n=1000` | 1562.31 |
+| `cold_start/from_snapshot_n=1000` | 1628.20 |
+| `encrypted_storage_get/plain` → `/encrypted` | 0.30 → 2.16 |
+| `encrypted_storage_put/plain` → `/encrypted` | 0.57 → 2.71 |
+| `encrypted_wal_append/plain` → `/encrypted` | 741.26 → 862.52 |
+| `encrypted_wal_replay/plain` → `/encrypted` | 174.21 → 2160.51 |
+
+`recall` here includes the v1.3 widening loop
+(`SemanticStore::recall`), which replaced a fixed `k × 4` index probe
+with a geometric widen. Unfiltered recall still issues exactly one
+probe, so the numbers moved *down* relative to v0.2.6 on the same
+hardware rather than up — the loop costs nothing when the first probe
+fills `k`.

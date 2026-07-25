@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::checkpoint_scheduler::CheckpointScheduler;
 use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
@@ -83,6 +83,8 @@ impl Tool for Stats {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "stats",
+            title: "Memory statistics",
+            annotations: ToolAnnotations::read_only(),
             description: DESCRIPTION,
             input_schema: json!({
                 "type": "object",
@@ -123,6 +125,7 @@ impl Tool for Stats {
                 "errors_total": m.errors_total,
                 "last_promoted_to_warm": m.last_promoted_to_warm,
                 "last_archived_to_cold": m.last_archived_to_cold,
+                "last_orphans_reclaimed": m.last_orphans_reclaimed,
             })
         });
 

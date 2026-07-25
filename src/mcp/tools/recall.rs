@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::semantic::{MemoryKind, RecallFilters, SemanticStore};
 
 const DESCRIPTION: &str = "Retrieve memories semantically similar to a query. \
@@ -37,6 +37,8 @@ impl Tool for Recall {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "recall",
+            title: "Recall memories",
+            annotations: ToolAnnotations::read_only(),
             description: DESCRIPTION,
             input_schema: json!({
                 "type": "object",
@@ -53,6 +55,22 @@ impl Tool for Recall {
                         "type": "string",
                         "enum": ["fact", "decision", "preference", "conversation"],
                         "description": "Optional type filter."
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional tag filter. A memory must carry EVERY \
+            tag listed here to match (AND, not OR). Exact, case-sensitive."
+                    },
+                    "min_similarity": {
+                        "type": "number",
+                        "minimum": -1.0,
+                        "maximum": 1.0,
+                        "description": "Optional relevance floor on cosine similarity, \
+            where 1.0 is identical and 0.0 is unrelated. Omit to get the nearest \
+            `limit` memories however far away they are. ~0.5 is a reasonable cut-off \
+            for \"actually about the same thing\"; use it when you would rather get \
+            nothing back than get a weak match."
                     }
                 },
                 "required": ["query"]
@@ -101,7 +119,33 @@ impl Tool for Recall {
             })?),
         };
 
-        let filters = RecallFilters { scope, kind };
+        let tags = super::parse_tags_arg(args.get("tags"))?;
+        let min_similarity = match args.get("min_similarity") {
+            None | Some(Value::Null) => None,
+            Some(Value::Number(n)) => {
+                let v = n.as_f64().ok_or_else(|| {
+                    ToolError::InvalidArguments("`min_similarity` must be a number".into())
+                })?;
+                if !(-1.0..=1.0).contains(&v) {
+                    return Err(ToolError::InvalidArguments(
+                        "`min_similarity` must be between -1.0 and 1.0".into(),
+                    ));
+                }
+                Some(v as f32)
+            }
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`min_similarity` must be a number".into(),
+                ));
+            }
+        };
+
+        let filters = RecallFilters {
+            scope,
+            kind,
+            tags,
+            min_similarity,
+        };
         let hits = self
             .store
             .recall(query, limit as usize, &filters)
@@ -125,7 +169,14 @@ impl Tool for Recall {
                     "tags": h.item.tags,
                     "scope": h.item.scope,
                     "created_at": h.item.created_at.to_rfc3339(),
+                    // `score` is a cosine DISTANCE — lower is closer.
+                    // Kept under its original name for wire
+                    // compatibility. `similarity` is the same number
+                    // in the orientation agents actually reason about
+                    // (1.0 = identical) and is what `min_similarity`
+                    // filters on.
                     "score": h.score,
+                    "similarity": crate::memory::semantic::similarity_from_distance(h.score),
                 })
             })
             .collect();

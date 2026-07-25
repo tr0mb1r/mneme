@@ -11,11 +11,15 @@ offs are. Changes take effect on the next `mneme run`.
 
 ## Quick reference
 
+`mneme init` writes exactly the keys below. Three more
+(`[storage] encryption`, `[mcp] sse_port`, and the whole `[telemetry]`
+section) still *load* for backwards compatibility but have no effect —
+see [Reserved settings](#reserved-settings).
+
 ```toml
 [storage]
 data_dir   = "~/.mneme"
 max_size_gb = 10
-encryption = false
 
 [embeddings]
 model      = "bge-m3"     # or "minilm-l6"
@@ -23,7 +27,8 @@ device     = "auto"       # "auto" / "cpu" / "cuda" / "metal"
 batch_size = 32
 
 [scopes]
-default = "global"
+default           = "global"
+derive_from_roots = false
 
 [checkpoints]
 session_interval_secs   = 30
@@ -43,15 +48,10 @@ max_remember_chars         = 10000
 
 [mcp]
 transport = "stdio"
-sse_port  = 7878
 
 [daemon]
 idle_timeout_minutes = 30
 log_level            = "default"
-
-[telemetry]
-enabled  = false
-endpoint = ""
 
 [logging]
 level       = "info"
@@ -59,6 +59,28 @@ file        = "~/.mneme/logs/mneme.log"
 max_size_mb = 100
 max_files   = 5
 ```
+
+---
+
+## Reserved settings
+
+Three settings are accepted on load but have **no effect**. They exist
+so a `config.toml` written by an older release keeps working; since v1.3
+`mneme init` no longer writes them into new configs, because handing
+someone a knob that does nothing is worse than omitting it.
+
+| Setting | What it actually does |
+|---|---|
+| `[storage] encryption` | Nothing. Encryption is gated by the presence of `~/.mneme/keystore.json` — run `mneme encrypt`. |
+| `[mcp] sse_port` | Nothing. No SSE / HTTP transport exists; `[mcp] transport` isn't consulted either. |
+| `[telemetry] enabled` / `endpoint` | Nothing. There is no telemetry subsystem, and no code path in the binary makes a network call. |
+
+If you have these in your config, you can delete them or leave them —
+either way behaviour is identical. See
+[Roadmap](./roadmap.md#reserved-configuration).
+
+`[consolidation] schedule` is a partial case: it *is* read, but only
+`"idle"` is implemented. Any other value logs a warning and falls back.
 
 ---
 
@@ -101,15 +123,15 @@ data dir crosses this number. Tracked under `Phase 7 polish`.
 |---|---|
 | **Type** | bool |
 | **Default** | `false` |
-| **Affects** | (advisory — see below) |
+| **Affects** | nothing |
 
-In v1.2+ this field is **advisory only**. The decision of whether
-mneme is running encrypted is made by the presence of
-`~/.mneme/keystore.json`, not by this flag. To enable encryption,
-run `mneme encrypt`; to disable it, run `mneme decrypt
---yes-i-really-mean-it`. See the [Encryption at rest](./encryption.md)
-chapter for the full workflow, including how to recover on a new
-machine via the 12-word BIP39 mnemonic.
+**Reserved — setting this does nothing**, in either direction. Whether
+mneme is running encrypted is decided by the presence of
+`~/.mneme/keystore.json`. To enable encryption, run `mneme encrypt`; to
+disable it, run `mneme decrypt --yes-i-really-mean-it`. See the
+[Encryption at rest](./encryption.md) chapter for the full workflow,
+including how to recover on a new machine via the 12-word BIP39
+mnemonic. `mneme init` no longer writes this key.
 
 Earlier mneme docs said this flag would be wired to a future opt-in;
 v1.2 ships the feature with `mneme encrypt` as the user-facing
@@ -222,6 +244,67 @@ missing-`config.toml` fallback path.
 
 `list_scopes` shows every distinct scope across the three layers.
 Cross-process semantics: see [switch_scope](./mcp-surface.md#session-helpers).
+
+### `derive_from_roots`
+
+| | |
+|---|---|
+| **Type** | boolean |
+| **Default** | `false` |
+| **Affects** | the per-connection default scope |
+
+Derive each connection's default scope from the MCP client's declared
+workspace roots, so a host opened on `~/code/billing-api` writes into
+scope `billing-api` without the agent ever calling `switch_scope`.
+
+The name comes from the first root's `name`, or the last path segment of
+its `uri` if no name was given; it is lowercased with unsupported
+characters collapsed to `-` (`My Project` → `my-project`). If the client
+sends no roots, or nothing survives sanitisation, the configured
+`default` stands.
+
+**Off by default on purpose.** Turning it on changes where new memories
+land, which means facts stored before the switch stop appearing in a
+default-scoped `recall`. That is exactly what someone who wants project
+isolation is asking for, and an unpleasant surprise for anyone else.
+
+This is *per connection*, which is what makes it work in daemon mode:
+`initialize` arrives once per client, so a Claude Code session in repo A
+and a Cursor session in repo B land in different scopes off one shared
+daemon.
+
+### `MNEME_SCOPE` (environment)
+
+Not a config key, but it belongs here. Setting `MNEME_SCOPE` in the
+environment overrides `[scopes] default` for the process lifetime, and
+takes precedence over `derive_from_roots` — explicit beats inferred.
+It is sanitised the same way.
+
+Useful for a repo-local MCP config:
+
+```json
+{
+  "mcpServers": {
+    "mneme": {
+      "command": "mneme",
+      "args": ["run"],
+      "env": { "MNEME_SCOPE": "billing-api" }
+    }
+  }
+}
+```
+
+**Only affects `mneme run`.** In daemon mode the host spawns
+`mneme client`, which is a byte pipe that never builds a scope cell, and
+the daemon has its own environment. Use `derive_from_roots` there.
+
+Resolution order, lowest precedence first:
+
+1. `[scopes] default`
+2. `MNEME_SCOPE`
+3. roots derivation, if `derive_from_roots = true` and `MNEME_SCOPE` is unset
+4. `switch_scope` during the session
+5. an explicit `scope` argument on the individual tool call
 
 ---
 
@@ -434,9 +517,11 @@ ADR-0012 amendment A1.
 |---|---|
 | **Type** | unsigned 16-bit integer |
 | **Default** | `7878` |
-| **Affects** | (unused) |
+| **Affects** | nothing |
 
-Reserved for a future SSE transport. Setting it today is a no-op.
+Reserved for a future SSE / Streamable HTTP transport. Setting it today
+is a no-op, and `mneme init` no longer writes it. See
+[Reserved settings](#reserved-settings).
 
 ---
 
@@ -483,7 +568,12 @@ up to `debug` while leaving CLI tools (`mneme stats`,
 
 ---
 
-## `[telemetry]` — opt-in usage reporting
+## `[telemetry]` — reserved, no effect
+
+Accepted on load for backwards compatibility; `mneme init` no longer
+writes the section. There is no telemetry subsystem and **no code path
+in the binary makes a network call** — not opt-in-and-disabled, simply
+absent. See [Reserved settings](#reserved-settings).
 
 ### `enabled`
 
@@ -491,12 +581,7 @@ up to `debug` while leaving CLI tools (`mneme stats`,
 |---|---|
 | **Type** | bool |
 | **Default** | `false` |
-| **Affects** | nothing in v1.0 |
-
-Reserved. Mneme is **off by default and never enabled
-silently** — anonymous usage telemetry is opt-in only and ships in
-a future release. Setting it today does nothing; the binary
-contains no telemetry transport.
+| **Affects** | nothing |
 
 ### `endpoint`
 
@@ -504,8 +589,7 @@ contains no telemetry transport.
 |---|---|
 | **Type** | URL string |
 | **Default** | `""` |
-
-Same status as `enabled` — placeholder.
+| **Affects** | nothing |
 
 ---
 

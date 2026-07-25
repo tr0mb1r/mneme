@@ -8,7 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{Tool, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::procedural::ProceduralStore;
 use crate::scope::ScopeState;
 
@@ -34,6 +34,8 @@ impl Tool for Pin {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "pin",
+            title: "Pin a rule",
+            annotations: ToolAnnotations::additive(),
             description: DESCRIPTION,
             input_schema: json!({
                 "type": "object",

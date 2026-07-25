@@ -1,12 +1,16 @@
 //! Tool registry. A `Tool` is a verb the agent can call.
 //!
-//! Phase 1 ships three stubs (`remember`, `recall`, `forget`) that don't
-//! yet touch storage — they exercise the MCP protocol surface so we can
-//! prove conformance before wiring the persistence layers in Phase 2/3.
+//! Thirteen tools ship, spanning every memory layer: `remember` /
+//! `recall` / `update` / `forget` (L4 semantic), `pin` / `unpin` (L0
+//! procedural), `record_event` / `recall_recent` / `summarize_session`
+//! (L3 episodic), `switch_scope` (session state), and `stats` /
+//! `list_scopes` / `export` (diagnostics). `book/src/mcp-surface.md` is
+//! the authoritative inventory.
 //!
 //! Tool descriptions are deliberately written from the agent's point of
 //! view (spec §6.1: "the LLM reads the description to decide when to
-//! invoke"). Phase 1 already commits to the production wording.
+//! invoke"), and each descriptor carries [`ToolAnnotations`] so a host
+//! can tell a read from a delete without parsing prose.
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -48,13 +52,97 @@ pub enum ToolError {
     Internal(String),
 }
 
+/// Behaviour hints emitted as MCP's `tools/list` → `annotations`.
+///
+/// Hosts use these to decide what needs a confirmation prompt. Without
+/// them a host cannot tell `forget` (deletes a memory) from `stats`
+/// (reads counters), so it must either prompt for everything or prompt
+/// for nothing.
+///
+/// The spec's defaults are unhelpfully permissive — `destructiveHint`
+/// defaults to `true` and `openWorldHint` to `true` — so every field is
+/// emitted explicitly rather than relying on omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolAnnotations {
+    /// The tool does not modify any stored state.
+    pub read_only: bool,
+    /// The tool may destroy or overwrite existing data. Meaningful only
+    /// when `read_only` is false.
+    pub destructive: bool,
+    /// Calling the tool twice with the same arguments leaves the same
+    /// end state as calling it once. Meaningful only when `read_only`
+    /// is false.
+    pub idempotent: bool,
+}
+
+impl ToolAnnotations {
+    /// Reads only. Trivially idempotent, never destructive.
+    pub const fn read_only() -> Self {
+        Self {
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+        }
+    }
+
+    /// Creates new data on every call (`remember`, `pin`,
+    /// `record_event`). Never overwrites, so not destructive — but not
+    /// idempotent either, because a second call mints a second row
+    /// under a fresh ULID.
+    pub const fn additive() -> Self {
+        Self {
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+        }
+    }
+
+    /// Removes or overwrites existing data (`forget`, `unpin`,
+    /// `update`). Idempotent: re-applying lands in the same state.
+    pub const fn destructive() -> Self {
+        Self {
+            read_only: false,
+            destructive: true,
+            idempotent: true,
+        }
+    }
+
+    /// Changes session state without touching stored memories
+    /// (`switch_scope`). Converges on repeat.
+    pub const fn session_state() -> Self {
+        Self {
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+        }
+    }
+
+    fn to_json(self, title: &str) -> Value {
+        json!({
+            "title": title,
+            "readOnlyHint": self.read_only,
+            "destructiveHint": self.destructive,
+            "idempotentHint": self.idempotent,
+            // Mneme is a local-first store and no tool path makes a
+            // network call (cardinal rule: the server never talks to a
+            // model), so the world it touches is closed by definition.
+            "openWorldHint": false,
+        })
+    }
+}
+
 /// A tool's machine-readable signature. Mirrors the MCP `tools/list`
-/// entry: name, human description, and a JSON Schema for `arguments`.
+/// entry: name, human-readable title, description, a JSON Schema for
+/// `arguments`, and behaviour annotations.
 #[derive(Debug, Clone)]
 pub struct ToolDescriptor {
     pub name: &'static str,
+    /// Human-readable display name, for UIs that would otherwise show
+    /// the raw snake_case `name`.
+    pub title: &'static str,
     pub description: &'static str,
     pub input_schema: Value,
+    pub annotations: ToolAnnotations,
 }
 
 /// A tool invocation produces one or more `ContentBlock`s. MCP
@@ -275,8 +363,10 @@ impl ToolRegistry {
 pub fn descriptor_to_json(d: &ToolDescriptor) -> Value {
     json!({
         "name": d.name,
+        "title": d.title,
         "description": d.description,
         "inputSchema": d.input_schema,
+        "annotations": d.annotations.to_json(d.title),
     })
 }
 
@@ -380,6 +470,59 @@ mod tests {
     async fn unknown_tool_returns_none() {
         let (r, _tmp) = fresh_registry();
         assert!(r.get("nope").is_none());
+    }
+
+    /// Every tool must declare its behaviour, and the classification
+    /// has to be right — a host that trusts `readOnlyHint` on a tool
+    /// that deletes memories would skip the confirmation prompt.
+    #[test]
+    fn every_tool_declares_correct_annotations() {
+        let (r, _tmp) = fresh_registry();
+        let expected: &[(&str, ToolAnnotations)] = &[
+            ("export", ToolAnnotations::read_only()),
+            ("forget", ToolAnnotations::destructive()),
+            ("list_scopes", ToolAnnotations::read_only()),
+            ("pin", ToolAnnotations::additive()),
+            ("recall", ToolAnnotations::read_only()),
+            ("recall_recent", ToolAnnotations::read_only()),
+            ("record_event", ToolAnnotations::additive()),
+            ("remember", ToolAnnotations::additive()),
+            ("stats", ToolAnnotations::read_only()),
+            ("summarize_session", ToolAnnotations::read_only()),
+            ("switch_scope", ToolAnnotations::session_state()),
+            ("unpin", ToolAnnotations::destructive()),
+            ("update", ToolAnnotations::destructive()),
+        ];
+        for d in r.list() {
+            let want = expected
+                .iter()
+                .find(|(n, _)| *n == d.name)
+                .map(|(_, a)| *a)
+                .unwrap_or_else(|| panic!("tool `{}` has no expected annotation", d.name));
+            assert_eq!(d.annotations, want, "wrong annotations for `{}`", d.name);
+            assert!(!d.title.is_empty(), "tool `{}` has no title", d.name);
+        }
+        assert_eq!(r.list().len(), expected.len());
+    }
+
+    /// The wire form must carry all four hints explicitly — the spec's
+    /// defaults for the omitted ones are the wrong way round for us.
+    #[test]
+    fn annotations_serialise_all_four_hints() {
+        let (r, _tmp) = fresh_registry();
+        let forget = r.get("forget").unwrap();
+        let json = descriptor_to_json(&forget.descriptor());
+        let ann = &json["annotations"];
+        assert_eq!(ann["readOnlyHint"], false);
+        assert_eq!(ann["destructiveHint"], true);
+        assert_eq!(ann["idempotentHint"], true);
+        assert_eq!(ann["openWorldHint"], false);
+        assert_eq!(json["title"], "Forget a memory");
+
+        let stats = r.get("stats").unwrap();
+        let json = descriptor_to_json(&stats.descriptor());
+        assert_eq!(json["annotations"]["readOnlyHint"], true);
+        assert_eq!(json["annotations"]["destructiveHint"], false);
     }
 
     #[test]

@@ -147,6 +147,7 @@ impl Resource for Stats {
                 "errors_total": m.errors_total,
                 "last_promoted_to_warm": m.last_promoted_to_warm,
                 "last_archived_to_cold": m.last_archived_to_cold,
+                "last_orphans_reclaimed": m.last_orphans_reclaimed,
             })
         });
 

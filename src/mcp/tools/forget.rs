@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use ulid::Ulid;
 
-use super::{Tool, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::ids::{EventId, MemoryId};
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
@@ -60,6 +60,8 @@ impl Tool for Forget {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "forget",
+            title: "Forget a memory",
+            annotations: ToolAnnotations::destructive(),
             description: DESCRIPTION,
             input_schema: json!({
                 "type": "object",

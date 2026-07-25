@@ -36,13 +36,18 @@
 //! `recall(query, k, filters)`:
 //!
 //! 1. Embed the query.
-//! 2. `index.read().search(query_vec, k * OVERFETCH)` — `OVERFETCH`
-//!    leaves headroom for filter rejections without an extra round
-//!    trip.
+//! 2. `index.read().search(query_vec, k * RECALL_OVERFETCH)` — the
+//!    over-fetch leaves headroom for filter rejections without an
+//!    extra round trip.
 //! 3. For each `(id, score)`, load the [`MemoryItem`] from
 //!    [`Storage`]. Missing metadata is logged and skipped — see the
 //!    write-path ordering note for when this can happen.
-//! 4. Apply scope/kind filters; truncate to `k`.
+//! 4. Apply the [`RecallFilters`] predicates (scope, kind, tags,
+//!    similarity floor).
+//! 5. If fewer than `k` candidates survived and the index still has
+//!    unseen vectors, widen the probe and repeat from step 2 over the
+//!    newly-revealed suffix. Without this, a selective filter
+//!    silently returns a short list; see [`SemanticStore::recall`].
 //!
 //! # Forget path
 //!
@@ -98,11 +103,23 @@ use crate::storage::Storage;
 use crate::storage::wal::{self, WalOp, WalWriter};
 use crate::{MnemeError, Result};
 
-/// How many extra results to over-fetch from HNSW before applying
-/// scope/kind filters. 4× matches `index::hnsw::OVERSHOOT_FACTOR`'s
-/// philosophy for tombstones — gives filters headroom to reject up to
-/// ~75% of hits without underfilling.
+/// How many extra results to over-fetch from HNSW on the *first*
+/// filtered-recall probe. 4× matches `index::hnsw::OVERSHOOT_FACTOR`'s
+/// philosophy for tombstones — it lets filters reject up to ~75% of
+/// hits without a second probe.
+///
+/// It is only the starting width: [`SemanticStore::recall`] widens
+/// geometrically (see [`RECALL_WIDEN_FACTOR`]) until it has `k`
+/// survivors or the index is exhausted. A fixed 4× would silently
+/// underfill whenever the requested scope / kind / tag set is a
+/// minority of the corpus — asking for 10 `work` memories out of a
+/// 10 000-memory corpus that is 1 % `work` would return ~0.
 const RECALL_OVERFETCH: usize = 4;
+
+/// Growth factor applied to the HNSW fetch width on each successive
+/// probe when filters have rejected too much to fill `k`. Geometric
+/// so the worst case is O(log(corpus/k)) probes rather than O(corpus/k).
+const RECALL_WIDEN_FACTOR: usize = 4;
 
 /// Snapshot file name under `<root>/semantic/`. Documented here so the
 /// scheduler and the loader can't drift.
@@ -165,10 +182,98 @@ pub struct RecallHit {
 }
 
 /// Optional filters applied after the HNSW returns candidates.
+///
+/// Every field is a *narrowing* predicate: a candidate must satisfy
+/// all of the populated ones to survive. [`SemanticStore::recall`]
+/// compensates for the narrowing by widening its HNSW fetch until it
+/// has enough survivors, so a selective filter costs extra probes
+/// rather than silently returning a short list.
 #[derive(Debug, Clone, Default)]
 pub struct RecallFilters {
     pub scope: Option<String>,
     pub kind: Option<MemoryKind>,
+    /// Every tag listed here must be present on the memory (AND, not
+    /// OR). Empty means "no tag constraint". Matching is exact and
+    /// case-sensitive, consistent with how `remember` stores them.
+    pub tags: Vec<String>,
+    /// Cosine-similarity floor in `[-1.0, 1.0]`, where `1.0` is
+    /// identical. Hits scoring below it are dropped. `None` keeps
+    /// every hit the index returns — which is the pre-v1.3 behaviour
+    /// and means a query with no good match still yields the `k`
+    /// nearest vectors, however far away they are.
+    ///
+    /// Relates to [`RecallHit::score`] (a cosine *distance*) as
+    /// `similarity = 1.0 - score`.
+    pub min_similarity: Option<f32>,
+}
+
+impl RecallFilters {
+    /// Convenience for the common "just filter by scope" case.
+    pub fn with_scope(scope: impl Into<String>) -> Self {
+        Self {
+            scope: Some(scope.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Apply every populated predicate to one candidate.
+    fn matches(&self, item: &MemoryItem, score: f32) -> bool {
+        if let Some(want_scope) = &self.scope
+            && &item.scope != want_scope
+        {
+            return false;
+        }
+        if let Some(want_kind) = self.kind
+            && item.kind != want_kind
+        {
+            return false;
+        }
+        if !self
+            .tags
+            .iter()
+            .all(|want| item.tags.iter().any(|have| have == want))
+        {
+            return false;
+        }
+        if let Some(floor) = self.min_similarity
+            && similarity_from_distance(score) < floor
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// Convert the cosine *distance* the index reports into the cosine
+/// *similarity* agents reason about. Distance is `1 - cos θ` over
+/// L2-normalized vectors, so this is just the inverse.
+pub fn similarity_from_distance(distance: f32) -> f32 {
+    1.0 - distance
+}
+
+/// Cosine-similarity floor at which a new memory is reported as a
+/// near-duplicate of an existing one.
+///
+/// Deliberately strict. The report is advisory — it never blocks a
+/// write — but a false positive teaches the agent to distrust it, and
+/// under BGE-M3 genuinely distinct facts about the same subject
+/// routinely reach 0.85-0.90. 0.95 keeps the signal to restatements
+/// and near-verbatim repeats.
+pub const NEAR_DUPLICATE_SIMILARITY: f32 = 0.95;
+
+/// An existing memory that a pending write closely restates. Produced
+/// by [`SemanticStore::remember_checked`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct NearDuplicate {
+    pub id: MemoryId,
+    /// Cosine similarity to the incoming content, `1.0` = identical.
+    pub similarity: f32,
+    /// The existing memory's content, so the caller can show the agent
+    /// what it is about to duplicate without a second round trip.
+    pub content: String,
+    /// The existing memory's scope, which may differ from the incoming
+    /// write's.
+    pub scope: String,
 }
 
 /// Patch passed to [`SemanticStore::update`]. Each `Some` field is
@@ -499,6 +604,33 @@ impl SemanticStore {
         tags: Vec<String>,
         scope: String,
     ) -> Result<MemoryId> {
+        self.remember_checked(content, kind, tags, scope, false)
+            .await
+            .map(|(id, _)| id)
+    }
+
+    /// [`SemanticStore::remember`], optionally reporting whether the
+    /// new content is a near-duplicate of something already stored.
+    ///
+    /// L4 has no lifecycle pass — nothing dedupes, decays, or compacts
+    /// it — so an agent that re-states the same fact every session
+    /// grows the corpus without bound and dilutes recall precision.
+    /// This is the cheap half of the fix: tell the caller, let it
+    /// decide. The memory is stored either way; the verbatim principle
+    /// means mneme never silently drops or rewrites what it was given.
+    ///
+    /// The check costs one index search and **no extra embedding** —
+    /// it reuses the vector computed for the write, which matters
+    /// because a second BGE-M3 forward pass would roughly double the
+    /// 150 ms p95 `remember` budget.
+    pub async fn remember_checked(
+        &self,
+        content: &str,
+        kind: MemoryKind,
+        tags: Vec<String>,
+        scope: String,
+        check_duplicates: bool,
+    ) -> Result<(MemoryId, Option<NearDuplicate>)> {
         let trimmed = content.trim();
         if trimmed.is_empty() {
             return Err(MnemeError::Storage("memory content is empty".into()));
@@ -512,6 +644,13 @@ impl SemanticStore {
                 self.embedder.dim()
             )));
         }
+
+        // Probe before inserting, so the new row cannot match itself.
+        let duplicate = if check_duplicates {
+            self.nearest_duplicate(&vector).await?
+        } else {
+            None
+        };
 
         let item = MemoryItem {
             id: MemoryId::new(),
@@ -535,13 +674,74 @@ impl SemanticStore {
             })
             .await?;
         self.note_mutation();
-        Ok(item.id)
+        Ok((item.id, duplicate))
+    }
+
+    /// Top-1 index probe for [`remember_checked`]. Returns `Some` only
+    /// when the nearest existing memory clears
+    /// [`NEAR_DUPLICATE_SIMILARITY`].
+    ///
+    /// Deliberately does **not** filter by scope: the same fact stored
+    /// under two scopes is still worth flagging, and the caller has the
+    /// scope of both rows to decide.
+    async fn nearest_duplicate(&self, vector: &[f32]) -> Result<Option<NearDuplicate>> {
+        let hits = {
+            let guard = self
+                .index
+                .read()
+                .map_err(|e| MnemeError::Index(format!("hnsw rwlock poisoned: {e}")))?;
+            guard.search(vector, 1)?
+        };
+        let Some((id, distance)) = hits.first().copied() else {
+            return Ok(None);
+        };
+        let similarity = similarity_from_distance(distance);
+        if similarity < NEAR_DUPLICATE_SIMILARITY {
+            return Ok(None);
+        }
+        // An orphan vector (metadata already deleted) is not a
+        // duplicate of anything the agent can act on.
+        let Some(bytes) = self.storage.get(&mem_key(&id)).await? else {
+            return Ok(None);
+        };
+        let existing: MemoryItem = postcard::from_bytes(&bytes)
+            .map_err(|e| MnemeError::Storage(format!("decode MemoryItem {id}: {e}")))?;
+        Ok(Some(NearDuplicate {
+            id,
+            similarity,
+            content: existing.content,
+            scope: existing.scope,
+        }))
     }
 
     /// Top-`k` nearest memories to `query`, optionally filtered.
     ///
     /// Returns an empty `Vec` (not an error) when nothing matches —
     /// `recall` is allowed to be empty by spec.
+    ///
+    /// # Filter compensation
+    ///
+    /// Filters in [`RecallFilters`] are applied *after* the vector
+    /// search, because the HNSW indexes vectors only — it has no
+    /// notion of scope, kind, or tags. A single fixed-width probe
+    /// therefore underfills whenever the filter is selective: the
+    /// nearest `k · 4` vectors may contain zero `work`-scoped rows
+    /// even when the corpus holds hundreds.
+    ///
+    /// So we widen instead. Each probe asks the index for more
+    /// candidates than the last (geometric, [`RECALL_WIDEN_FACTOR`])
+    /// and only the newly-revealed suffix is decoded — [`HnswIndex::search`]
+    /// returns a distance-ordered prefix, so a wider probe is a
+    /// superset whose leading entries are unchanged. The loop stops on
+    /// the first of: `k` survivors found, the index returned fewer
+    /// candidates than we asked for (exhausted), or we have already
+    /// asked for every live vector.
+    ///
+    /// Cost: unfiltered recall is exactly one probe, as before. A
+    /// filtered recall that matches nothing degrades to a full index
+    /// walk — correct, and bounded by `O(log(corpus / k))` probes.
+    ///
+    /// [`HnswIndex::search`]: crate::index::hnsw::HnswIndex::search
     pub async fn recall(
         &self,
         query: &str,
@@ -557,50 +757,132 @@ impl SemanticStore {
         }
         let qvec = self.embedder.embed(trimmed).await?;
 
-        // The HNSW search is sync + cheap; do it inside a `read()`
-        // guard scope so we don't hold the lock across the storage
-        // awaits below.
-        let raw_hits: Vec<(MemoryId, f32)> = {
+        let mut out: Vec<RecallHit> = Vec::with_capacity(k);
+        // Candidates already decoded, so a widened probe re-walks only
+        // the suffix it revealed.
+        let mut consumed = 0usize;
+        let mut want = k.saturating_mul(RECALL_OVERFETCH).max(k);
+        let mut probes = 0usize;
+
+        loop {
+            // The HNSW search is sync + cheap; do it inside a `read()`
+            // guard scope so we don't hold the lock across the storage
+            // awaits below.
+            let (raw_hits, live_len): (Vec<(MemoryId, f32)>, usize) = {
+                let guard = self
+                    .index
+                    .read()
+                    .map_err(|e| MnemeError::Index(format!("hnsw rwlock poisoned: {e}")))?;
+                (guard.search(&qvec, want)?, guard.len())
+            };
+            probes += 1;
+
+            for (id, score) in raw_hits.iter().skip(consumed) {
+                let key = mem_key(id);
+                let bytes = match self.storage.get(&key).await? {
+                    Some(b) => b,
+                    None => {
+                        // Vector exists in HNSW but no metadata in KV —
+                        // see the write-path ordering note. Skip; the
+                        // consolidation scheduler's orphan sweep
+                        // (`gc_orphan_vectors`) tombstones it.
+                        tracing::warn!(memory_id = %id, "recall: orphan vector, no metadata");
+                        continue;
+                    }
+                };
+                let item: MemoryItem = postcard::from_bytes(&bytes)
+                    .map_err(|e| MnemeError::Storage(format!("decode MemoryItem {id}: {e}")))?;
+
+                if !filters.matches(&item, *score) {
+                    continue;
+                }
+                out.push(RecallHit {
+                    item,
+                    score: *score,
+                });
+                if out.len() >= k {
+                    break;
+                }
+            }
+            consumed = raw_hits.len();
+
+            if out.len() >= k {
+                break;
+            }
+            // `search` gave us less than we asked for ⇒ we have seen
+            // every live vector it can offer. Same conclusion if the
+            // width already covers the whole live corpus.
+            if raw_hits.len() < want || want >= live_len {
+                break;
+            }
+            let wider = want.saturating_mul(RECALL_WIDEN_FACTOR);
+            // Belt-and-braces: a non-growing width would spin forever.
+            // Unreachable while RECALL_WIDEN_FACTOR > 1 and `want` is
+            // below usize::MAX, both of which hold by construction.
+            if wider <= want {
+                break;
+            }
+            want = wider;
+        }
+
+        if probes > 1 {
+            tracing::debug!(
+                probes,
+                returned = out.len(),
+                requested = k,
+                "recall widened its index probe to satisfy filters"
+            );
+        }
+        Ok(out)
+    }
+
+    /// Tombstone every indexed vector whose metadata row is gone.
+    /// Returns how many were reclaimed.
+    ///
+    /// # Why orphans exist
+    ///
+    /// [`SemanticStore::forget`] deletes the `mem:` row and *then*
+    /// appends the `VectorDelete`. A `kill -9` between the two leaves a
+    /// vector with no metadata. `recall` already skips such rows (it
+    /// logs `orphan vector, no metadata` and moves on), so an orphan is
+    /// never *returned* — but it still occupies RAM, consumes a slot in
+    /// every search's candidate budget, and makes `index.len()`
+    /// disagree with the real corpus size.
+    ///
+    /// # Safety of the sweep
+    ///
+    /// It can only ever remove vectors that are already unreachable: a
+    /// missing metadata row means no `recall` could surface that id.
+    /// The direction is one-way, so a spuriously-slow storage read
+    /// cannot cause data loss — worst case is a vector that stays one
+    /// pass longer. Reuses `forget`, which tombstones unconditionally
+    /// and no-ops on the already-absent metadata delete, so the WAL
+    /// records are identical to an interrupted `forget` completing.
+    pub async fn gc_orphan_vectors(&self) -> Result<usize> {
+        let ids = {
             let guard = self
                 .index
                 .read()
                 .map_err(|e| MnemeError::Index(format!("hnsw rwlock poisoned: {e}")))?;
-            guard.search(&qvec, k.saturating_mul(RECALL_OVERFETCH))?
+            guard.live_ids()
         };
 
-        let mut out = Vec::with_capacity(k);
-        for (id, score) in raw_hits {
-            let key = mem_key(&id);
-            let bytes = match self.storage.get(&key).await? {
-                Some(b) => b,
-                None => {
-                    // Vector exists in HNSW but no metadata in KV —
-                    // see the write-path ordering note. Skip; future
-                    // GC sweep will tombstone the orphan vector.
-                    tracing::warn!(memory_id = %id, "recall: orphan vector, no metadata");
-                    continue;
-                }
-            };
-            let item: MemoryItem = postcard::from_bytes(&bytes)
-                .map_err(|e| MnemeError::Storage(format!("decode MemoryItem {id}: {e}")))?;
-
-            if let Some(want_scope) = &filters.scope
-                && &item.scope != want_scope
-            {
+        let mut reclaimed = 0usize;
+        for id in ids {
+            if self.storage.get(&mem_key(&id)).await?.is_some() {
                 continue;
             }
-            if let Some(want_kind) = filters.kind
-                && item.kind != want_kind
-            {
-                continue;
-            }
-
-            out.push(RecallHit { item, score });
-            if out.len() >= k {
-                break;
-            }
+            // `forget` tombstones the vector even with no metadata to
+            // delete — exactly the completion an interrupted forget
+            // never got to.
+            self.forget(id).await?;
+            reclaimed += 1;
+            tracing::debug!(memory_id = %id, "gc: reclaimed orphan vector");
         }
-        Ok(out)
+        if reclaimed > 0 {
+            tracing::info!(reclaimed, "gc: tombstoned orphan vectors");
+        }
+        Ok(reclaimed)
     }
 
     /// Tombstone a memory. Returns `true` if metadata existed
@@ -883,19 +1165,310 @@ mod tests {
             .unwrap();
 
         let hits = s
-            .recall(
-                "topic",
-                10,
-                &RecallFilters {
-                    scope: Some("work".into()),
-                    kind: None,
-                },
-            )
+            .recall("topic", 10, &RecallFilters::with_scope("work"))
             .await
             .unwrap();
         assert!(!hits.is_empty());
         assert!(hits.iter().all(|h| h.item.scope == "work"));
         assert!(hits.iter().any(|h| h.item.id == work_id));
+    }
+
+    /// Regression: a selective scope filter must not silently
+    /// underfill. Pre-v1.3 `recall` probed a fixed `k * 4` candidates
+    /// and post-filtered, so asking for 10 `work` memories out of a
+    /// corpus that is ~4 % `work` returned far fewer than 10 even
+    /// though the index held plenty. The widening loop fixes it.
+    #[tokio::test]
+    async fn recall_fills_k_when_scope_is_a_small_minority() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+
+        // 480 noise memories in `personal`, 20 in `work`. With the old
+        // fixed 4× probe, a k=10 `work` recall saw only the 40 nearest
+        // vectors overall — statistically ~1-2 `work` rows.
+        for i in 0..480 {
+            s.remember(
+                &format!("noise number {i}"),
+                MemoryKind::Fact,
+                vec![],
+                "personal".into(),
+            )
+            .await
+            .unwrap();
+        }
+        for i in 0..20 {
+            s.remember(
+                &format!("work item {i}"),
+                MemoryKind::Fact,
+                vec![],
+                "work".into(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let hits = s
+            .recall("anything at all", 10, &RecallFilters::with_scope("work"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.len(),
+            10,
+            "scope filter underfilled: got {} of 10 requested from a 20-row scope",
+            hits.len()
+        );
+        assert!(hits.iter().all(|h| h.item.scope == "work"));
+        // No duplicates — the widening loop must not re-emit the
+        // candidates an earlier probe already consumed.
+        let mut ids: Vec<_> = hits.iter().map(|h| h.item.id).collect();
+        ids.sort();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(before, ids.len(), "widening loop emitted duplicate hits");
+    }
+
+    /// A filter that matches nothing returns empty rather than
+    /// looping forever or erroring.
+    #[tokio::test]
+    async fn recall_with_unmatchable_filter_terminates_empty() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        for i in 0..50 {
+            s.remember(
+                &format!("row {i}"),
+                MemoryKind::Fact,
+                vec![],
+                "personal".into(),
+            )
+            .await
+            .unwrap();
+        }
+        let hits = s
+            .recall("row", 10, &RecallFilters::with_scope("nonexistent-scope"))
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_filters_by_tags_requiring_all() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let both = s
+            .remember(
+                "deploy notes",
+                MemoryKind::Fact,
+                vec!["ops".into(), "prod".into()],
+                "personal".into(),
+            )
+            .await
+            .unwrap();
+        let only_one = s
+            .remember(
+                "deploy notes staging",
+                MemoryKind::Fact,
+                vec!["ops".into()],
+                "personal".into(),
+            )
+            .await
+            .unwrap();
+
+        // Both tags required ⇒ only the two-tag memory survives.
+        let hits = s
+            .recall(
+                "deploy",
+                10,
+                &RecallFilters {
+                    tags: vec!["ops".into(), "prod".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].item.id, both);
+
+        // A single tag both share ⇒ both survive.
+        let hits = s
+            .recall(
+                "deploy",
+                10,
+                &RecallFilters {
+                    tags: vec!["ops".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|h| h.item.id == only_one));
+    }
+
+    #[tokio::test]
+    async fn recall_min_similarity_drops_weak_hits() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        s.remember("exact phrase here", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+
+        // Unfiltered: the nearest vector comes back however far it is.
+        let loose = s
+            .recall("exact phrase here", 10, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(loose.len(), 1);
+
+        // A floor above the achievable similarity drops it. 1.01 is
+        // unreachable by construction (max similarity is 1.0), so this
+        // holds for any embedder including the stub.
+        let strict = s
+            .recall(
+                "exact phrase here",
+                10,
+                &RecallFilters {
+                    min_similarity: Some(1.01),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(strict.is_empty(), "min_similarity floor was not applied");
+    }
+
+    #[tokio::test]
+    async fn remember_checked_flags_an_identical_restatement() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let first = s
+            .remember(
+                "the staging database is wiped every Sunday",
+                MemoryKind::Fact,
+                vec![],
+                "work".into(),
+            )
+            .await
+            .unwrap();
+
+        let (second, dup) = s
+            .remember_checked(
+                "the staging database is wiped every Sunday",
+                MemoryKind::Fact,
+                vec![],
+                "work".into(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let dup = dup.expect("identical content must be flagged");
+        assert_eq!(dup.id, first);
+        assert_eq!(dup.scope, "work");
+        assert!(
+            dup.similarity >= NEAR_DUPLICATE_SIMILARITY,
+            "similarity {} below threshold",
+            dup.similarity
+        );
+        // Advisory only — the write still landed.
+        assert_ne!(second, first);
+        assert!(s.get(second).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn remember_checked_stays_quiet_for_unrelated_content() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        s.remember(
+            "the staging database is wiped every Sunday",
+            MemoryKind::Fact,
+            vec![],
+            "work".into(),
+        )
+        .await
+        .unwrap();
+
+        let (_, dup) = s
+            .remember_checked(
+                "alice prefers tabs over spaces",
+                MemoryKind::Preference,
+                vec![],
+                "work".into(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(dup.is_none(), "unrelated content flagged as duplicate");
+    }
+
+    /// Opting out must skip the probe entirely — `remember` is on the
+    /// 150 ms p95 write path.
+    #[tokio::test]
+    async fn remember_without_check_never_reports_duplicates() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        s.remember("same text", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let (_, dup) = s
+            .remember_checked("same text", MemoryKind::Fact, vec![], "p".into(), false)
+            .await
+            .unwrap();
+        assert!(dup.is_none());
+    }
+
+    /// An orphan is an indexed vector whose metadata row is gone —
+    /// what an interrupted `forget` leaves behind. The sweep must
+    /// reclaim it and leave every reachable memory alone.
+    #[tokio::test]
+    async fn gc_reclaims_orphan_vectors_only() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let keep = s
+            .remember("keep me", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let orphan = s
+            .remember("orphan me", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+
+        // Simulate a `forget` that died after the metadata delete but
+        // before the WAL tombstone: drop the row behind the store's back.
+        s.storage.delete(&mem_key(&orphan)).await.unwrap();
+
+        let reclaimed = s.gc_orphan_vectors().await.unwrap();
+        assert_eq!(reclaimed, 1, "expected exactly the orphan to be reclaimed");
+        assert!(s.get(keep).await.unwrap().is_some(), "live memory removed");
+
+        // Idempotent: a second sweep finds nothing.
+        assert_eq!(s.gc_orphan_vectors().await.unwrap(), 0);
+
+        // And the reclaimed vector no longer occupies a recall slot.
+        let hits = s
+            .recall("orphan me", 10, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert!(hits.iter().all(|h| h.item.id != orphan));
+    }
+
+    #[tokio::test]
+    async fn gc_on_a_clean_store_is_a_noop() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        for i in 0..5 {
+            s.remember(&format!("row {i}"), MemoryKind::Fact, vec![], "p".into())
+                .await
+                .unwrap();
+        }
+        assert_eq!(s.gc_orphan_vectors().await.unwrap(), 0);
+    }
+
+    #[test]
+    fn similarity_is_the_inverse_of_distance() {
+        assert_eq!(similarity_from_distance(0.0), 1.0);
+        assert_eq!(similarity_from_distance(1.0), 0.0);
+        assert_eq!(similarity_from_distance(2.0), -1.0);
     }
 
     #[tokio::test]
@@ -916,8 +1489,8 @@ mod tests {
                 "topic",
                 10,
                 &RecallFilters {
-                    scope: None,
                     kind: Some(MemoryKind::Decision),
+                    ..Default::default()
                 },
             )
             .await

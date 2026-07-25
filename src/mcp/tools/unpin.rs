@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use ulid::Ulid;
 
-use super::{Tool, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::ids::MemoryId;
 use crate::memory::procedural::ProceduralStore;
 
@@ -32,6 +32,8 @@ impl Tool for Unpin {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "unpin",
+            title: "Unpin a rule",
+            annotations: ToolAnnotations::destructive(),
             description: DESCRIPTION,
             input_schema: json!({
                 "type": "object",
