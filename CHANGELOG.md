@@ -14,15 +14,6 @@ the work that landed before automation was wired up.
 
 ## [1.3.0](https://github.com/tr0mb1r/mneme/compare/v1.2.2...v1.3.0) - 2026-07-25
 
-### Added
-
-- *(retrieval)* make auto-context reach L4, fix filtered-recall underfill
-
-### Fixed
-
-- *(deps)* bump quinn-proto and memmap2 past two more advisories
-- *(config)* escape TOML string values; bump three advisory-flagged deps
-
 > A retrieval-quality release, plus a documentation-truth pass. It came
 > out of a full review of the tree against its own docs, which turned up
 > several places where `book/src/mcp-surface.md` promised behaviour the
@@ -59,6 +50,22 @@ the work that landed before automation was wired up.
   exhausted. Unfiltered recall still issues exactly one probe — the
   `recall` bench moved *down* 17 % on unchanged hardware, not up.
   Regression test pins the contract.
+- *(config)* **`mneme init` wrote an unparseable `config.toml` on
+  Windows.** The starter template interpolated paths into TOML *basic*
+  strings, where `\U` in `C:\Users\...` begins an 8-digit unicode
+  escape — so `mneme init` emitted a file the next `mneme run` refused to
+  read ("invalid unicode 8-digit hex code"). Every string value now goes
+  through `toml::Value`'s own writer, which picks a literal string for a
+  path with backslashes, a multi-line literal when it also contains an
+  apostrophe, and a basic string otherwise. Introduced and fixed within
+  this release, so no published version is affected.
+- *(deps)* Bumped five transitive dependencies past newly-published
+  advisories: `anyhow` 1.0.104 (UB in `Error::downcast_mut`),
+  `crossbeam-epoch` 0.9.20 (RUSTSEC-2026-0204, invalid pointer
+  dereference), `quinn-proto` 0.11.16 (RUSTSEC-2026-0185, remote memory
+  exhaustion), `memmap2` 0.9.11 (RUSTSEC-2026-0186, unchecked pointer
+  offset), and `spin` 0.9.9 (yanked). Lockfile-only — no manifest change,
+  no new dependency, nothing added to `deny.toml`'s ignore list.
 
 ### Added
 
@@ -153,7 +160,7 @@ the work that landed before automation was wired up.
 
 ### Tests
 
-- 751 tests pass (was 702), 0 failures. New coverage: the scope-minority recall
+- 754 tests pass (was 702), 0 failures. New coverage: the scope-minority recall
   underfill regression, unmatchable-filter termination, tag AND
   semantics, the similarity floor, context query-parameter parsing
   (including lenient handling of junk), semantic fold-in and scope
