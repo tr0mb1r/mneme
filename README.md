@@ -69,7 +69,15 @@ wired for `claude-code`, `claude-desktop`, `cursor`, and `opencode`, and
 surface; enable with `mneme encrypt`, recover on a fresh machine with
 `mneme recover`; a 12-word BIP39 recovery phrase is shown once on
 setup) and **time-range bounds on `recall_recent`** (`since`/`until`
-parameters, RFC3339 or ULID).
+parameters, RFC3339 or ULID). v1.3 makes `mneme://context` return all
+four layers (read `mneme://context?q=<topic>` to get semantic hits),
+widens the HNSW probe so **filtered `recall` stops underfilling**, adds
+`tags` / `min_similarity` filters and a `similarity` field on results,
+**per-project scoping** from the MCP client's workspace roots
+(`[scopes] derive_from_roots`, off by default), a near-duplicate
+advisory on `remember`, `resources/templates/list`, and behaviour-hint
+annotations and titles on every tool — see
+[`book/src/release-notes-v1_3.md`](book/src/release-notes-v1_3.md).
 Optional Claude Code lifecycle hooks
 (`SessionStart`/`PreCompact`/`Stop`) are documented in
 [`docs/CLAUDE_CODE_SETUP.md`](docs/CLAUDE_CODE_SETUP.md) §7 with

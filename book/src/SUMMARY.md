@@ -27,6 +27,7 @@
 
 - [v1.1](./release-notes-v1_1.md)
 - [v1.2](./release-notes-v1_2.md)
+- [v1.3](./release-notes-v1_3.md)
 
 # Contributing
 

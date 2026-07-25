@@ -23,23 +23,28 @@ work that the agent would otherwise forget.**
 
 ## Status
 
-**v1.2.2 shipped 2026-06-07** — a security hardening release:
-`mneme restore` refuses archives that try to escape the data dir
-through planted symlinks (CWE-22), the recovery phrase is wiped from
-heap after key derivation, and secret temp files are `0600` from
-creation (see the
-[v1.2 release notes](./release-notes-v1_2.md#v122--restore-hardening--secret-hygiene)).
-Previous: v1.2.1 (2026-06-06), v1.2.0 (2026-06-06), v1.1.1
-(2026-05-23), v1.0 (2026-05-18). Latest release on
+**v1.3.0 shipped 2026-07-25** — a retrieval-quality release:
+`mneme://context` finally returns semantic (L4) and working (L1)
+memories instead of a hardcoded empty list, filtered `recall` no longer
+silently underfills when the matching scope is a small slice of the
+corpus, and `recall` gains `tags` / `min_similarity` filters. Also:
+per-project scoping from MCP workspace roots, a near-duplicate advisory
+on `remember`, behaviour-hint annotations and titles on every tool, and
+an orphan-vector sweep (see the
+[v1.3 release notes](./release-notes-v1_3.md)).
+Previous: v1.2.2 (2026-06-07), v1.2.1 (2026-06-06), v1.2.0
+(2026-06-06), v1.1.1 (2026-05-23), v1.0 (2026-05-18). Latest release on
 [`mneme-mcp`](https://crates.io/crates/mneme-mcp) (crates.io) and the
 [Homebrew tap](https://github.com/tr0mb1r/homebrew-mneme). The MCP wire
 surface is the semver-tracked contract from 1.0 onward (see [MCP
 surface](./mcp-surface.md)); the Rust library API is private. The
 on-disk format is stable behind a versioned schema with a migration
-path. v1.2 adds **encryption at rest** (opt-in, XChaCha20-Poly1305
-AEAD, OS keyring KEK + BIP39 recovery phrase) and **`recall_recent`
-time-range bounds** (`since`/`until`). See
-[v1.2 release notes](./release-notes-v1_2.md) and
+path — `schema_version` is unchanged in v1.3, so there is no migration.
+v1.2 added **encryption at rest** (opt-in, XChaCha20-Poly1305 AEAD, OS
+keyring KEK + BIP39 recovery phrase) and **`recall_recent` time-range
+bounds** (`since`/`until`). See
+[v1.3 release notes](./release-notes-v1_3.md),
+[v1.2 release notes](./release-notes-v1_2.md), and
 [Versioning](./versioning.md) for details.
 
 ## What works today
