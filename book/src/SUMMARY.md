@@ -8,6 +8,7 @@
 - [Supported agents](./agents.md)
 - [Setting up with Claude Code](./claude-code-setup.md)
 - [Recommended Claude Code config](./claude-code-config.md)
+- [Setting up with Hermes Agent](./hermes-setup.md)
 
 # Concepts
 

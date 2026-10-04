@@ -15,9 +15,10 @@ and which v1.1 daemon features are available end-to-end.
 | Claude Desktop | `mneme init claude-desktop` | `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) / `~/.config/Claude/claude_desktop_config.json` (Linux) / `%APPDATA%/Claude/claude_desktop_config.json` (Windows) | Manual paste into system prompt | ❌ | ✅ | ✅ | No hooks — agent calibration relies on system-prompt paste or first-use tool-description discovery. |
 | Cursor | `mneme init cursor` | `~/.cursor/mcp.json` (uniform across macOS/Linux/Windows) | Per-repo `.cursor/rules/*.mdc` or legacy `.cursorrules` | ❌ | ✅ | ✅ | No global instruction-file install path — the installer drops the MCP entry and prints the rules-file content for the user to paste per-repo. |
 | OpenCode | `mneme init opencode` | `~/.config/opencode/opencode.json` (`mcp.mneme`) | mneme-owned file referenced via `instructions[]` | ❌ (but `instructions[]` auto-loads) | ✅ | ✅ | `instructions[]` is the cleanest of the no-hooks agents — guidance file is loaded on every session without manual paste. |
+| Hermes Agent | `mneme init hermes` | `$HERMES_HOME/config.yaml` (`mcp_servers.mneme`; `~/.hermes` by default) | `mneme` skill + marker block in `$HERMES_HOME/SOUL.md` | ❌ | ✅ (local) | ✅ (local) | Local `mneme client` by default; `--url` connects to `mneme serve` over Streamable HTTP for container setups. See [Setting up with Hermes Agent](./hermes-setup.md). |
 
-**All four** use the `mneme client` bridge under the hood. That means
-the daemon features below apply uniformly:
+**All five** use the `mneme client` bridge under the hood by default.
+That means the daemon features below apply uniformly:
 
 - **D12 auto-spawn** (commit `742003e`, wait-budget bumped 5s→30s at
   `8846268`): when the agent's MCP host launches `mneme client` and the
@@ -31,6 +32,18 @@ the daemon features below apply uniformly:
 - **Active-drain on SIGTERM** (commit `1664a8b`): `mneme stop` now
   exits cleanly in milliseconds even with multiple connected clients
   (was 30 + s prior). Visible in dev iteration; transparent to agents.
+
+### Remote agents (Streamable HTTP)
+
+An agent that can't spawn `mneme client` — typically one in another
+container — connects to `mneme serve` (or a daemon with
+`[http] enabled = true`) at `http://<host>:7878/mcp` with a bearer
+token. `mneme init hermes --url …` writes that shape for Hermes; any
+other MCP client with Streamable HTTP support can be pointed at the
+same endpoint by hand. Auto-spawn and auto-reconnect don't apply: the
+server is a long-running service, and a client whose session has
+expired gets `404` and re-initializes per the MCP spec. See
+[CLI surface](./cli.md#mode-c--network-service-mneme-serve).
 
 ## Tier 2 — deferred
 
@@ -74,8 +87,8 @@ contract is the same across all four:
 
 1. Resolve the agent's MCP-config file path (per-OS if needed).
 2. Merge the `mneme` entry into the agent's MCP-server registry using
-   `crate::init::json_config` (idempotent — running `mneme init <agent>`
-   twice is a no-op).
+   `crate::init::json_config`, or `crate::init::yaml_config` for a YAML
+   config (idempotent — running `mneme init <agent>` twice is a no-op).
 3. Drop the mneme instruction file alongside (`MNEME_MD_TEMPLATE` from
    `crate::init::assets`) — exact location varies per agent's
    instruction-file convention.
@@ -85,6 +98,7 @@ contract is the same across all four:
 5. (Optional) Install agent-specific hook scripts via
    `crate::init::assets::write_executable`.
 
-Use `src/init/agents/claude_code.rs` as the reference. The other three
-(`claude_desktop.rs`, `cursor.rs`, `opencode.rs`) demonstrate variants
-for agents without a hooks API.
+Use `src/init/agents/claude_code.rs` as the reference. The others
+(`claude_desktop.rs`, `cursor.rs`, `opencode.rs`, `hermes.rs`)
+demonstrate variants for agents without a hooks API; `hermes.rs` also
+shows a YAML config and a remote (`--url`) transport.

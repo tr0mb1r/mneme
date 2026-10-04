@@ -10,24 +10,27 @@ they're outstanding, which is more useful than a version number.
 
 ## Platform gaps
 
-**Windows runs `mneme run` only.** `mneme daemon` and `mneme client`
+**Windows runs `mneme run` and `mneme serve` only.** `mneme daemon` and `mneme client`
 depend on Unix domain sockets; Windows named-pipe support (ADR-0012
 D2/D9) isn't implemented, so the daemon-mode default doesn't apply
 there. `mneme stop` also returns `not yet implemented` on Windows — use
 Task Manager or `Stop-Process`. Every other subcommand works, and the
 release pipeline ships a Windows binary. Configure your MCP host with
-`args: ["run"]` rather than `["client"]`.
+`args: ["run"]` rather than `["client"]`, or run `mneme serve` and
+point HTTP-capable hosts at it to share one server.
 
-**No SSE / Streamable HTTP transport.** `[mcp] transport` accepts only
-`stdio`, and the value isn't consulted. `[mcp] sse_port` is reserved and
-has no effect. There is no remote or multi-machine story: mneme is a
-local process serving local hosts. ADR-0012 D7 (keepalive frames) is
-deferred with it.
+**Streamable HTTP has no server-to-client stream.** `mneme serve` (and
+the daemon with `[http] enabled`) answer every request with plain JSON
+and return `405` for `GET /mcp`, because mneme never sends
+notifications or requests to the client. Resumable streams
+(`Last-Event-ID`), JSON-RPC batching (removed in MCP 2025-06-18), and
+TLS are not implemented; put a reverse proxy in front for TLS. The
+legacy HTTP+SSE transport (MCP 2024-11-05) isn't offered.
 
 ## Agent installers
 
 `mneme init <agent>` is fully wired for `claude-code`,
-`claude-desktop`, `cursor`, and `opencode`. Three targets are declared
+`claude-desktop`, `cursor`, `opencode`, and `hermes`. Three targets are declared
 in `--help` but return `not yet implemented` with a tracked pointer
 rather than silently doing nothing:
 
@@ -50,7 +53,7 @@ writes them into new configs.
 | Key | Reality |
 |---|---|
 | `[storage] encryption` | Encryption is gated by the presence of `keystore.json` (run `mneme encrypt`), not by this flag. |
-| `[mcp] sse_port` | No SSE transport exists. |
+| `[mcp] sse_port` | Superseded by `[http] bind`. |
 | `[telemetry]` (whole section) | No telemetry subsystem exists. mneme makes no network calls on any code path. |
 | `[consolidation] schedule` | Only `"idle"` is implemented. Any other value logs a warning and falls back to it. Future modes (`every_<n>m`, cron, `on_demand`) aren't built. |
 
