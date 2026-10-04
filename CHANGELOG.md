@@ -12,6 +12,18 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+## [1.4.0](https://github.com/tr0mb1r/mneme/compare/v1.3.1...v1.4.0) - 2026-10-04
+
+### Added
+
+- *(deploy)* Dockerfile, mneme + Hermes Compose stack, Hermes setup guide
+- *(init)* `mneme init hermes` for Hermes Agent, local or remote
+- *(mcp)* Streamable HTTP transport (`mneme serve`, `[http]` in the daemon)
+
+### Security
+
+- *(deps)* bump rustls to 0.23.45 (RUSTSEC-2026-0285), async-trait to 0.1.92
+
 ## [1.3.1](https://github.com/tr0mb1r/mneme/compare/v1.3.0...v1.3.1) - 2026-07-25
 
 ### Documentation
