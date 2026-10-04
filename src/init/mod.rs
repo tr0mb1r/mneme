@@ -7,6 +7,8 @@
 //!   AGENTS.md, etc.) without touching surrounding content.
 //! - (later) `template` — load and render the MNEME.md content the
 //!   `init` command writes per integration.
+//! - [`yaml_config`] — comment-preserving line edits to a YAML
+//!   config (Hermes Agent's `config.yaml`).
 //! - (later) `config_merge` — surgically add / update mneme entries
 //!   in JSON / TOML / YAML config files (settings.json,
 //!   claude_desktop_config.json, etc.) preserving the user's other
@@ -20,3 +22,4 @@ pub mod agents;
 pub mod assets;
 pub mod json_config;
 pub mod marker;
+pub mod yaml_config;

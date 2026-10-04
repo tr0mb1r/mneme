@@ -24,6 +24,11 @@
 //!   that surface (only `mcp` + `instructions[]`, both stable per
 //!   OpenCode docs as of 2026-05-16), so the gate was misaligned.
 //!
+//! - `hermes` — Hermes Agent (Nous Research). YAML `config.yaml`
+//!   edited through `init::yaml_config`; supports local (`mneme
+//!   client`) and remote (`--url`, Streamable HTTP) transports, the
+//!   latter for Hermes and mneme in separate containers.
+//!
 //! The stubs return [`AgentError::NotYetImplemented`] with the
 //! tracked task number so a user who tries an unimplemented
 //! agent gets a useful pointer rather than silent acceptance.
@@ -31,6 +36,7 @@
 pub mod claude_code;
 pub mod claude_desktop;
 pub mod cursor;
+pub mod hermes;
 pub mod opencode;
 
 use std::path::PathBuf;
@@ -72,6 +78,25 @@ pub enum Agent {
     /// guidance auto-loads through opencode.json's `instructions[]`.
     #[value(name = "opencode")]
     OpenCode,
+    /// Hermes Agent (Nous Research) — `$HERMES_HOME/config.yaml`
+    /// (`~/.hermes` by default). Local `mneme client` by default;
+    /// `--url` connects to a remote `mneme serve` over HTTP.
+    #[value(name = "hermes")]
+    Hermes,
+}
+
+/// Per-install knobs beyond the mode. Only Hermes consumes them today;
+/// other agents reject non-default values rather than ignore them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstallOptions {
+    /// Remote mneme MCP endpoint (Streamable HTTP), e.g.
+    /// `http://mneme:7878/mcp`. `None` = spawn `mneme client` locally.
+    pub url: Option<String>,
+    /// Environment variable the agent reads the bearer token from
+    /// when `url` is set.
+    pub token_env: Option<String>,
+    /// Override the agent's config directory (Hermes: `$HERMES_HOME`).
+    pub agent_home: Option<PathBuf>,
 }
 
 /// What `mneme init <agent>` should do — install (the default),
@@ -118,6 +143,22 @@ pub enum AgentError {
 /// `home_dir` instead of resolving it itself so tests can pass a
 /// tempdir; the CLI handler resolves via `dirs::home_dir()`.
 pub fn run(agent: Agent, mode: InstallMode, home_dir: &std::path::Path) -> Result<(), AgentError> {
+    run_with_options(agent, mode, home_dir, &InstallOptions::default())
+}
+
+/// [`run`] with [`InstallOptions`]. Errors if options are given for an
+/// agent that doesn't support them.
+pub fn run_with_options(
+    agent: Agent,
+    mode: InstallMode,
+    home_dir: &std::path::Path,
+    opts: &InstallOptions,
+) -> Result<(), AgentError> {
+    if agent != Agent::Hermes && *opts != InstallOptions::default() {
+        return Err(AgentError::Generic(
+            "--url, --token-env and --hermes-home only apply to `mneme init hermes`".into(),
+        ));
+    }
     match agent {
         Agent::ClaudeCode => claude_code::run(mode, home_dir),
         Agent::ClaudeDesktop => claude_desktop::run(mode, home_dir),
@@ -135,6 +176,7 @@ pub fn run(agent: Agent, mode: InstallMode, home_dir: &std::path::Path) -> Resul
             "release-planning §4.7 B.M4",
         )),
         Agent::OpenCode => opencode::run(mode, home_dir),
+        Agent::Hermes => hermes::run(mode, home_dir, opts),
     }
 }
 
