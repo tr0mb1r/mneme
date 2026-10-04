@@ -67,9 +67,14 @@ fn scaffold_only() -> Result<()> {
 }
 
 fn install_agent(agent: Agent, mode: InstallMode, opts: &InstallOptions) -> Result<()> {
-    let home = agents::default_home_dir().ok_or_else(|| {
-        MnemeError::Config("could not resolve home directory for agent install".into())
-    })?;
+    // An explicit agent home (`--hermes-home`) makes $HOME irrelevant;
+    // fall back to it so the install works as a UID with no passwd
+    // entry, e.g. a one-shot container writing into Hermes' volume.
+    let home = agents::default_home_dir()
+        .or_else(|| opts.agent_home.clone())
+        .ok_or_else(|| {
+            MnemeError::Config("could not resolve home directory for agent install".into())
+        })?;
     agents::run_with_options(agent, mode, &home, opts)
         .map_err(|e| MnemeError::Config(e.to_string()))
 }

@@ -10,9 +10,10 @@
 ## What it is
 
 Mneme is a persistent memory tool for AI agents. It runs as a long-lived
-process on your machine, exposes its functionality via the Model Context
-Protocol (MCP), and lets any compatible agent — Claude Desktop, Claude
-Code, Cursor, Cline, Aider — remember things across sessions.
+process on your machine (or as a container), exposes its functionality
+via the Model Context Protocol (MCP), and lets any compatible agent —
+Claude Desktop, Claude Code, Cursor, OpenCode, Hermes Agent, Cline,
+Aider — remember things across sessions.
 
 The clearest one-line description: **Mneme remembers things about your
 work that the agent would otherwise forget.**
@@ -22,7 +23,9 @@ work that the agent would otherwise forget.**
 - A vector database (it uses one internally, but that's an implementation detail)
 - A RAG framework
 - A codebase indexer (modern agents read code with shell tools — that's not Mneme's job)
-- A web service or SaaS
+- A hosted service or SaaS (`mneme serve` exposes MCP over HTTP for
+  agents in neighbouring containers, but it's still your process on
+  your machine)
 - A library to embed in another application
 - An LLM
 
@@ -30,6 +33,13 @@ work that the agent would otherwise forget.**
 
 - **Claude Code** — see [`docs/CLAUDE_CODE_SETUP.md`](docs/CLAUDE_CODE_SETUP.md)
   for the full guide (recommended path for terminal users).
+- **Hermes Agent** (bare metal or Docker Compose) — see
+  [`docs/HERMES_SETUP.md`](docs/HERMES_SETUP.md); `mneme init hermes`
+  does the wiring, and [`deploy/compose/hermes/`](deploy/compose/hermes/)
+  is a ready-made mneme + Hermes stack.
+- **Containers / remote agents** — `mneme serve` speaks MCP Streamable
+  HTTP with bearer-token auth; the repo's [`Dockerfile`](Dockerfile)
+  runs it. See the [CLI surface](book/src/cli.md#mode-c--network-service-mneme-serve).
 - **Claude Desktop / other MCP hosts** — see
   [Smoke-testing the MCP server](#smoke-testing-the-mcp-server) below.
 - **Understanding what mneme actually stores** — see
@@ -38,9 +48,9 @@ work that the agent would otherwise forget.**
   schedules.
 - **What isn't built yet** — see
   [`book/src/roadmap.md`](book/src/roadmap.md). Notably: **on Windows
-  only `mneme run` works** — `mneme daemon`, `mneme client`, and
-  `mneme stop` need Unix domain sockets, so configure your MCP host
-  with `args: ["run"]` there.
+  only `mneme run` and `mneme serve` work** — `mneme daemon`,
+  `mneme client`, and `mneme stop` need Unix domain sockets, so
+  configure your MCP host with `args: ["run"]` there.
 
 ## What works today
 
@@ -78,6 +88,10 @@ widens the HNSW probe so **filtered `recall` stops underfilling**, adds
 advisory on `remember`, `resources/templates/list`, and behaviour-hint
 annotations and titles on every tool — see
 [`book/src/release-notes-v1_3.md`](book/src/release-notes-v1_3.md).
+Unreleased: a **Streamable HTTP transport** (`mneme serve`, or
+`[http] enabled` on the daemon) so agents in other containers can
+connect, a `Dockerfile`, and **`mneme init hermes`** for Hermes Agent
+(local `mneme client` or remote `--url`).
 Optional Claude Code lifecycle hooks
 (`SessionStart`/`PreCompact`/`Stop`) are documented in
 [`docs/CLAUDE_CODE_SETUP.md`](docs/CLAUDE_CODE_SETUP.md) §7 with

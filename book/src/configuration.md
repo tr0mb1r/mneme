@@ -53,6 +53,14 @@ transport = "stdio"
 idle_timeout_minutes = 30
 log_level            = "default"
 
+[http]
+enabled              = false
+bind                 = "127.0.0.1:7878"
+token_file           = ""
+allowed_origins      = []
+max_sessions         = 256
+session_idle_minutes = 1440
+
 [logging]
 level       = "info"
 file        = "~/.mneme/logs/mneme.log"
@@ -72,7 +80,7 @@ someone a knob that does nothing is worse than omitting it.
 | Setting | What it actually does |
 |---|---|
 | `[storage] encryption` | Nothing. Encryption is gated by the presence of `~/.mneme/keystore.json` — run `mneme encrypt`. |
-| `[mcp] sse_port` | Nothing. No SSE / HTTP transport exists; `[mcp] transport` isn't consulted either. |
+| `[mcp] sse_port` | Nothing. Superseded by [`[http] bind`](#http--streamable-http-listener); `[mcp] transport` isn't consulted either. |
 | `[telemetry] enabled` / `endpoint` | Nothing. There is no telemetry subsystem, and no code path in the binary makes a network call. |
 
 If you have these in your config, you can delete them or leave them —
@@ -501,15 +509,13 @@ threshold.
 | **Type** | string |
 | **Default** | `"stdio"` |
 | **Valid** | `"stdio"` |
-| **Affects** | how `mneme run` speaks (does NOT affect `mneme daemon`) |
+| **Affects** | nothing (informational) |
 
-`mneme run` ships stdio only — JSON-RPC framed line-delimited JSON
-over stdin/stdout, the standard MCP local-tool transport. `mneme
-daemon` (the v1.1 default entry point) speaks the same line-
-delimited JSON over a Unix domain socket at
-`~/.mneme/run/mneme.sock` and is not configurable via this field.
-SSE event-stream framing for the daemon transport is deferred per
-ADR-0012 amendment A1.
+The transport is chosen by the command, not by this field: `mneme run`
+speaks line-delimited JSON over stdin/stdout; `mneme daemon` speaks the
+same over a Unix domain socket at `~/.mneme/run/mneme.sock` (plus
+Streamable HTTP when [`[http] enabled`](#http--streamable-http-listener));
+`mneme serve` speaks Streamable HTTP only.
 
 ### `sse_port`
 
@@ -519,8 +525,9 @@ ADR-0012 amendment A1.
 | **Default** | `7878` |
 | **Affects** | nothing |
 
-Reserved for a future SSE / Streamable HTTP transport. Setting it today
-is a no-op, and `mneme init` no longer writes it. See
+Superseded by [`[http] bind`](#http--streamable-http-listener), which
+configures the Streamable HTTP transport. Setting it is a no-op, and
+`mneme init` no longer writes it. See
 [Reserved settings](#reserved-settings).
 
 ---
@@ -565,6 +572,93 @@ Daemon-only log level override. Falls back to the global
 `[logging] level` when set to `"default"`. Lets you turn the daemon
 up to `debug` while leaving CLI tools (`mneme stats`,
 `mneme inspect`, etc.) at the global level.
+
+---
+
+## `[http]` — Streamable HTTP listener
+
+MCP over HTTP, for agents that connect over the network instead of
+spawning `mneme client` — typically an agent in another container.
+`mneme serve` always runs this listener; `mneme daemon` runs it next
+to the Unix socket only when `enabled = true`. Every key except
+`enabled`, `max_sessions` and `session_idle_minutes` has an
+environment override, so a container can run with no config file.
+Endpoints and the security model are described in
+[Setting up with Hermes Agent](./hermes-setup.md#the-http-transport).
+
+### `enabled`
+
+| | |
+|---|---|
+| **Type** | bool |
+| **Default** | `false` |
+| **Affects** | `mneme daemon` only |
+
+Also open the HTTP listener when running `mneme daemon`, so one process
+serves bare-metal agents over the socket and remote ones over HTTP.
+While it's on, `[daemon] idle_timeout_minutes` is ignored: HTTP clients
+aren't counted as connected, so the daemon would otherwise stop under
+an active HTTP agent. `mneme serve` ignores this key.
+
+### `bind`
+
+| | |
+|---|---|
+| **Type** | string, `ip:port` |
+| **Default** | `"127.0.0.1:7878"` |
+| **Override** | `MNEME_HTTP_BIND`, or `mneme serve --bind` |
+
+Address to listen on. Must be an IP address, not a hostname. Loopback
+by default; inside a container use `0.0.0.0:7878` (the image sets
+this). mneme serves plain HTTP: only listen beyond loopback on a
+private network, or behind a TLS-terminating proxy.
+
+### `token_file`
+
+| | |
+|---|---|
+| **Type** | string (path) |
+| **Default** | `""` (= `~/.mneme/run/auth.token`) |
+| **Override** | `MNEME_HTTP_TOKEN` (the value), `MNEME_HTTP_TOKEN_FILE` (a path) |
+
+Where the bearer token comes from. Precedence: `MNEME_HTTP_TOKEN`, then
+`MNEME_HTTP_TOKEN_FILE`, then this key, then the daemon's own
+`~/.mneme/run/auth.token` (created if missing). Files are re-read on
+every request, so rotating the token (`mneme auth rotate` for the
+default file) needs no restart. Surrounding whitespace is ignored.
+
+### `allowed_origins`
+
+| | |
+|---|---|
+| **Type** | list of strings |
+| **Default** | `[]` |
+| **Override** | `MNEME_HTTP_ALLOWED_ORIGINS` (comma-separated) |
+
+Browser `Origin` values to accept, matched exactly; `"*"` accepts any.
+A request that carries an `Origin` header not on this list gets `403`
+(DNS-rebinding protection). Agents don't send `Origin`, so leave it
+empty unless a browser-based client needs access.
+
+### `max_sessions`
+
+| | |
+|---|---|
+| **Type** | unsigned integer |
+| **Default** | `256` |
+
+Cap on concurrently open MCP sessions. An `initialize` beyond it gets
+`503`.
+
+### `session_idle_minutes`
+
+| | |
+|---|---|
+| **Type** | unsigned integer (minutes) |
+| **Default** | `1440` (24 h) |
+
+Sessions with no traffic for this long are dropped. A client that comes
+back gets `404` and re-initializes, as the MCP spec prescribes.
 
 ---
 
@@ -645,7 +739,7 @@ Older logs beyond this count are deleted on each rotation.
 
 ## Environment overrides
 
-Two environment variables override config fields at boot. They're
+These environment variables override config fields at boot. They're
 intended for cross-cutting use (per-project isolation, offline CI),
 not for everyday tuning — use the config file for that.
 
@@ -675,6 +769,16 @@ MNEME_EMBEDDER=stub mneme run     # offline, ~10 ms cold start
 Stored vectors under `MNEME_EMBEDDER=stub` are **not portable** to
 the real models — switching back will trigger a re-embed migration
 on the next boot.
+
+### `MNEME_HTTP_*`
+
+`MNEME_HTTP_BIND`, `MNEME_HTTP_TOKEN`, `MNEME_HTTP_TOKEN_FILE`, and
+`MNEME_HTTP_ALLOWED_ORIGINS` override the matching
+[`[http]`](#http--streamable-http-listener) keys. Built for containers:
+
+```sh
+docker run -e MNEME_HTTP_TOKEN=... -v mneme-data:/data mneme   # binds 0.0.0.0:7878
+```
 
 ---
 

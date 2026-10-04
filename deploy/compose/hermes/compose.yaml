@@ -1,0 +1,82 @@
+# mneme + Hermes Agent on one Compose network.
+#
+#   cp .env.example .env                   # then set MNEME_HTTP_TOKEN
+#   docker compose up -d --wait mneme      # first boot downloads the model
+#   docker compose up -d hermes            # seeds config.yaml + SOUL.md
+#   docker compose run --rm hermes-setup   # wire mneme into Hermes
+#   docker compose restart hermes
+#
+# Hermes reaches mneme at http://mneme:7878/mcp over the private
+# network; nothing is published on the host unless you uncomment the
+# `ports:` below. Both services read the same MNEME_HTTP_TOKEN from
+# .env: mneme to check it, Hermes to send it (its config.yaml only
+# references ${MNEME_HTTP_TOKEN}, never the value).
+
+name: mneme-hermes
+
+services:
+  mneme:
+    image: ${MNEME_IMAGE:-mneme:local}
+    build:
+      context: ../../..
+    restart: unless-stopped
+    command: ["serve"]
+    environment:
+      MNEME_HTTP_BIND: 0.0.0.0:7878
+      MNEME_HTTP_TOKEN: ${MNEME_HTTP_TOKEN:?set MNEME_HTTP_TOKEN in .env}
+      # Only needed if you enable encryption at rest: containers have no
+      # OS keyring, so the recovery phrase unlocks the store at boot.
+      # MNEME_RECOVERY_PHRASE: ${MNEME_RECOVERY_PHRASE}
+    volumes:
+      - mneme-data:/data
+    networks: [agents]
+    healthcheck:
+      # Same probe as the image's HEALTHCHECK, with room for the first
+      # boot's model download (~1.5 GB for bge-m3).
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/7878 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
+      interval: 15s
+      timeout: 5s
+      start_period: 15m
+      retries: 3
+    # Publish on the host only if something outside Compose needs it:
+    # ports:
+    #   - "127.0.0.1:7878:7878"
+
+  hermes:
+    image: ${HERMES_IMAGE:-nousresearch/hermes-agent:latest}
+    restart: unless-stopped
+    command: ["gateway", "run"]
+    depends_on:
+      mneme:
+        condition: service_healthy
+    environment:
+      HERMES_UID: ${HERMES_UID:-10000}
+      HERMES_GID: ${HERMES_GID:-10000}
+      # Resolved by Hermes when it expands ${MNEME_HTTP_TOKEN} in the
+      # mcp_servers.mneme Authorization header.
+      MNEME_HTTP_TOKEN: ${MNEME_HTTP_TOKEN:?set MNEME_HTTP_TOKEN in .env}
+    volumes:
+      - ${HERMES_DATA:-./hermes-data}:/opt/data
+    networks: [agents]
+
+  # One-shot: writes mcp_servers.mneme, the mneme skill, and (once
+  # Hermes has seeded SOUL.md) the memory block into Hermes' data dir.
+  # Runs as Hermes' UID so the files stay owned by Hermes. Run it after
+  # Hermes' first start so SOUL.md exists:
+  #   docker compose run --rm hermes-setup
+  #   docker compose run --rm hermes-setup --uninstall   # to reverse
+  hermes-setup:
+    image: ${MNEME_IMAGE:-mneme:local}
+    profiles: ["setup"]
+    user: "${HERMES_UID:-10000}:${HERMES_GID:-10000}"
+    entrypoint: ["mneme", "init", "hermes", "--hermes-home", "/opt/data", "--url", "http://mneme:7878/mcp"]
+    command: ["--upgrade"]
+    volumes:
+      - ${HERMES_DATA:-./hermes-data}:/opt/data
+    network_mode: none
+
+volumes:
+  mneme-data:
+
+networks:
+  agents:

@@ -16,12 +16,11 @@ through MCP.
 Default data directory is `~/.mneme/` (override with `MNEME_DATA_DIR` —
 see [Configuration](./configuration.md#environment-overrides)).
 
-## Two MCP server modes: `daemon` vs `run`
+## MCP server modes: `daemon`, `run`, `serve`
 
-mneme ships **two interchangeable MCP server entry points**, plus a
-thin per-agent bridge. Pick the one that matches your install shape;
-both serve the same MCP surface against the same `~/.mneme/` data
-directory.
+mneme ships **three MCP server entry points**, plus a thin per-agent
+bridge. Pick the one that matches your install shape; all serve the
+same MCP surface against the same `~/.mneme/` data directory.
 
 ### Mode A — daemon mode (v1.1 default)
 
@@ -85,6 +84,36 @@ or daemonization are awkward (CI, sandbox, container shell);
 debugging — `mneme run </dev/null` reproduces an MCP boot
 end-to-end without needing a daemon to be up.
 
+### Mode C — network service (`mneme serve`)
+
+```
+Hermes (container) ─HTTP─┐
+other MCP client  ─HTTP─┼─▶  mneme serve :7878/mcp  ─▶  /data (or ~/.mneme/)
+                         │
+          (bearer token on every request; many sessions)
+```
+
+- **`mneme serve [--bind host:port]`** speaks MCP Streamable HTTP
+  (protocol `2025-06-18`): `POST /mcp` per JSON-RPC message, an
+  `Mcp-Session-Id` per client, `DELETE /mcp` to end a session,
+  `GET /healthz` for liveness. Foreground, no idle timeout, holds the
+  lockfile like the other modes. This is the container entry point
+  (the repo's `Dockerfile` runs it).
+- Every `/mcp` request needs `Authorization: Bearer <token>`. The token
+  comes from `MNEME_HTTP_TOKEN`, `MNEME_HTTP_TOKEN_FILE`,
+  `[http] token_file`, or `~/.mneme/run/auth.token`.
+- **`mneme daemon` can do both**: with `[http] enabled = true` it opens
+  the same HTTP listener next to the Unix socket, so bare-metal agents
+  keep using `mneme client` while a containerised one uses HTTP.
+- Settings and the security model: [Configuration →
+  `[http]`](./configuration.md#http--streamable-http-listener) and
+  [Setting up with Hermes Agent](./hermes-setup.md#the-http-transport).
+
+**Pick this mode when:** the agent runs in another container or on
+another host and can't spawn `mneme client`; you want mneme as a
+standalone service with its own lifecycle; you're on Windows and want
+several hosts to share one server.
+
 ### Decision matrix
 
 | Question | If yes, prefer |
@@ -95,6 +124,7 @@ end-to-end without needing a daemon to be up.
 | Restricted shell / CI / sandbox without socket support? | run |
 | Debugging mneme itself end-to-end on stdin? | run |
 | Want `mneme init claude-code`'s default? | daemon + client |
+| Agent in another container / on another host? | serve (or daemon with `[http] enabled`) |
 
 ### What `mneme client` is NOT
 
@@ -118,18 +148,21 @@ end-to-end without needing a daemon to be up.
 | `mneme init claude-code` (v1.1 default) | `["client"]` | One daemon, many clients. Token reference by path. |
 | `claude mcp add … mneme client` (manual, daemon mode) | `["client"]` | Same shape, hand-rolled. |
 | `claude mcp add … mneme run` (manual, fallback) | `["run"]` | Single-host stdio. No daemon, no socket, no token file. |
+| `mneme init hermes --url http://mneme:7878/mcp` | — (`url` + `headers`) | Streamable HTTP to `mneme serve`. The header references `${MNEME_HTTP_TOKEN}`; the value stays out of the config. |
 
-## Subcommands (17)
+## Subcommands (18)
 
 ### Lifecycle
 
 | Subcommand | What it does |
 |------------|--------------|
 | `mneme init` | Scaffold `~/.mneme/` (config, schema_version, directory layout) and run the schema migration to the binary's `CURRENT_SCHEMA_VERSION`. Idempotent — safe to rerun; only fills in missing pieces. Writes `config.toml` if absent; leaves an existing file alone. |
-| `mneme init <agent> [--upgrade\|--uninstall\|--show]` | v1.1 per-agent installer per ADR-0012 / release-planning §4. `<agent>` ∈ {`claude-code`, `claude-desktop`, `cursor`, `opencode`, `cline`, `codex`, `gemini-cli`}. Today `claude-code`, `claude-desktop`, `cursor`, and `opencode` ship fully wired; the others return `NotYetImplemented` with a tracked task pointer until each integration is validated end-to-end on a real install. Atomic (tmpfile + fsync + rename per file), idempotent (re-run is byte-identical), reversible (`--uninstall` removes mneme-owned files + entries while preserving every other key in the user's config files). `--show` previews the plan without writing. |
+| `mneme init <agent> [--upgrade\|--uninstall\|--show]` | v1.1 per-agent installer per ADR-0012 / release-planning §4. `<agent>` ∈ {`claude-code`, `claude-desktop`, `cursor`, `opencode`, `hermes`, `cline`, `codex`, `gemini-cli`}. Today `claude-code`, `claude-desktop`, `cursor`, `opencode`, and `hermes` ship fully wired; the others return `NotYetImplemented` with a tracked task pointer until each integration is validated end-to-end on a real install. Atomic (tmpfile + fsync + rename per file), idempotent (re-run is byte-identical), reversible (`--uninstall` removes mneme-owned files + entries while preserving every other key in the user's config files). `--show` previews the plan without writing. |
 | `mneme daemon [--foreground]` | **v1.1 default MCP server entry point** per ADR-0012. Binds `~/.mneme/run/mneme.sock` (Unix domain socket on macOS / Linux; Windows named pipe lands in M4), accepts multiple MCP clients concurrently, gates each connection on the auth handshake (`MNEME-AUTH: <token>\n` per ADR-0012 D3), serves them via `tokio::spawn` per connection. Acquires `~/.mneme/.lock` for the lifetime of the process. Storage writes serialise through the single-writer seam (D8). Auto-shuts-down after `[daemon].idle_timeout_minutes` (default 30; `0` disables) of no clients. SIGTERM drains in-flight clients up to 30 s before runtime tears them down. Emits `session_start` on boot and `session_end` on graceful exit (ADR-0009). **Self-detaches by default** (D9): the parent spawns a detached child, prints the child PID to stdout, and exits 0 — the shell prompt returns immediately and Ctrl-C in the spawning shell does not kill the daemon. Pass `--foreground` to skip self-detach (right for systemd / launchd unit files and for debugging). Stop a detached daemon with `mneme stop` or `kill <pid>`. |
 | `mneme client` | **Per-agent stdio↔socket bridge** (v1.1). MCP hosts (Claude Code, Claude Desktop, Cursor, …) spawn this as their per-session subprocess. It reads `~/.mneme/run/auth.token`, opens the socket, writes the `MNEME-AUTH:` handshake, then byte-pipes stdin↔socket and socket↔stdout until either side closes. Holds no lockfile, parses no MCP frames, emits no lifecycle events — pure transport adapter. The token value never lands in any agent config file (Invariant 3). |
 | `mneme run` | **Single-host MCP server fallback.** Speaks JSON-RPC over stdio against MCP `2025-06-18`. Acquires `~/.mneme/.lock` for the lifetime of the process; refuses to boot if another instance holds it. Right pick when the host spawns mneme directly with no shared daemon (debugging, restricted environments, CI/test). For multi-session sharing, use `mneme daemon` + `mneme client` instead. SIGTERM / Ctrl-C / SIGINT are treated as a clean exit. Same `session_start`/`session_end` emit semantics as `mneme daemon` — both share the boot path via `execute_with_mode`. |
+| `mneme serve [--bind <host:port>]` | **Network MCP server** (Streamable HTTP, MCP `2025-06-18`). Listens on `--bind`, else `MNEME_HTTP_BIND`, else `[http] bind` (default `127.0.0.1:7878`). `POST /mcp` per JSON-RPC message with `Authorization: Bearer <token>`; `initialize` returns `Mcp-Session-Id`; `DELETE /mcp` ends a session; unauthenticated `GET /healthz` for health checks. Foreground, no idle timeout; acquires `~/.mneme/.lock` like `run` / `daemon`. The container entry point. |
+| `mneme init hermes [--url <url> [--token-env <VAR>]] [--hermes-home <dir>]` | Hermes Agent installer. Without `--url`: `mcp_servers.mneme` spawns `mneme client`. With `--url`: a Streamable HTTP entry whose `Authorization` header references `${MNEME_HTTP_TOKEN}` (or `--token-env`). Also installs the `mneme` skill and, if `SOUL.md` exists, a marker block in it. Edits `config.yaml` line by line so comments survive. `--hermes-home` overrides `$HERMES_HOME` / `~/.hermes`. |
 | `mneme stop` | Find the running server via the lockfile, send SIGTERM, and wait up to 10 s for it to drop the lock. Stale lockfile (PID no longer running) is cleaned up automatically. Exits 0 on either path; non-zero only if the process is alive but won't exit within the timeout. Works for both `mneme daemon` and `mneme run`. |
 | `mneme demo` | Print a 4-pattern walkthrough of the v1.1 memory surface (cross-session recall, `record_event`, `pin`, `mneme://context`). Pure text — pair with a real Claude Code / Claude Desktop session to see the patterns work end-to-end. Complements `mneme init <agent>`'s post-install prompt for users who want to come back to the patterns later. |
 
