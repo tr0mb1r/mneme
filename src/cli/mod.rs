@@ -82,6 +82,21 @@ pub enum Command {
         /// do?" before committing.
         #[arg(long, conflicts_with_all = ["upgrade", "uninstall"])]
         show: bool,
+        /// hermes only: connect to a remote mneme over Streamable HTTP
+        /// instead of spawning `mneme client`, e.g.
+        /// `http://mneme:7878/mcp` when both run in one Compose network.
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// hermes only, with --url: environment variable Hermes reads
+        /// the bearer token from (default `MNEME_HTTP_TOKEN`). The
+        /// config references it as `${VAR}`; the value is never written.
+        #[arg(long, value_name = "VAR", requires = "url")]
+        token_env: Option<String>,
+        /// hermes only: Hermes' home directory. Defaults to
+        /// `$HERMES_HOME`, then `~/.hermes`. Point it at the host
+        /// directory mounted as the container's `/opt/data`.
+        #[arg(long, value_name = "DIR")]
+        hermes_home: Option<PathBuf>,
     },
     /// Start the MCP server (stdio). Right pick when the host
     /// (Claude Desktop, Cursor, etc.) spawns mneme directly as a
@@ -241,7 +256,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             upgrade,
             uninstall,
             show,
-        } => init::execute(agent, upgrade, uninstall, show),
+            url,
+            token_env,
+            hermes_home,
+        } => init::execute(
+            agent,
+            upgrade,
+            uninstall,
+            show,
+            crate::init::agents::InstallOptions {
+                url,
+                token_env,
+                agent_home: hermes_home,
+            },
+        ),
         Command::Run => run::execute(),
         Command::Daemon { foreground } => daemon::execute(foreground),
         Command::Serve { bind } => run::execute_with_mode(run::TransportMode::Http { bind }),

@@ -11,14 +11,27 @@
 //!   and `--show` flags supported.
 
 use crate::config::Config;
-use crate::init::agents::{self, Agent, InstallMode};
+use crate::init::agents::{self, Agent, InstallMode, InstallOptions};
 use crate::storage::layout;
 use crate::{MnemeError, Result, migrate};
 use std::path::Path;
 
-pub fn execute(agent: Option<Agent>, upgrade: bool, uninstall: bool, show: bool) -> Result<()> {
+pub fn execute(
+    agent: Option<Agent>,
+    upgrade: bool,
+    uninstall: bool,
+    show: bool,
+    opts: InstallOptions,
+) -> Result<()> {
     match agent {
         None => {
+            if opts != InstallOptions::default() {
+                return Err(MnemeError::Config(
+                    "--url / --token-env / --hermes-home require an <agent> argument, \
+                     e.g. `mneme init hermes --url http://mneme:7878/mcp`"
+                        .into(),
+                ));
+            }
             // v1.0 behaviour: scaffold only. Reject the flags that
             // only make sense per-agent so the user gets a clear
             // error rather than silent ignore.
@@ -41,7 +54,7 @@ pub fn execute(agent: Option<Agent>, upgrade: bool, uninstall: bool, show: bool)
             } else {
                 InstallMode::Install
             };
-            install_agent(agent, mode)
+            install_agent(agent, mode, &opts)
         }
     }
 }
@@ -53,11 +66,12 @@ fn scaffold_only() -> Result<()> {
     init_at(&root)
 }
 
-fn install_agent(agent: Agent, mode: InstallMode) -> Result<()> {
+fn install_agent(agent: Agent, mode: InstallMode, opts: &InstallOptions) -> Result<()> {
     let home = agents::default_home_dir().ok_or_else(|| {
         MnemeError::Config("could not resolve home directory for agent install".into())
     })?;
-    agents::run(agent, mode, &home).map_err(|e| MnemeError::Config(e.to_string()))
+    agents::run_with_options(agent, mode, &home, opts)
+        .map_err(|e| MnemeError::Config(e.to_string()))
 }
 
 pub fn init_at(root: &Path) -> Result<()> {
