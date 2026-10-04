@@ -23,6 +23,8 @@ pub struct Config {
     #[serde(default)]
     pub daemon: DaemonConfig,
     #[serde(default)]
+    pub http: HttpConfig,
+    #[serde(default)]
     pub budgets: BudgetsConfig,
     #[serde(default)]
     pub checkpoints: CheckpointsConfig,
@@ -92,11 +94,11 @@ pub struct ScopesConfig {
 pub struct McpConfig {
     #[serde(default = "default_mcp_transport")]
     pub transport: String,
-    /// **Reserved — has no effect.** Port for a future SSE / Streamable
-    /// HTTP transport. Only `transport = "stdio"` is implemented, and
-    /// `transport` itself is not consulted. Accepted so existing
-    /// `config.toml` files keep loading; `mneme init` no longer writes
-    /// it. Tracked in `book/src/roadmap.md`.
+    /// **Reserved — has no effect.** Superseded by `[http] bind`, which
+    /// configures the Streamable HTTP transport. `transport` itself is
+    /// informational: the command (`run` / `daemon` / `serve`) picks the
+    /// transport. Both keys are accepted so existing `config.toml` files
+    /// keep loading; `mneme init` no longer writes `sse_port`.
     #[serde(default = "default_sse_port")]
     pub sse_port: u16,
 }
@@ -122,6 +124,38 @@ pub struct DaemonConfig {
     /// binary chatty.
     #[serde(default = "default_daemon_log_level")]
     pub log_level: String,
+}
+
+/// `[http]` — the MCP Streamable HTTP listener. `mneme serve` always
+/// runs it; `mneme daemon` runs it next to the Unix socket only when
+/// `enabled = true`. Each field can be overridden from the environment
+/// (`MNEME_HTTP_BIND`, `MNEME_HTTP_TOKEN` / `MNEME_HTTP_TOKEN_FILE`,
+/// `MNEME_HTTP_ALLOWED_ORIGINS`) so a container needs no config file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HttpConfig {
+    /// Also open the HTTP listener when running `mneme daemon`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `host:port` to listen on. Loopback by default; a container
+    /// sets `0.0.0.0:7878` so other services on its network can reach it.
+    #[serde(default = "default_http_bind")]
+    pub bind: String,
+    /// File holding the bearer token clients must send. Empty means
+    /// `<data_dir>/run/auth.token` (the daemon's token, created on
+    /// first use). `$MNEME_HTTP_TOKEN` beats both.
+    #[serde(default)]
+    pub token_file: String,
+    /// Browser `Origin` values to accept. Agents don't send `Origin`;
+    /// leave empty unless a browser-based client needs access.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    /// Cap on concurrently open MCP sessions.
+    #[serde(default = "default_http_max_sessions")]
+    pub max_sessions: usize,
+    /// Drop sessions with no traffic for this many minutes. Clients
+    /// then re-initialize transparently.
+    #[serde(default = "default_http_session_idle_minutes")]
+    pub session_idle_minutes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -227,6 +261,15 @@ fn default_daemon_idle_timeout_minutes() -> u64 {
 fn default_daemon_log_level() -> String {
     "default".into()
 }
+fn default_http_bind() -> String {
+    "127.0.0.1:7878".into()
+}
+fn default_http_max_sessions() -> usize {
+    256
+}
+fn default_http_session_idle_minutes() -> u64 {
+    24 * 60
+}
 fn default_session_interval_secs() -> u64 {
     30
 }
@@ -315,6 +358,18 @@ impl Default for DaemonConfig {
         Self {
             idle_timeout_minutes: default_daemon_idle_timeout_minutes(),
             log_level: default_daemon_log_level(),
+        }
+    }
+}
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_http_bind(),
+            token_file: String::new(),
+            allowed_origins: Vec::new(),
+            max_sessions: default_http_max_sessions(),
+            session_idle_minutes: default_http_session_idle_minutes(),
         }
     }
 }
@@ -451,6 +506,17 @@ impl Config {
         let schedule = toml_value(&self.consolidation.schedule);
         let transport = toml_value(&self.mcp.transport);
         let daemon_log_level = toml_value(&self.daemon.log_level);
+        let http_bind = toml_value(&self.http.bind);
+        let http_token_file = toml_value(&self.http.token_file);
+        let http_allowed_origins = format!(
+            "[{}]",
+            self.http
+                .allowed_origins
+                .iter()
+                .map(|o| toml_value(o))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         let log_level = toml_value(&self.logging.level);
         format!(
             r#"# mneme configuration. Every value below is the built-in
@@ -514,7 +580,9 @@ auto_context_token_budget = {auto_context_token_budget}
 max_remember_chars = {max_remember_chars}
 
 [mcp]
-# Only "stdio" is implemented.
+# Informational. Transports are picked by command: `mneme run`
+# (stdio), `mneme daemon` (Unix socket, plus HTTP when [http] enabled),
+# `mneme serve` (HTTP only).
 transport = {transport}
 
 [daemon]
@@ -523,6 +591,19 @@ idle_timeout_minutes = {idle_timeout_minutes}
 # "default" inherits [logging] level; set to e.g. "debug" to make just
 # the daemon verbose.
 log_level = {daemon_log_level}
+
+[http]
+# MCP Streamable HTTP listener, for agents that connect over the
+# network (e.g. another container). `mneme serve` always runs it;
+# `mneme daemon` runs it alongside the Unix socket when enabled.
+enabled = {http_enabled}
+bind = {http_bind}
+# Bearer-token file. Empty = <data_dir>/run/auth.token. The
+# MNEME_HTTP_TOKEN env var overrides it.
+token_file = {http_token_file}
+allowed_origins = {http_allowed_origins}
+max_sessions = {http_max_sessions}
+session_idle_minutes = {http_session_idle_minutes}
 
 [logging]
 level = {log_level}
@@ -550,6 +631,12 @@ max_files = {max_files}
             transport = transport,
             idle_timeout_minutes = self.daemon.idle_timeout_minutes,
             daemon_log_level = daemon_log_level,
+            http_enabled = self.http.enabled,
+            http_bind = http_bind,
+            http_token_file = http_token_file,
+            http_allowed_origins = http_allowed_origins,
+            http_max_sessions = self.http.max_sessions,
+            http_session_idle_minutes = self.http.session_idle_minutes,
             log_level = log_level,
             log_file = log_file,
             max_size_mb = self.logging.max_size_mb,
@@ -580,6 +667,12 @@ mod tests {
         assert_eq!(c.budgets.max_remember_chars, 10_000);
         assert_eq!(c.daemon.idle_timeout_minutes, 30);
         assert_eq!(c.daemon.log_level, "default");
+        assert!(!c.http.enabled);
+        assert_eq!(c.http.bind, "127.0.0.1:7878");
+        assert_eq!(c.http.token_file, "");
+        assert!(c.http.allowed_origins.is_empty());
+        assert_eq!(c.http.max_sessions, 256);
+        assert_eq!(c.http.session_idle_minutes, 1440);
         assert_eq!(c.checkpoints.session_interval_secs, 30);
         assert_eq!(c.checkpoints.session_interval_turns, 5);
         assert_eq!(c.checkpoints.hnsw_snapshot_inserts, 1000);
@@ -672,6 +765,22 @@ mod tests {
     /// host's real defaults, so this fails on Linux and macOS too. The
     /// original `starter_template_matches_defaults` only caught it on a
     /// Windows runner, which is a whole CI round-trip too late.
+    /// `allowed_origins` is the only list-valued key in the template;
+    /// make sure a non-empty one renders as valid TOML.
+    #[test]
+    fn starter_template_round_trips_http_settings() {
+        let mut c = Config::default();
+        c.http.enabled = true;
+        c.http.bind = "0.0.0.0:9000".into();
+        c.http.token_file = "/run/secrets/mneme_token".into();
+        c.http.allowed_origins = vec!["http://localhost:3000".into(), "https://a\"b".into()];
+
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("config.toml");
+        c.write_starter(&p).unwrap();
+        assert_eq!(Config::load(&p).unwrap(), c);
+    }
+
     #[test]
     fn starter_template_survives_windows_style_paths() {
         let mut c = Config::default();
