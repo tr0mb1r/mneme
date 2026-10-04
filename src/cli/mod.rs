@@ -59,8 +59,8 @@ pub enum AuthCommand {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Scaffold `~/.mneme/`, or install mneme into a specific
-    /// agent (`claude-code`, `claude-desktop`, `cursor`, and
-    /// `opencode` are fully wired today; the remaining Tier-1
+    /// agent (`claude-code`, `claude-desktop`, `cursor`, `opencode`,
+    /// and `hermes` are fully wired today; the remaining Tier-1
     /// agents land per release-planning §4.7 B.M3-M4).
     Init {
         /// Target agent. Omit for v1.0 scaffold-only behaviour
@@ -112,6 +112,22 @@ pub enum Command {
         /// when debugging.
         #[arg(long)]
         foreground: bool,
+    },
+    /// Serve MCP over Streamable HTTP (`POST /mcp`) in the foreground.
+    /// The pick for containers: run mneme as its own service and point
+    /// agents in other containers at `http://<host>:7878/mcp`. Every
+    /// request must carry `Authorization: Bearer <token>`; the token
+    /// comes from `$MNEME_HTTP_TOKEN`, `$MNEME_HTTP_TOKEN_FILE`,
+    /// `[http] token_file`, or `~/.mneme/run/auth.token`. `GET /healthz`
+    /// is an unauthenticated liveness probe. Takes the same lockfile as
+    /// `run` / `daemon`; to serve HTTP and the Unix socket from one
+    /// process, set `[http] enabled = true` and use `mneme daemon`.
+    Serve {
+        /// `host:port` to listen on. Overrides `$MNEME_HTTP_BIND` and
+        /// `[http] bind` (default `127.0.0.1:7878`). Use `0.0.0.0:7878`
+        /// inside a container.
+        #[arg(long)]
+        bind: Option<String>,
     },
     /// Stdio↔unix-socket bridge to a running `mneme daemon`. Spawned
     /// by MCP hosts as their per-session subprocess; reads the auth
@@ -228,6 +244,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         } => init::execute(agent, upgrade, uninstall, show),
         Command::Run => run::execute(),
         Command::Daemon { foreground } => daemon::execute(foreground),
+        Command::Serve { bind } => run::execute_with_mode(run::TransportMode::Http { bind }),
         Command::Client => client::execute(),
         Command::Stats => stats::execute(),
         Command::Inspect { id, query } => inspect::execute(id, query),

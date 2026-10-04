@@ -54,6 +54,18 @@ pub(crate) const FAILED_MESSAGE_CAP: usize = 500;
 
 pub struct Server<R, W> {
     transport: StdioTransport<R, W>,
+    session: McpSession,
+}
+
+/// Transport-independent MCP protocol state for one client
+/// connection: the registries, the per-connection scope cell, the
+/// `initialized` latch, and every method handler.
+///
+/// [`Server`] pairs one of these with a newline-delimited stream
+/// transport (stdio / Unix socket). The Streamable HTTP transport
+/// (`crate::mcp::transport::http`) holds one per `Mcp-Session-Id`
+/// and feeds it one POST body at a time via [`McpSession::handle_frame`].
+pub struct McpSession {
     tools: Arc<ToolRegistry>,
     resources: Arc<ResourceRegistry>,
     /// Available to handlers; Phase 2 tools don't consume it yet (per
@@ -85,19 +97,13 @@ pub struct Server<R, W> {
     initialized: AtomicBool,
 }
 
-impl<R, W> Server<R, W>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
+impl McpSession {
     pub fn new(
-        transport: StdioTransport<R, W>,
         tools: Arc<ToolRegistry>,
         resources: Arc<ResourceRegistry>,
         storage: Arc<dyn Storage>,
     ) -> Self {
         Self {
-            transport,
             tools,
             resources,
             storage,
@@ -138,55 +144,45 @@ where
         self
     }
 
-    /// Run until the peer closes stdin (EOF) or sends `shutdown`.
-    pub async fn run(&mut self) -> anyhow::Result<()> {
-        loop {
-            let frame = match self.transport.read_frame().await {
-                Ok(f) => f,
-                Err(FrameError::Eof) => {
-                    tracing::info!("peer closed stdin, shutting down");
-                    return Ok(());
-                }
-                Err(FrameError::Oversize { cap }) => {
-                    tracing::warn!(cap, "discarded oversize frame");
-                    continue;
-                }
-                Err(FrameError::Io(e)) => return Err(e.into()),
-            };
-
-            match parse_inbound(&frame) {
-                Ok(Inbound::Request(req)) => {
-                    let resp = self.dispatch(req).await;
-                    self.send(&resp).await?;
-                }
-                Ok(Inbound::Notification(n)) => {
-                    if n.method == "notifications/initialized" {
-                        self.initialized.store(true, Ordering::SeqCst);
-                        tracing::info!("client signalled initialized");
-                    } else {
-                        tracing::debug!(method = %n.method, "ignoring notification");
-                    }
-                }
-                Ok(Inbound::Response(_)) => {
-                    tracing::debug!("ignoring unsolicited response (no client requests yet)");
-                }
-                Err(ParseError::InvalidJson(_)) => {
-                    let resp = Response::error(Id::Null, error_codes::PARSE_ERROR, "parse error");
-                    self.send(&resp).await?;
-                }
-                Err(e) => {
-                    let resp =
-                        Response::error(Id::Null, error_codes::INVALID_REQUEST, e.to_string());
-                    self.send(&resp).await?;
-                }
-            }
-        }
+    /// Whether the client has sent `notifications/initialized`.
+    pub fn is_initialized(&self) -> bool {
+        self.initialized.load(Ordering::SeqCst)
     }
 
-    async fn send(&self, resp: &Response) -> anyhow::Result<()> {
-        let bytes = serde_json::to_vec(resp)?;
-        self.transport.write_frame(&bytes).await?;
-        Ok(())
+    /// Process one inbound JSON-RPC frame. Returns the response to
+    /// send back, or `None` when the frame needs no reply
+    /// (notifications and client-side responses).
+    ///
+    /// Takes `&self` so a transport may run frames from the same
+    /// session concurrently; every piece of mutable state behind it
+    /// is atomic or internally synchronised.
+    pub async fn handle_frame(&self, frame: &[u8]) -> Option<Response> {
+        match parse_inbound(frame) {
+            Ok(Inbound::Request(req)) => Some(self.dispatch(req).await),
+            Ok(Inbound::Notification(n)) => {
+                if n.method == "notifications/initialized" {
+                    self.initialized.store(true, Ordering::SeqCst);
+                    tracing::info!("client signalled initialized");
+                } else {
+                    tracing::debug!(method = %n.method, "ignoring notification");
+                }
+                None
+            }
+            Ok(Inbound::Response(_)) => {
+                tracing::debug!("ignoring unsolicited response (no client requests yet)");
+                None
+            }
+            Err(ParseError::InvalidJson(_)) => Some(Response::error(
+                Id::Null,
+                error_codes::PARSE_ERROR,
+                "parse error",
+            )),
+            Err(e) => Some(Response::error(
+                Id::Null,
+                error_codes::INVALID_REQUEST,
+                e.to_string(),
+            )),
+        }
     }
 
     async fn dispatch(&self, req: Request) -> Response {
@@ -353,6 +349,72 @@ where
                 Response::error(id, error_codes::INTERNAL_ERROR, msg)
             }
         }
+    }
+}
+
+impl<R, W> Server<R, W>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    pub fn new(
+        transport: StdioTransport<R, W>,
+        tools: Arc<ToolRegistry>,
+        resources: Arc<ResourceRegistry>,
+        storage: Arc<dyn Storage>,
+    ) -> Self {
+        Self {
+            transport,
+            session: McpSession::new(tools, resources, storage),
+        }
+    }
+
+    /// See [`McpSession::with_scope_from_roots`].
+    pub fn with_scope_from_roots(mut self, enabled: bool) -> Self {
+        self.session = self.session.with_scope_from_roots(enabled);
+        self
+    }
+
+    /// See [`McpSession::with_session`].
+    pub fn with_session(
+        mut self,
+        session: Arc<ActiveSession>,
+        scheduler: Arc<CheckpointScheduler>,
+        episodic: Arc<EpisodicStore>,
+        scope_state: Arc<ScopeState>,
+    ) -> Self {
+        self.session = self
+            .session
+            .with_session(session, scheduler, episodic, scope_state);
+        self
+    }
+
+    /// Run until the peer closes stdin (EOF) or sends `shutdown`.
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        loop {
+            let frame = match self.transport.read_frame().await {
+                Ok(f) => f,
+                Err(FrameError::Eof) => {
+                    tracing::info!("peer closed stdin, shutting down");
+                    return Ok(());
+                }
+                Err(FrameError::Oversize { cap }) => {
+                    tracing::warn!(cap, "discarded oversize frame");
+                    continue;
+                }
+                Err(FrameError::Io(e)) => return Err(e.into()),
+            };
+
+            if let Some(resp) = self.session.handle_frame(&frame).await {
+                self.send(&resp).await?;
+            }
+        }
+    }
+
+    async fn send(&self, resp: &Response) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec(resp)?;
+        self.transport.write_frame(&bytes).await?;
+        Ok(())
     }
 }
 
@@ -703,8 +765,8 @@ mod tests {
         let transport = StdioTransport::new(input.as_bytes(), Vec::<u8>::new());
         let (tools, resources, storage, _tmp) = bare_registries();
         let mut server = Server::new(transport, tools, resources, storage);
-        server.scope_state = Some(Arc::clone(&scope_state));
-        server.derive_scope_from_roots = true;
+        server.session.scope_state = Some(Arc::clone(&scope_state));
+        server.session.derive_scope_from_roots = true;
         server.run().await.unwrap();
 
         assert_eq!(scope_state.current(), "billing-api");
@@ -728,7 +790,7 @@ mod tests {
         let transport = StdioTransport::new(input.as_bytes(), Vec::<u8>::new());
         let (tools, resources, storage, _tmp) = bare_registries();
         let mut server = Server::new(transport, tools, resources, storage);
-        server.scope_state = Some(Arc::clone(&scope_state));
+        server.session.scope_state = Some(Arc::clone(&scope_state));
         // derive_scope_from_roots left at its default of false.
         server.run().await.unwrap();
 
@@ -750,8 +812,8 @@ mod tests {
         let transport = StdioTransport::new(input.as_bytes(), Vec::<u8>::new());
         let (tools, resources, storage, _tmp) = bare_registries();
         let mut server = Server::new(transport, tools, resources, storage);
-        server.scope_state = Some(Arc::clone(&scope_state));
-        server.derive_scope_from_roots = true;
+        server.session.scope_state = Some(Arc::clone(&scope_state));
+        server.session.derive_scope_from_roots = true;
         server.run().await.unwrap();
 
         assert_eq!(scope_state.current(), "global");

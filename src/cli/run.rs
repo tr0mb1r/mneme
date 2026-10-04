@@ -1,5 +1,7 @@
 //! `mneme run` — load config, take the lockfile, open storage, start
-//! the MCP server on stdio.
+//! the MCP server on stdio. The same boot path backs `mneme daemon`
+//! (Unix socket, optionally plus HTTP) and `mneme serve` (HTTP only);
+//! only the [`TransportMode`] differs.
 //!
 //! Sequence on startup:
 //!   1. Resolve `~/.mneme/` (or env-overridden root).
@@ -20,7 +22,7 @@ use crate::Result;
 use crate::config::Config;
 use crate::embed::{self, Embedder};
 use crate::mcp::resources::ResourceRegistry;
-use crate::mcp::server::Server;
+use crate::mcp::server::{McpSession, Server};
 use crate::mcp::tools::ToolRegistry;
 use crate::mcp::transport::stdio::StdioTransport;
 use crate::memory::checkpoint_scheduler::{CheckpointScheduler, CheckpointSchedulerConfig};
@@ -106,6 +108,79 @@ pub enum TransportMode {
     /// no clients) and SSE keepalive (D7) land in following M3
     /// commits.
     DaemonServeMany,
+    /// MCP Streamable HTTP on a TCP port (`mneme serve`). Foreground,
+    /// multi-client, no idle timeout: built for containers, where a
+    /// service manager owns the lifecycle and agents in other
+    /// containers connect over the network. `bind` overrides
+    /// `$MNEME_HTTP_BIND` and `[http] bind`. Works on every platform,
+    /// so it is also the multi-client option on Windows.
+    Http { bind: Option<String> },
+}
+
+/// Environment overrides for `[http]`, read only at boot.
+pub const HTTP_BIND_ENV: &str = "MNEME_HTTP_BIND";
+pub const HTTP_TOKEN_ENV: &str = "MNEME_HTTP_TOKEN";
+pub const HTTP_TOKEN_FILE_ENV: &str = "MNEME_HTTP_TOKEN_FILE";
+pub const HTTP_ALLOWED_ORIGINS_ENV: &str = "MNEME_HTTP_ALLOWED_ORIGINS";
+
+/// Resolve the HTTP listener settings. Precedence, highest first:
+/// `bind_override` (the `--bind` flag), environment, `[http]`, defaults.
+///
+/// Token: `$MNEME_HTTP_TOKEN` (literal), then `$MNEME_HTTP_TOKEN_FILE`,
+/// then `[http] token_file`, then the daemon's `<root>/run/auth.token`,
+/// generated if absent. `env` is injected so tests don't have to mutate
+/// the process environment.
+pub(crate) fn resolve_http_options(
+    cfg: &crate::config::HttpConfig,
+    root: &std::path::Path,
+    bind_override: Option<&str>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<crate::mcp::transport::http::HttpOptions> {
+    use crate::mcp::transport::http::{HttpOptions, TokenSource};
+
+    let env_nonempty = |k: &str| env(k).filter(|v| !v.trim().is_empty());
+
+    let bind_str = bind_override
+        .map(str::to_owned)
+        .or_else(|| env_nonempty(HTTP_BIND_ENV))
+        .unwrap_or_else(|| cfg.bind.clone());
+    let bind: std::net::SocketAddr = bind_str.trim().parse().map_err(|e| {
+        MnemeError::Config(format!(
+            "invalid HTTP bind address {bind_str:?} (expected host:port, e.g. 0.0.0.0:7878): {e}"
+        ))
+    })?;
+
+    let token = if let Some(t) = env_nonempty(HTTP_TOKEN_ENV) {
+        TokenSource::Static(t)
+    } else if let Some(f) = env_nonempty(HTTP_TOKEN_FILE_ENV) {
+        TokenSource::File(f.trim().into())
+    } else if !cfg.token_file.trim().is_empty() {
+        TokenSource::File(cfg.token_file.trim().into())
+    } else {
+        let path = crate::daemon::auth::ensure_token(root)
+            .map_err(|e| MnemeError::Config(format!("ensure auth token: {e}")))?;
+        TokenSource::File(path)
+    };
+
+    let allowed_origins = match env(HTTP_ALLOWED_ORIGINS_ENV) {
+        Some(v) => v
+            .split(',')
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        None => cfg.allowed_origins.clone(),
+    };
+
+    Ok(HttpOptions {
+        bind,
+        token,
+        allowed_origins,
+        max_sessions: cfg.max_sessions,
+        session_idle_ttl: std::time::Duration::from_secs(
+            cfg.session_idle_minutes.max(1).saturating_mul(60),
+        ),
+    })
 }
 
 pub fn execute() -> Result<()> {
@@ -267,6 +342,24 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     // its handshake can re-read the current token bytes.
     let daemon_root = Arc::new(root.clone());
 
+    // HTTP listener settings: always for `mneme serve`, and for the
+    // daemon when `[http] enabled`. Resolved here so a bad bind
+    // address or unreadable token setting fails before any serving.
+    let http = match &mode {
+        TransportMode::Http { bind } => Some(resolve_http_options(
+            &config.http,
+            &root,
+            bind.as_deref(),
+            |k| std::env::var(k).ok(),
+        )?),
+        TransportMode::DaemonServeMany if config.http.enabled => {
+            Some(resolve_http_options(&config.http, &root, None, |k| {
+                std::env::var(k).ok()
+            })?)
+        }
+        _ => None,
+    };
+
     // First-boot upgrade audit (release-planning §5.3, Invariant 7).
     // Scans L4 once for memories above max_remember_chars and writes
     // a passive summary to ~/.mneme/diagnostics.log so users
@@ -375,6 +468,7 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
                 max_remember_chars,
                 daemon_idle_timeout_minutes,
                 daemon_root,
+                http,
             },
         ))
         .map_err(|e| MnemeError::Mcp(format!("server exited with error: {e}")));
@@ -464,6 +558,9 @@ struct DaemonRuntimeConfig {
     max_remember_chars: usize,
     daemon_idle_timeout_minutes: u64,
     daemon_root: Arc<std::path::PathBuf>,
+    /// Streamable HTTP listener settings; `Some` for `mneme serve` and
+    /// for a daemon with `[http] enabled`.
+    http: Option<crate::mcp::transport::http::HttpOptions>,
 }
 
 async fn async_main(
@@ -505,13 +602,15 @@ async fn async_main(
         max_remember_chars,
         daemon_idle_timeout_minutes,
         daemon_root,
+        http,
     } = cfg;
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         protocol = crate::mcp::PROTOCOL_VERSION,
         embed_dim = semantic.dim(),
-        "mneme MCP server starting on stdio"
+        transport = ?mode,
+        "mneme MCP server starting"
     );
 
     // ADR-0009 — emit `session_start` to L3 before serving traffic so
@@ -618,6 +717,63 @@ async fn async_main(
         }
     };
 
+    // Builds one fully wired `McpSession` per HTTP `initialize`. Same
+    // SEC-001 rule as the daemon's accept loop: a fresh `ScopeState`
+    // per session so one agent's `switch_scope` can't leak into
+    // another's, with the backing stores shared via Arc.
+    let http_session_factory: crate::mcp::transport::http::SessionFactory = {
+        let semantic = Arc::clone(&semantic);
+        let procedural = Arc::clone(&procedural);
+        let episodic = Arc::clone(&episodic);
+        let storage = Arc::clone(&storage);
+        let cold = cold.clone();
+        let consolidation = Arc::clone(&consolidation);
+        let checkpoint_scheduler = Arc::clone(&checkpoint_scheduler);
+        let active_session = Arc::clone(&active_session);
+        let orchestrator = Arc::clone(&orchestrator);
+        let sessions_dir = sessions_dir.clone();
+        let default_scope = default_scope.clone();
+        Arc::new(move || {
+            let scope_c = ScopeState::new(&default_scope);
+            let tool = Arc::new(ToolRegistry::defaults_with_schedulers(
+                Arc::clone(&semantic),
+                Arc::clone(&procedural),
+                Arc::clone(&episodic),
+                Arc::clone(&storage),
+                cold.clone(),
+                schema_version,
+                Some(Arc::clone(&consolidation)),
+                Some(Arc::clone(&checkpoint_scheduler)),
+                Arc::clone(&scope_c),
+                Some(Arc::clone(&active_session)),
+                max_remember_chars,
+            ));
+            let resource = Arc::new(ResourceRegistry::defaults_with_schedulers(
+                Arc::clone(&semantic),
+                Arc::clone(&procedural),
+                Arc::clone(&episodic),
+                Arc::clone(&orchestrator),
+                cold.clone(),
+                schema_version,
+                auto_context_budget,
+                Some(Arc::clone(&consolidation)),
+                Some(Arc::clone(&checkpoint_scheduler)),
+                Some(Arc::clone(&active_session)),
+                Some(sessions_dir.clone()),
+                Some(Arc::clone(&scope_c)),
+                Some((Arc::clone(&storage), max_remember_chars)),
+            ));
+            McpSession::new(tool, resource, Arc::clone(&storage))
+                .with_session(
+                    Arc::clone(&active_session),
+                    Arc::clone(&checkpoint_scheduler),
+                    Arc::clone(&episodic),
+                    scope_c,
+                )
+                .with_scope_from_roots(derive_scope_from_roots)
+        })
+    };
+
     match mode {
         TransportMode::Stdio => {
             tracing::info!("transport=stdio: reading frames from stdin");
@@ -701,6 +857,36 @@ async fn async_main(
             // mark, so `changed()` reliably fires on the `send(true)`.
             let (shutdown_tx, mut shutdown_rx_outer) = tokio::sync::watch::channel(false);
             let _ = shutdown_rx_outer.borrow_and_update();
+
+            // `[http] enabled`: serve Streamable HTTP next to the
+            // socket. Bound up front so a taken port fails the boot
+            // instead of being logged and forgotten. HTTP sessions are
+            // stateless between requests, so the socket's
+            // connected-client count can't see them; the idle timeout
+            // is therefore off while HTTP is on, or the daemon would
+            // exit under an active HTTP agent.
+            let mut daemon_idle_timeout_minutes = daemon_idle_timeout_minutes;
+            let http_task = match http {
+                Some(opts) => {
+                    let listener = crate::mcp::transport::http::bind(&opts).await?;
+                    if daemon_idle_timeout_minutes != 0 {
+                        tracing::info!(
+                            "transport=daemon-serve-many: [http] enabled; idle timeout disabled"
+                        );
+                        daemon_idle_timeout_minutes = 0;
+                    }
+                    let mut rx = shutdown_rx_outer.clone();
+                    Some(tokio::spawn(crate::mcp::transport::http::serve_on(
+                        listener,
+                        opts,
+                        http_session_factory,
+                        async move {
+                            let _ = rx.changed().await;
+                        },
+                    )))
+                }
+                None => None,
+            };
 
             // The spawned per-connection tasks need their futures
             // to be `Send` for `tokio::spawn`. The boxed-trait-object
@@ -925,6 +1111,18 @@ async fn async_main(
                 "transport=daemon-serve-many: entering graceful drain"
             );
             wait_for_drain(Arc::clone(&active_clients)).await;
+            if let Some(task) = http_task {
+                match task.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(error = %e, "HTTP listener ended with error"),
+                    Err(e) => tracing::warn!(error = %e, "HTTP listener task panicked"),
+                }
+            }
+        }
+        TransportMode::Http { .. } => {
+            let opts = http.ok_or_else(|| anyhow::anyhow!("HTTP options were not resolved"))?;
+            crate::mcp::transport::http::serve(opts, http_session_factory, shutdown_signal())
+                .await?;
         }
         // Windows fallback for the daemon transports: bind_listener
         // and its UnixListener-based plumbing are #[cfg(unix)] in
@@ -1115,6 +1313,134 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod http_option_tests {
+    use super::*;
+    use crate::config::HttpConfig;
+    use crate::mcp::transport::http::TokenSource;
+    use std::collections::HashMap;
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    #[test]
+    fn defaults_bind_loopback_and_use_the_daemon_token_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let o =
+            resolve_http_options(&HttpConfig::default(), tmp.path(), None, env_of(&[])).unwrap();
+        assert_eq!(o.bind.to_string(), "127.0.0.1:7878");
+        match o.token {
+            TokenSource::File(p) => {
+                assert_eq!(p, crate::daemon::auth::token_path(tmp.path()));
+                assert!(p.exists(), "token file must be generated");
+            }
+            other => panic!("expected file token, got {other:?}"),
+        }
+        assert!(o.allowed_origins.is_empty());
+        assert_eq!(o.max_sessions, 256);
+        assert_eq!(
+            o.session_idle_ttl,
+            std::time::Duration::from_secs(1440 * 60)
+        );
+    }
+
+    #[test]
+    fn flag_beats_env_beats_config_for_bind() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = HttpConfig {
+            bind: "127.0.0.1:1111".into(),
+            ..HttpConfig::default()
+        };
+        let env = env_of(&[(HTTP_BIND_ENV, "0.0.0.0:2222")]);
+        let o = resolve_http_options(&cfg, tmp.path(), None, &env).unwrap();
+        assert_eq!(o.bind.to_string(), "0.0.0.0:2222");
+        let o = resolve_http_options(&cfg, tmp.path(), Some("0.0.0.0:3333"), &env).unwrap();
+        assert_eq!(o.bind.to_string(), "0.0.0.0:3333");
+        let o = resolve_http_options(&cfg, tmp.path(), None, env_of(&[])).unwrap();
+        assert_eq!(o.bind.to_string(), "127.0.0.1:1111");
+    }
+
+    #[test]
+    fn token_precedence_env_value_then_env_file_then_config_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = HttpConfig {
+            token_file: "/cfg/token".into(),
+            ..HttpConfig::default()
+        };
+        let o = resolve_http_options(
+            &cfg,
+            tmp.path(),
+            None,
+            env_of(&[
+                (HTTP_TOKEN_ENV, "s3cret"),
+                (HTTP_TOKEN_FILE_ENV, "/env/token"),
+            ]),
+        )
+        .unwrap();
+        assert!(matches!(o.token, TokenSource::Static(ref t) if t == "s3cret"));
+
+        let o = resolve_http_options(
+            &cfg,
+            tmp.path(),
+            None,
+            env_of(&[(HTTP_TOKEN_FILE_ENV, "/env/token")]),
+        )
+        .unwrap();
+        assert!(matches!(o.token, TokenSource::File(ref p) if p.as_os_str() == "/env/token"));
+
+        let o = resolve_http_options(&cfg, tmp.path(), None, env_of(&[])).unwrap();
+        assert!(matches!(o.token, TokenSource::File(ref p) if p.as_os_str() == "/cfg/token"));
+    }
+
+    #[test]
+    fn blank_env_values_are_ignored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let o = resolve_http_options(
+            &HttpConfig::default(),
+            tmp.path(),
+            None,
+            env_of(&[(HTTP_TOKEN_ENV, "  "), (HTTP_BIND_ENV, "")]),
+        )
+        .unwrap();
+        assert_eq!(o.bind.to_string(), "127.0.0.1:7878");
+        assert!(matches!(o.token, TokenSource::File(_)));
+    }
+
+    #[test]
+    fn allowed_origins_env_is_comma_separated() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let o = resolve_http_options(
+            &HttpConfig::default(),
+            tmp.path(),
+            None,
+            env_of(&[(HTTP_ALLOWED_ORIGINS_ENV, "http://a, http://b ,")]),
+        )
+        .unwrap();
+        assert_eq!(o.allowed_origins, vec!["http://a", "http://b"]);
+    }
+
+    #[test]
+    fn invalid_bind_is_a_config_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = resolve_http_options(
+            &HttpConfig::default(),
+            tmp.path(),
+            Some("mneme:7878"),
+            env_of(&[]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid HTTP bind address"),
+            "{err}"
+        );
     }
 }
 
