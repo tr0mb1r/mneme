@@ -139,6 +139,150 @@ pub fn remove_entry(input: &str, top_key: &str, child_key: &str) -> Result<Strin
     Ok(doc.join(lines))
 }
 
+/// Insert or replace one item of the block sequence at
+/// `top_key.child_key` (e.g. Hermes' `hooks.pre_llm_call`), leaving any
+/// other items — the user's own hooks — untouched.
+///
+/// Our item is recognised by `marker`, a substring that only it
+/// contains (the hook script's path). `item` is the item's lines without
+/// indentation, the first starting with `- `. If the sequence doesn't
+/// exist yet it's created as a fresh `child_key:` entry.
+pub fn upsert_list_item(
+    input: &str,
+    top_key: &str,
+    child_key: &str,
+    marker: &str,
+    item: &[String],
+) -> Result<String, YamlEditError> {
+    let cleaned = remove_list_item(input, top_key, child_key, marker)?;
+    let doc = Doc::parse(&cleaned)?;
+    let existing = match doc.find_top(top_key)? {
+        Some(top) => {
+            let block = doc.block_after(top.line);
+            doc.child_indent(&block)
+                .map(|ci| doc.find_child(&block, ci, child_key))
+                .transpose()?
+                .flatten()
+                .map(|range| (ci_of(&doc, range.0), range))
+        }
+        None => None,
+    };
+    let Some((child_line, (_, end))) = existing else {
+        return upsert_entry(&cleaned, top_key, child_key, item);
+    };
+    let (value, _) =
+        split_comment(strip_key(doc.lines[child_line].trim_start(), child_key).unwrap_or_default());
+    let items = sequence_items(&doc, child_line, end);
+    match value {
+        "" if !items.is_empty() => {}
+        "" | "[]" | "null" | "~" => return upsert_entry(&cleaned, top_key, child_key, item),
+        other => {
+            return Err(YamlEditError::Unsupported(format!(
+                "`{child_key}: {other}` is not a block sequence"
+            )));
+        }
+    }
+    let item_indent = indent_of(&doc.lines[items[0].0]);
+    let insert_at = items.last().map(|r| r.1).unwrap_or(child_line + 1);
+    let pad = " ".repeat(item_indent);
+    let mut rendered = vec![format!("{pad}{MANAGED_COMMENT}")];
+    rendered.extend(item.iter().map(|l| format!("{pad}{l}")));
+    let mut lines = doc.lines.clone();
+    lines.splice(insert_at..insert_at, rendered);
+    Ok(doc.join(lines))
+}
+
+/// Remove the item containing `marker` from the sequence at
+/// `top_key.child_key`. No-op if absent. If no items remain, the
+/// sequence key is removed as well, via [`remove_entry`].
+pub fn remove_list_item(
+    input: &str,
+    top_key: &str,
+    child_key: &str,
+    marker: &str,
+) -> Result<String, YamlEditError> {
+    let doc = Doc::parse(input)?;
+    let Some(top) = doc.find_top(top_key)? else {
+        return Ok(input.to_owned());
+    };
+    let block = doc.block_after(top.line);
+    let Some(ci) = doc.child_indent(&block) else {
+        return Ok(input.to_owned());
+    };
+    let Some((start, end)) = doc.find_child(&block, ci, child_key)? else {
+        return Ok(input.to_owned());
+    };
+    let child_line = ci_of(&doc, start);
+    let items = sequence_items(&doc, child_line, end);
+    let Some(&(mut from, to)) = items
+        .iter()
+        .find(|(a, b)| doc.lines[*a..*b].iter().any(|l| l.contains(marker)))
+    else {
+        return Ok(input.to_owned());
+    };
+    if from > child_line + 1 && doc.lines[from - 1].trim() == MANAGED_COMMENT {
+        from -= 1;
+    }
+    let mut lines = doc.lines.clone();
+    lines.drain(from..to);
+    let out = doc.join(lines);
+    if items.len() == 1 {
+        // That was the only item: drop the now-empty key.
+        return remove_entry(&out, top_key, child_key);
+    }
+    Ok(out)
+}
+
+/// Line index of the key line of a child entry whose range (from
+/// `find_child`) may start with our managed comment.
+fn ci_of(doc: &Doc, start: usize) -> usize {
+    if doc.lines[start].trim() == MANAGED_COMMENT {
+        start + 1
+    } else {
+        start
+    }
+}
+
+/// `[start, end)` line ranges of the items of the block sequence under
+/// the key on `key_line`, whose entry ends at `end`. Items may sit at
+/// the key's own indentation (legal YAML) or deeper.
+fn sequence_items(doc: &Doc, key_line: usize, end: usize) -> Vec<(usize, usize)> {
+    let is_item = |l: &str| {
+        let t = l.trim_start();
+        t == "-" || t.starts_with("- ")
+    };
+    let Some(first) = (key_line + 1..end).find(|&i| is_significant(&doc.lines[i])) else {
+        return Vec::new();
+    };
+    if !is_item(&doc.lines[first]) {
+        return Vec::new();
+    }
+    let indent = indent_of(&doc.lines[first]);
+    let mut items: Vec<(usize, usize)> = Vec::new();
+    for i in first..end {
+        let l = &doc.lines[i];
+        if !is_significant(l) {
+            continue;
+        }
+        if indent_of(l) == indent && is_item(l) {
+            if let Some(last) = items.last_mut() {
+                last.1 = i;
+            }
+            items.push((i, end));
+        } else if indent_of(l) < indent {
+            break;
+        }
+    }
+    // Trim trailing blank / comment lines off each item so they stay
+    // with whatever follows.
+    for item in items.iter_mut() {
+        while item.1 > item.0 + 1 && !is_significant(&doc.lines[item.1 - 1]) {
+            item.1 -= 1;
+        }
+    }
+    items
+}
+
 /// Whether `child_key` exists under `top_key`.
 pub fn has_entry(input: &str, top_key: &str, child_key: &str) -> Result<bool, YamlEditError> {
     let doc = Doc::parse(input)?;
@@ -324,7 +468,14 @@ impl Doc {
         let mut end = block.end;
         for i in start + 1..block.end {
             let l = &self.lines[i];
-            if is_significant(l) && indent_of(l) <= indent {
+            // A block sequence may sit at its key's own indentation
+            // (`key:\n- item`), so `- ` lines at that depth still
+            // belong to the entry.
+            let same_depth_item = indent_of(l) == indent && {
+                let t = l.trim_start();
+                t == "-" || t.starts_with("- ")
+            };
+            if is_significant(l) && indent_of(l) <= indent && !same_depth_item {
                 end = i;
                 break;
             }
@@ -619,5 +770,96 @@ logging: {}
     fn hash_inside_quotes_is_not_a_comment() {
         assert_eq!(split_comment(" \"a # b\" # c"), ("\"a # b\"", Some("# c")));
         assert_eq!(split_comment(" a#b"), ("a#b", None));
+    }
+
+    // ---------- sequences (hooks.pre_llm_call) ----------
+
+    fn hook_item(arg: &str) -> Vec<String> {
+        vec![
+            format!("- command: \"/h/agent-hooks/mneme-context.py {arg}\""),
+            "  timeout: 20".into(),
+        ]
+    }
+
+    const MARK: &str = "agent-hooks/mneme-context.py";
+
+    #[test]
+    fn sequence_is_created_when_absent() {
+        let out =
+            upsert_list_item("a: 1\n", "hooks", "pre_llm_call", MARK, &hook_item("x")).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "a: 1\n\nhooks:\n  {MANAGED_COMMENT}\n  pre_llm_call:\n    - command: \"/h/agent-hooks/mneme-context.py x\"\n      timeout: 20\n"
+            )
+        );
+        assert_eq!(
+            remove_list_item(&out, "hooks", "pre_llm_call", MARK).unwrap(),
+            "a: 1\n"
+        );
+    }
+
+    #[test]
+    fn item_is_appended_beside_the_users_hooks_and_removed_alone() {
+        let input = "\
+hooks:
+  pre_llm_call:
+  - command: ~/.hermes/agent-hooks/git-status.sh
+    timeout: 5
+  post_tool_call:
+    - command: fmt.sh
+hooks_auto_accept: false
+";
+        let out = upsert_list_item(input, "hooks", "pre_llm_call", MARK, &hook_item("x")).unwrap();
+        let expected = format!(
+            "\
+hooks:
+  pre_llm_call:
+  - command: ~/.hermes/agent-hooks/git-status.sh
+    timeout: 5
+  {MANAGED_COMMENT}
+  - command: \"/h/agent-hooks/mneme-context.py x\"
+    timeout: 20
+  post_tool_call:
+    - command: fmt.sh
+hooks_auto_accept: false
+"
+        );
+        assert_eq!(out, expected);
+        assert_eq!(
+            remove_list_item(&out, "hooks", "pre_llm_call", MARK).unwrap(),
+            input
+        );
+    }
+
+    #[test]
+    fn upserting_a_sequence_item_replaces_ours_only() {
+        let once = upsert_list_item("", "hooks", "pre_llm_call", MARK, &hook_item("old")).unwrap();
+        let twice =
+            upsert_list_item(&once, "hooks", "pre_llm_call", MARK, &hook_item("new")).unwrap();
+        assert!(!twice.contains("old"), "{twice}");
+        assert_eq!(twice.matches("mneme-context.py").count(), 1, "{twice}");
+        let again =
+            upsert_list_item(&twice, "hooks", "pre_llm_call", MARK, &hook_item("new")).unwrap();
+        assert_eq!(again, twice);
+    }
+
+    #[test]
+    fn empty_flow_sequence_becomes_a_block() {
+        let out = upsert_list_item(
+            "hooks:\n  pre_llm_call: []\n",
+            "hooks",
+            "pre_llm_call",
+            MARK,
+            &hook_item("x"),
+        )
+        .unwrap();
+        assert!(out.contains("  pre_llm_call:\n    - command:"), "{out}");
+    }
+
+    #[test]
+    fn non_empty_flow_sequence_is_refused() {
+        let input = "hooks:\n  pre_llm_call: [{command: a.sh}]\n";
+        assert!(upsert_list_item(input, "hooks", "pre_llm_call", MARK, &hook_item("x")).is_err());
     }
 }

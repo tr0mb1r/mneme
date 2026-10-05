@@ -25,6 +25,12 @@ In every case `mneme init hermes` does the Hermes-side wiring:
   a missing `SOUL.md` on first start and creating the file first would
   suppress that. Start Hermes once, then run the installer (or re-run it
   with `--upgrade`).
+- installs a **context-reload hook**: a `pre_llm_call` shell hook that,
+  at session start and right after Hermes compresses the conversation,
+  re-injects your pinned rules, recent activity and memories relevant to
+  the current message. See [Context reload after
+  compression](#context-reload-after-compression). Skip it with
+  `--no-hook`.
 
 `mneme init hermes --show` prints the plan without writing anything, and
 `mneme init hermes --uninstall` reverses it exactly.
@@ -199,6 +205,69 @@ docker run --rm --user "$(id -u):$(id -g)" -v ~/.hermes:/hermes mneme \
 
 ---
 
+## Context reload after compression
+
+Long Hermes conversations get compressed: older turns are replaced by a
+summary. Whatever the agent had loaded from mneme at the start (pinned
+rules, the current state of a task) goes with them, and that's exactly
+where agents lose track.
+
+`mneme init hermes` installs `$HERMES_HOME/agent-hooks/mneme-context.py`
+and wires it as a `pre_llm_call` hook, which Hermes runs once per turn,
+after any compression and before the model sees the turn:
+
+```yaml
+hooks:
+  # managed by mneme — undo with: mneme init hermes --uninstall
+  pre_llm_call:
+    - command: "/opt/data/agent-hooks/mneme-context.py --url http://mneme:7878/mcp --token-env MNEME_HTTP_TOKEN"
+      timeout: 20
+```
+
+(In local mode the command ends `--command mneme --arg client`.) On
+ordinary turns it returns immediately and injects nothing. On the first
+turn of a session, and on the first turn after a compression, it reads
+`mneme://context?q=<the user's message>` and appends to that turn:
+
+```text
+[mneme] The conversation was just compressed. Reloaded from long-term memory (mneme) so you keep your rules and current state:
+
+Pinned rules (binding, follow them):
+- Always answer with numbers first.
+
+Memories relevant to this message:
+- QQQ3 positions use a 6% trailing stop-loss. (id 01K9…)
+
+Recent events:
+- 2026-10-05 14:02 decision: moved the QQQ3 stop from 8% to 6%
+```
+
+Compression is detected two ways, so a change in Hermes' wording doesn't
+silently disable it: a new `[CONTEXT COMPACTION` summary in the history,
+or the history getting shorter than on the previous turn. Per-session
+state lives in `$HERMES_HOME/mneme-hook-state/`.
+
+Details:
+
+- **Consent.** Hermes asks before running a new shell hook, and a gateway
+  (no terminal) silently skips hooks nobody approved. The installer
+  therefore records the hook's exact command in
+  `$HERMES_HOME/shell-hooks-allowlist.json`, the documented
+  manual-approval file; running `mneme init hermes` is the approval.
+  `hermes hooks list` shows it; `hermes hooks revoke` or
+  `mneme init hermes --no-hook` withdraws it.
+- **Token.** In remote mode the hook reads `MNEME_HTTP_TOKEN` (or your
+  `--token-env`) from its environment, falling back to
+  `$HERMES_HOME/.env`, because Hermes strips secrets from hook
+  environments on multi-profile gateways. Put the token in `.env` if you
+  run one.
+- **Fail-open.** Any error (mneme unreachable, wrong token, timeout)
+  injects nothing and logs one line; it never breaks a turn.
+- **Requirements.** Python 3 (Hermes itself runs on it) and nothing else:
+  the script uses only the standard library.
+- **Windows, local mode:** not installed. There Hermes runs `mneme run`
+  itself, and a second instance can't open the same store.
+
 ## The HTTP transport
 
 `mneme serve` (and `mneme daemon` with `[http] enabled`) implement MCP
@@ -269,6 +338,11 @@ See [Encryption at rest](../book/src/encryption.md).
   layout the line editor won't guess at (for example
   `mcp_servers: {github: {...}}` in flow style, or tab indentation). The
   error includes the snippet to paste by hand.
+- **The context doesn't come back after compression.** `hermes hooks
+  list` should show the `pre_llm_call` hook as approved; `hermes hooks
+  test pre_llm_call` runs it once. A gateway skips unapproved hooks, so
+  if you edited the hook command by hand, re-run `mneme init hermes
+  --upgrade` to re-approve it.
 - **The agent doesn't use memory unprompted.** Check that the block is in
   `SOUL.md` (run `mneme init hermes --upgrade` after Hermes has created
   the file) and that the `mneme` skill is listed by `/skills`.

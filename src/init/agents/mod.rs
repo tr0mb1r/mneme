@@ -97,6 +97,9 @@ pub struct InstallOptions {
     pub token_env: Option<String>,
     /// Override the agent's config directory (Hermes: `$HERMES_HOME`).
     pub agent_home: Option<PathBuf>,
+    /// Skip lifecycle hooks the installer would otherwise add (Hermes:
+    /// the context-reload hook).
+    pub no_hook: bool,
 }
 
 /// What `mneme init <agent>` should do — install (the default),
@@ -156,7 +159,8 @@ pub fn run_with_options(
 ) -> Result<(), AgentError> {
     if agent != Agent::Hermes && *opts != InstallOptions::default() {
         return Err(AgentError::Generic(
-            "--url, --token-env and --hermes-home only apply to `mneme init hermes`".into(),
+            "--url, --token-env, --hermes-home and --no-hook only apply to `mneme init hermes`"
+                .into(),
         ));
     }
     match agent {

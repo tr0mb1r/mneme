@@ -36,8 +36,23 @@
 //!   *missing* `SOUL.md` on first start, and creating the file first
 //!   would suppress that. The post-install message says how to finish.
 //!
-//! Uninstall removes the entry, the skill, and the marker block.
-//! Everything else in those files is preserved. Idempotent.
+//! Context-reload hook (unless `--no-hook`): Hermes compresses long
+//! conversations, and the pinned rules and working state the agent had
+//! loaded go with the compressed turns. `$HERMES_HOME/agent-hooks/
+//! mneme-context.py`, wired as a `pre_llm_call` shell hook in
+//! `config.yaml`, re-reads `mneme://context` at session start and on
+//! the first turn after a compression and injects it into that turn.
+//! Hermes asks before running a new shell hook, and a gateway (no TTY)
+//! skips unapproved hooks, so the installer also records the hook's
+//! exact command in `$HERMES_HOME/shell-hooks-allowlist.json`, Hermes'
+//! documented manual-approval file. Running `mneme init hermes` is the
+//! approval; `--no-hook` opts out, `hermes hooks revoke` withdraws it.
+//! Skipped on Windows in local mode, where Hermes runs `mneme run`
+//! itself and a second instance can't share the store.
+//!
+//! Uninstall removes the entry, the skill, the marker block, the hook,
+//! its state, and its approval. Everything else in those files is
+//! preserved. Idempotent.
 
 use std::path::{Path, PathBuf};
 
@@ -53,6 +68,17 @@ pub const DEFAULT_TOKEN_ENV: &str = "MNEME_HTTP_TOKEN";
 const MCP_KEY: &str = "mcp_servers";
 /// Our entry's name. Hermes prefixes tools with it: `mcp_mneme_recall`.
 const SERVER_NAME: &str = "mneme";
+
+/// Top-level `config.yaml` key holding shell hooks, and the event ours
+/// runs on.
+const HOOKS_KEY: &str = "hooks";
+const HOOK_EVENT: &str = "pre_llm_call";
+/// File name of the installed hook; also how our hook entry and
+/// allowlist approval are recognised.
+const HOOK_FILE: &str = "mneme-context.py";
+/// Seconds Hermes lets the hook run. It only does work at session
+/// start and after a compression; otherwise it returns at once.
+const HOOK_TIMEOUT_SECS: u32 = 20;
 
 /// Seconds Hermes waits for the server to connect and finish
 /// `initialize`. Generous: in local mode the first connect may
@@ -102,8 +128,10 @@ tools appear as `mcp_mneme_<tool>`; its resources are read with
    item as a binding rule. Read `mneme://context` for recent events; for a
    topic-focused view read `mneme://context?q=<topic>`.
 2. **Recall before answering** when the user references prior context that is
-   not already loaded: `mcp_mneme_recall` with a short query. Filter with
-   `tags` or `scope` when you know them.
+   not already loaded: `mcp_mneme_recall` with a short query. It matches by
+   meaning and by exact words at once, so query a file name, account, env var
+   or error string directly (`mode: "keyword"` for literal matches only).
+   Filter with `tags` or `scope` when you know them.
 3. **Remember** durable facts with `mcp_mneme_remember`: decisions and their
    reasons, preferences the user states, project conventions, conclusions
    from investigation. One fact per memory, under ~500 characters.
@@ -156,6 +184,9 @@ struct Paths {
     config: PathBuf,
     skill: PathBuf,
     soul: PathBuf,
+    hook: PathBuf,
+    hook_state: PathBuf,
+    allowlist: PathBuf,
 }
 
 impl Paths {
@@ -165,8 +196,58 @@ impl Paths {
             config: hermes_home.join("config.yaml"),
             skill: hermes_home.join("skills").join("mneme").join("SKILL.md"),
             soul: hermes_home.join("SOUL.md"),
+            hook: hermes_home.join("agent-hooks").join(HOOK_FILE),
+            hook_state: hermes_home.join("mneme-hook-state"),
+            allowlist: hermes_home.join("shell-hooks-allowlist.json"),
         }
     }
+}
+
+/// The shell command Hermes runs for our hook. Hermes splits it with
+/// `shlex.split` (no shell), so each part is POSIX-quoted.
+fn hook_command(paths: &Paths, t: &Transport) -> String {
+    let mut parts = vec![paths.hook.display().to_string()];
+    match t {
+        Transport::Local => {
+            parts.extend(["--command", "mneme", "--arg", "client"].map(String::from));
+        }
+        Transport::Remote { url, token_env } => {
+            parts.extend([
+                "--url".into(),
+                url.clone(),
+                "--token-env".into(),
+                token_env.clone(),
+            ]);
+        }
+    }
+    parts
+        .iter()
+        .map(|p| shell_quote(p))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-:@=+,".contains(c))
+    {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', "'\"'\"'"))
+    }
+}
+
+/// Whether to install the hook for this transport.
+fn wants_hook(opts: &InstallOptions, t: &Transport) -> bool {
+    !opts.no_hook && (cfg!(unix) || matches!(t, Transport::Remote { .. }))
+}
+
+fn hook_item(command: &str) -> Vec<String> {
+    vec![
+        format!("- command: {}", yaml_config::quote(command)),
+        format!("  timeout: {HOOK_TIMEOUT_SECS}"),
+    ]
 }
 
 /// Resolve Hermes' home: `--hermes-home`, then `$HERMES_HOME`, then
@@ -190,10 +271,14 @@ pub fn run(mode: InstallMode, home_dir: &Path, opts: &InstallOptions) -> Result<
 fn run_at(mode: InstallMode, hermes_home: &Path, opts: &InstallOptions) -> Result<(), AgentError> {
     let paths = Paths::new(hermes_home);
     match mode {
-        InstallMode::Install | InstallMode::Upgrade => install(&paths, &transport(opts)?),
+        InstallMode::Install | InstallMode::Upgrade => {
+            let t = transport(opts)?;
+            install(&paths, &t, wants_hook(opts, &t))
+        }
         InstallMode::Uninstall => uninstall(&paths),
         InstallMode::Show => {
-            print_plan(&paths, &transport(opts)?);
+            let t = transport(opts)?;
+            print_plan(&paths, &t, wants_hook(opts, &t));
             Ok(())
         }
     }
@@ -298,7 +383,7 @@ fn read_or_empty(path: &Path) -> Result<String, AgentError> {
     }
 }
 
-fn install(paths: &Paths, t: &Transport) -> Result<(), AgentError> {
+fn install(paths: &Paths, t: &Transport, with_hook: bool) -> Result<(), AgentError> {
     // 1. config.yaml — the only step that can be refused, so it goes
     //    first and nothing else is written if it fails.
     let existing = read_or_empty(&paths.config)?;
@@ -310,8 +395,45 @@ fn install(paths: &Paths, t: &Transport) -> Result<(), AgentError> {
                 snippet(t)
             ))
         })?;
+    // The hook entry rides along in the same write. Unlike the MCP
+    // entry it's optional, so a `hooks:` layout we can't edit skips the
+    // hook with a warning instead of failing the install.
+    let command = hook_command(paths, t);
+    let (updated, hook_installed) = if with_hook {
+        match yaml_config::upsert_list_item(
+            &updated,
+            HOOKS_KEY,
+            HOOK_EVENT,
+            HOOK_FILE,
+            &hook_item(&command),
+        ) {
+            Ok(with) => (with, true),
+            Err(e) => {
+                eprintln!(
+                    "warning: not installing the context-reload hook ({e} in {}). To add it by hand:\n\n{HOOKS_KEY}:\n  {HOOK_EVENT}:\n{}",
+                    paths.config.display(),
+                    hook_item(&command)
+                        .iter()
+                        .map(|l| format!("    {l}\n"))
+                        .collect::<String>()
+                );
+                (updated, false)
+            }
+        }
+    } else {
+        // `--no-hook` on a re-install takes a previously installed hook out.
+        let without = yaml_config::remove_list_item(&updated, HOOKS_KEY, HOOK_EVENT, HOOK_FILE)
+            .unwrap_or(updated);
+        (without, false)
+    };
     if updated != existing {
         assets::write_text(&paths.config, &updated)?;
+    }
+    if hook_installed {
+        assets::write_executable(&paths.hook, assets::HERMES_CONTEXT_HOOK)?;
+        approve_hook(&paths.allowlist, &paths.hook, &command)?;
+    } else if !with_hook {
+        remove_hook_files(paths)?;
     }
 
     // 2. The skill.
@@ -329,7 +451,97 @@ fn install(paths: &Paths, t: &Transport) -> Result<(), AgentError> {
         false
     };
 
-    print_post_install(paths, t, soul_updated);
+    print_post_install(paths, t, soul_updated, hook_installed);
+    Ok(())
+}
+
+/// Record our hook's exact command in Hermes' shell-hook allowlist,
+/// replacing any earlier approval of a mneme hook command (the URL or
+/// token variable may have changed). Other approvals are untouched.
+/// Same entry shape Hermes writes itself.
+fn approve_hook(allowlist: &Path, script: &Path, command: &str) -> Result<(), AgentError> {
+    let mut data = read_allowlist(allowlist)?;
+    let approvals = data
+        .as_object_mut()
+        .and_then(|o| o.get_mut("approvals"))
+        .and_then(|a| a.as_array_mut())
+        .ok_or_else(|| AgentError::Generic("unreachable: normalised allowlist".into()))?;
+    approvals.retain(|e| !is_our_approval(e));
+    let mtime = std::fs::metadata(script)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+    approvals.push(serde_json::json!({
+        "event": HOOK_EVENT,
+        "command": command,
+        "approved_at": chrono::Utc::now().to_rfc3339(),
+        "script_mtime_at_approval": mtime,
+    }));
+    write_allowlist(allowlist, &data)
+}
+
+fn is_our_approval(entry: &serde_json::Value) -> bool {
+    entry.get("event").and_then(|v| v.as_str()) == Some(HOOK_EVENT)
+        && entry
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|c| c.contains(HOOK_FILE))
+}
+
+/// The allowlist as `{"approvals": [...], ...}`, other keys kept.
+/// Missing or unreadable files start empty, as Hermes does.
+fn read_allowlist(path: &Path) -> Result<serde_json::Value, AgentError> {
+    let mut data = match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(s.trim_start_matches('\u{feff}'))
+            .unwrap_or_else(|_| serde_json::json!({})),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.into()),
+    };
+    if !data.is_object() {
+        data = serde_json::json!({});
+    }
+    if !data["approvals"].is_array() {
+        data["approvals"] = serde_json::json!([]);
+    }
+    Ok(data)
+}
+
+fn write_allowlist(path: &Path, data: &serde_json::Value) -> Result<(), AgentError> {
+    let text = serde_json::to_string_pretty(data)
+        .map_err(|e| AgentError::Generic(format!("serialise allowlist: {e}")))?;
+    assets::write_text(path, &(text + "\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Remove the hook script, its per-session state, and its approval.
+fn remove_hook_files(paths: &Paths) -> Result<(), AgentError> {
+    if paths.hook.exists() {
+        std::fs::remove_file(&paths.hook)?;
+    }
+    if let Some(dir) = paths.hook.parent()
+        && dir.exists()
+        && std::fs::read_dir(dir)?.next().is_none()
+    {
+        std::fs::remove_dir(dir)?;
+    }
+    if paths.hook_state.exists() {
+        std::fs::remove_dir_all(&paths.hook_state)?;
+    }
+    if paths.allowlist.exists() {
+        let mut data = read_allowlist(&paths.allowlist)?;
+        if let Some(a) = data["approvals"].as_array_mut() {
+            let before = a.len();
+            a.retain(|e| !is_our_approval(e));
+            if a.len() != before {
+                write_allowlist(&paths.allowlist, &data)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -337,11 +549,13 @@ fn uninstall(paths: &Paths) -> Result<(), AgentError> {
     if paths.config.exists() {
         let existing = std::fs::read_to_string(&paths.config)?;
         let updated = yaml_config::remove_entry(&existing, MCP_KEY, SERVER_NAME)
+            .and_then(|s| yaml_config::remove_list_item(&s, HOOKS_KEY, HOOK_EVENT, HOOK_FILE))
             .map_err(|e| AgentError::Generic(format!("{e} in {}", paths.config.display())))?;
         if updated != existing {
             assets::write_text(&paths.config, &updated)?;
         }
     }
+    remove_hook_files(paths)?;
     if paths.skill.exists() {
         std::fs::remove_file(&paths.skill)?;
     }
@@ -373,6 +587,10 @@ fn uninstall(paths: &Paths) -> Result<(), AgentError> {
     eprintln!("    • mcp_servers.mneme from {}", paths.config.display());
     eprintln!("    • {}", paths.skill.display());
     eprintln!("    • the mneme block in {}", paths.soul.display());
+    eprintln!(
+        "    • the context-reload hook {} and its approval",
+        paths.hook.display()
+    );
     eprintln!();
     eprintln!("  Everything else in those files is preserved. Run /reload-mcp in");
     eprintln!("  Hermes (or restart the gateway) to drop the server.");
@@ -380,7 +598,7 @@ fn uninstall(paths: &Paths) -> Result<(), AgentError> {
     Ok(())
 }
 
-fn print_plan(paths: &Paths, t: &Transport) {
+fn print_plan(paths: &Paths, t: &Transport, with_hook: bool) {
     println!(
         "`mneme init hermes` would write (Hermes home: {}):",
         paths.home.display()
@@ -398,17 +616,34 @@ fn print_plan(paths: &Paths, t: &Transport) {
         "  {}  [short mneme block, only if the file already exists]",
         paths.soul.display()
     );
+    if with_hook {
+        println!(
+            "  {}  [context-reload hook, wired as hooks.{HOOK_EVENT} in config.yaml]",
+            paths.hook.display()
+        );
+        println!(
+            "  {}  [approval for that hook's exact command]",
+            paths.allowlist.display()
+        );
+    }
     println!();
     println!("The config.yaml entry:");
     println!();
     for l in snippet(t).lines() {
         println!("  {l}");
     }
+    if with_hook {
+        println!("  {HOOKS_KEY}:");
+        println!("    {HOOK_EVENT}:");
+        for l in hook_item(&hook_command(paths, t)) {
+            println!("      {l}");
+        }
+    }
     println!();
     println!("Re-run with --uninstall to reverse.");
 }
 
-fn print_post_install(paths: &Paths, t: &Transport, soul_updated: bool) {
+fn print_post_install(paths: &Paths, t: &Transport, soul_updated: bool, hook_installed: bool) {
     eprintln!();
     eprintln!(
         "✓ mneme installed for Hermes Agent ({})",
@@ -429,6 +664,16 @@ fn print_post_install(paths: &Paths, t: &Transport, soul_updated: bool) {
     eprintln!("    • Skill                 {}", paths.skill.display());
     if soul_updated {
         eprintln!("    • Memory block in       {}", paths.soul.display());
+    }
+    if hook_installed {
+        eprintln!("    • Context-reload hook   {}", paths.hook.display());
+        eprintln!("      (hooks.{HOOK_EVENT}; reloads pinned rules and recent state at");
+        eprintln!("      session start and after context compression. Approved in");
+        eprintln!(
+            "      {}; withdraw with `hermes hooks revoke`",
+            paths.allowlist.display()
+        );
+        eprintln!("      or reinstall with --no-hook.)");
     }
     eprintln!();
     eprintln!("  Next steps:");
@@ -498,6 +743,22 @@ mod tests {
         std::fs::read_to_string(p).unwrap()
     }
 
+    /// The `mcp_servers:` block of a config, up to the next top-level key.
+    fn mcp_block(cfg: &str) -> String {
+        let start = cfg.find("mcp_servers:").expect("mcp_servers block");
+        let rest = &cfg[start..];
+        let end = rest[1..]
+            .find("\n\n")
+            .or_else(|| rest[1..].find("\nhooks:"))
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        rest[..end].to_owned()
+    }
+
+    fn allowlist(home: &Path) -> serde_json::Value {
+        serde_json::from_str(&read(&home.join("shell-hooks-allowlist.json"))).unwrap()
+    }
+
     #[test]
     fn local_install_writes_command_entry_and_skill() {
         let tmp = TempDir::new().unwrap();
@@ -531,7 +792,7 @@ mod tests {
             cfg.contains("    headers:\n      Authorization: \"Bearer ${MNEME_HTTP_TOKEN}\"\n"),
             "{cfg}"
         );
-        assert!(!cfg.contains("command:"));
+        assert!(!mcp_block(&cfg).contains("command:"), "{cfg}");
     }
 
     #[test]
@@ -554,7 +815,7 @@ mod tests {
         )
         .unwrap();
         let cfg = read(&tmp.path().join("config.yaml"));
-        assert!(!cfg.contains("command:"), "{cfg}");
+        assert!(!mcp_block(&cfg).contains("command:"), "{cfg}");
         assert_eq!(cfg.matches("  mneme:\n").count(), 1, "{cfg}");
     }
 
@@ -729,5 +990,157 @@ mcp_servers:
             hermes_home(Path::new("/home/u"), &opts),
             PathBuf::from("/opt/data")
         );
+    }
+
+    // ---------- context-reload hook ----------
+
+    #[test]
+    fn hook_is_installed_wired_and_approved() {
+        let tmp = TempDir::new().unwrap();
+        run_at(
+            InstallMode::Install,
+            tmp.path(),
+            &remote("http://mneme:7878/mcp"),
+        )
+        .unwrap();
+        let script = tmp.path().join("agent-hooks/mneme-context.py");
+        assert_eq!(read(&script), assets::HERMES_CONTEXT_HOOK);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "hook must be executable");
+        }
+        let cfg = read(&tmp.path().join("config.yaml"));
+        let command = format!(
+            "{} --url http://mneme:7878/mcp --token-env MNEME_HTTP_TOKEN",
+            script.display()
+        );
+        assert!(
+            cfg.contains(&format!(
+                "hooks:\n  # managed by mneme — undo with: mneme init hermes --uninstall\n  pre_llm_call:\n    - command: \"{command}\"\n      timeout: 20\n"
+            )),
+            "{cfg}"
+        );
+        let approvals = allowlist(tmp.path());
+        let a = &approvals["approvals"][0];
+        assert_eq!(a["event"], "pre_llm_call");
+        assert_eq!(
+            a["command"], command,
+            "approval must match the configured command exactly"
+        );
+        assert!(a["approved_at"].is_string());
+    }
+
+    #[test]
+    fn local_hook_spawns_mneme_client() {
+        let tmp = TempDir::new().unwrap();
+        run_at(InstallMode::Install, tmp.path(), &local()).unwrap();
+        let cfg = read(&tmp.path().join("config.yaml"));
+        if cfg!(unix) {
+            assert!(
+                cfg.contains("mneme-context.py --command mneme --arg client\""),
+                "{cfg}"
+            );
+        } else {
+            assert!(
+                !cfg.contains("mneme-context.py"),
+                "no local hook on Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn reinstalling_replaces_the_approval_and_keeps_other_approvals() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("shell-hooks-allowlist.json"),
+            r#"{"approvals":[{"event":"post_tool_call","command":"fmt.sh"}],"note":"keep"}"#,
+        )
+        .unwrap();
+        run_at(InstallMode::Install, tmp.path(), &remote("http://a:1/mcp")).unwrap();
+        run_at(InstallMode::Upgrade, tmp.path(), &remote("http://b:2/mcp")).unwrap();
+        let data = allowlist(tmp.path());
+        let approvals = data["approvals"].as_array().unwrap();
+        assert_eq!(approvals.len(), 2, "{data}");
+        assert!(approvals.iter().any(|a| a["command"] == "fmt.sh"));
+        assert!(
+            approvals
+                .iter()
+                .any(|a| a["command"].as_str().unwrap().contains("http://b:2/mcp"))
+        );
+        assert_eq!(data["note"], "keep");
+        let cfg = read(&tmp.path().join("config.yaml"));
+        assert_eq!(cfg.matches("mneme-context.py").count(), 1, "{cfg}");
+    }
+
+    #[test]
+    fn hook_sits_beside_the_users_own_hooks() {
+        let tmp = TempDir::new().unwrap();
+        let original = "hooks:\n  pre_llm_call:\n    - command: ~/.hermes/agent-hooks/git.sh\n";
+        std::fs::write(tmp.path().join("config.yaml"), original).unwrap();
+        run_at(
+            InstallMode::Install,
+            tmp.path(),
+            &remote("http://mneme:7878/mcp"),
+        )
+        .unwrap();
+        let cfg = read(&tmp.path().join("config.yaml"));
+        assert!(cfg.contains("git.sh"), "{cfg}");
+        assert!(cfg.contains("mneme-context.py"), "{cfg}");
+        run_at(InstallMode::Uninstall, tmp.path(), &local()).unwrap();
+        assert_eq!(read(&tmp.path().join("config.yaml")), original);
+    }
+
+    #[test]
+    fn no_hook_skips_it_and_removes_an_earlier_one() {
+        let tmp = TempDir::new().unwrap();
+        run_at(
+            InstallMode::Install,
+            tmp.path(),
+            &remote("http://mneme:7878/mcp"),
+        )
+        .unwrap();
+        let mut opts = remote("http://mneme:7878/mcp");
+        opts.no_hook = true;
+        run_at(InstallMode::Upgrade, tmp.path(), &opts).unwrap();
+        assert!(!read(&tmp.path().join("config.yaml")).contains("mneme-context.py"));
+        assert!(!tmp.path().join("agent-hooks").exists());
+        assert!(
+            allowlist(tmp.path())["approvals"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_hook_state_and_approval() {
+        let tmp = TempDir::new().unwrap();
+        run_at(
+            InstallMode::Install,
+            tmp.path(),
+            &remote("http://mneme:7878/mcp"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("mneme-hook-state")).unwrap();
+        std::fs::write(tmp.path().join("mneme-hook-state/abc.json"), "{}").unwrap();
+        run_at(InstallMode::Uninstall, tmp.path(), &local()).unwrap();
+        assert!(!tmp.path().join("agent-hooks").exists());
+        assert!(!tmp.path().join("mneme-hook-state").exists());
+        assert!(!read(&tmp.path().join("config.yaml")).contains("hooks:"));
+        assert!(
+            allowlist(tmp.path())["approvals"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn hook_paths_with_spaces_are_quoted_for_shlex() {
+        assert_eq!(shell_quote("/opt/data/x.py"), "/opt/data/x.py");
+        assert_eq!(shell_quote("/Users/A B/x.py"), "'/Users/A B/x.py'");
+        assert_eq!(shell_quote("it's"), "'it'\"'\"'s'");
     }
 }

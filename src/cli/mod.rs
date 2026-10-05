@@ -97,6 +97,11 @@ pub enum Command {
         /// directory mounted as the container's `/opt/data`.
         #[arg(long, value_name = "DIR")]
         hermes_home: Option<PathBuf>,
+        /// hermes only: don't install the context-reload hook (a
+        /// `pre_llm_call` shell hook that re-injects pinned rules and
+        /// recent state at session start and after context compression).
+        #[arg(long)]
+        no_hook: bool,
     },
     /// Start the MCP server (stdio). Right pick when the host
     /// (Claude Desktop, Cursor, etc.) spawns mneme directly as a
@@ -259,6 +264,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             url,
             token_env,
             hermes_home,
+            no_hook,
         } => init::execute(
             agent,
             upgrade,
@@ -268,6 +274,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 url,
                 token_env,
                 agent_home: hermes_home,
+                no_hook,
             },
         ),
         Command::Run => run::execute(),

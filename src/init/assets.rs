@@ -32,6 +32,12 @@ use std::path::Path;
 /// current binary's copy.
 pub const MNEME_MD_TEMPLATE: &str = include_str!("../../templates/MNEME.md");
 
+/// Hermes Agent `pre_llm_call` shell hook (stdlib-only Python) that
+/// reloads pinned rules and recent state from mneme at session start
+/// and right after Hermes compresses the conversation. Installed by
+/// `mneme init hermes`.
+pub const HERMES_CONTEXT_HOOK: &str = include_str!("../../templates/hermes/mneme-context.py");
+
 /// Claude Code lifecycle hook scripts (release-planning §4.4 +
 /// `docs/CLAUDE_CODE_SETUP.md` §7). Ship as embedded `&str`s so
 /// `mneme init claude-code` writes them to
