@@ -92,18 +92,21 @@ a simple inverted index over `content`, fused with the vector hits)
 would be the single biggest recall improvement available. Workaround
 today: `mneme export | jq`.
 
-**L4 has no lifecycle.** L3 has a full hot → warm → cold pipeline with a
-scheduler; L4 grows monotonically. What exists as of v1.3 is a
-`duplicate_advisory` on `remember` (tells the agent when new content
-restates an existing memory — advisory only, the write still lands) and
-an orphan-vector sweep in the consolidation pass. What doesn't exist:
+**L4 has no automatic lifecycle.** L3 has a full hot → warm → cold
+pipeline with a scheduler; L4 grows monotonically unless the agent
+curates it. What exists: `supersedes` on `remember` / `update` (retires
+an outdated memory from recall without deleting it), a similarity
+advisory on every `remember` that names the closest current memory
+(≥ 0.80), and an orphan-vector sweep in the consolidation pass. What
+doesn't exist:
 
 - **No `last_accessed` on semantic or procedural items.** `MemoryItem`
   has no touch-on-read field, so L4 carries no recency signal at all and
   nothing can decay. Adding it is an on-disk schema change (postcard is
   not self-describing), so it needs a migration.
-- **No compaction.** Nothing merges or retires near-duplicate facts;
-  the advisory only reports them.
+- **No automatic compaction.** Nothing merges or retires near-duplicate
+  facts on its own; the advisory reports them and `supersedes` is the
+  agent's tool for retiring them.
 - **`EpisodicStore::touch` is never called from the tool surface**, so
   L3's `last_accessed` ordering is effectively creation order.
 

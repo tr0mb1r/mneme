@@ -71,6 +71,12 @@ impl Tool for Recall {
             `limit` memories however far away they are. ~0.5 is a reasonable cut-off \
             for \"actually about the same thing\"; use it when you would rather get \
             nothing back than get a weak match."
+                    },
+                    "include_superseded": {
+                        "type": "boolean",
+                        "description": "Also return memories that a newer memory replaced \
+            (`remember` with `supersedes`). They come after every current match and \
+            carry `superseded_by`. Defaults to false."
                     }
                 },
                 "required": ["query"]
@@ -140,11 +146,22 @@ impl Tool for Recall {
             }
         };
 
+        let include_superseded = match args.get("include_superseded") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`include_superseded` must be a boolean".into(),
+                ));
+            }
+        };
+
         let filters = RecallFilters {
             scope,
             kind,
             tags,
             min_similarity,
+            include_superseded,
         };
         let hits = self
             .store
@@ -158,7 +175,7 @@ impl Tool for Recall {
         let body: Vec<Value> = hits
             .iter()
             .map(|h| {
-                json!({
+                let mut row = json!({
                     "id": h.item.id.to_string(),
                     "content": h.item.content,
                     // `kind` matches the field name used by every
@@ -177,7 +194,11 @@ impl Tool for Recall {
                     // filters on.
                     "score": h.score,
                     "similarity": crate::memory::semantic::similarity_from_distance(h.score),
-                })
+                });
+                if let Some(newer) = h.superseded_by {
+                    row["superseded_by"] = json!(newer.to_string());
+                }
+                row
             })
             .collect();
 
@@ -308,5 +329,47 @@ mod tests {
         let arr = v.as_array().unwrap();
         assert!(!arr.is_empty());
         assert_eq!(arr[0]["kind"], "fact");
+    }
+
+    #[tokio::test]
+    async fn include_superseded_marks_replaced_memories() {
+        let tmp = TempDir::new().unwrap();
+        let s = fresh_store(&tmp);
+        let old = s
+            .remember("balance is 5200", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let new = s
+            .remember("balance is 4800", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        s.supersede(old, new).await.unwrap();
+        let r = Recall::new(Arc::clone(&s));
+        let rows = |res: ToolResult| -> Vec<Value> {
+            let text = match &res.content[0] {
+                crate::mcp::tools::ContentBlock::Text(t) => t.clone(),
+            };
+            serde_json::from_str::<Value>(&text)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let default = rows(r.invoke(json!({ "query": "balance" })).await.unwrap());
+        assert_eq!(default.len(), 1);
+        assert!(default[0].get("superseded_by").is_none());
+        let all = rows(
+            r.invoke(json!({ "query": "balance", "include_superseded": true }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1]["id"], old.to_string());
+        assert_eq!(all[1]["superseded_by"], new.to_string());
+        let err = r
+            .invoke(json!({ "query": "x", "include_superseded": "yes" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
 }

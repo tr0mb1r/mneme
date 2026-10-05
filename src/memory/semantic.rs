@@ -98,9 +98,9 @@ use crate::index::delta::{HnswApplier, replay_into};
 use crate::index::hnsw::HnswIndex;
 use crate::index::snapshot;
 use crate::memory::activity::ActivityCounter;
-use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
 use crate::storage::wal::{self, WalOp, WalWriter};
+use crate::storage::{MEM_KEY_PREFIX, SUP_KEY_PREFIX};
 use crate::{MnemeError, Result};
 
 /// How many extra results to over-fetch from HNSW on the *first*
@@ -179,6 +179,10 @@ pub struct RecallHit {
     /// Cosine distance under the embedder's L2-normalized output:
     /// `0.0` is identical, `2.0` is opposite. Lower is more similar.
     pub score: f32,
+    /// The memory that replaced this one (`remember` with
+    /// `supersedes`). Only ever `Some` when the caller asked for
+    /// superseded memories via [`RecallFilters::include_superseded`].
+    pub superseded_by: Option<MemoryId>,
 }
 
 /// Optional filters applied after the HNSW returns candidates.
@@ -205,6 +209,11 @@ pub struct RecallFilters {
     /// Relates to [`RecallHit::score`] (a cosine *distance*) as
     /// `similarity = 1.0 - score`.
     pub min_similarity: Option<f32>,
+    /// Also return memories another memory has superseded. They are
+    /// ranked after every current match and carry
+    /// [`RecallHit::superseded_by`]. Off by default: an outdated fact
+    /// is what the agent asked to stop seeing.
+    pub include_superseded: bool,
 }
 
 impl RecallFilters {
@@ -251,15 +260,35 @@ pub fn similarity_from_distance(distance: f32) -> f32 {
     1.0 - distance
 }
 
-/// Cosine-similarity floor at which a new memory is reported as a
-/// near-duplicate of an existing one.
-///
-/// Deliberately strict. The report is advisory — it never blocks a
-/// write — but a false positive teaches the agent to distrust it, and
-/// under BGE-M3 genuinely distinct facts about the same subject
-/// routinely reach 0.85-0.90. 0.95 keeps the signal to restatements
-/// and near-verbatim repeats.
+/// Cosine-similarity floor above which `remember` labels the closest
+/// existing memory a near-duplicate (`duplicate_advisory`) rather than
+/// merely related (`related_memory`). Near-verbatim repeats live here.
 pub const NEAR_DUPLICATE_SIMILARITY: f32 = 0.95;
+
+/// Cosine-similarity floor at which `remember` reports the closest
+/// existing memory at all.
+///
+/// Calibrated against BGE-M3 on realistic agent memories (English and
+/// Russian), measured memory-to-memory:
+///
+/// | pair | similarity |
+/// |---|---|
+/// | paraphrased restatement of one fact | 0.82 – 0.96 |
+/// | same fact, updated value ("balance 5,200" → "4,800") | 0.83 – 0.95 |
+/// | different fact, same subject | 0.55 – 0.79 (one parallel pair: 0.84) |
+/// | unrelated | 0.36 – 0.48 |
+///
+/// Two consequences. A restatement and an update are not separable by
+/// similarity, so the advisory names the candidate and lets the agent
+/// choose (`supersedes`, `forget`, or ignore). And the pre-1.5 single
+/// 0.95 threshold fired on almost none of these: an agent restating or
+/// updating facts in its own words never saw a warning.
+pub const RELATED_SIMILARITY: f32 = 0.80;
+
+/// How many nearest neighbours `remember` inspects when looking for
+/// the closest *current* memory. A few, so a superseded nearest hit
+/// doesn't hide the live one right behind it.
+const NEAREST_PROBE: usize = 4;
 
 /// An existing memory that a pending write closely restates. Produced
 /// by [`SemanticStore::remember_checked`].
@@ -647,7 +676,7 @@ impl SemanticStore {
 
         // Probe before inserting, so the new row cannot match itself.
         let duplicate = if check_duplicates {
-            self.nearest_duplicate(&vector).await?
+            self.nearest_existing(&vector, RELATED_SIMILARITY).await?
         } else {
             None
         };
@@ -677,41 +706,91 @@ impl SemanticStore {
         Ok((item.id, duplicate))
     }
 
-    /// Top-1 index probe for [`remember_checked`]. Returns `Some` only
-    /// when the nearest existing memory clears
-    /// [`NEAR_DUPLICATE_SIMILARITY`].
+    /// Nearest-neighbour probe for [`remember_checked`]: the closest
+    /// *current* memory, if it clears `floor`. The caller classifies
+    /// the similarity (restatement vs. related).
     ///
+    /// Superseded memories are skipped — pointing the agent at a fact
+    /// it already retired would just invite it to retire it again.
     /// Deliberately does **not** filter by scope: the same fact stored
     /// under two scopes is still worth flagging, and the caller has the
     /// scope of both rows to decide.
-    async fn nearest_duplicate(&self, vector: &[f32]) -> Result<Option<NearDuplicate>> {
+    async fn nearest_existing(&self, vector: &[f32], floor: f32) -> Result<Option<NearDuplicate>> {
         let hits = {
             let guard = self
                 .index
                 .read()
                 .map_err(|e| MnemeError::Index(format!("hnsw rwlock poisoned: {e}")))?;
-            guard.search(vector, 1)?
+            guard.search(vector, NEAREST_PROBE)?
         };
-        let Some((id, distance)) = hits.first().copied() else {
+        for (id, distance) in hits {
+            let similarity = similarity_from_distance(distance);
+            if similarity < floor {
+                // Distance-ordered: nothing further can clear it.
+                return Ok(None);
+            }
+            // An orphan vector (metadata already deleted) is not a
+            // duplicate of anything the agent can act on.
+            let Some(bytes) = self.storage.get(&mem_key(&id)).await? else {
+                continue;
+            };
+            if self.superseded_by(id).await?.is_some() {
+                continue;
+            }
+            let existing: MemoryItem = postcard::from_bytes(&bytes)
+                .map_err(|e| MnemeError::Storage(format!("decode MemoryItem {id}: {e}")))?;
+            return Ok(Some(NearDuplicate {
+                id,
+                similarity,
+                content: existing.content,
+                scope: existing.scope,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Record that `new` replaces `old`. Returns `false` (and writes
+    /// nothing) if either memory doesn't exist or they're the same id.
+    ///
+    /// From then on `old` is left out of [`recall`](Self::recall) and
+    /// therefore out of `mneme://context`, unless the caller passes
+    /// [`RecallFilters::include_superseded`]. It stays fully readable
+    /// by id and in exports: nothing is deleted. Superseding an
+    /// already-superseded memory re-points it at the newer one.
+    pub async fn supersede(&self, old: MemoryId, new: MemoryId) -> Result<bool> {
+        if old == new {
+            return Ok(false);
+        }
+        let _g = self.write_lock.lock().await;
+        if self.storage.get(&mem_key(&old)).await?.is_none()
+            || self.storage.get(&mem_key(&new)).await?.is_none()
+        {
+            return Ok(false);
+        }
+        self.storage.put(&sup_key(&old), &new.0.to_bytes()).await?;
+        self.note_mutation();
+        Ok(true)
+    }
+
+    /// The memory that superseded `id`, if any.
+    ///
+    /// The link is checked lazily: if the superseding memory has since
+    /// been forgotten, `id` counts as current again. That keeps
+    /// `forget` cheap (no reverse index to maintain) and means undoing
+    /// a mistaken supersede is just forgetting the replacement.
+    pub async fn superseded_by(&self, id: MemoryId) -> Result<Option<MemoryId>> {
+        let Some(bytes) = self.storage.get(&sup_key(&id)).await? else {
             return Ok(None);
         };
-        let similarity = similarity_from_distance(distance);
-        if similarity < NEAR_DUPLICATE_SIMILARITY {
+        let Ok(raw) = <[u8; 16]>::try_from(bytes.as_slice()) else {
+            tracing::warn!(memory_id = %id, "ignoring malformed supersession link");
+            return Ok(None);
+        };
+        let new = MemoryId(ulid::Ulid::from_bytes(raw));
+        if self.storage.get(&mem_key(&new)).await?.is_none() {
             return Ok(None);
         }
-        // An orphan vector (metadata already deleted) is not a
-        // duplicate of anything the agent can act on.
-        let Some(bytes) = self.storage.get(&mem_key(&id)).await? else {
-            return Ok(None);
-        };
-        let existing: MemoryItem = postcard::from_bytes(&bytes)
-            .map_err(|e| MnemeError::Storage(format!("decode MemoryItem {id}: {e}")))?;
-        Ok(Some(NearDuplicate {
-            id,
-            similarity,
-            content: existing.content,
-            scope: existing.scope,
-        }))
+        Ok(Some(new))
     }
 
     /// Top-`k` nearest memories to `query`, optionally filtered.
@@ -758,6 +837,9 @@ impl SemanticStore {
         let qvec = self.embedder.embed(trimmed).await?;
 
         let mut out: Vec<RecallHit> = Vec::with_capacity(k);
+        // Superseded matches (only collected when asked for). They rank
+        // after every current match, whatever their similarity.
+        let mut stale: Vec<RecallHit> = Vec::new();
         // Candidates already decoded, so a widened probe re-walks only
         // the suffix it revealed.
         let mut consumed = 0usize;
@@ -796,10 +878,19 @@ impl SemanticStore {
                 if !filters.matches(&item, *score) {
                     continue;
                 }
-                out.push(RecallHit {
-                    item,
-                    score: *score,
-                });
+                match self.superseded_by(item.id).await? {
+                    None => out.push(RecallHit {
+                        item,
+                        score: *score,
+                        superseded_by: None,
+                    }),
+                    Some(newer) if filters.include_superseded => stale.push(RecallHit {
+                        item,
+                        score: *score,
+                        superseded_by: Some(newer),
+                    }),
+                    Some(_) => continue,
+                }
                 if out.len() >= k {
                     break;
                 }
@@ -833,6 +924,8 @@ impl SemanticStore {
                 "recall widened its index probe to satisfy filters"
             );
         }
+        let room = k.saturating_sub(out.len());
+        out.extend(stale.into_iter().take(room));
         Ok(out)
     }
 
@@ -896,6 +989,10 @@ impl SemanticStore {
         if existed {
             self.storage.delete(&key).await?;
         }
+        // Drop this memory's own supersession link. Links *to* it are
+        // left in place and resolve as "not superseded" once it's gone
+        // (see `superseded_by`).
+        self.storage.delete(&sup_key(&id)).await?;
         // Tombstone the vector unconditionally — even if the metadata
         // is gone, leaving an orphan vector wastes RAM and can return
         // `recall` results that mysteriously vanish at decode time.
@@ -1074,6 +1171,13 @@ impl Drop for SemanticStore {
             state.notify.notify_one();
         }
     }
+}
+
+fn sup_key(id: &MemoryId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(SUP_KEY_PREFIX.len() + 16);
+    k.extend_from_slice(SUP_KEY_PREFIX);
+    k.extend_from_slice(&id.0.to_bytes());
+    k
 }
 
 fn mem_key(id: &MemoryId) -> Vec<u8> {
@@ -2000,5 +2104,131 @@ mod tests {
         .unwrap();
         assert_eq!(s2.len(), 0);
         assert_eq!(s2.dim(), 8);
+    }
+
+    // ---------- supersession ----------
+
+    async fn two(s: &SemanticStore) -> (MemoryId, MemoryId) {
+        let old = s
+            .remember("balance is 5200", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let new = s
+            .remember("balance is 4800", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        (old, new)
+    }
+
+    #[tokio::test]
+    async fn superseded_memory_drops_out_of_recall() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = two(&s).await;
+        assert!(s.supersede(old, new).await.unwrap());
+        assert_eq!(s.superseded_by(old).await.unwrap(), Some(new));
+
+        let hits = s
+            .recall("balance is 5200", 10, &RecallFilters::default())
+            .await
+            .unwrap();
+        let ids: Vec<MemoryId> = hits.iter().map(|h| h.item.id).collect();
+        assert_eq!(
+            ids,
+            vec![new],
+            "superseded memory must be hidden by default"
+        );
+        // Still readable by id.
+        assert!(s.get(old).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn include_superseded_ranks_them_last_and_marks_them() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = two(&s).await;
+        s.supersede(old, new).await.unwrap();
+        let filters = RecallFilters {
+            include_superseded: true,
+            ..Default::default()
+        };
+        let hits = s.recall("balance is 5200", 10, &filters).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].item.id, new);
+        assert_eq!(hits[0].superseded_by, None);
+        assert_eq!(hits[1].item.id, old);
+        assert_eq!(hits[1].superseded_by, Some(new));
+    }
+
+    #[tokio::test]
+    async fn forgetting_the_replacement_revives_the_original() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = two(&s).await;
+        s.supersede(old, new).await.unwrap();
+        s.forget(new).await.unwrap();
+        assert_eq!(s.superseded_by(old).await.unwrap(), None);
+        let hits = s
+            .recall("balance", 10, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].item.id, old);
+    }
+
+    #[tokio::test]
+    async fn forgetting_the_original_removes_its_link() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = two(&s).await;
+        s.supersede(old, new).await.unwrap();
+        s.forget(old).await.unwrap();
+        assert!(s.storage.get(&sup_key(&old)).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn supersede_rejects_missing_or_identical_ids() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = two(&s).await;
+        assert!(!s.supersede(old, old).await.unwrap());
+        assert!(!s.supersede(MemoryId::new(), new).await.unwrap());
+        assert!(!s.supersede(old, MemoryId::new()).await.unwrap());
+        assert_eq!(s.superseded_by(old).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn resupersede_points_at_the_newest() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, mid) = two(&s).await;
+        let newest = s
+            .remember("balance is 4100", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        s.supersede(old, mid).await.unwrap();
+        s.supersede(old, newest).await.unwrap();
+        assert_eq!(s.superseded_by(old).await.unwrap(), Some(newest));
+    }
+
+    #[tokio::test]
+    async fn nearest_existing_skips_superseded_neighbours() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        // The stub embeds by first byte + length: these three are
+        // identical vectors.
+        let (old, new) = two(&s).await;
+        s.supersede(old, new).await.unwrap();
+        let (_, dup) = s
+            .remember_checked(
+                "balance is 4100",
+                MemoryKind::Fact,
+                vec![],
+                "p".into(),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dup.expect("a current neighbour exists").id, new);
     }
 }

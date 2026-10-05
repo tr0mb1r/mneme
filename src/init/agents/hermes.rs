@@ -106,8 +106,13 @@ tools appear as `mcp_mneme_<tool>`; its resources are read with
    `tags` or `scope` when you know them.
 3. **Remember** durable facts with `mcp_mneme_remember`: decisions and their
    reasons, preferences the user states, project conventions, conclusions
-   from investigation. One fact per memory, under ~500 characters. Correct a
-   stale memory with `mcp_mneme_update`; delete one with `mcp_mneme_forget`.
+   from investigation. One fact per memory, under ~500 characters.
+   **When a fact changes** (a new balance, a reversed decision), pass the old
+   memory's id in `supersedes`: the old one stays readable by id but stops
+   showing up in recall. If the reply says the new memory is close to an
+   existing one, decide: it replaces it → `mcp_mneme_update` the new id with
+   `supersedes: "<old id>"`; it only restates it → `mcp_mneme_forget` the new
+   id; both are true → ignore the note.
 4. **Pin** rules that must apply every session ("always answer in British
    English") with `mcp_mneme_pin` instead of `remember`.
 5. **Record events** worth a timeline with `mcp_mneme_record_event`

@@ -15,6 +15,16 @@ Keep memories concise — target under 500 characters; the tool returns a
 between 2,000 and 10,000. Anything over 10,000 is rejected — extract the key
 insight and remember that instead.
 
+## When a fact changes (pass `supersedes`)
+
+When a new memory replaces an older one — a new balance, a reversed
+decision, a corrected detail — pass the old id in `supersedes` on
+`remember`. The old memory stays readable by id but stops competing in
+`recall` and auto-context. If `remember` replies that the new memory is
+close to an existing one, decide: it replaces it → `update` the new id
+with `supersedes: "<old id>"`; it just restates it → `forget` the new id;
+both are true → ignore the note.
+
 ## When NOT to remember
 
 - Code or file contents — those are read fresh from disk each session.

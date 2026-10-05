@@ -25,6 +25,13 @@ pub use encrypted::EncryptedStorage;
 /// Memory items live at `MEM_KEY_PREFIX || ulid_bytes`.
 pub(crate) const MEM_KEY_PREFIX: &[u8] = b"mem:";
 
+/// Supersession links: `SUP_KEY_PREFIX || old_ulid_bytes` holds the
+/// 16-byte ULID of the memory that replaced it. Kept beside the item
+/// rather than inside [`MemoryItem`](crate::memory::semantic::MemoryItem)
+/// because that struct is postcard-encoded (not self-describing), so a
+/// new field would make every existing record undecodable.
+pub(crate) const SUP_KEY_PREFIX: &[u8] = b"sup:";
+
 #[async_trait]
 pub trait Storage: Send + Sync {
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;

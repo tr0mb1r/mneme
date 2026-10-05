@@ -320,6 +320,7 @@ mod tests {
                 created_at: Utc::now(),
             },
             score: distance,
+            superseded_by: None,
         }
     }
 

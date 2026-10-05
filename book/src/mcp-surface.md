@@ -14,8 +14,8 @@ serves.
 
 | Tool | Layer | Use when |
 |------|-------|----------|
-| `remember` | L4 semantic | The user shares a fact, decision, or preference that should persist across sessions. **Size guidance:** target under 500 chars; 500–2k accepted with a `length_advisory`, 2k–10k with a `length_warning`, over 10k rejected with a structured error. See [§Size guardrails](#size-guardrails) below. |
-| `update` | L4 semantic | The user revises an existing memory; re-embeds automatically when `content` changes. |
+| `remember` | L4 semantic | The user shares a fact, decision, or preference that should persist across sessions. **Size guidance:** target under 500 chars; 500–2k accepted with a `length_advisory`, 2k–10k with a `length_warning`, over 10k rejected with a structured error. See [§Size guardrails](#size-guardrails) below. **Replacing a fact:** pass `supersedes` (an id or array of ids) and the old memories drop out of `recall` and auto-context while staying readable by id. When the nearest current memory has similarity ≥ 0.80 the reply names it, both in the text and in `_meta` (`related_memory`, or `duplicate_advisory` at ≥ 0.95). See [§Superseding and similarity advisories](#superseding-and-similarity-advisories). |
+| `update` | L4 semantic | The user revises an existing memory; re-embeds automatically when `content` changes. Also takes `supersedes`, to retire older memories after the fact (e.g. after `remember` reported a close match). |
 | `forget` | L4 semantic, L0 procedural, L3 episodic (hot+warm) | The user explicitly asks to remove a memory. `id=…` resolves the ULID across all three layers, first hit wins; cold-archive entries stay out of reach by design. Confirm before calling. |
 | `pin` | L0 procedural | A *rule* should surface on every recall context (e.g. "always use `uv`, not `pip`"). |
 | `unpin` | L0 procedural | A previously-pinned rule no longer applies. |
@@ -25,7 +25,7 @@ serves.
 
 | Tool | Layer | Use when |
 |------|-------|----------|
-| `recall` | L4 semantic | Semantic similarity search — find memories close to a natural-language query. Filter with `scope`, `type`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). |
+| `recall` | L4 semantic | Semantic similarity search — find memories close to a natural-language query. Filter with `scope`, `type`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). Superseded memories are left out unless `include_superseded: true`, in which case they come after every current match and carry `superseded_by`. |
 | `recall_recent` | L3 episodic | "What did we just do?" — time-ordered events (tool calls, lifecycle events, conversation, decisions). Optional `since` / `until` bound the result to a `[since, until)` window against `created_at` (RFC3339 or 26-char ULID); when either bound is set, `limit` caps at 1000 instead of 200. The server does not parse natural language — convert phrases like "last Tuesday" to RFC3339 client-side before calling. |
 
 ### Session helpers
@@ -169,6 +169,46 @@ budget pass guarantees no single layer is starved by another.
 
 L4's weight applies only when the read carries a `?q=` seed; without one
 the layer contributes nothing to score against.
+
+## Superseding and similarity advisories
+
+Facts change: a balance moves, a decision is reversed, a port is
+reassigned. Storing the new version next to the old one leaves both
+competing in `recall`, so `remember` and `update` take `supersedes`:
+
+```json
+{"name": "remember", "arguments": {"content": "D account balance is 4,800 EUR (2026-10-04)",
+                                   "supersedes": "01K8Z…"}}
+```
+
+The superseded memory is not deleted. It stays readable by id (`forget`
+and exports still see it), but `recall` and `mneme://context` skip it
+unless `include_superseded: true`. Forgetting the replacement brings the
+original back, so a mistaken supersede is undone by forgetting the new
+memory.
+
+To help the agent notice when it should supersede, every `remember`
+reply names the closest current memory once similarity reaches 0.80:
+
+```text
+stored memory 01K90…
+note: close to memory 01K8Z… (similarity 0.95): "D account balance is 5,200 EUR (2026-10-01)".
+If this replaces it, call `update` on the new id with `supersedes: "01K8Z…"`; if it only
+restates it, `forget` the new id.
+```
+
+The same information is in `_meta.related_memory`, or
+`_meta.duplicate_advisory` from 0.95 up (the pre-1.5 name), with
+`existing_id`, `existing_content`, `existing_scope`, `similarity` and
+`message`. It's in the text as well because some MCP hosts never show
+`_meta` to the model.
+
+Why 0.80, and why one piece of advice for both cases: measured with
+BGE-M3 on realistic agent memories, a paraphrased restatement scores
+0.82–0.96, the same fact with an updated value 0.83–0.95, a different
+fact about the same subject 0.55–0.79, and unrelated memories 0.36–0.48.
+Restatements and updates overlap completely, so mneme can't tell them
+apart; it points at the candidate and lets the agent decide.
 
 ## Size guardrails
 

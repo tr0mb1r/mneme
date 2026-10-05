@@ -282,6 +282,12 @@ Unfiltered recall still issues exactly one probe.
 > corpus. `remember` also now reports a `duplicate_advisory` in `_meta`
 > when new content closely restates an existing memory — advisory only;
 > the write still lands.
+>
+> **Changed in v1.5.** `remember` names the closest current memory from
+> similarity 0.80 up (`related_memory`, or `duplicate_advisory` at
+> ≥ 0.95), in the reply text as well as `_meta`. `remember` and `update`
+> take `supersedes`; superseded memories drop out of `recall` and
+> auto-context unless `include_superseded: true`.
 
 ---
 

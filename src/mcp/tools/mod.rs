@@ -411,6 +411,39 @@ pub(crate) fn parse_tags_arg(arg: Option<&Value>) -> Result<Vec<String>, ToolErr
     }
 }
 
+/// Parse `supersedes`: one ULID string or an array of them, deduplicated.
+pub(crate) fn parse_supersedes(v: Option<&Value>) -> Result<Vec<crate::ids::MemoryId>, ToolError> {
+    let raw: Vec<&str> = match v {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|i| {
+                i.as_str().ok_or_else(|| {
+                    ToolError::InvalidArguments("`supersedes` entries must be strings".into())
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => {
+            return Err(ToolError::InvalidArguments(
+                "`supersedes` must be a memory id or an array of ids".into(),
+            ));
+        }
+    };
+    let mut out = Vec::with_capacity(raw.len());
+    for s in raw {
+        let id = ulid::Ulid::from_string(s.trim())
+            .map(crate::ids::MemoryId)
+            .map_err(|_| {
+                ToolError::InvalidArguments(format!("`supersedes`: `{s}` is not a memory id"))
+            })?;
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

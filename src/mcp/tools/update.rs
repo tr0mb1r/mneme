@@ -22,7 +22,10 @@ const DESCRIPTION: &str = "Edit an existing memory in place. Provide \
 supplied fields change. Use this when the user revises a fact, narrows \
 a preference, or re-classifies a memory; do NOT use this for \
 unrelated information (call `remember` for new memories instead). \
-Re-embedding happens automatically when `content` changes.";
+Re-embedding happens automatically when `content` changes. Pass \
+`supersedes` to mark older memories as replaced by this one (for \
+example after `remember` reported a close existing memory): they stay \
+readable by id but drop out of `recall` and auto-context.";
 
 pub struct Update {
     store: Arc<SemanticStore>,
@@ -71,7 +74,14 @@ impl Tool for Update {
                         "items": { "type": "string" },
                         "description": "Replacement tag list. Pass [] to clear."
                     },
-                    "scope": { "type": "string", "description": "Replacement scope." }
+                    "scope": { "type": "string", "description": "Replacement scope." },
+                    "supersedes": {
+                        "oneOf": [
+                            { "type": "string" },
+                            { "type": "array", "items": { "type": "string" } }
+                        ],
+                        "description": "Id (or ids) of older memories this one replaces."
+                    }
                 },
                 "required": ["id"]
             }),
@@ -169,6 +179,26 @@ impl Tool for Update {
             }
         };
 
+        let supersedes = super::parse_supersedes(args.get("supersedes"))?;
+        if supersedes.contains(&memory_id) {
+            return Err(ToolError::InvalidArguments(
+                "`supersedes` must not include the memory being updated".into(),
+            ));
+        }
+        for old in &supersedes {
+            let exists = self
+                .store
+                .get(*old)
+                .await
+                .map_err(|e| ToolError::Internal(format!("update failed: {e}")))?
+                .is_some();
+            if !exists {
+                return Err(ToolError::InvalidArguments(format!(
+                    "`supersedes`: no memory with id {old}"
+                )));
+            }
+        }
+
         let patch = UpdatePatch {
             content,
             kind,
@@ -191,11 +221,25 @@ impl Tool for Update {
             );
         }
 
-        let mut result = ToolResult::text(if existed {
+        if existed {
+            for old in &supersedes {
+                self.store
+                    .supersede(*old, memory_id)
+                    .await
+                    .map_err(|e| ToolError::Internal(format!("supersede {old} failed: {e}")))?;
+            }
+        }
+
+        let mut text = if existed {
             format!("updated memory {memory_id}")
         } else {
             format!("no such memory {memory_id}")
-        });
+        };
+        if existed && !supersedes.is_empty() {
+            let ids: Vec<String> = supersedes.iter().map(ToString::to_string).collect();
+            text.push_str(&format!(" (supersedes {})", ids.join(", ")));
+        }
+        let mut result = ToolResult::text(text);
         // Only attach an advisory/warning if the update actually
         // landed and the content was the field changing — no point
         // in advising on a no-op or a metadata-only patch.
@@ -434,5 +478,52 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    #[tokio::test]
+    async fn update_can_supersede_after_the_fact() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let old = s
+            .remember("balance is 5200", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let new = s
+            .remember("balance is 4800", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let u = Update::new(Arc::clone(&s));
+        let res = u
+            .invoke(json!({ "id": new.to_string(), "supersedes": old.to_string() }))
+            .await
+            .unwrap();
+        let text = match &res.content[0] {
+            crate::mcp::tools::ContentBlock::Text(t) => t.clone(),
+        };
+        assert_eq!(text, format!("updated memory {new} (supersedes {old})"));
+        assert_eq!(s.superseded_by(old).await.unwrap(), Some(new));
+        let hits = s
+            .recall("balance", 5, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_superseding_itself_or_a_missing_id() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let id = s
+            .remember("x", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let u = Update::new(Arc::clone(&s));
+        for bad in [id.to_string(), Ulid::new().to_string()] {
+            let err = u
+                .invoke(json!({ "id": id.to_string(), "supersedes": bad }))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::InvalidArguments(_)));
+        }
     }
 }

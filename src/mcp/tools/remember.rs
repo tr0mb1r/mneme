@@ -8,7 +8,9 @@ use serde_json::{Value, json};
 
 use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
-use crate::memory::semantic::{MemoryKind, SemanticStore};
+use crate::memory::semantic::{
+    MemoryKind, NEAR_DUPLICATE_SIMILARITY, NearDuplicate, SemanticStore,
+};
 use crate::scope::ScopeState;
 
 const DESCRIPTION: &str = "Store a piece of information for future recall. \
@@ -27,9 +29,20 @@ field suggesting future memories be more concise.\n\
 - Over 10,000 chars: rejected with a structured error. Extract a key \
 insight or store a brief summary plus a source reference instead.\n\
 \n\
+REPLACING A FACT: when this memory replaces an older one (a new \
+balance, a changed decision, a corrected detail), pass its id in \
+`supersedes`. The old memory stays readable by id but drops out of \
+`recall` and auto-context, so stale and current versions don't compete. \
+When a close existing memory is found, the reply says so (and gives its \
+id) so you can decide.\n\
+\n\
 DO NOT use for: transient information from tool outputs (those are \
 captured automatically), or contents of source code files (those are \
 read live from disk).";
+
+/// How much of an existing memory's content to quote in the reply
+/// text when pointing the agent at it.
+const QUOTE_CHARS: usize = 160;
 
 pub struct Remember {
     store: Arc<SemanticStore>,
@@ -84,7 +97,15 @@ impl Tool for Remember {
                         "description": "Optional tags for retrieval."
                     },
                     "scope": { "type": "string", "description": "Optional scope override. Defaults to the session's current scope (set by `switch_scope`)." },
-                    "pinned": { "type": "boolean", "description": "Promote to procedural memory." }
+                    "pinned": { "type": "boolean", "description": "Promote to procedural memory." },
+                    "supersedes": {
+                        "oneOf": [
+                            { "type": "string" },
+                            { "type": "array", "items": { "type": "string" } }
+                        ],
+                        "description": "Id (or ids) of memories this one replaces. They stay \
+            readable by id but drop out of recall and auto-context."
+                    }
                 },
                 "required": ["content"]
             }),
@@ -144,6 +165,24 @@ impl Tool for Remember {
             );
         }
 
+        // Validate `supersedes` before writing anything, so a typo'd id
+        // doesn't leave a new memory stored next to the one it was
+        // meant to retire.
+        let supersedes = super::parse_supersedes(args.get("supersedes"))?;
+        for old in &supersedes {
+            let exists = self
+                .store
+                .get(*old)
+                .await
+                .map_err(|e| ToolError::Internal(format!("remember failed: {e}")))?
+                .is_some();
+            if !exists {
+                return Err(ToolError::InvalidArguments(format!(
+                    "`supersedes`: no memory with id {old}"
+                )));
+            }
+        }
+
         let (id, duplicate) = self
             .store
             .remember_checked(content, kind, tags, scope, true)
@@ -159,42 +198,114 @@ impl Tool for Remember {
             );
         }
 
-        let mut result = ToolResult::text(format!("stored memory {id}"));
+        for old in &supersedes {
+            self.store
+                .supersede(*old, id)
+                .await
+                .map_err(|e| ToolError::Internal(format!("supersede {old} failed: {e}")))?;
+        }
 
-        // Merge the size advisory (if any) and the duplicate advisory
+        let mut text = format!("stored memory {id}");
+        if !supersedes.is_empty() {
+            let ids: Vec<String> = supersedes.iter().map(ToString::to_string).collect();
+            text.push_str(&format!(" (supersedes {})", ids.join(", ")));
+        }
+
+        // Merge the size advisory (if any) and the similarity advisory
         // (if any) into a single `_meta` object. They are independent —
         // a long restatement trips both.
         let mut meta = size_tier::success_meta(tier, len, self.max_chars)
             .and_then(|m| m.as_object().cloned())
             .unwrap_or_default();
-        if let Some(dup) = duplicate {
+        // A neighbour the caller just superseded is the expected
+        // outcome, not something to warn about.
+        if let Some(near) = duplicate.filter(|d| !supersedes.contains(&d.id)) {
+            let (key, advisory, note) = similarity_advisory(&near);
             tracing::info!(
                 memory_id = %id,
-                duplicate_of = %dup.id,
-                similarity = dup.similarity,
-                "remember: stored a near-duplicate of an existing memory"
+                existing = %near.id,
+                similarity = near.similarity,
+                kind = key,
+                "remember: stored close to an existing memory"
             );
+            meta.insert(key.into(), advisory);
+            // Also in the text: some MCP hosts never show `_meta` to the
+            // model, and an advisory the agent can't see is useless.
+            text.push('\n');
+            text.push_str(&note);
+        }
+        if !supersedes.is_empty() {
             meta.insert(
-                "duplicate_advisory".into(),
-                json!({
-                    "existing_id": dup.id.to_string(),
-                    "existing_content": dup.content,
-                    "existing_scope": dup.scope,
-                    "similarity": dup.similarity,
-                    "message": format!(
-                        "This closely restates memory {} (similarity {:.2}). It was stored \
-                         anyway — mneme never discards what you gave it. If the new wording \
-                         supersedes the old, call `update` on {} instead and `forget` this \
-                         one; if both are worth keeping, ignore this.",
-                        dup.id, dup.similarity, dup.id
-                    ),
-                }),
+                "supersedes".into(),
+                json!(
+                    supersedes
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                ),
             );
         }
+
+        let mut result = ToolResult::text(text);
         if !meta.is_empty() {
             result = result.with_meta(Value::Object(meta));
         }
         Ok(result)
+    }
+}
+
+/// Build the `_meta` entry and the note appended to the reply text for
+/// the nearest existing memory.
+///
+/// Similarity can't tell a restatement from an updated value (both
+/// land around 0.82–0.96 under BGE-M3; see
+/// [`crate::memory::semantic::RELATED_SIMILARITY`]), so the guidance is
+/// the same either way: supersede, forget the new one, or ignore. Only
+/// the key differs: `duplicate_advisory` (≥ [`NEAR_DUPLICATE_SIMILARITY`],
+/// its pre-1.5 name and shape) or `related_memory` below that.
+fn similarity_advisory(near: &NearDuplicate) -> (&'static str, Value, String) {
+    let quoted = quote(&near.content);
+    let (key, relation) = if near.similarity >= NEAR_DUPLICATE_SIMILARITY {
+        ("duplicate_advisory", "near-duplicate of")
+    } else {
+        ("related_memory", "close to")
+    };
+    let message = format!(
+        "The new memory is {relation} memory {} (similarity {:.2}). Both are stored. \
+         If the new one is an updated version (new value, changed decision), \
+         retire the old one: call `update` on the new id with `supersedes: \"{}\"` \
+         (or pass `supersedes` to `remember` up front next time). If it only \
+         restates the old one, `forget` the new id. If both are true and \
+         distinct, ignore this.",
+        near.id, near.similarity, near.id
+    );
+    let note = format!(
+        "note: {relation} memory {} (similarity {:.2}): \"{quoted}\". If this \
+         replaces it, call `update` on the new id with `supersedes: \"{}\"`; if it \
+         only restates it, `forget` the new id.",
+        near.id, near.similarity, near.id
+    );
+    (
+        key,
+        json!({
+            "existing_id": near.id.to_string(),
+            "existing_content": near.content,
+            "existing_scope": near.scope,
+            "similarity": near.similarity,
+            "message": message,
+        }),
+        note,
+    )
+}
+
+fn quote(content: &str) -> String {
+    let one_line = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= QUOTE_CHARS {
+        one_line
+    } else {
+        let mut cut: String = one_line.chars().take(QUOTE_CHARS).collect();
+        cut.push('…');
+        cut
     }
 }
 
@@ -505,5 +616,127 @@ mod tests {
         assert!(!hits.is_empty());
         assert_eq!(hits[0].item.scope, "work");
         assert_eq!(hits[0].item.tags, vec!["ci".to_string()]);
+    }
+
+    fn text_of(res: &ToolResult) -> String {
+        match &res.content[0] {
+            crate::mcp::tools::ContentBlock::Text(t) => t.clone(),
+        }
+    }
+
+    fn id_of(res: &ToolResult) -> crate::ids::MemoryId {
+        let text = text_of(res);
+        let raw = text.split_whitespace().nth(2).unwrap();
+        crate::ids::MemoryId(Ulid::from_string(raw).unwrap())
+    }
+
+    #[tokio::test]
+    async fn supersedes_retires_the_old_memory() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r = Remember::new(Arc::clone(&store), make_scope());
+        let old = id_of(
+            &r.invoke(json!({ "content": "balance is 5200" }))
+                .await
+                .unwrap(),
+        );
+        let res = r
+            .invoke(json!({ "content": "balance is 4800", "supersedes": old.to_string() }))
+            .await
+            .unwrap();
+        let new = id_of(&res);
+        assert!(text_of(&res).contains(&format!("(supersedes {old})")));
+        assert_eq!(res.meta.as_ref().unwrap()["supersedes"][0], old.to_string());
+        // The neighbour it just retired must not be reported back.
+        let meta = res.meta.unwrap();
+        assert!(meta.get("duplicate_advisory").is_none(), "{meta}");
+        assert!(meta.get("related_memory").is_none(), "{meta}");
+        assert_eq!(store.superseded_by(old).await.unwrap(), Some(new));
+    }
+
+    #[tokio::test]
+    async fn supersedes_accepts_an_array() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r = Remember::new(Arc::clone(&store), make_scope());
+        let a = id_of(&r.invoke(json!({ "content": "alpha" })).await.unwrap());
+        let b = id_of(&r.invoke(json!({ "content": "bravo" })).await.unwrap());
+        let res = r
+            .invoke(json!({ "content": "merged", "supersedes": [a.to_string(), b.to_string()] }))
+            .await
+            .unwrap();
+        let new = id_of(&res);
+        assert_eq!(store.superseded_by(a).await.unwrap(), Some(new));
+        assert_eq!(store.superseded_by(b).await.unwrap(), Some(new));
+    }
+
+    #[tokio::test]
+    async fn bad_supersedes_is_rejected_before_anything_is_stored() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r = Remember::new(Arc::clone(&store), make_scope());
+        for bad in [
+            json!("not-a-ulid"),
+            json!(42),
+            json!([1]),
+            json!(Ulid::new().to_string()),
+        ] {
+            let err = r
+                .invoke(json!({ "content": "x", "supersedes": bad }))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::InvalidArguments(_)), "{bad}");
+        }
+        assert_eq!(store.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_note_is_also_in_the_reply_text() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r = Remember::new(Arc::clone(&store), make_scope());
+        let first = id_of(
+            &r.invoke(json!({ "content": "CI runs on ubuntu" }))
+                .await
+                .unwrap(),
+        );
+        let res = r
+            .invoke(json!({ "content": "CI runs on ubuntu" }))
+            .await
+            .unwrap();
+        let text = text_of(&res);
+        assert!(text.starts_with("stored memory "), "{text}");
+        assert!(
+            text.contains(&format!("near-duplicate of memory {first}")),
+            "{text}"
+        );
+        assert!(text.contains("\"CI runs on ubuntu\""), "{text}");
+    }
+
+    #[test]
+    fn advisory_key_depends_on_similarity() {
+        let near = |similarity| NearDuplicate {
+            id: crate::ids::MemoryId::new(),
+            similarity,
+            content: "D account balance is 5,200 EUR".into(),
+            scope: "global".into(),
+        };
+        let (k, v, note) = similarity_advisory(&near(0.97));
+        assert_eq!(k, "duplicate_advisory");
+        assert!(v["message"].as_str().unwrap().contains("supersedes"));
+        assert!(note.contains("near-duplicate of"));
+        let (k, v, note) = similarity_advisory(&near(0.86));
+        assert_eq!(k, "related_memory");
+        assert_eq!(v["existing_content"], "D account balance is 5,200 EUR");
+        assert!(note.contains("close to memory"), "{note}");
+        assert!(note.contains("`update`"), "{note}");
+    }
+
+    #[test]
+    fn long_quotes_are_truncated() {
+        let q = quote(&"word ".repeat(100));
+        assert!(q.chars().count() <= QUOTE_CHARS + 1);
+        assert!(q.ends_with('…'));
+        assert_eq!(quote("a\n  b"), "a b");
     }
 }

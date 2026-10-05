@@ -137,6 +137,7 @@ mod tests {
                 created_at: Utc::now() - Duration::days(age_days),
             },
             score: distance,
+            superseded_by: None,
         }
     }
 
