@@ -12,6 +12,14 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+## [1.4.1](https://github.com/tr0mb1r/mneme/compare/v1.4.0...v1.4.1) - 2026-10-05
+
+### Added
+
+- *(hermes)* context-reload hook — pins and state come back after compression
+- *(recall)* hybrid search — BM25 keyword matches fused with vectors
+- *(memory)* `supersedes` on remember/update; similarity advisory from 0.80
+
 ## [1.4.0](https://github.com/tr0mb1r/mneme/compare/v1.3.1...v1.4.0) - 2026-10-04
 
 ### Added
