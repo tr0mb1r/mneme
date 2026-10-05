@@ -25,7 +25,7 @@ serves.
 
 | Tool | Layer | Use when |
 |------|-------|----------|
-| `recall` | L4 semantic | Semantic similarity search — find memories close to a natural-language query. Filter with `scope`, `type`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). Superseded memories are left out unless `include_superseded: true`, in which case they come after every current match and carry `superseded_by`. |
+| `recall` | L4 semantic | Hybrid search — meaning *and* exact words, fused, so both questions and exact names (`live_bt.py`, "D account", an env var, an error string) work. `mode` picks `hybrid` (default), `semantic`, or `keyword`; each row says which search found it in `match` (`semantic` / `keyword` / `both`). See [§Hybrid recall](#hybrid-recall). Filter with `scope`, `type`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). Superseded memories are left out unless `include_superseded: true`, in which case they come after every current match and carry `superseded_by`. |
 | `recall_recent` | L3 episodic | "What did we just do?" — time-ordered events (tool calls, lifecycle events, conversation, decisions). Optional `since` / `until` bound the result to a `[since, until)` window against `created_at` (RFC3339 or 26-char ULID); when either bound is set, `limit` caps at 1000 instead of 200. The server does not parse natural language — convert phrases like "last Tuesday" to RFC3339 client-side before calling. |
 
 ### Session helpers
@@ -169,6 +169,46 @@ budget pass guarantees no single layer is starved by another.
 
 L4's weight applies only when the read carries a `?q=` seed; without one
 the layer contributes nothing to score against.
+
+## Hybrid recall
+
+`recall` (and the `semantic` section of `mneme://context?q=…`) runs two
+searches and merges them:
+
+- **Vector search** over the embeddings, as before.
+- **Keyword search**: BM25 over an in-memory inverted index of memory
+  contents. Identifiers are indexed whole *and* in parts —
+  `live_bt.py` is the terms `live_bt.py`, `live`, `bt`, `py` — so a
+  query for either form matches. Single letters count ("D account"),
+  Unicode letters count, and there's no stemming (inflections are the
+  vector side's job).
+
+Ranking starts from each memory's cosine similarity to the query (also
+computed for memories only the keyword search found), so with no literal
+evidence the order is exactly the vector order. A memory that contains
+the query's terms gains up to +0.2, scaled by the square of how much of
+the query it covers (IDF-weighted, so `live_bt.py` counts for far more
+than `the`), and +0.1 more if it contains the query as a contiguous
+phrase. Every filter, `min_similarity` included, applies to both kinds
+of hit.
+
+Measured on a corpus of realistic agent memories full of lookalikes
+(`live_bt.py` beside `live_mm.py` and `live_bt_old.py`, accounts A–G,
+`IBKR_GATEWAY_PORT` beside `…_HOST` and `…_USER`, ports 9090/9091):
+
+| model | query type | semantic top-1 | hybrid top-1 |
+|---|---|---|---|
+| MiniLM-L6 | exact name | 6 / 10 | 10 / 10 |
+| MiniLM-L6 | name inside a question | 6 / 8 | 8 / 8 |
+| MiniLM-L6 | natural-language question | 9 / 10 | 10 / 10 |
+| BGE-M3 | exact name | 9 / 10 | 10 / 10 |
+| BGE-M3 | name inside a question | 8 / 8 | 8 / 8 |
+| BGE-M3 | natural-language question | 10 / 10 | 10 / 10 |
+
+The keyword index is built from storage on the first `recall` after
+startup (one pass over the stored memories) and kept current by every
+write. It exists only in memory, so it adds nothing to the data
+directory and nothing to encrypt.
 
 ## Superseding and similarity advisories
 

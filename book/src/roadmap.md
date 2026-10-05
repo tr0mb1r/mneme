@@ -83,14 +83,14 @@ from `config.toml`.
 
 ## Retrieval and memory hygiene
 
-**No lexical or exact-match search.** `recall` is pure vector search, so
-it's weakest exactly where a coding agent often needs strength: an
-environment variable name, a ULID, an error string, a function
-identifier. There is no substring or keyword path anywhere — `mneme
-inspect --query` also goes through the embedder. A hybrid index (BM25 or
-a simple inverted index over `content`, fused with the vector hits)
-would be the single biggest recall improvement available. Workaround
-today: `mneme export | jq`.
+**Keyword search has no stemming and no substring matching.** `recall`
+is hybrid (vector + BM25, see
+[MCP surface](./mcp-surface.md#hybrid-recall)), but the keyword half
+matches whole tokens: `backtest` doesn't match `backtesting`, and a
+fragment of an identifier only matches at `_ . - / :` boundaries
+(`gateway` finds `IBKR_GATEWAY_PORT`; `gatew` doesn't). The keyword index
+is rebuilt in memory on the first recall after each start, one pass over
+the stored memories.
 
 **L4 has no automatic lifecycle.** L3 has a full hot → warm → cold
 pipeline with a scheduler; L4 grows monotonically unless the agent

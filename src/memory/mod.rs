@@ -6,6 +6,7 @@ pub mod checkpoint_scheduler;
 pub mod consolidation;
 pub mod consolidation_scheduler;
 pub mod episodic;
+pub mod keyword;
 pub mod procedural;
 pub mod semantic;
 pub mod snapshot_scheduler;

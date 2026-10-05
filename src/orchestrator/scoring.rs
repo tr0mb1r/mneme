@@ -138,6 +138,7 @@ mod tests {
             },
             score: distance,
             superseded_by: None,
+            matched: crate::memory::semantic::MatchSource::Semantic,
         }
     }
 

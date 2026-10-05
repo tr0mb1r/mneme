@@ -7,12 +7,15 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
-use crate::memory::semantic::{MemoryKind, RecallFilters, SemanticStore};
+use crate::memory::semantic::{MemoryKind, RecallFilters, RecallMode, SemanticStore};
 
-const DESCRIPTION: &str = "Retrieve memories semantically similar to a query. \
+const DESCRIPTION: &str = "Retrieve memories relevant to a query. \
 Use this when you need context the user previously shared but isn't in the \
-current conversation. Returns an empty list when nothing matches — that is \
-not an error.";
+current conversation. Searches by meaning AND by exact words at once, so \
+both questions (\"what did we decide about auth?\") and exact names \
+(`live_bt.py`, \"D account\", an env var, an error string) work; each row \
+says which search found it in `match`. Returns an empty list when nothing \
+matches — that is not an error.";
 
 /// Cap on the result count. Above ~100 the LLM context burn dwarfs any
 /// retrieval signal. Matches spec §6.1's `recall.limit.maximum`.
@@ -71,6 +74,13 @@ impl Tool for Recall {
             `limit` memories however far away they are. ~0.5 is a reasonable cut-off \
             for \"actually about the same thing\"; use it when you would rather get \
             nothing back than get a weak match."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["hybrid", "semantic", "keyword"],
+                        "description": "hybrid (default): meaning + exact words, fused. \
+            semantic: meaning only. keyword: exact words only — use for a precise \
+            name or identifier when near-synonyms would be noise."
                     },
                     "include_superseded": {
                         "type": "boolean",
@@ -156,12 +166,27 @@ impl Tool for Recall {
             }
         };
 
+        let mode = match args.get("mode") {
+            None | Some(Value::Null) => RecallMode::Hybrid,
+            Some(Value::String(s)) => RecallMode::parse(s).ok_or_else(|| {
+                ToolError::InvalidArguments(format!(
+                    "`mode` must be one of hybrid|semantic|keyword, got `{s}`"
+                ))
+            })?,
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`mode` must be a string".into(),
+                ));
+            }
+        };
+
         let filters = RecallFilters {
             scope,
             kind,
             tags,
             min_similarity,
             include_superseded,
+            mode,
         };
         let hits = self
             .store
@@ -194,6 +219,8 @@ impl Tool for Recall {
                     // filters on.
                     "score": h.score,
                     "similarity": crate::memory::semantic::similarity_from_distance(h.score),
+                    // "semantic", "keyword", or "both".
+                    "match": h.matched.as_str(),
                 });
                 if let Some(newer) = h.superseded_by {
                     row["superseded_by"] = json!(newer.to_string());

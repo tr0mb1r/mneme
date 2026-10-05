@@ -41,7 +41,10 @@ subsequent context assembly via `mneme://procedural`.
 ## Recall
 
 The active context already includes relevant memories from `mneme://context`.
-Call `recall` only when you need to search beyond what's already loaded.
+Call `recall` only when you need to search beyond what's already loaded. It
+matches by meaning and by exact words at once, so you can query a file name,
+account, env var or error string directly; pass `mode: "keyword"` when only
+literal matches are wanted.
 
 ## Episodic events (call `record_event`)
 

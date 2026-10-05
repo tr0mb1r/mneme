@@ -287,7 +287,10 @@ Unfiltered recall still issues exactly one probe.
 > similarity 0.80 up (`related_memory`, or `duplicate_advisory` at
 > ≥ 0.95), in the reply text as well as `_meta`. `remember` and `update`
 > take `supersedes`; superseded memories drop out of `recall` and
-> auto-context unless `include_superseded: true`.
+> auto-context unless `include_superseded: true`. `recall` is hybrid:
+> vector search fused with BM25 keyword search over an in-memory index,
+> so exact names are found reliably; `mode` selects `hybrid` (default),
+> `semantic`, or `keyword`, and each row reports `match`.
 
 ---
 

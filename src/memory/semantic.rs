@@ -98,6 +98,7 @@ use crate::index::delta::{HnswApplier, replay_into};
 use crate::index::hnsw::HnswIndex;
 use crate::index::snapshot;
 use crate::memory::activity::ActivityCounter;
+use crate::memory::keyword::{self, KeywordHit, KeywordIndex};
 use crate::storage::Storage;
 use crate::storage::wal::{self, WalOp, WalWriter};
 use crate::storage::{MEM_KEY_PREFIX, SUP_KEY_PREFIX};
@@ -120,6 +121,25 @@ const RECALL_OVERFETCH: usize = 4;
 /// probe when filters have rejected too much to fill `k`. Geometric
 /// so the worst case is O(log(corpus/k)) probes rather than O(corpus/k).
 const RECALL_WIDEN_FACTOR: usize = 4;
+
+/// How many keyword (BM25) hits recall considers before filters. BM25
+/// over an in-memory index is cheap; this only bounds the storage reads
+/// that follow.
+const KEYWORD_FETCH: usize = 200;
+
+/// Hybrid ranking adds `KEYWORD_WEIGHT × coverage²` to a memory's
+/// cosine similarity, where coverage is the IDF-weighted share of the
+/// query it contains ([`KeywordHit::coverage`]). Squared so partial
+/// overlaps — a natural-language question sharing "the" and "user" with
+/// some memory — add almost nothing, while containing every query term
+/// adds the full weight. 0.2 is about twice the similarity gap between
+/// a right answer and a lookalike under BGE-M3, so literal evidence
+/// wins those, without overturning a clear semantic winner.
+const KEYWORD_WEIGHT: f32 = 0.2;
+
+/// Further added when a memory contains the query as a contiguous run
+/// of whole words ("D account", "live_bt.py").
+const PHRASE_WEIGHT: f32 = 0.1;
 
 /// Snapshot file name under `<root>/semantic/`. Documented here so the
 /// scheduler and the loader can't drift.
@@ -183,6 +203,49 @@ pub struct RecallHit {
     /// `supersedes`). Only ever `Some` when the caller asked for
     /// superseded memories via [`RecallFilters::include_superseded`].
     pub superseded_by: Option<MemoryId>,
+    /// Which half of hybrid recall found this memory.
+    pub matched: MatchSource,
+}
+
+/// How [`SemanticStore::recall`] finds candidates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RecallMode {
+    /// Vector and keyword search, fused (the default).
+    #[default]
+    Hybrid,
+    /// Vector similarity only (the pre-1.5 behaviour).
+    Semantic,
+    /// Keyword (BM25) matches only, for exact-name lookups.
+    Keyword,
+}
+
+impl RecallMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "hybrid" => Some(Self::Hybrid),
+            "semantic" => Some(Self::Semantic),
+            "keyword" => Some(Self::Keyword),
+            _ => None,
+        }
+    }
+}
+
+/// Which search found a [`RecallHit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchSource {
+    Semantic,
+    Keyword,
+    Both,
+}
+
+impl MatchSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Keyword => "keyword",
+            Self::Both => "both",
+        }
+    }
 }
 
 /// Optional filters applied after the HNSW returns candidates.
@@ -214,6 +277,9 @@ pub struct RecallFilters {
     /// [`RecallHit::superseded_by`]. Off by default: an outdated fact
     /// is what the agent asked to stop seeing.
     pub include_superseded: bool,
+    /// Vector, keyword, or both (default). Every other filter,
+    /// `min_similarity` included, applies to hits from either search.
+    pub mode: RecallMode,
 }
 
 impl RecallFilters {
@@ -227,6 +293,20 @@ impl RecallFilters {
 
     /// Apply every populated predicate to one candidate.
     fn matches(&self, item: &MemoryItem, score: f32) -> bool {
+        if !self.matches_metadata(item) {
+            return false;
+        }
+        if let Some(floor) = self.min_similarity
+            && similarity_from_distance(score) < floor
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Scope / kind / tag predicates — everything except the
+    /// similarity floor, which keyword matches don't answer to.
+    fn matches_metadata(&self, item: &MemoryItem) -> bool {
         if let Some(want_scope) = &self.scope
             && &item.scope != want_scope
         {
@@ -237,19 +317,9 @@ impl RecallFilters {
         {
             return false;
         }
-        if !self
-            .tags
+        self.tags
             .iter()
             .all(|want| item.tags.iter().any(|have| have == want))
-        {
-            return false;
-        }
-        if let Some(floor) = self.min_similarity
-            && similarity_from_distance(score) < floor
-        {
-            return false;
-        }
-        true
     }
 }
 
@@ -408,6 +478,12 @@ pub struct SemanticStore {
     /// consolidation until the system goes idle. Internal-only;
     /// callers consume it via [`Self::activity_counter`].
     activity: Arc<ActivityCounter>,
+
+    /// Lexical half of hybrid recall. `None` until the first recall
+    /// builds it from storage (under `write_lock`, so no write slips
+    /// between the scan and the swap-in); kept in step by every write
+    /// after that. Memory-only by design: see [`super::keyword`].
+    keyword: RwLock<Option<KeywordIndex>>,
 }
 
 impl SemanticStore {
@@ -558,6 +634,7 @@ impl SemanticStore {
             snapshot: snapshot_state,
             scheduler_join,
             activity: ActivityCounter::new(),
+            keyword: RwLock::new(None),
         }))
     }
 
@@ -702,6 +779,7 @@ impl SemanticStore {
                 vec: vector,
             })
             .await?;
+        self.with_keyword_index(|idx| idx.insert(item.id, &item.content));
         self.note_mutation();
         Ok((item.id, duplicate))
     }
@@ -834,8 +912,43 @@ impl SemanticStore {
         if trimmed.is_empty() {
             return Err(MnemeError::Embedding("recall query is empty".into()));
         }
+        // Embedded in every mode: keyword-only hits still report their
+        // vector similarity, so the agent can compare rows.
         let qvec = self.embedder.embed(trimmed).await?;
 
+        let (semantic, semantic_stale) = match filters.mode {
+            RecallMode::Keyword => (Vec::new(), Vec::new()),
+            _ => self.semantic_candidates(&qvec, k, filters).await?,
+        };
+        if filters.mode == RecallMode::Semantic {
+            return Ok(append_stale(semantic, semantic_stale, k));
+        }
+        let (lexical, lexical_stale) = self.keyword_candidates(trimmed, &qvec, k, filters).await?;
+        let fused = fuse(trimmed, semantic, lexical, k, filters.mode);
+
+        let mut stale = semantic_stale;
+        for hit in lexical_stale {
+            if !stale.iter().any(|h| h.item.id == hit.item.id) {
+                stale.push(hit);
+            }
+        }
+        stale.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(append_stale(fused, stale, k))
+    }
+
+    /// Vector candidates: the `k` nearest current memories passing
+    /// `filters`, plus (if asked for) superseded ones, widening the
+    /// index probe as described on [`recall`](Self::recall).
+    async fn semantic_candidates(
+        &self,
+        qvec: &[f32],
+        k: usize,
+        filters: &RecallFilters,
+    ) -> Result<(Vec<RecallHit>, Vec<RecallHit>)> {
         let mut out: Vec<RecallHit> = Vec::with_capacity(k);
         // Superseded matches (only collected when asked for). They rank
         // after every current match, whatever their similarity.
@@ -855,7 +968,7 @@ impl SemanticStore {
                     .index
                     .read()
                     .map_err(|e| MnemeError::Index(format!("hnsw rwlock poisoned: {e}")))?;
-                (guard.search(&qvec, want)?, guard.len())
+                (guard.search(qvec, want)?, guard.len())
             };
             probes += 1;
 
@@ -883,11 +996,13 @@ impl SemanticStore {
                         item,
                         score: *score,
                         superseded_by: None,
+                        matched: MatchSource::Semantic,
                     }),
                     Some(newer) if filters.include_superseded => stale.push(RecallHit {
                         item,
                         score: *score,
                         superseded_by: Some(newer),
+                        matched: MatchSource::Semantic,
                     }),
                     Some(_) => continue,
                 }
@@ -924,9 +1039,150 @@ impl SemanticStore {
                 "recall widened its index probe to satisfy filters"
             );
         }
-        let room = k.saturating_sub(out.len());
-        out.extend(stale.into_iter().take(room));
-        Ok(out)
+        Ok((out, stale))
+    }
+
+    /// Keyword candidates: BM25 matches passing `filters`, best first,
+    /// each paired with its keyword score. Superseded matches go in the second list when
+    /// asked for.
+    async fn keyword_candidates(
+        &self,
+        query: &str,
+        qvec: &[f32],
+        k: usize,
+        filters: &RecallFilters,
+    ) -> Result<(Vec<(RecallHit, KeywordHit)>, Vec<RecallHit>)> {
+        self.ensure_keyword_index().await?;
+        let raw = {
+            let guard = self
+                .keyword
+                .read()
+                .map_err(|e| MnemeError::Index(format!("keyword rwlock poisoned: {e}")))?;
+            guard
+                .as_ref()
+                .map(|idx| idx.search(query, KEYWORD_FETCH))
+                .unwrap_or_default()
+        };
+        if raw.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let distances: std::collections::HashMap<MemoryId, f32> = {
+            let ids: std::collections::HashSet<MemoryId> = raw.iter().map(|h| h.id).collect();
+            let guard = self
+                .index
+                .read()
+                .map_err(|e| MnemeError::Index(format!("hnsw rwlock poisoned: {e}")))?;
+            guard
+                .vectors_for(&ids)
+                .into_iter()
+                .map(|(id, v)| (id, 1.0 - dot(&v, qvec)))
+                .collect()
+        };
+
+        // Twice `k`, so fusion has room to reorder.
+        let cap = k.saturating_mul(2);
+        let mut out = Vec::new();
+        let mut stale = Vec::new();
+        for kh in raw {
+            if out.len() >= cap {
+                break;
+            }
+            let Some(bytes) = self.storage.get(&mem_key(&kh.id)).await? else {
+                continue;
+            };
+            let item: MemoryItem = postcard::from_bytes(&bytes)
+                .map_err(|e| MnemeError::Storage(format!("decode MemoryItem {}: {e}", kh.id)))?;
+            // A memory with no vector (mid-write, or a crash between
+            // the KV put and the WAL append) still matched literally;
+            // report it as orthogonal rather than dropping it.
+            let score = distances.get(&kh.id).copied().unwrap_or(1.0);
+            if !filters.matches(&item, score) {
+                continue;
+            }
+            match self.superseded_by(item.id).await? {
+                None => out.push((
+                    RecallHit {
+                        item,
+                        score,
+                        superseded_by: None,
+                        matched: MatchSource::Keyword,
+                    },
+                    kh,
+                )),
+                Some(newer) if filters.include_superseded => stale.push(RecallHit {
+                    item,
+                    score,
+                    superseded_by: Some(newer),
+                    matched: MatchSource::Keyword,
+                }),
+                Some(_) => {}
+            }
+        }
+        Ok((out, stale))
+    }
+
+    /// Build the keyword index from storage if it doesn't exist yet.
+    ///
+    /// Holds `write_lock` for the scan, so a concurrent write either
+    /// lands before the scan (and is in it) or after the index is in
+    /// place (and updates it). Cost is one pass over the `mem:` rows,
+    /// paid once per process on the first recall.
+    async fn ensure_keyword_index(&self) -> Result<()> {
+        if self.keyword_built()? {
+            return Ok(());
+        }
+        let _g = self.write_lock.lock().await;
+        if self.keyword_built()? {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let rows = self.storage.scan_prefix(MEM_KEY_PREFIX).await?;
+        let mut idx = KeywordIndex::new();
+        for (key, bytes) in rows {
+            match postcard::from_bytes::<MemoryItem>(&bytes) {
+                Ok(item) => idx.insert(item.id, &item.content),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    key_len = key.len(),
+                    "keyword index: skipping undecodable memory row"
+                ),
+            }
+        }
+        tracing::info!(
+            memories = idx.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "built keyword index"
+        );
+        *self
+            .keyword
+            .write()
+            .map_err(|e| MnemeError::Index(format!("keyword rwlock poisoned: {e}")))? = Some(idx);
+        Ok(())
+    }
+
+    fn keyword_built(&self) -> Result<bool> {
+        Ok(self
+            .keyword
+            .read()
+            .map_err(|e| MnemeError::Index(format!("keyword rwlock poisoned: {e}")))?
+            .is_some())
+    }
+
+    /// Apply `f` to the keyword index if it has been built. Callers
+    /// hold `write_lock`. A poisoned lock drops the index so the next
+    /// recall rebuilds it from storage rather than serving stale data.
+    fn with_keyword_index(&self, f: impl FnOnce(&mut KeywordIndex)) {
+        match self.keyword.write() {
+            Ok(mut guard) => {
+                if let Some(idx) = guard.as_mut() {
+                    f(idx);
+                }
+            }
+            Err(poisoned) => {
+                tracing::warn!("keyword index lock poisoned; it will be rebuilt");
+                *poisoned.into_inner() = None;
+            }
+        }
     }
 
     /// Tombstone every indexed vector whose metadata row is gone.
@@ -993,6 +1249,7 @@ impl SemanticStore {
         // left in place and resolve as "not superseded" once it's gone
         // (see `superseded_by`).
         self.storage.delete(&sup_key(&id)).await?;
+        self.with_keyword_index(|idx| idx.remove(id));
         // Tombstone the vector unconditionally — even if the metadata
         // is gone, leaving an orphan vector wastes RAM and can return
         // `recall` results that mysteriously vanish at decode time.
@@ -1068,6 +1325,7 @@ impl SemanticStore {
         self.storage.put(&key, &value).await?;
         if let Some(vec) = new_vector {
             self.wal.append(WalOp::VectorReplace { id, vec }).await?;
+            self.with_keyword_index(|idx| idx.insert(id, &item.content));
             self.note_mutation();
         }
         Ok(true)
@@ -1171,6 +1429,66 @@ impl Drop for SemanticStore {
             state.notify.notify_one();
         }
     }
+}
+
+/// Merge the two candidate lists and rank them, best first, at most
+/// `k`.
+///
+/// Ranking starts from each memory's cosine similarity to the query
+/// (computed for keyword-only hits too), so with no literal evidence
+/// the order is exactly the semantic order. Keyword evidence adds
+/// [`KEYWORD_WEIGHT`] × coverage² and an exact phrase adds
+/// [`PHRASE_WEIGHT`]. In keyword mode, where every hit is lexical, the
+/// keyword evidence leads and similarity only breaks ties.
+fn fuse(
+    query: &str,
+    semantic: Vec<RecallHit>,
+    lexical: Vec<(RecallHit, KeywordHit)>,
+    k: usize,
+    mode: RecallMode,
+) -> Vec<RecallHit> {
+    let query_words = keyword::words(query);
+    let mut merged: Vec<(RecallHit, f32)> = semantic.into_iter().map(|h| (h, 0.0)).collect();
+    for (hit, kh) in lexical {
+        let evidence = KEYWORD_WEIGHT * kh.coverage * kh.coverage;
+        match merged.iter_mut().find(|(h, _)| h.item.id == hit.item.id) {
+            Some((existing, ev)) => {
+                existing.matched = MatchSource::Both;
+                *ev = evidence;
+            }
+            None => merged.push((hit, evidence)),
+        }
+    }
+    for (hit, ev) in merged.iter_mut() {
+        if keyword::contains_phrase(&keyword::words(&hit.item.content), &query_words) {
+            *ev += PHRASE_WEIGHT;
+        }
+    }
+    let rank = |(hit, ev): &(RecallHit, f32)| -> f32 {
+        let similarity = similarity_from_distance(hit.score);
+        match mode {
+            RecallMode::Keyword => ev * 10.0 + similarity,
+            _ => similarity + ev,
+        }
+    };
+    merged.sort_by(|a, b| {
+        rank(b)
+            .partial_cmp(&rank(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged.into_iter().take(k).map(|(h, _)| h).collect()
+}
+
+/// Superseded hits rank after every current one and only fill leftover
+/// room.
+fn append_stale(mut hits: Vec<RecallHit>, stale: Vec<RecallHit>, k: usize) -> Vec<RecallHit> {
+    let room = k.saturating_sub(hits.len());
+    hits.extend(stale.into_iter().take(room));
+    hits
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 fn sup_key(id: &MemoryId) -> Vec<u8> {
@@ -2230,5 +2548,277 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dup.expect("a current neighbour exists").id, new);
+    }
+
+    // ---------- hybrid (keyword + vector) recall ----------
+
+    fn mode(mode: RecallMode) -> RecallFilters {
+        RecallFilters {
+            mode,
+            ..Default::default()
+        }
+    }
+
+    /// The stub embeds by (first byte, length). "lxxxxxxxxx" has the
+    /// same first byte and length as the query "live_bt.py", so it is
+    /// the query's exact vector twin — the lookalike that pure vector
+    /// search ranks first.
+    async fn exact_name_corpus(s: &SemanticStore) -> (MemoryId, MemoryId) {
+        let real = s
+            .remember(
+                "live_bt.py runs the live backtest loop every 15 minutes",
+                MemoryKind::Fact,
+                vec![],
+                "p".into(),
+            )
+            .await
+            .unwrap();
+        let twin = s
+            .remember("lxxxxxxxxx", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        s.remember(
+            "report_gen.py runs nightly",
+            MemoryKind::Fact,
+            vec![],
+            "p".into(),
+        )
+        .await
+        .unwrap();
+        (real, twin)
+    }
+
+    #[tokio::test]
+    async fn hybrid_finds_an_exact_name_that_vector_search_ranks_below_a_lookalike() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (real, twin) = exact_name_corpus(&s).await;
+
+        let semantic = s
+            .recall("live_bt.py", 3, &mode(RecallMode::Semantic))
+            .await
+            .unwrap();
+        assert_eq!(
+            semantic[0].item.id, twin,
+            "precondition: vector search prefers the twin"
+        );
+
+        let hybrid = s
+            .recall("live_bt.py", 3, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(hybrid[0].item.id, real);
+        assert_ne!(hybrid[0].matched, MatchSource::Semantic);
+        let twin_hit = hybrid.iter().find(|h| h.item.id == twin).unwrap();
+        assert_eq!(twin_hit.matched, MatchSource::Semantic);
+    }
+
+    #[tokio::test]
+    async fn keyword_mode_returns_only_literal_matches_with_their_similarity() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (real, twin) = exact_name_corpus(&s).await;
+        let hits = s
+            .recall("live_bt.py", 10, &mode(RecallMode::Keyword))
+            .await
+            .unwrap();
+        // `report_gen.py` shares the token `py`, so it matches too, but
+        // below the memory that contains the whole name.
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].item.id, real);
+        assert!(hits.iter().all(|h| h.item.id != twin), "no literal match");
+        assert!(hits.iter().all(|h| h.matched == MatchSource::Keyword));
+        assert!((0.0..=2.0).contains(&hits[0].score));
+    }
+
+    #[tokio::test]
+    async fn phrase_matches_respect_word_boundaries() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let target = s
+            .remember(
+                "Balance of the D account is 5,200 EUR",
+                MemoryKind::Fact,
+                vec![],
+                "p".into(),
+            )
+            .await
+            .unwrap();
+        s.remember(
+            "a used account for testing",
+            MemoryKind::Fact,
+            vec![],
+            "p".into(),
+        )
+        .await
+        .unwrap();
+        let hits = s
+            .recall("D account", 2, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(hits[0].item.id, target);
+    }
+
+    #[tokio::test]
+    async fn keyword_index_covers_memories_written_before_it_was_built() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        assert!(!s.keyword_built().unwrap());
+        let id = s
+            .remember("QQQ3 stop-loss is 8%", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let hits = s
+            .recall("qqq3", 5, &mode(RecallMode::Keyword))
+            .await
+            .unwrap();
+        assert!(s.keyword_built().unwrap());
+        assert_eq!(hits[0].item.id, id);
+    }
+
+    #[tokio::test]
+    async fn keyword_index_follows_update_and_forget() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let id = s
+            .remember("port is 8080", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        s.recall("8080", 5, &mode(RecallMode::Keyword))
+            .await
+            .unwrap(); // build
+        s.update(
+            id,
+            UpdatePatch {
+                content: Some("port is 9090".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            s.recall("8080", 5, &mode(RecallMode::Keyword))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.recall("9090", 5, &mode(RecallMode::Keyword))
+                .await
+                .unwrap()[0]
+                .item
+                .id,
+            id
+        );
+        // Written after the build: picked up incrementally.
+        let later = s
+            .remember(
+                "port 7070 is reserved",
+                MemoryKind::Fact,
+                vec![],
+                "p".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            s.recall("7070", 5, &mode(RecallMode::Keyword))
+                .await
+                .unwrap()[0]
+                .item
+                .id,
+            later
+        );
+        s.forget(later).await.unwrap();
+        assert!(
+            s.recall("7070", 5, &mode(RecallMode::Keyword))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn filters_and_supersession_apply_to_keyword_hits() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let work = s
+            .remember(
+                "deploy.sh pushes to staging",
+                MemoryKind::Fact,
+                vec![],
+                "work".into(),
+            )
+            .await
+            .unwrap();
+        s.remember(
+            "deploy.sh is broken on macOS",
+            MemoryKind::Fact,
+            vec![],
+            "home".into(),
+        )
+        .await
+        .unwrap();
+        let scoped = RecallFilters {
+            scope: Some("work".into()),
+            mode: RecallMode::Keyword,
+            ..Default::default()
+        };
+        let hits = s.recall("deploy.sh", 5, &scoped).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].item.id, work);
+
+        let newer = s
+            .remember(
+                "deploy.sh pushes to production",
+                MemoryKind::Fact,
+                vec![],
+                "work".into(),
+            )
+            .await
+            .unwrap();
+        s.supersede(work, newer).await.unwrap();
+        let hits = s.recall("deploy.sh", 5, &scoped).await.unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.item.id).collect::<Vec<_>>(),
+            vec![newer]
+        );
+    }
+
+    #[test]
+    fn a_stopword_overlap_does_not_outrank_a_semantic_match() {
+        let item = |content: &str| MemoryItem {
+            id: MemoryId::new(),
+            content: content.into(),
+            kind: MemoryKind::Fact,
+            tags: vec![],
+            scope: "p".into(),
+            created_at: Utc::now(),
+        };
+        let semantic_hit = RecallHit {
+            item: item("User prefers Vim keybindings"),
+            score: 0.2,
+            superseded_by: None,
+            matched: MatchSource::Semantic,
+        };
+        let weak_keyword = RecallHit {
+            item: item("the user called twice"),
+            score: 0.7,
+            superseded_by: None,
+            matched: MatchSource::Keyword,
+        };
+        let kh = KeywordHit {
+            id: weak_keyword.item.id,
+            score: 1.0,
+            coverage: 2.0 / 6.0,
+        };
+        let semantic_id = semantic_hit.item.id;
+        let fused = fuse(
+            "which editor does the user prefer",
+            vec![semantic_hit],
+            vec![(weak_keyword, kh)],
+            5,
+            RecallMode::Hybrid,
+        );
+        assert_eq!(fused[0].item.id, semantic_id);
     }
 }

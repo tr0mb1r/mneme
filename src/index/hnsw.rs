@@ -38,7 +38,7 @@ use crate::ids::MemoryId;
 use crate::{MnemeError, Result};
 use instant_distance::{Builder, HnswMap, Point, Search};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Multiplier applied to the requested `k` when querying the committed
 /// HNSW. We then filter tombstones, merge with the brute-forced
@@ -148,6 +148,26 @@ impl HnswIndex {
         ids.sort_unstable();
         ids.dedup();
         ids
+    }
+
+    /// Current vectors for `ids` (those still live), in one pass over
+    /// the corpus. Later rows win, which is what `replace` relies on: it
+    /// tombstones the committed row and appends the successor.
+    pub fn vectors_for(&self, ids: &HashSet<MemoryId>) -> HashMap<MemoryId, Vec<f32>> {
+        let mut out = HashMap::with_capacity(ids.len());
+        for (i, (id, vec)) in self.corpus.iter().enumerate().rev() {
+            if out.len() == ids.len() {
+                break;
+            }
+            if !ids.contains(id) || out.contains_key(id) {
+                continue;
+            }
+            if i < self.committed_len && self.tombstones.contains(id) {
+                continue;
+            }
+            out.insert(*id, vec.clone());
+        }
+        out
     }
 
     /// Append a vector. Idempotent on `(id, vec)` only at the corpus
@@ -604,5 +624,28 @@ mod tests {
     fn empty_index_search_is_empty_not_error() {
         let idx = HnswIndex::new(4);
         assert!(idx.search(&vec_for(1.0), 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn vectors_for_returns_current_vectors_only() {
+        let mut idx = HnswIndex::new(2);
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let c = MemoryId::new();
+        idx.insert(a, &[1.0, 0.0]).unwrap();
+        idx.insert(b, &[0.0, 1.0]).unwrap();
+        idx.insert(c, &[0.6, 0.8]).unwrap();
+        idx.rebuild_snapshot().unwrap();
+        idx.replace(a, &[0.0, -1.0]).unwrap();
+        idx.delete(b).unwrap();
+        let want: HashSet<MemoryId> = [a, b, c].into_iter().collect();
+        let got = idx.vectors_for(&want);
+        assert_eq!(
+            got.get(&a),
+            Some(&vec![0.0, -1.0]),
+            "replace's successor wins"
+        );
+        assert!(!got.contains_key(&b), "deleted vectors are not returned");
+        assert_eq!(got.get(&c), Some(&vec![0.6, 0.8]));
     }
 }
