@@ -1003,7 +1003,7 @@ mcp_servers:
             &remote("http://mneme:7878/mcp"),
         )
         .unwrap();
-        let script = tmp.path().join("agent-hooks/mneme-context.py");
+        let script = tmp.path().join("agent-hooks").join("mneme-context.py");
         assert_eq!(read(&script), assets::HERMES_CONTEXT_HOOK);
         #[cfg(unix)]
         {
