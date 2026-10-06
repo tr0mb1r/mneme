@@ -1003,7 +1003,7 @@ mcp_servers:
             &remote("http://mneme:7878/mcp"),
         )
         .unwrap();
-        let script = tmp.path().join("agent-hooks/mneme-context.py");
+        let script = tmp.path().join("agent-hooks").join("mneme-context.py");
         assert_eq!(read(&script), assets::HERMES_CONTEXT_HOOK);
         #[cfg(unix)]
         {
@@ -1012,13 +1012,16 @@ mcp_servers:
             assert!(mode & 0o111 != 0, "hook must be executable");
         }
         let cfg = read(&tmp.path().join("config.yaml"));
+        // Built with the same quoting as the installer: a Windows path has
+        // backslashes, so it gets shell-quoted and then YAML-escaped.
         let command = format!(
             "{} --url http://mneme:7878/mcp --token-env MNEME_HTTP_TOKEN",
-            script.display()
+            shell_quote(&script.display().to_string())
         );
         assert!(
             cfg.contains(&format!(
-                "hooks:\n  # managed by mneme — undo with: mneme init hermes --uninstall\n  pre_llm_call:\n    - command: \"{command}\"\n      timeout: 20\n"
+                "hooks:\n  # managed by mneme — undo with: mneme init hermes --uninstall\n  pre_llm_call:\n    - command: {}\n      timeout: 20\n",
+                yaml_config::quote(&command)
             )),
             "{cfg}"
         );
