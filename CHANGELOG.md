@@ -11,6 +11,14 @@ Conventional Commits on the `main` branch; this seed entry summarises
 the work that landed before automation was wired up.
 
 ## [Unreleased]
+# Changelog
+
+All notable changes to mneme are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
+project adheres to [Semantic Versioning](https://semver.org/) — see
+[`book/src/versioning.md`](book/src/versioning.md) for the project's
+pre-1.0 cadence and 1.0 gates.
+
 
 ## [1.4.1](https://github.com/tr0mb1r/mneme/compare/v1.4.0...v1.4.1) - 2026-10-05
 
