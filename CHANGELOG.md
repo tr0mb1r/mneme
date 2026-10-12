@@ -12,6 +12,12 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+## [1.5.1](https://github.com/tr0mb1r/mneme/compare/v1.5.0...v1.5.1) - 2026-10-12
+
+### Documentation
+
+- *(book)* v1.4 and v1.5 release notes, current status, Hermes page
+
 ## [1.5.0](https://github.com/tr0mb1r/mneme/compare/v1.4.1...v1.5.0) - 2026-10-12
 
 > Hardening from running mneme as the long-term memory of Hermes Agent
