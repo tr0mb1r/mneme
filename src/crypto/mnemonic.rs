@@ -278,10 +278,17 @@ mod tests {
     fn debug_does_not_leak_words() {
         let m = Mnemonic::generate().unwrap();
         let phrase = m.to_phrase();
-        let first_word = phrase.split_whitespace().next().unwrap();
         let dbg = format!("{m:?}");
         assert!(dbg.contains("redacted"));
-        assert!(!dbg.contains(first_word));
+        // Compare whole tokens: a BIP39 word such as `act` or `red` can
+        // be a substring of "<redacted>" without anything leaking.
+        let tokens: Vec<&str> = dbg
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .filter(|t| !t.is_empty())
+            .collect();
+        for word in phrase.split_whitespace() {
+            assert!(!tokens.contains(&word), "debug output leaks `{word}`");
+        }
     }
 
     #[test]
