@@ -14,8 +14,9 @@ they're outstanding, which is more useful than a version number.
 depend on Unix domain sockets; Windows named-pipe support (ADR-0012
 D2/D9) isn't implemented, so the daemon-mode default doesn't apply
 there. `mneme stop` also returns `not yet implemented` on Windows — use
-Task Manager or `Stop-Process`. Every other subcommand works, and the
-release pipeline ships a Windows binary. Configure your MCP host with
+Task Manager or `Stop-Process`. Every other subcommand works. The
+release pipeline builds a Windows binary, but 1.5.0 shipped without one
+(the Windows build hung); use `cargo install mneme-mcp` there. Configure your MCP host with
 `args: ["run"]` rather than `["client"]`, or run `mneme serve` and
 point HTTP-capable hosts at it to share one server.
 

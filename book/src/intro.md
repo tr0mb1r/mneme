@@ -6,7 +6,7 @@
 Mneme is a persistent memory tool for AI agents. It runs as a long-lived
 process on your machine, exposes its functionality via the
 [Model Context Protocol (MCP)][mcp], and lets any compatible agent —
-Claude Desktop, Claude Code, Cursor, Cline, Aider — remember things across
+Claude Desktop, Claude Code, Cursor, OpenCode, Hermes Agent — remember things across
 sessions.
 
 The clearest one-line description: **Mneme remembers things about your
@@ -23,29 +23,32 @@ work that the agent would otherwise forget.**
 
 ## Status
 
-**v1.3.0 shipped 2026-07-25** — a retrieval-quality release:
-`mneme://context` finally returns semantic (L4) and working (L1)
-memories instead of a hardcoded empty list, filtered `recall` no longer
-silently underfills when the matching scope is a small slice of the
-corpus, and `recall` gains `tags` / `min_similarity` filters. Also:
-per-project scoping from MCP workspace roots, a near-duplicate advisory
-on `remember`, behaviour-hint annotations and titles on every tool, and
-an orphan-vector sweep (see the
-[v1.3 release notes](./release-notes-v1_3.md)).
-Previous: v1.2.2 (2026-06-07), v1.2.1 (2026-06-06), v1.2.0
-(2026-06-06), v1.1.1 (2026-05-23), v1.0 (2026-05-18). Latest release on
+**v1.5.0 shipped 2026-10-12** — hardening from day-to-day use as an
+agent's long-term memory: credential-shaped writes are refused by
+default (`[guardrails] secrets`), every tool rejects undeclared
+arguments, `record_event` needs a real payload, exact duplicates are
+short-circuited, `stats` explains what consolidation is waiting for,
+and the Hermes hook injects pinned rules whole (see the
+[v1.5 release notes](./release-notes-v1_5.md)).
+
+**v1.4** (2026-10-04 / 2026-10-05) made mneme a network service:
+`mneme serve` speaks MCP Streamable HTTP with bearer-token auth,
+`mneme init hermes` wires [Hermes Agent](./hermes-setup.md) locally or
+remotely with a context-reload hook, and `recall` became **hybrid**
+(BM25 keyword matches fused with vectors) with `supersedes` to retire
+outdated facts (see the [v1.4 release notes](./release-notes-v1_4.md)).
+
+Previous: v1.3.0 (2026-07-25), v1.2.x (2026-06), v1.1.1 (2026-05-23),
+v1.0 (2026-05-18). Latest release on
 [`mneme-mcp`](https://crates.io/crates/mneme-mcp) (crates.io) and the
 [Homebrew tap](https://github.com/tr0mb1r/homebrew-mneme). The MCP wire
 surface is the semver-tracked contract from 1.0 onward (see [MCP
 surface](./mcp-surface.md)); the Rust library API is private. The
 on-disk format is stable behind a versioned schema with a migration
-path — `schema_version` is unchanged in v1.3, so there is no migration.
-v1.2 added **encryption at rest** (opt-in, XChaCha20-Poly1305 AEAD, OS
-keyring KEK + BIP39 recovery phrase) and **`recall_recent` time-range
-bounds** (`since`/`until`). See
-[v1.3 release notes](./release-notes-v1_3.md),
-[v1.2 release notes](./release-notes-v1_2.md), and
-[Versioning](./versioning.md) for details.
+path — `schema_version` has been 1 since v1.0, so no release so far has
+needed a migration. v1.2 added **encryption at rest** (opt-in,
+XChaCha20-Poly1305 AEAD, OS keyring KEK + BIP39 recovery phrase). See
+[Versioning](./versioning.md) for the release policy.
 
 ## What works today
 
@@ -57,11 +60,12 @@ bounds** (`since`/`until`). See
 | L4 semantic (long-term facts) | `remember`, `recall`, `update`, `forget` | — | redb + WAL + HNSW vector index |
 | Auto-context | — | `mneme://context` | All four layers, packed to a token budget |
 | Diagnostics | `stats`, `list_scopes`, `export`, `switch_scope` | `mneme://stats` | — |
+| Network service | `mneme serve`, or the daemon with `[http] enabled` | Streamable HTTP `/mcp`, `/healthz`, `/version` | Same store, bearer-token auth |
 
 v1.1 ships **daemon mode** (`mneme daemon` + `mneme client` bridge —
 one warm process, many MCP hosts) over a Unix domain socket, the
 per-agent installer **`mneme init <agent>`** wired for `claude-code`,
-`claude-desktop`, `cursor`, and `opencode`, content **size guardrails**
+`claude-desktop`, `cursor`, and `opencode` (v1.4 adds `hermes`), content **size guardrails**
 with a first-boot upgrade audit, and the v1.0 → v1.1 **migration test**
 as a release gate. `mneme run` is still the single-host stdio fallback.
 MCP protocol version `2025-06-18`.

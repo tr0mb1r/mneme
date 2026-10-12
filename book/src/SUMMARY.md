@@ -9,6 +9,7 @@
 - [Setting up with Claude Code](./claude-code-setup.md)
 - [Recommended Claude Code config](./claude-code-config.md)
 - [Setting up with Hermes Agent](./hermes-setup.md)
+- [Hermes Agent with mneme](./hermes-with-mneme.md)
 
 # Concepts
 
@@ -26,9 +27,11 @@
 
 # Release notes
 
-- [v1.1](./release-notes-v1_1.md)
-- [v1.2](./release-notes-v1_2.md)
+- [v1.5](./release-notes-v1_5.md)
+- [v1.4](./release-notes-v1_4.md)
 - [v1.3](./release-notes-v1_3.md)
+- [v1.2](./release-notes-v1_2.md)
+- [v1.1](./release-notes-v1_1.md)
 
 # Contributing
 
