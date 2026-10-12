@@ -134,8 +134,35 @@ impl EpisodicEvent {
 pub struct RecentFilters {
     pub scope: Option<String>,
     pub kind: Option<String>,
+    /// Include-only list: when non-empty an event passes only if its
+    /// kind equals one of these. Combines (AND) with `kind`.
+    pub kinds: Vec<String>,
+    /// Exclude list: an event whose kind equals any of these is
+    /// skipped. Checked per row with plain string compares, so the
+    /// scan loop stays allocation-free.
+    pub exclude_kinds: Vec<String>,
+    /// Fixed exclusions that need no per-call allocation (the
+    /// orchestrator's `DEFAULT_EXCLUDED_KINDS`). Applied on top of
+    /// `exclude_kinds`; empty by default.
+    pub exclude_kinds_static: &'static [&'static str],
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
+}
+
+/// Single-scan summary of the hot tier's age profile, produced by
+/// [`EpisodicStore::hot_age_summary`]. Lets `stats` report how close
+/// the oldest event is to the hot-to-warm threshold without a second
+/// pass over the prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotAgeSummary {
+    /// Rows under the hot prefix.
+    pub count: usize,
+    /// Minimum `last_accessed` across the hot tier (the field
+    /// consolidation ages on); `None` when the tier is empty.
+    pub oldest_last_accessed: Option<DateTime<Utc>>,
+    /// Rows with `last_accessed <= cutoff`, i.e. what the next
+    /// consolidation pass would promote to warm.
+    pub eligible: usize,
 }
 
 /// Hot-tier reader/writer against the redb-backed [`Storage`] handle.
@@ -293,6 +320,14 @@ impl EpisodicStore {
             {
                 continue;
             }
+            if !filters.kinds.is_empty() && !filters.kinds.contains(&event.kind) {
+                continue;
+            }
+            if filters.exclude_kinds.contains(&event.kind)
+                || filters.exclude_kinds_static.contains(&event.kind.as_str())
+            {
+                continue;
+            }
             if let Some(since) = filters.since
                 && event.created_at < since
             {
@@ -398,6 +433,33 @@ impl EpisodicStore {
     /// cardinalities (≤thousands) that's microseconds.
     pub async fn count_hot(&self) -> Result<usize> {
         Ok(self.storage.scan_prefix(EPI_KEY_PREFIX).await?.len())
+    }
+
+    /// Age profile of the hot tier in one scan: row count, oldest
+    /// `last_accessed`, and how many rows are at or past `cutoff`
+    /// (`last_accessed <= cutoff`, the comparison consolidation uses).
+    /// Replaces [`count_hot`](Self::count_hot) wherever the caller
+    /// also wants the ages, so stats costs one scan, not two.
+    pub async fn hot_age_summary(&self, cutoff: DateTime<Utc>) -> Result<HotAgeSummary> {
+        let raw = self.storage.scan_prefix(EPI_KEY_PREFIX).await?;
+        let mut oldest: Option<DateTime<Utc>> = None;
+        let mut eligible = 0usize;
+        for (_k, v) in &raw {
+            let event: EpisodicEvent = postcard::from_bytes(v)
+                .map_err(|e| MnemeError::Storage(format!("decode EpisodicEvent: {e}")))?;
+            if event.last_accessed <= cutoff {
+                eligible += 1;
+            }
+            oldest = Some(match oldest {
+                Some(o) if o <= event.last_accessed => o,
+                _ => event.last_accessed,
+            });
+        }
+        Ok(HotAgeSummary {
+            count: raw.len(),
+            oldest_last_accessed: oldest,
+            eligible,
+        })
     }
 
     /// Warm-tier event count.
@@ -531,6 +593,115 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, target);
+    }
+
+    #[tokio::test]
+    async fn recall_recent_kinds_and_exclude_kinds() {
+        let s = store();
+        let d = s.record("decision", "p", "\"d\"").await.unwrap();
+        let t = s.record("tool_call", "p", "\"t\"").await.unwrap();
+        let n = s.record("note", "p", "\"n\"").await.unwrap();
+
+        let sorted = |mut v: Vec<EventId>| {
+            v.sort_by_key(|i| i.0);
+            v
+        };
+        let ids = |hits: Vec<EpisodicEvent>| sorted(hits.into_iter().map(|e| e.id).collect());
+
+        let only = s
+            .recall_recent(
+                &RecentFilters {
+                    kinds: vec!["decision".into(), "note".into()],
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(only), sorted(vec![d, n]));
+
+        let without = s
+            .recall_recent(
+                &RecentFilters {
+                    exclude_kinds: vec!["tool_call".into()],
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(without), sorted(vec![d, n]));
+
+        let both = s
+            .recall_recent(
+                &RecentFilters {
+                    kinds: vec!["decision".into(), "tool_call".into()],
+                    exclude_kinds: vec!["decision".into()],
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(both), vec![t]);
+
+        // Static exclusions stack with the owned list.
+        let static_only = s
+            .recall_recent(
+                &RecentFilters {
+                    exclude_kinds_static: &["tool_call"],
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(static_only), sorted(vec![d, n]));
+        let stacked = s
+            .recall_recent(
+                &RecentFilters {
+                    exclude_kinds: vec!["decision".into()],
+                    exclude_kinds_static: &["tool_call"],
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(stacked), vec![n]);
+    }
+
+    #[tokio::test]
+    async fn hot_age_summary_empty_tier() {
+        let s = store();
+        let sum = s.hot_age_summary(Utc::now()).await.unwrap();
+        assert_eq!(sum.count, 0);
+        assert_eq!(sum.oldest_last_accessed, None);
+        assert_eq!(sum.eligible, 0);
+    }
+
+    #[tokio::test]
+    async fn hot_age_summary_reports_oldest_and_eligible() {
+        use crate::memory::consolidation::_record_backdated_for_tests;
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let s = EpisodicStore::new(Arc::clone(&backing));
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(30);
+        let mid = now - chrono::Duration::days(10);
+        _record_backdated_for_tests(&backing, "k", "p", "\"a\"", old)
+            .await
+            .unwrap();
+        _record_backdated_for_tests(&backing, "k", "p", "\"b\"", mid)
+            .await
+            .unwrap();
+        s.record("k", "p", "\"fresh\"").await.unwrap();
+
+        let cutoff = now - chrono::Duration::days(28);
+        let sum = s.hot_age_summary(cutoff).await.unwrap();
+        assert_eq!(sum.count, 3);
+        assert_eq!(sum.oldest_last_accessed, Some(old));
+        assert_eq!(sum.eligible, 1);
+        assert_eq!(sum.count, s.count_hot().await.unwrap());
     }
 
     #[tokio::test]

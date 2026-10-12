@@ -314,12 +314,17 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     }
     let scope_state = ScopeState::new(&default_scope);
     let derive_scope_from_roots = config.scopes.derive_from_roots;
+    let auto_log_tool_calls = config.episodic.auto_log_tool_calls;
 
     // `remember` / `update` content ceiling (release-planning v2.1
     // §5.3). Configured via `[budgets] max_remember_chars`; the
     // 500/2,000-character advisory and warning bounds inside
     // `size_tier` are fixed.
     let max_remember_chars = config.budgets.max_remember_chars;
+
+    // `[guardrails] secrets`: what the write tools do with
+    // credential-shaped content. Threaded into every tool registry.
+    let secrets_mode = config.guardrails.secrets;
 
     // Daemon idle-timeout (ADR-0012 D6). Honored only by
     // `DaemonServeMany`; stdio + DaemonAcceptOne ignore it. `0`
@@ -461,11 +466,13 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
                 // `DaemonServeMany` mints.
                 default_scope: default_scope.clone(),
                 derive_scope_from_roots,
+                auto_log_tool_calls,
                 sessions_dir,
                 auto_context_budget,
                 schema_version: on_disk_version.max(migrate::CURRENT_SCHEMA_VERSION),
                 active_model_name: active_model_name.clone(),
                 max_remember_chars,
+                secrets_mode,
                 daemon_idle_timeout_minutes,
                 daemon_root,
                 http,
@@ -551,11 +558,15 @@ struct DaemonRuntimeConfig {
     /// replace its default scope with one derived from the client's
     /// `initialize` roots.
     derive_scope_from_roots: bool,
+    /// `[episodic] auto_log_tool_calls` — which tool calls are
+    /// mirrored into the L3 timeline.
+    auto_log_tool_calls: crate::config::AutoLogToolCalls,
     sessions_dir: std::path::PathBuf,
     auto_context_budget: TokenBudget,
     schema_version: u32,
     active_model_name: String,
     max_remember_chars: usize,
+    secrets_mode: crate::config::SecretsMode,
     daemon_idle_timeout_minutes: u64,
     daemon_root: Arc<std::path::PathBuf>,
     /// Streamable HTTP listener settings; `Some` for `mneme serve` and
@@ -595,11 +606,13 @@ async fn async_main(
         scope_state,
         default_scope,
         derive_scope_from_roots,
+        auto_log_tool_calls,
         sessions_dir,
         auto_context_budget,
         schema_version,
         active_model_name,
         max_remember_chars,
+        secrets_mode,
         daemon_idle_timeout_minutes,
         daemon_root,
         http,
@@ -664,6 +677,7 @@ async fn async_main(
         Arc::clone(&scope_state),
         Some(Arc::clone(&active_session)),
         max_remember_chars,
+        secrets_mode,
     ));
     let resource_registry: Arc<ResourceRegistry> =
         Arc::new(ResourceRegistry::defaults_with_schedulers(
@@ -702,7 +716,8 @@ async fn async_main(
             let transport = StdioTransport::new(reader, writer);
             let mut server = Server::new(transport, tool, resource, storage)
                 .with_session(active_session, checkpoint_scheduler, episodic, scope_state)
-                .with_scope_from_roots(derive_scope_from_roots);
+                .with_scope_from_roots(derive_scope_from_roots)
+                .with_auto_log_tool_calls(auto_log_tool_calls);
             if with_signal {
                 tokio::select! {
                     result = server.run() => result?,
@@ -747,6 +762,7 @@ async fn async_main(
                 Arc::clone(&scope_c),
                 Some(Arc::clone(&active_session)),
                 max_remember_chars,
+                secrets_mode,
             ));
             let resource = Arc::new(ResourceRegistry::defaults_with_schedulers(
                 Arc::clone(&semantic),
@@ -771,6 +787,7 @@ async fn async_main(
                     scope_c,
                 )
                 .with_scope_from_roots(derive_scope_from_roots)
+                .with_auto_log_tool_calls(auto_log_tool_calls)
         })
     };
 
@@ -950,6 +967,7 @@ async fn async_main(
                                         Arc::clone(&scope_c),
                                         Some(Arc::clone(&active_session)),
                                         max_remember_chars,
+                                        secrets_mode,
                                     ));
                                 let resource: Arc<ResourceRegistry> =
                                     Arc::new(ResourceRegistry::defaults_with_schedulers(
@@ -1043,7 +1061,8 @@ async fn async_main(
                                         episodic_c,
                                         scope_c,
                                     )
-                                    .with_scope_from_roots(derive_scope_from_roots);
+                                    .with_scope_from_roots(derive_scope_from_roots)
+                                    .with_auto_log_tool_calls(auto_log_tool_calls);
                                     // Race the serve loop against the
                                     // daemon-level shutdown broadcast.
                                     // `Server::run` blocks in

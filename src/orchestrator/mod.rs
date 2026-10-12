@@ -92,7 +92,25 @@ pub struct ContextRequest {
     /// pass trims. Defaults to [`SEMANTIC_FETCH`]; clamped to
     /// [`MAX_SEMANTIC_FETCH`].
     pub semantic_limit: Option<usize>,
+    /// Include only episodic events of these kinds. When non-empty it
+    /// replaces the default exclusion of [`DEFAULT_EXCLUDED_KINDS`]:
+    /// naming a kind is how a caller opts back in to it.
+    pub kinds: Vec<String>,
+    /// Episodic kinds to hide, in addition to the default exclusions.
+    pub exclude_kinds: Vec<String>,
 }
+
+/// Auto-logged episodic kinds kept out of auto-context unless the
+/// request asks for them via [`ContextRequest::kinds`]. They are
+/// mirrored in by the server (ADR-0009) rather than written by the
+/// agent, so they dominate the hot tier (56 of 61 events in one
+/// deployment) and crowd real decisions out of the token budget.
+pub const DEFAULT_EXCLUDED_KINDS: &[&str] = &[
+    "tool_call",
+    "tool_call_failed",
+    "session_start",
+    "session_end",
+];
 
 /// Phase 5 §3 owner. Holds an `Arc` to each memory store so it can
 /// be cheaply cloned into background tasks (the snapshot scheduler,
@@ -149,6 +167,8 @@ impl Orchestrator {
             query: query.map(|q| q.to_owned()),
             scope: scope.map(|s| s.to_owned()),
             semantic_limit: None,
+            kinds: Vec::new(),
+            exclude_kinds: Vec::new(),
         };
         self.build_context_with(&req, budget).await
     }
@@ -171,7 +191,7 @@ impl Orchestrator {
             .min(MAX_SEMANTIC_FETCH);
 
         let proc_fut = self.fetch_procedural(scope_owned.clone());
-        let epi_fut = self.fetch_episodic(scope_owned.clone());
+        let epi_fut = self.fetch_episodic(scope_owned.clone(), &req.kinds, &req.exclude_kinds);
         let sem_fut =
             self.fetch_semantic(req.query.as_deref(), scope_owned.clone(), semantic_limit);
         let work_fut = self.fetch_working();
@@ -199,9 +219,22 @@ impl Orchestrator {
     async fn fetch_episodic(
         &self,
         scope: Option<String>,
+        kinds: &[String],
+        exclude_kinds: &[String],
     ) -> Result<Vec<crate::memory::episodic::EpisodicEvent>> {
+        // Filtering happens inside `recall_recent`'s scan so excluded
+        // rows never occupy the over-fetch window. An explicit
+        // include list opts back in to the auto-logged kinds; without
+        // one the defaults are excluded on top of the caller's list.
         let filters = RecentFilters {
             scope,
+            kinds: kinds.to_vec(),
+            exclude_kinds: exclude_kinds.to_vec(),
+            exclude_kinds_static: if kinds.is_empty() {
+                DEFAULT_EXCLUDED_KINDS
+            } else {
+                &[]
+            },
             ..Default::default()
         };
         self.episodic.recall_recent(&filters, EPISODIC_FETCH).await
@@ -312,7 +345,7 @@ mod tests {
             .await
             .unwrap();
         a.episodic
-            .record("tool_call", "personal", "\"git status\"")
+            .record("note", "personal", "\"git status\"")
             .await
             .unwrap();
         let _ = a
@@ -356,12 +389,9 @@ mod tests {
             .pin("personal pin".into(), vec![], "personal".into())
             .await
             .unwrap();
+        a.episodic.record("note", "work", "\"a\"").await.unwrap();
         a.episodic
-            .record("tool_call", "work", "\"a\"")
-            .await
-            .unwrap();
-        a.episodic
-            .record("tool_call", "personal", "\"b\"")
+            .record("note", "personal", "\"b\"")
             .await
             .unwrap();
 
@@ -370,7 +400,93 @@ mod tests {
             .await
             .unwrap();
         assert!(ctx.procedural.iter().all(|p| p.scope == "work"));
+        assert_eq!(ctx.episodic.len(), 1);
         assert!(ctx.episodic.iter().all(|e| e.scope == "work"));
+    }
+
+    async fn seed_mixed_kinds(a: &Arcs) {
+        for kind in [
+            "tool_call",
+            "tool_call_failed",
+            "session_start",
+            "session_end",
+            "decision",
+            "summary",
+        ] {
+            a.episodic
+                .record(kind, "personal", "{\"content\":\"x\"}")
+                .await
+                .unwrap();
+        }
+    }
+
+    fn kinds_of(ctx: &AssembledContext) -> Vec<String> {
+        let mut k: Vec<String> = ctx.episodic.iter().map(|e| e.kind.clone()).collect();
+        k.sort();
+        k
+    }
+
+    #[tokio::test]
+    async fn default_context_hides_auto_logged_kinds() {
+        let (o, _tmp, a) = fresh_orchestrator();
+        seed_mixed_kinds(&a).await;
+        let ctx = o
+            .build_context(None, None, TokenBudget::default())
+            .await
+            .unwrap();
+        assert_eq!(kinds_of(&ctx), vec!["decision", "summary"]);
+    }
+
+    #[tokio::test]
+    async fn kinds_request_opts_back_in() {
+        let (o, _tmp, a) = fresh_orchestrator();
+        seed_mixed_kinds(&a).await;
+        let req = ContextRequest {
+            kinds: vec!["tool_call".into()],
+            ..Default::default()
+        };
+        let ctx = o
+            .build_context_with(&req, TokenBudget::default())
+            .await
+            .unwrap();
+        assert_eq!(kinds_of(&ctx), vec!["tool_call"]);
+    }
+
+    #[tokio::test]
+    async fn exclude_kinds_adds_to_the_default_exclusions() {
+        let (o, _tmp, a) = fresh_orchestrator();
+        seed_mixed_kinds(&a).await;
+        let req = ContextRequest {
+            exclude_kinds: vec!["decision".into()],
+            ..Default::default()
+        };
+        let ctx = o
+            .build_context_with(&req, TokenBudget::default())
+            .await
+            .unwrap();
+        assert_eq!(kinds_of(&ctx), vec!["summary"]);
+    }
+
+    /// The point of filtering inside the scan: with more noise rows
+    /// than the over-fetch window, the real events still come through.
+    #[tokio::test]
+    async fn noise_beyond_the_overfetch_window_does_not_crowd_out_events() {
+        let (o, _tmp, a) = fresh_orchestrator();
+        a.episodic
+            .record("decision", "personal", "{\"content\":\"keep\"}")
+            .await
+            .unwrap();
+        for i in 0..(EPISODIC_FETCH + 10) {
+            a.episodic
+                .record("tool_call", "personal", &format!("{{\"i\":{i}}}"))
+                .await
+                .unwrap();
+        }
+        let ctx = o
+            .build_context(None, None, TokenBudget::default())
+            .await
+            .unwrap();
+        assert_eq!(kinds_of(&ctx), vec!["decision"]);
     }
 
     #[tokio::test]

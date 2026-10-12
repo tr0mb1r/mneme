@@ -36,6 +36,9 @@ session_interval_turns  = 5
 hnsw_snapshot_inserts   = 1000
 hnsw_snapshot_minutes   = 60
 
+[episodic]
+auto_log_tool_calls = "writes"   # or "all" / "off"
+
 [consolidation]
 hot_to_warm_days  = 28
 warm_to_cold_days = 180
@@ -45,6 +48,9 @@ schedule          = "idle"
 default_recall_limit       = 10
 auto_context_token_budget  = 4000
 max_remember_chars         = 10000
+
+[guardrails]
+secrets = "reject"              # or "warn" / "off"
 
 [mcp]
 transport = "stdio"
@@ -302,9 +308,15 @@ Useful for a repo-local MCP config:
 }
 ```
 
-**Only affects `mneme run`.** In daemon mode the host spawns
-`mneme client`, which is a byte pipe that never builds a scope cell, and
-the daemon has its own environment. Use `derive_from_roots` there.
+**It is read by the process that serves, not by `mneme client`.** That
+is `mneme run`, `mneme serve` (set it in the container's environment) or
+`mneme daemon`. In daemon mode the host spawns `mneme client`, which is a
+byte pipe that never builds a scope cell, so an `env` block on the host's
+entry has no effect and the daemon's own environment decides. Use
+`derive_from_roots` there. Either way the value is a default for *every*
+connection to that instance; `switch_scope` is per connection and is
+forgotten on reconnect, so an agent that spans topics should pass `scope`
+on each call.
 
 Resolution order, lowest precedence first:
 
@@ -381,6 +393,37 @@ you only want insert-count-driven snapshots.
 
 ---
 
+## `[episodic]` — what lands on the timeline
+
+### `auto_log_tool_calls`
+
+| | |
+|---|---|
+| **Type** | string |
+| **Default** | `"writes"` |
+| **Valid** | `"writes"`, `"all"`, `"off"` |
+| **Affects** | which tool calls the server mirrors into L3 as `tool_call` events |
+
+Every successful `tools/call` used to be mirrored into the timeline,
+reads included, so verifying a clean-up (`recall`, `stats`) or deleting
+test data (`forget`) kept producing fresh events and the timeline never
+settled. Now:
+
+- `"writes"`: mirror every tool except those that declare
+  `readOnlyHint: true` (`recall`, `recall_recent`, `summarize_session`,
+  `stats`, `list_scopes`, `export`). `remember`, `update`, `pin`,
+  `unpin`, `forget`, `record_event` and `switch_scope` are still logged,
+  so deletions stay auditable.
+- `"all"`: mirror every successful call, as in 1.4.1 and earlier.
+- `"off"`: mirror nothing, `tool_call_failed` included.
+
+`tool_call_failed` is logged in `"writes"` and `"all"`. The `tool_call`
+payload carries the value-bearing argument of write tools
+(`remember.content`, for instance), so it is also the place a credential
+would be copied to if `[guardrails] secrets` let one through.
+
+---
+
 ## `[consolidation]` — L3 hot/warm/cold tiering
 
 ### `hot_to_warm_days`
@@ -396,6 +439,11 @@ from the `epi:` prefix to `wepi:` on the next consolidation pass.
 Lower = smaller hot-tier scans (faster `recall_recent` on busy
 servers); higher = events stay in the agent-facing recent feed
 longer.
+
+With the default, nothing is promoted during the first 28 days, however
+many times the scheduler runs. `stats` reports the threshold, the age of
+the oldest hot event and `next_promotion_in_days` under `consolidation`;
+see [Memory layers](./memory-layers.md).
 
 ### `warm_to_cold_days`
 
@@ -444,9 +492,9 @@ logs a warning and falls back to `"idle"` cadence.
 | **Default** | `10` |
 | **Affects** | `recall` results when the agent omits `limit` |
 
-Default `k` for the `recall` tool when the agent doesn't provide
+Default `limit` for the `recall` tool when the agent doesn't provide
 one. `recall` callers can override per-call up to a hard cap of
-500.
+100.
 
 ### `auto_context_token_budget`
 
@@ -476,9 +524,10 @@ without a config change.
 |---|---|
 | **Type** | unsigned integer (characters) |
 | **Default** | `10000` |
-| **Affects** | `remember` and `update` content acceptance ceiling |
+| **Affects** | `remember`, `update` and `record_event` size ceiling |
 
-Hard ceiling on `remember` / `update` content length. Above this,
+Hard ceiling on `remember` / `update` content length (and on the
+serialised `record_event` payload). Above this,
 the tool returns a structured `memory_too_large` error
 (`isError=true`, `_meta.error.code = "memory_too_large"`) suggesting
 the agent extract a key insight or summarize first. The verbatim
@@ -497,6 +546,45 @@ Raise this only when you have a specific need (research notes, long
 runbooks). The advisory + warning meta will still surface above
 500/2,000 chars; tightening the ceiling moves only the rejection
 threshold.
+
+---
+
+## `[guardrails]` — write-time checks
+
+### `secrets`
+
+| | |
+|---|---|
+| **Type** | string |
+| **Default** | `"reject"` |
+| **Valid** | `"reject"`, `"warn"`, `"off"` |
+| **Affects** | `remember`, `update` (when `content` is given), `pin`, `record_event` |
+
+What the write tools do when the content holds a credential in a
+high-confidence format: an AWS access key id, a PEM private key header, a
+JWT, a GitHub token (`ghp_…`, `github_pat_…`), a Slack token, an OpenAI or
+Anthropic key (`sk-…`), a Google API key (`AIza…`), a Stripe key or an age
+secret key. Each pattern needs a fixed prefix and a long random body, so
+ordinary prose and hyphenated words don't match.
+
+- `"reject"`: nothing is written. The reply has `isError: true` and
+  `_meta.error = {"code": "secret_detected", "pattern": "<name>",
+  "offset": <character offset>}`. The matched text is never echoed or
+  logged. For `record_event`, `path` locates the string inside the
+  payload.
+- `"warn"`: the write is stored and the reply carries
+  `_meta.secret_advisory` (`pattern`, `offset`, `high_confidence`,
+  `message`) plus a one-line warning in the reply text (for `record_event`
+  it names the payload `path` too). The automatic
+  `tool_call` event for that write omits the content.
+- `"off"`: no scan.
+
+A looser `password`/`secret`/`token`/`api_key` followed by `:` or `=` and
+eight or more characters is **warn-only** in `"reject"` and `"warn"`
+modes: it never blocks a write, it only adds the advisory. The scan covers
+the text of `content` and the string values of a `record_event` payload,
+not tags or scope. See
+[MCP surface](./mcp-surface.md#write-guardrails).
 
 ---
 

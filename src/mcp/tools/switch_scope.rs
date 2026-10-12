@@ -26,7 +26,13 @@ call, write tools (`remember`, `pin`) that omit the `scope` argument \
 land in the new scope; filter tools (`recall`, `recall_recent`, \
 `forget`, ...) are unaffected — they still match every scope when \
 `scope` is omitted, so pass `scope` explicitly to filter. The change \
-lasts until the server restarts.";
+is held per MCP session only (one connection on stdio or the daemon, \
+one `Mcp-Session-Id` over HTTP): it is not saved, and it resets to the \
+configured default when the client reconnects or the server restarts. \
+Agents that span several topics should pass `scope` on every write and \
+filtered read rather than rely on this call; for a fixed default, set \
+`MNEME_SCOPE` on the serving process (`mneme run`'s environment, the \
+daemon's, or the container's), not on `mneme client`.";
 
 pub struct SwitchScope {
     scope_state: Arc<ScopeState>,
@@ -107,6 +113,20 @@ mod tests {
         assert!(matches!(err, ToolError::InvalidArguments(_)));
         // State unchanged on rejection.
         assert_eq!(state.current(), "personal");
+    }
+
+    /// The description must not promise persistence the per-session
+    /// scope cell never had, and must point agents at the durable
+    /// alternatives.
+    #[test]
+    fn description_is_truthful_about_session_lifetime() {
+        assert!(!DESCRIPTION.contains("until the server restarts"));
+        assert!(DESCRIPTION.contains("per MCP session"));
+        assert!(DESCRIPTION.contains("reconnects"));
+        assert!(DESCRIPTION.contains("every write"));
+        assert!(DESCRIPTION.contains("MNEME_SCOPE"));
+        assert!(DESCRIPTION.contains("serving process"));
+        assert!(!DESCRIPTION.contains("client's environment"));
     }
 
     #[tokio::test]

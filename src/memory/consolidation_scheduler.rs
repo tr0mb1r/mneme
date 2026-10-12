@@ -258,6 +258,13 @@ impl ConsolidationScheduler {
         self.state.metrics()
     }
 
+    /// The hot-to-warm / warm-to-cold thresholds this scheduler runs
+    /// with. `stats` surfaces them next to the oldest hot event's age
+    /// so "0 promoted" can be read against "nothing is old enough yet".
+    pub fn params(&self) -> ConsolidationParams {
+        self.state.params
+    }
+
     /// Stop the scheduler gracefully. Sets the shutdown flag, wakes
     /// the loop, and awaits the spawned task. Idempotent: a second
     /// call after shutdown returns immediately.
@@ -390,6 +397,22 @@ mod tests {
             tick_interval: Duration::from_millis(50),
             enabled: true,
         }
+    }
+
+    #[tokio::test]
+    async fn params_returns_the_configured_thresholds() {
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let tmp = TempDir::new().unwrap();
+        let sched = ConsolidationScheduler::start(
+            storage,
+            ColdArchive::new(tmp.path()),
+            params(),
+            SchedulerConfig::disabled(),
+            vec![],
+        );
+        let got = sched.params();
+        assert_eq!(got.hot_to_warm_days, 28);
+        assert_eq!(got.warm_to_cold_days, 180);
     }
 
     /// A pass with an L4 handle attached also reclaims orphan vectors,

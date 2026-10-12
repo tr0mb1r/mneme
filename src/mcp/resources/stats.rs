@@ -8,10 +8,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use serde_json::{Value, json};
 
 use super::{Resource, ResourceContent, ResourceDescriptor, ResourceError};
 use crate::mcp::tools::size_tier;
+use crate::mcp::tools::stats::{consolidation_json, hot_summary};
 use crate::memory::checkpoint_scheduler::CheckpointScheduler;
 use crate::memory::consolidation_scheduler::ConsolidationScheduler;
 use crate::memory::episodic::EpisodicStore;
@@ -110,7 +112,7 @@ impl Resource for Stats {
         ResourceDescriptor {
             uri: "mneme://stats",
             name: "stats",
-            description: "Memory health metrics: per-layer counts, schema version, snapshot LSN.",
+            description: "Memory health metrics: per-layer counts, server version, schema version, snapshot LSN, consolidation status.",
             mime_type: "application/json",
         }
     }
@@ -122,11 +124,11 @@ impl Resource for Stats {
             .list(None)
             .map_err(|e| ResourceError::Internal(format!("procedural list: {e}")))?
             .len();
-        let hot_count = self
-            .episodic
-            .count_hot()
+        let now = Utc::now();
+        let hot = hot_summary(&self.episodic, self.consolidation.as_deref(), now)
             .await
-            .map_err(|e| ResourceError::Internal(format!("episodic count_hot: {e}")))?;
+            .map_err(|e| ResourceError::Internal(format!("episodic hot_age_summary: {e}")))?;
+        let hot_count = hot.count;
         let warm_count = self
             .episodic
             .count_warm()
@@ -138,18 +140,10 @@ impl Resource for Stats {
             .map_err(|e| ResourceError::Internal(format!("cold list_quarters: {e}")))?
             .len();
 
-        let consolidation = self.consolidation.as_ref().map(|s| {
-            let m = s.metrics();
-            json!({
-                "last_consolidation_at": m.last_consolidation_at
-                    .map(|d| d.to_rfc3339()),
-                "runs_total": m.runs_total,
-                "errors_total": m.errors_total,
-                "last_promoted_to_warm": m.last_promoted_to_warm,
-                "last_archived_to_cold": m.last_archived_to_cold,
-                "last_orphans_reclaimed": m.last_orphans_reclaimed,
-            })
-        });
+        let consolidation = self
+            .consolidation
+            .as_ref()
+            .map(|s| consolidation_json(s, &hot, now));
 
         let working = self.checkpoints.as_ref().map(|s| {
             let m = s.metrics();
@@ -174,6 +168,7 @@ impl Resource for Stats {
         };
 
         let body = json!({
+            "version": env!("CARGO_PKG_VERSION"),
             "schema_version": self.schema_version,
             "memories": {
                 "semantic": semantic_count,
@@ -417,5 +412,90 @@ mod tests {
         assert_eq!(cons["last_archived_to_cold"], 0);
 
         sched.shutdown().await;
+    }
+
+    /// The resource and the tool share one builder; check the resource
+    /// emits the new fields and the version.
+    #[tokio::test]
+    async fn consolidation_block_carries_thresholds_ages_and_version() {
+        use crate::memory::consolidation::{_record_backdated_for_tests, ConsolidationParams};
+        use crate::memory::consolidation_scheduler::{ConsolidationScheduler, SchedulerConfig};
+
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&backing)));
+        _record_backdated_for_tests(
+            &backing,
+            "k",
+            "p",
+            "\"old\"",
+            Utc::now() - chrono::Duration::days(5),
+        )
+        .await
+        .unwrap();
+        let sched = ConsolidationScheduler::start(
+            Arc::clone(&backing),
+            ColdArchive::new(tmp.path()),
+            ConsolidationParams {
+                hot_to_warm_days: 28,
+                warm_to_cold_days: 180,
+            },
+            SchedulerConfig::disabled(),
+            vec![],
+        );
+        let s = Stats::new(
+            semantic,
+            procedural,
+            episodic,
+            ColdArchive::new(tmp.path()),
+            1,
+        )
+        .with_consolidation(sched);
+
+        let c = s.read("mneme://stats").await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        let cons = &v["consolidation"];
+        assert_eq!(cons["thresholds"]["hot_to_warm_days"], 28);
+        assert_eq!(cons["thresholds"]["warm_to_cold_days"], 180);
+        assert_eq!(cons["hot_eligible_for_warm"], 0);
+        let age = cons["hot_oldest_age_days"].as_f64().unwrap();
+        assert!((age - 5.0).abs() < 0.1, "age {age}");
+        let next = cons["next_promotion_in_days"].as_f64().unwrap();
+        assert!((next - 23.0).abs() < 0.1, "next {next}");
+        assert_eq!(v["memories"]["episodic"]["hot"], 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_hot_tier_counts_down_from_full_threshold() {
+        use crate::memory::consolidation::ConsolidationParams;
+        use crate::memory::consolidation_scheduler::{ConsolidationScheduler, SchedulerConfig};
+
+        let (s, tmp) = fixture().await;
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let sched = ConsolidationScheduler::start(
+            backing,
+            ColdArchive::new(tmp.path()),
+            ConsolidationParams {
+                hot_to_warm_days: 28,
+                warm_to_cold_days: 180,
+            },
+            SchedulerConfig::disabled(),
+            vec![],
+        );
+        // The fixture records one fresh event, so hot is non-empty but
+        // nothing is eligible; fresh age rounds to ~0.
+        let s = s.with_consolidation(sched);
+        let c = s.read("mneme://stats").await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
+        let cons = &v["consolidation"];
+        assert_eq!(cons["hot_eligible_for_warm"], 0);
+        assert!(cons["hot_oldest_age_days"].as_f64().unwrap() < 0.1);
+        let next = cons["next_promotion_in_days"].as_f64().unwrap();
+        assert!((next - 28.0).abs() < 0.1, "next {next}");
     }
 }

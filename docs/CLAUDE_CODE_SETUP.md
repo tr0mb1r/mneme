@@ -271,7 +271,7 @@ proactively rather than only when you ask:
   `recall_recent` returns L3 events without embedding — use it for
   "what did we just do on this branch?". They do not cross-pollinate.
 - When the user shares a fact, decision, or preference that should
-  outlive the session, call `remember` with the matching `kind`
+  outlive the session, call `remember` with the matching `type`
   (`fact`, `decision`, `preference`, `conversation`) and a `scope`
   if the project has its own.
 - When the user states a hard rule ("always use uv", "we never

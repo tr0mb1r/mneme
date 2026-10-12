@@ -100,7 +100,7 @@ struct TemplateEntry {
     /// `true` when this handler already appears in `resources/list`
     /// under a fixed URI, so listing it again would duplicate the
     /// entry. `mneme://context` is both a fixed resource and a
-    /// template (`mneme://context{?q,scope,limit}`);
+    /// template (`mneme://context{?q,scope,limit,kinds,exclude_kinds}`);
     /// `mneme://session/{id}` is template-only.
     also_fixed: bool,
 }
@@ -411,7 +411,7 @@ mod tests {
         let (r, _tmp) = fresh_registry();
         let templates: Vec<_> = r.list_templates().iter().map(|t| t.uri_template).collect();
         assert!(
-            templates.contains(&"mneme://context{?q,scope,limit}"),
+            templates.contains(&"mneme://context{?q,scope,limit,kinds,exclude_kinds}"),
             "templates were {templates:?}"
         );
     }
@@ -465,6 +465,6 @@ mod tests {
             templates.contains(&"mneme://session/{id}"),
             "got {templates:?}"
         );
-        assert!(templates.contains(&"mneme://context{?q,scope,limit}"));
+        assert!(templates.contains(&"mneme://context{?q,scope,limit,kinds,exclude_kinds}"));
     }
 }

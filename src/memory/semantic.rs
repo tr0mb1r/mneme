@@ -360,6 +360,12 @@ pub const RELATED_SIMILARITY: f32 = 0.80;
 /// doesn't hide the live one right behind it.
 const NEAREST_PROBE: usize = 4;
 
+/// How many nearest neighbours [`SemanticStore::remember_or_dedupe`]
+/// inspects when looking for an identical twin in the target scope.
+/// Wider than [`NEAREST_PROBE`] because identical rows in *other*
+/// scopes tie with the twin on distance and can fill the short probe.
+const DEDUP_PROBE: usize = 16;
+
 /// An existing memory that a pending write closely restates. Produced
 /// by [`SemanticStore::remember_checked`].
 #[derive(Debug, Clone, PartialEq)]
@@ -373,6 +379,27 @@ pub struct NearDuplicate {
     /// The existing memory's scope, which may differ from the incoming
     /// write's.
     pub scope: String,
+}
+
+/// What [`SemanticStore::remember_or_dedupe`] did with a write.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RememberOutcome {
+    /// A new memory was written. `near` is the closest *current*
+    /// neighbour (any scope) at or above [`RELATED_SIMILARITY`], exactly
+    /// as [`SemanticStore::remember_checked`] reports it.
+    Stored {
+        id: MemoryId,
+        near: Option<NearDuplicate>,
+    },
+    /// Nothing was written: a current memory in the same scope already
+    /// holds identical content (after whitespace normalisation).
+    Existing(MemoryId),
+}
+
+/// Trim and collapse runs of internal whitespace, so a retry that
+/// differs only in spacing still counts as the same content.
+fn normalise_content(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Patch passed to [`SemanticStore::update`]. Each `Some` field is
@@ -767,8 +794,93 @@ impl SemanticStore {
             created_at: Utc::now(),
         };
 
+        self.write_item(vector, &item).await?;
+        Ok((item.id, duplicate))
+    }
+
+    /// [`SemanticStore::remember_checked`] with the duplicate probe on,
+    /// except that an exact repeat is not written at all.
+    ///
+    /// A retried `remember` (timeout, dropped reply, agent loop) used to
+    /// store a second identical memory and only advise about it. Here,
+    /// if a *current* (not superseded) memory in the *same scope* has
+    /// identical content after trimming and collapsing whitespace, no
+    /// row is written and [`RememberOutcome::Existing`] names it. Kind
+    /// and tags are not compared: the first write's metadata stands.
+    /// Anything else (different scope, different text, superseded twin)
+    /// is stored as `remember_checked` would, with the same advisory.
+    ///
+    /// Still one embedding and one index search; the probe now keeps all
+    /// current hits among the [`DEDUP_PROBE`] nearest (wider than
+    /// [`NEAREST_PROBE`], so identical rows in other scopes cannot push
+    /// the in-scope twin out) instead of the first current one. The
+    /// probe and the write are not under one lock, so two concurrent
+    /// identical writes can both land; that race is accepted (a retry is
+    /// sequential, and the advisory still covers the rest).
+    ///
+    /// Callers that supersede something must not use this: the new
+    /// memory is meant to coexist with a close neighbour until the
+    /// supersede link is written.
+    pub async fn remember_or_dedupe(
+        &self,
+        content: &str,
+        kind: MemoryKind,
+        tags: Vec<String>,
+        scope: String,
+    ) -> Result<RememberOutcome> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Err(MnemeError::Storage("memory content is empty".into()));
+        }
+
+        let vector = self.embedder.embed(trimmed).await?;
+        if vector.len() != self.embedder.dim() {
+            return Err(MnemeError::Embedding(format!(
+                "embedder returned dim {} but advertised {}",
+                vector.len(),
+                self.embedder.dim()
+            )));
+        }
+
+        // Probe before inserting, so the new row cannot match itself.
+        let neighbours = self
+            .current_neighbours(&vector, RELATED_SIMILARITY, DEDUP_PROBE, DEDUP_PROBE)
+            .await?;
+        // Normalised only once a neighbour actually clears the threshold:
+        // most writes have none, and then the work is skipped entirely.
+        let mut wanted: Option<String> = None;
+        for n in &neighbours {
+            if n.similarity < NEAR_DUPLICATE_SIMILARITY || n.scope != scope {
+                continue;
+            }
+            let wanted = wanted.get_or_insert_with(|| normalise_content(trimmed));
+            if normalise_content(&n.content) == *wanted {
+                return Ok(RememberOutcome::Existing(n.id));
+            }
+        }
+        let near = neighbours.into_iter().next();
+
+        let item = MemoryItem {
+            id: MemoryId::new(),
+            content: trimmed.to_owned(),
+            kind,
+            tags,
+            scope,
+            created_at: Utc::now(),
+        };
+
+        self.write_item(vector, &item).await?;
+        Ok(RememberOutcome::Stored { id: item.id, near })
+    }
+
+    /// The write tail shared by [`Self::remember_checked`] and
+    /// [`Self::remember_or_dedupe`]: encode, take the write lock, append
+    /// the metadata row, then the vector to the WAL, then update the
+    /// keyword index and the mutation counter. Order matters and is the
+    /// one documented on [`Self::remember`].
+    async fn write_item(&self, vector: Vec<f32>, item: &MemoryItem) -> Result<()> {
         let key = mem_key(&item.id);
-        let value = postcard::to_allocvec(&item)
+        let value = postcard::to_allocvec(item)
             .map_err(|e| MnemeError::Storage(format!("encode MemoryItem: {e}")))?;
 
         let _g = self.write_lock.lock().await;
@@ -781,7 +893,55 @@ impl SemanticStore {
             .await?;
         self.with_keyword_index(|idx| idx.insert(item.id, &item.content));
         self.note_mutation();
-        Ok((item.id, duplicate))
+        Ok(())
+    }
+
+    /// The current (not superseded, not orphaned) memories among the
+    /// `probe` nearest to `vector` that clear `floor`, closest first,
+    /// any scope, stopping once `limit` have been collected (so
+    /// [`Self::nearest_existing`] does not read rows it will not use).
+    async fn current_neighbours(
+        &self,
+        vector: &[f32],
+        floor: f32,
+        probe: usize,
+        limit: usize,
+    ) -> Result<Vec<NearDuplicate>> {
+        let hits = {
+            let guard = self
+                .index
+                .read()
+                .map_err(|e| MnemeError::Index(format!("hnsw rwlock poisoned: {e}")))?;
+            guard.search(vector, probe)?
+        };
+        let mut out = Vec::new();
+        for (id, distance) in hits {
+            if out.len() >= limit {
+                break;
+            }
+            let similarity = similarity_from_distance(distance);
+            if similarity < floor {
+                // Distance-ordered: nothing further can clear it.
+                break;
+            }
+            // An orphan vector (metadata already deleted) is not a
+            // duplicate of anything the agent can act on.
+            let Some(bytes) = self.storage.get(&mem_key(&id)).await? else {
+                continue;
+            };
+            if self.superseded_by(id).await?.is_some() {
+                continue;
+            }
+            let existing: MemoryItem = postcard::from_bytes(&bytes)
+                .map_err(|e| MnemeError::Storage(format!("decode MemoryItem {id}: {e}")))?;
+            out.push(NearDuplicate {
+                id,
+                similarity,
+                content: existing.content,
+                scope: existing.scope,
+            });
+        }
+        Ok(out)
     }
 
     /// Nearest-neighbour probe for [`remember_checked`]: the closest
@@ -794,37 +954,11 @@ impl SemanticStore {
     /// under two scopes is still worth flagging, and the caller has the
     /// scope of both rows to decide.
     async fn nearest_existing(&self, vector: &[f32], floor: f32) -> Result<Option<NearDuplicate>> {
-        let hits = {
-            let guard = self
-                .index
-                .read()
-                .map_err(|e| MnemeError::Index(format!("hnsw rwlock poisoned: {e}")))?;
-            guard.search(vector, NEAREST_PROBE)?
-        };
-        for (id, distance) in hits {
-            let similarity = similarity_from_distance(distance);
-            if similarity < floor {
-                // Distance-ordered: nothing further can clear it.
-                return Ok(None);
-            }
-            // An orphan vector (metadata already deleted) is not a
-            // duplicate of anything the agent can act on.
-            let Some(bytes) = self.storage.get(&mem_key(&id)).await? else {
-                continue;
-            };
-            if self.superseded_by(id).await?.is_some() {
-                continue;
-            }
-            let existing: MemoryItem = postcard::from_bytes(&bytes)
-                .map_err(|e| MnemeError::Storage(format!("decode MemoryItem {id}: {e}")))?;
-            return Ok(Some(NearDuplicate {
-                id,
-                similarity,
-                content: existing.content,
-                scope: existing.scope,
-            }));
-        }
-        Ok(None)
+        Ok(self
+            .current_neighbours(vector, floor, NEAREST_PROBE, 1)
+            .await?
+            .into_iter()
+            .next())
     }
 
     /// Record that `new` replaces `old`. Returns `false` (and writes
@@ -1821,6 +1955,150 @@ mod tests {
             .await
             .unwrap();
         assert!(dup.is_none(), "unrelated content flagged as duplicate");
+    }
+
+    #[tokio::test]
+    async fn dedupe_returns_the_existing_id_for_an_exact_repeat() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let RememberOutcome::Stored { id: first, near } = s
+            .remember_or_dedupe("CI runs on ubuntu", MemoryKind::Fact, vec![], "work".into())
+            .await
+            .unwrap()
+        else {
+            panic!("first write must store");
+        };
+        assert!(near.is_none());
+        let again = s
+            .remember_or_dedupe("CI runs on ubuntu", MemoryKind::Fact, vec![], "work".into())
+            .await
+            .unwrap();
+        assert_eq!(again, RememberOutcome::Existing(first));
+        assert_eq!(s.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dedupe_ignores_whitespace_differences() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let RememberOutcome::Stored { id: first, .. } = s
+            .remember_or_dedupe("a  b   c", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap()
+        else {
+            panic!("first write must store");
+        };
+        let again = s
+            .remember_or_dedupe("  a b c\n", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        assert_eq!(again, RememberOutcome::Existing(first));
+        assert_eq!(s.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dedupe_stores_across_scopes_and_keeps_the_advisory() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let RememberOutcome::Stored { id: first, .. } = s
+            .remember_or_dedupe("same text", MemoryKind::Fact, vec![], "work".into())
+            .await
+            .unwrap()
+        else {
+            panic!("first write must store");
+        };
+        let RememberOutcome::Stored { id: second, near } = s
+            .remember_or_dedupe("same text", MemoryKind::Fact, vec![], "home".into())
+            .await
+            .unwrap()
+        else {
+            panic!("a different scope must store");
+        };
+        assert_ne!(first, second);
+        assert_eq!(near.expect("advisory survives").id, first);
+        assert_eq!(s.len(), 2);
+    }
+
+    /// Identical rows in other scopes tie with the in-scope twin and must
+    /// not push it out of the dedup probe, whichever was written first.
+    #[tokio::test]
+    async fn dedupe_finds_the_in_scope_twin_among_many_cross_scope_copies() {
+        for twin_first in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let s = store_with_stub(tmp.path());
+            let mut scopes = vec!["a", "b", "c", "d", "f"];
+            let at = if twin_first { 0 } else { scopes.len() };
+            scopes.insert(at, "e");
+            let mut twin = None;
+            for scope in scopes {
+                let outcome = s
+                    .remember_or_dedupe("same text", MemoryKind::Fact, vec![], scope.into())
+                    .await
+                    .unwrap();
+                let RememberOutcome::Stored { id, .. } = outcome else {
+                    panic!("scope {scope} must store: {outcome:?}");
+                };
+                if scope == "e" {
+                    twin = Some(id);
+                }
+            }
+            assert_eq!(s.len(), 6);
+            let outcome = s
+                .remember_or_dedupe("same text", MemoryKind::Fact, vec![], "e".into())
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                RememberOutcome::Existing(twin.unwrap()),
+                "twin_first={twin_first}"
+            );
+            assert_eq!(s.len(), 6, "a deduplicated write must not add a row");
+        }
+    }
+
+    #[tokio::test]
+    async fn dedupe_stores_when_the_twin_was_superseded() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let RememberOutcome::Stored { id: old, .. } = s
+            .remember_or_dedupe("balance is 4100", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap()
+        else {
+            panic!("first write must store");
+        };
+        let newer = s
+            .remember("balance is 4200", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        s.supersede(old, newer).await.unwrap();
+        let outcome = s
+            .remember_or_dedupe("balance is 4100", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, RememberOutcome::Stored { .. }),
+            "a retired twin must not absorb the write: {outcome:?}"
+        );
+        assert_eq!(s.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn dedupe_stores_near_variants_with_different_content() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        s.remember_or_dedupe("CI runs on ubuntu", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        // Stub vectors: same first byte, length +1 -> similarity ~0.99.
+        let outcome = s
+            .remember_or_dedupe("CI runs on ubuntu.", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let RememberOutcome::Stored { near, .. } = outcome else {
+            panic!("different text must be stored");
+        };
+        assert!(near.expect("advisory").similarity >= NEAR_DUPLICATE_SIMILARITY);
     }
 
     /// Opting out must skip the probe entirely — `remember` is on the

@@ -64,7 +64,7 @@ fn bench_auto_context(c: &mut Criterion) {
         }
         for i in 0..(n / 4).max(1) {
             episodic
-                .record("tool_call", "personal", &format!("\"call-{i}\""))
+                .record("observation", "personal", &format!("\"call-{i}\""))
                 .await
                 .unwrap();
         }

@@ -20,15 +20,15 @@ the filter tools (`recall`, `recall_recent`, `forget`,
 
 ### Tools
 
-- `mneme.recall(query, limit?, scope?, kind?)` — semantic search across
+- `mneme.recall(query, limit?, scope?, type?, tags?, mode?)` — semantic search across
   **L4 only** (ADR-0010). L3 events are not embedded (ADR-0007); to
   search them by similarity, also `remember` the distilled fact to L4.
   Use `recall` before answering questions about past work.
 - `mneme.recall_recent(limit?, scope?, kind?)` — last-N L3 events. No
   embedding; fast. Use for "what was the last thing on this branch?"
   Pass `kind` to filter by event kind (e.g. `decision`, `milestone`).
-- `mneme.remember(content, kind, tags?, scope?)` — write L3 + L4.
-  `kind` ∈ {`fact`, `decision`, `preference`, `conversation`}.
+- `mneme.remember(content, type?, tags?, scope?, pinned?, supersedes?)` — write L3 + L4.
+  `type` ∈ {`fact` (default), `decision`, `preference`, `conversation`}.
   **Size:** target under 500 chars; 500–2k accepted with a
   `length_advisory`, 2k–10k with a `length_warning`, over 10k
   rejected. Extract the key insight rather than pasting source
@@ -48,12 +48,12 @@ the filter tools (`recall`, `recall_recent`, `forget`,
   semantic, L0 procedural, and L3 episodic (hot+warm tiers); first hit
   wins. Cold-archive entries are not reachable. **Always confirm with the
   user before calling.**
-- `mneme.summarize_session(session_id)` — returns a prompt template
+- `mneme.summarize_session(events?, scope?)` — returns a prompt template
   populated with recent L3 events. Feed it through your own completion
   path, then land the digest via `record_event(kind="summary",
   payload={"text": …, "covers": [event_ids]})` and `remember` / `pin`
   any durable facts or rules the digest surfaces.
-- `mneme.stats` / `mneme.list_scopes` / `mneme.export(scope?, limit?)`
+- `mneme.stats` / `mneme.list_scopes` / `mneme.export(scope?, limit_per_layer?)`
   — diagnostics. Cheap to call.
 - `mneme.switch_scope(scope)` — sets the current default scope for the
   rest of the process.
@@ -101,7 +101,7 @@ the filter tools (`recall`, `recall_recent`, `forget`,
   `mneme.recall` first. If it returns nothing, say so — never
   hallucinate past context.
 - **When the user shares a fact, decision, or preference** that should
-  outlive the session: call `mneme.remember` with the matching `kind`.
+  outlive the session: call `mneme.remember` with the matching `type`.
 - **When the user states a hard rule** ("always use uv", "never push to
   main"): call `mneme.pin` instead.
 - **Per substantive turn**: capture the exchange via

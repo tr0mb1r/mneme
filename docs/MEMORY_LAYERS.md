@@ -29,7 +29,7 @@ The rest of the doc is layer-by-layer detail.
 |---|---|---|---|---|---|
 | **L0 Procedural** | Always-on pinned rules (`pin` / `unpin`) | No | `~/.mneme/procedural/pinned.jsonl` | Live: file watched every 500 ms; external edits picked up in <1 s | Same |
 | **L1 Working session** | The current session's turns (tool, user, assistant), scratch state | No | `~/.mneme/sessions/<session_id>.snapshot` (atomic temp+rename per flush) | Checkpoint scheduler running; conversation mirror wired — `record_event(kind="user_message"/"assistant_message")` pushes a matching turn to L1 | Same |
-| **L3 Episodic** | Time-ordered events: tool calls, lifecycle events, conversation turns, curated semantic events | No (lexical only) | `~/.mneme/episodic/` (redb), three prefixes: `epi:` hot, `wepi:` warm, `cold/` zstd | Auto-emit running — `tool_call` (per-tool enriched payload), `tool_call_failed`, `session_start`, `session_end`. Agent-driven — `record_event` writes any kind. `ConsolidationScheduler` fires every 5 min when idle | Idle-time pass: hot → warm at age ≥ 28 d, warm → cold at age ≥ 180 d |
+| **L3 Episodic** | Time-ordered events: tool calls, lifecycle events, conversation turns, curated semantic events | No (lexical only) | `~/.mneme/episodic/` (redb), three prefixes: `epi:` hot, `wepi:` warm, `cold/` zstd | Auto-emit running — `tool_call` (per-tool enriched payload; write tools only by default, see `[episodic] auto_log_tool_calls`), `tool_call_failed`, `session_start`, `session_end`. Agent-driven — `record_event` writes any kind. `ConsolidationScheduler` fires every 5 min when idle | Idle-time pass: hot → warm at age ≥ 28 d, warm → cold at age ≥ 180 d |
 | **L4 Semantic** | Long-term facts, decisions, preferences, conversations | **Yes** — every `remember` / `update` re-embeds | `~/.mneme/episodic/` (redb), prefix `mem:` + `~/.mneme/index/hnsw.idx` snapshot + `~/.mneme/wal/` deltas | Live writes; **HNSW snapshot scheduler runs**: every 1000 inserts OR every 60 min, whichever first | Same |
 | **Auto-context resource** | Pinned + working turns + recent events, packed to a token budget; plus L4 hits when the read carries `?q=` | Reads only (embeds the `?q=` seed) | (assembled on demand) | On read of `mneme://context` | Same |
 | **Cold archive** | Quarter-bundled JSON, zstd-compressed | No | `~/.mneme/cold/<YYYY-Q>.zst` | Written only when L3 consolidation runs | Same as L3 |
@@ -142,6 +142,36 @@ warm (wepi:)  ──┐
 cold (zstd)
 ```
 
+**Nothing moves for the first four weeks, by design.** An event is
+promoted only once its `last_accessed` is at least `hot_to_warm_days`
+(28) old, and archived only at `warm_to_cold_days` (180). A fresh install
+therefore shows `runs_total` climbing (the scheduler wakes every 5 minutes)
+with `last_promoted_to_warm` at 0 for four weeks. **Zero promotions in the
+first four weeks is expected, not a fault.** To tell "idle because nothing
+is old enough" from "stuck", read the `consolidation` object in `stats` /
+`mneme://stats`:
+
+```json
+"consolidation": {
+  "runs_total": 754, "errors_total": 0, "last_promoted_to_warm": 0,
+  "thresholds": { "hot_to_warm_days": 28, "warm_to_cold_days": 180 },
+  "hot_oldest_age_days": 3.41,
+  "hot_eligible_for_warm": 0,
+  "next_promotion_in_days": 24.59
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `thresholds` | The `[consolidation]` values this server is running with. |
+| `hot_oldest_age_days` | Age of the oldest hot event, on `last_accessed` (the field consolidation uses). `null` when the hot tier is empty. |
+| `hot_eligible_for_warm` | Hot events already at or past `hot_to_warm_days`. These move on the next pass that finds a quiet window. |
+| `next_promotion_in_days` | `hot_to_warm_days` minus `hot_oldest_age_days`, never below 0; `0` once something is eligible. `null` when the hot tier is empty. |
+
+`stats` also carries a top-level `version` (the server's crate version).
+Eligible events that never move mean the idle gate hasn't closed: every
+`remember` / `forget` / `record` resets it (see the FAQ).
+
 The pass is idempotent and crash-safe: hot→warm writes the new key
 before deleting the old; warm→cold writes the cold bundle (atomic
 temp+rename) before deleting warm rows. A `kill -9` mid-pass leaves
@@ -158,13 +188,26 @@ fires a pass and refreshes its idle gate. Future modes
 > **Server-side auto-emit** (ADR-0009). `Server::handle_tools_call`
 > and `cli::run::async_main` emit:
 >
-> - `tool_call` after every successful dispatch — payload is enriched
+> - `tool_call` after a successful dispatch — payload is enriched
 >   per-tool with the value-bearing arg (e.g. `remember.content`,
 >   `recall.query`); diagnostic tools keep just `{tool: <name>}`.
 >   The full `arguments` JSON is **never** mirrored (privacy).
+>   Which calls are mirrored is `[episodic] auto_log_tool_calls`:
+>   `"writes"` (default) skips tools that declare `readOnlyHint: true`
+>   (`recall`, `recall_recent`, `summarize_session`, `stats`,
+>   `list_scopes`, `export`) and keeps the rest, `forget` included, so
+>   deletions stay auditable; `"all"` mirrors reads too (the 1.4.1
+>   behaviour); `"off"` mirrors nothing.
 > - `tool_call_failed` when a dispatch errors (carries `error_kind`
 >   and a truncated `message` string). Mirrors the success-path emit
->   but does NOT push a turn to L1.
+>   but does NOT push a turn to L1. Logged in `writes` and `all`, not
+>   in `off`. A secret-guard rejection records only the code
+>   `secret_detected`, never the content.
+>
+> Because the `tool_call` payload carries `remember` / `pin` / `update`
+> `content`, a credential stored under `[guardrails] secrets = "warn"`
+> (or `"off"`) is copied into this log too; `"reject"`, the default,
+> never stores it in either place.
 > - `session_start` on `mneme run` boot.
 > - `session_end` on graceful shutdown (`clean_shutdown=true`).
 >
@@ -183,7 +226,8 @@ fires a pass and refreshes its idle gate. Future modes
 > `last_archived_to_cold`) lands on the `mneme://stats` resource and
 > the `stats` tool under the `consolidation` key. A burst of writes
 > still inside its idle window suppresses the next pass — consolidation
-> only fires after the system goes quiet.
+> only fires after the system goes quiet. The same object reports the
+> tier thresholds and the age of the oldest hot event (see above).
 
 **Surfaced via:**
 - Tools: `recall_recent`, `summarize_session`, `record_event`.
@@ -199,7 +243,7 @@ where `remember`, `recall`, `update`, and `forget` live.
 
 **Embedding.** **Yes.** Every `remember` and every `update` that
 changes `content` calls the embedder. `update`s that change only
-`tags` / `scope` / `kind` skip the embedder.
+`tags` / `scope` / `type` skip the embedder.
 
 The active embedder is set in `[embeddings] model` in `config.toml`:
 - **`bge-m3`** (default) — ~1.5 GB, 1024-dim, multilingual, top-tier
@@ -316,6 +360,15 @@ else, so parameters ride on the URI's query string:
 | `q` (or `query`) | Natural-language seed for L4. Without it the `semantic` array is empty — a vector search needs something to be similar *to*. Percent-encoded. |
 | `scope` | Restricts L0 / L3 / L4 to one scope. L1 turns are session-local and always included. |
 | `limit` | Semantic over-fetch before the budget pass trims. Clamped server-side. |
+| `kinds` | Comma-separated event kinds; the L3 section holds only these. Naming an auto-logged kind opts back in to it. |
+| `exclude_kinds` | Comma-separated event kinds to hide from L3, on top of the default exclusions. |
+
+By default the L3 section leaves out the server's own `tool_call`,
+`tool_call_failed`, `session_start` and `session_end` events: in one
+deployment 56 of 61 context events were `tool_call` rows and they used most
+of the token budget. `?kinds=tool_call` brings them back; `recall_recent`
+and `mneme://recent` still return every kind. Each L3 row also carries its
+`retrieval_weight`.
 
 ```
 mneme://context                                  → L0 + L1 + L3
@@ -338,7 +391,7 @@ agent reads `mneme://context`. Latency budget per spec §13:
 deterministic. Verified by `orchestrator::tests::build_context_is_deterministic`.
 
 **Surfaced via:** Resource `mneme://context` (fixed form) and
-`mneme://context{?q,scope,limit}` (advertised via
+`mneme://context{?q,scope,limit,kinds,exclude_kinds}` (advertised via
 `resources/templates/list`).
 
 **What runs today:** All of the above.
@@ -380,6 +433,14 @@ batch_size = 32
 [budgets]
 default_recall_limit       = 10
 auto_context_token_budget  = 4000
+
+# Which tool calls are mirrored into L3 as `tool_call` events.
+[episodic]
+auto_log_tool_calls = "writes"   # "writes" | "all" | "off"
+
+# What write tools do with credential-shaped content.
+[guardrails]
+secrets = "reject"               # "reject" | "warn" | "off"
 ```
 
 Pick a smaller model (`minilm-l6`) and a tighter snapshot cadence
@@ -395,7 +456,7 @@ write workloads where snapshots are starting to dominate I/O.
 |---|---|---|
 | `remember` | **Yes** | Every L4 memory needs a vector for `recall`. |
 | `update` (changes `content`) | **Yes** | Re-embed via `WalOp::VectorReplace`. |
-| `update` (only `tags`/`scope`/`kind`) | No | Metadata-only path skips the embedder. |
+| `update` (only `tags`/`scope`/`type`) | No | Metadata-only path skips the embedder. |
 | `forget` | No | Tombstone the vector; no new embedding. |
 | `pin` / `unpin` | No | L0 is exact-match. |
 | `recall_recent` / `summarize_session` / `record_event` | No | L3 is lexical/temporal (ADR-0007). |
@@ -471,8 +532,17 @@ enough for the scheduler's idle gate to close — every `remember` /
 delays consolidation; (2) the event hasn't yet aged past
 `hot_to_warm_days` / `warm_to_cold_days`. Inspect `mneme://stats`
 under the `consolidation` key: `last_consolidation_at` is the
-wall-clock of the last pass, and `runs_total` confirms the
-scheduler is actually firing.
+wall-clock of the last pass, `runs_total` confirms the scheduler is
+actually firing, and `hot_oldest_age_days`, `hot_eligible_for_warm`
+and `next_promotion_in_days` say how far the oldest event is from the
+threshold.
+
+**Q: `consolidation.runs_total` is in the hundreds but nothing was ever
+promoted. Is it broken?**
+No. A run with nothing old enough to move promotes nothing. With the
+defaults the first promotion cannot happen before an event is 28 days
+old, so zero promotions in the first four weeks is expected. Check
+`next_promotion_in_days` for the countdown.
 
 **Q: Does mneme embed my pinned items so they show up in semantic
 recall?**

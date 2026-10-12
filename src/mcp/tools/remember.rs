@@ -6,10 +6,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use super::secret_guard::{self, Guard};
 use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
+use crate::config::SecretsMode;
+use crate::ids::MemoryId;
 use crate::memory::semantic::{
-    MemoryKind, NEAR_DUPLICATE_SIMILARITY, NearDuplicate, SemanticStore,
+    MemoryKind, NEAR_DUPLICATE_SIMILARITY, NearDuplicate, RememberOutcome, SemanticStore,
 };
 use crate::scope::ScopeState;
 
@@ -36,6 +39,12 @@ balance, a changed decision, a corrected detail), pass its id in \
 When a close existing memory is found, the reply says so (and gives its \
 id) so you can decide.\n\
 \n\
+RETRIES: storing content identical to an existing current memory in the \
+same scope (ignoring leading/trailing and repeated whitespace) writes \
+nothing; the reply says `already stored as <id>` with `deduplicated: true`, \
+so a retried call is safe. The first memory's type and tags stand. Not \
+applied when `supersedes` is passed.\n\
+\n\
 DO NOT use for: transient information from tool outputs (those are \
 captured automatically), or contents of source code files (those are \
 read live from disk).";
@@ -55,6 +64,8 @@ pub struct Remember {
     /// rejected with `memory_too_large` (release-planning v2.1 §5.4).
     /// Configured via `[budgets] max_remember_chars`.
     max_chars: usize,
+    /// `[guardrails] secrets`.
+    secrets: SecretsMode,
 }
 
 impl Remember {
@@ -63,6 +74,7 @@ impl Remember {
             store,
             scope_state,
             max_chars: DEFAULT_MAX_CHARS,
+            secrets: SecretsMode::default(),
         }
     }
 
@@ -70,6 +82,13 @@ impl Remember {
     /// advisory and warning bounds are fixed (per §5.3).
     pub fn with_max_chars(mut self, max_chars: usize) -> Self {
         self.max_chars = max_chars;
+        self
+    }
+
+    /// Set `[guardrails] secrets`. Defaults to `reject`, so fixtures
+    /// that never call this still get the guard.
+    pub fn with_secret_guard(mut self, mode: SecretsMode) -> Self {
+        self.secrets = mode;
         self
     }
 }
@@ -122,7 +141,6 @@ impl Tool for Remember {
                 "`content` must not be empty".into(),
             ));
         }
-
         // Size-tier check happens BEFORE embedding so we don't waste
         // a forward pass on content we're about to reject (§5.5).
         let len = size_tier::count_chars(content);
@@ -137,6 +155,13 @@ impl Tool for Remember {
             );
             return Ok(ToolResult::text(text).with_error().with_meta(meta));
         }
+
+        // After the size gate, so oversized content is rejected for its
+        // size without being regex-scanned first.
+        let secret_advisory = match secret_guard::guard_text(self.secrets, content)? {
+            Guard::Reject(r) => return Ok(r),
+            g => g.into_advisory(),
+        };
 
         let kind = match args.get("type").and_then(Value::as_str) {
             None => MemoryKind::Fact,
@@ -183,11 +208,44 @@ impl Tool for Remember {
             }
         }
 
-        let (id, duplicate) = self
-            .store
-            .remember_checked(content, kind, tags, scope, true)
-            .await
-            .map_err(|e| ToolError::Internal(format!("remember failed: {e}")))?;
+        // With `supersedes` the new memory is meant to sit next to a close
+        // neighbour until the link is written, so dedup is skipped there.
+        let (id, duplicate) = if supersedes.is_empty() {
+            // Only needed to tell the caller their `type`/`tags` were not
+            // applied; cloned up front because the store takes ownership.
+            let passed_tags = tags.clone();
+            let passed_kind = args.get("type").is_some().then_some(kind);
+            match self
+                .store
+                .remember_or_dedupe(content, kind, tags, scope)
+                .await
+                .map_err(|e| ToolError::Internal(format!("remember failed: {e}")))?
+            {
+                RememberOutcome::Stored { id, near } => (id, near),
+                RememberOutcome::Existing(id) => {
+                    tracing::info!(
+                        memory_id = %id,
+                        "remember: identical content already stored, nothing written"
+                    );
+                    let kept = self
+                        .differs_from_stored(id, passed_kind, &passed_tags)
+                        .await;
+                    let text = if kept {
+                        format!("already stored as {id}; existing type/tags kept")
+                    } else {
+                        format!("already stored as {id}")
+                    };
+                    let result = ToolResult::text(text)
+                        .with_meta(json!({ "deduplicated": true, "id": id.to_string() }));
+                    return Ok(secret_guard::attach(result, secret_advisory, id));
+                }
+            }
+        } else {
+            self.store
+                .remember_checked(content, kind, tags, scope, true)
+                .await
+                .map_err(|e| ToolError::Internal(format!("remember failed: {e}")))?
+        };
 
         if tier == Tier::Warning {
             tracing::info!(
@@ -250,7 +308,37 @@ impl Tool for Remember {
         if !meta.is_empty() {
             result = result.with_meta(Value::Object(meta));
         }
-        Ok(result)
+        Ok(secret_guard::attach(result, secret_advisory, id))
+    }
+}
+
+impl Remember {
+    /// Whether the caller passed a `type` or non-empty `tags` that differ
+    /// from the memory a dedup hit resolved to. A lookup failure is not
+    /// worth failing a successful dedup for, so it reads as "no".
+    async fn differs_from_stored(
+        &self,
+        id: MemoryId,
+        passed_kind: Option<MemoryKind>,
+        passed_tags: &[String],
+    ) -> bool {
+        if passed_kind.is_none() && passed_tags.is_empty() {
+            return false;
+        }
+        let Some(stored) = self.store.get(id).await.ok().flatten() else {
+            return false;
+        };
+        let kind_differs = passed_kind.is_some_and(|k| k != stored.kind);
+        let tags_differ = !passed_tags.is_empty() && {
+            let mut a = passed_tags.to_vec();
+            let mut b = stored.tags;
+            a.sort();
+            a.dedup();
+            b.sort();
+            b.dedup();
+            a != b
+        };
+        kind_differs || tags_differ
     }
 }
 
@@ -343,11 +431,12 @@ mod tests {
         Ulid::from_string(id_str).expect("expected valid ULID");
     }
 
-    /// Storing the same fact twice must still succeed, but the second
+    /// Storing a near-identical fact must still succeed, but the second
     /// call carries a `duplicate_advisory` so the agent can choose to
-    /// `update` instead of growing the corpus forever.
+    /// `update` instead of growing the corpus forever. (Byte-identical
+    /// content is short-circuited instead; see the `dedup` tests.)
     #[tokio::test]
-    async fn second_identical_write_carries_a_duplicate_advisory() {
+    async fn second_near_identical_write_carries_a_duplicate_advisory() {
         let tmp = TempDir::new().unwrap();
         let store = store(&tmp);
         let r = Remember::new(Arc::clone(&store), make_scope());
@@ -359,7 +448,7 @@ mod tests {
         assert!(first.meta.is_none(), "first write should carry no advisory");
 
         let second = r
-            .invoke(json!({ "content": "CI runs on ubuntu-latest only" }))
+            .invoke(json!({ "content": "CI runs on ubuntu-latest only." }))
             .await
             .unwrap();
         assert!(!second.is_error, "the duplicate must still be stored");
@@ -401,7 +490,10 @@ mod tests {
         // 600 chars lands in the advisory tier (500-2,000).
         let long = "x".repeat(600);
         r.invoke(json!({ "content": long })).await.unwrap();
-        let second = r.invoke(json!({ "content": long })).await.unwrap();
+        let second = r
+            .invoke(json!({ "content": format!("{long}.") }))
+            .await
+            .unwrap();
         let meta = second.meta.expect("expected both advisories");
         assert!(
             meta.get("length_advisory").is_some(),
@@ -701,7 +793,7 @@ mod tests {
                 .unwrap(),
         );
         let res = r
-            .invoke(json!({ "content": "CI runs on ubuntu" }))
+            .invoke(json!({ "content": "CI runs on ubuntu." }))
             .await
             .unwrap();
         let text = text_of(&res);
@@ -711,6 +803,184 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("\"CI runs on ubuntu\""), "{text}");
+    }
+
+    fn id_from_dedup_text(res: &ToolResult) -> String {
+        text_of(res)
+            .strip_prefix("already stored as ")
+            .expect("expected `already stored as <id>`")
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn dedup_identical_write_returns_the_existing_id() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r = Remember::new(Arc::clone(&store), make_scope());
+        let first = id_of(
+            &r.invoke(json!({ "content": "CI runs on ubuntu" }))
+                .await
+                .unwrap(),
+        );
+        let res = r
+            .invoke(json!({ "content": "CI runs on ubuntu" }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        assert_eq!(id_from_dedup_text(&res), first.to_string());
+        let meta = res.meta.expect("expected dedup meta");
+        assert_eq!(meta["deduplicated"], true);
+        assert_eq!(meta["id"], first.to_string());
+        assert_eq!(store.len(), 1, "a deduplicated write must not add a row");
+    }
+
+    #[tokio::test]
+    async fn dedup_matches_whitespace_variants() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r = Remember::new(Arc::clone(&store), make_scope());
+        let first = id_of(
+            &r.invoke(json!({ "content": "deploys  go out\non Fridays" }))
+                .await
+                .unwrap(),
+        );
+        let res = r
+            .invoke(json!({ "content": "  deploys go out on Fridays \n" }))
+            .await
+            .unwrap();
+        assert_eq!(id_from_dedup_text(&res), first.to_string());
+        assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dedup_is_per_scope() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r = Remember::new(Arc::clone(&store), make_scope());
+        let work = id_of(
+            &r.invoke(json!({ "content": "same fact", "scope": "work" }))
+                .await
+                .unwrap(),
+        );
+        let res = r
+            .invoke(json!({ "content": "same fact", "scope": "home" }))
+            .await
+            .unwrap();
+        assert!(text_of(&res).starts_with("stored memory "), "{res:?}");
+        assert_ne!(id_of(&res), work);
+        assert_eq!(store.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dedup_reply_says_when_type_or_tags_were_not_applied() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r = Remember::new(Arc::clone(&store), make_scope());
+        let first = id_of(
+            &r.invoke(json!({ "content": "ship on Fridays", "tags": ["ops"] }))
+                .await
+                .unwrap(),
+        );
+        let kept = format!("already stored as {first}; existing type/tags kept");
+
+        let res = r
+            .invoke(json!({ "content": "ship on Fridays", "type": "decision" }))
+            .await
+            .unwrap();
+        assert_eq!(text_of(&res), kept, "different type");
+
+        let res = r
+            .invoke(json!({ "content": "ship on Fridays", "tags": ["ops", "release"] }))
+            .await
+            .unwrap();
+        assert_eq!(text_of(&res), kept, "different tags");
+        assert_eq!(res.meta.unwrap()["deduplicated"], true);
+
+        // Same type and tags (any order), no type/tags, and the default
+        // type spelled out all keep the plain reply.
+        for args in [
+            json!({ "content": "ship on Fridays", "type": "fact", "tags": ["ops"] }),
+            json!({ "content": "ship on Fridays" }),
+            json!({ "content": "ship on Fridays", "tags": [] }),
+        ] {
+            let res = r.invoke(args.clone()).await.unwrap();
+            assert_eq!(
+                text_of(&res),
+                format!("already stored as {first}"),
+                "{args}"
+            );
+        }
+        assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dedup_reply_keeps_the_secret_advisory() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r =
+            Remember::new(Arc::clone(&store), make_scope()).with_secret_guard(SecretsMode::Warn);
+        let content = format!("the deploy key is {}", aws_key());
+        let first = id_of(&r.invoke(json!({ "content": content })).await.unwrap());
+        let res = r.invoke(json!({ "content": content })).await.unwrap();
+        let text = text_of(&res);
+        assert!(
+            text.starts_with(&format!("already stored as {first}")),
+            "unexpected dedup text: {text}"
+        );
+        // The warn-mode advisory also reaches the text, as on the stored
+        // path, because some hosts never show `_meta` to the model.
+        assert!(
+            text.contains("credential pattern aws_access_key_id")
+                && text.contains(&first.to_string()),
+            "advisory missing from the dedup text: {text}"
+        );
+        let meta = res.meta.expect("expected dedup meta");
+        assert_eq!(meta["deduplicated"], true);
+        assert_eq!(
+            meta["secret_advisory"]["pattern"], "aws_access_key_id",
+            "advisory lost on the dedup path: {meta}"
+        );
+        assert_eq!(store.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dedup_ignores_a_superseded_twin() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r = Remember::new(Arc::clone(&store), make_scope());
+        let old = id_of(
+            &r.invoke(json!({ "content": "balance is 5200" }))
+                .await
+                .unwrap(),
+        );
+        r.invoke(json!({ "content": "balance is 4800", "supersedes": old.to_string() }))
+            .await
+            .unwrap();
+        let res = r
+            .invoke(json!({ "content": "balance is 5200" }))
+            .await
+            .unwrap();
+        assert!(text_of(&res).starts_with("stored memory "), "{res:?}");
+        assert_ne!(id_of(&res), old);
+        assert_eq!(store.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn dedup_is_skipped_when_superseding() {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        let r = Remember::new(Arc::clone(&store), make_scope());
+        let old = id_of(
+            &r.invoke(json!({ "content": "balance is 5200" }))
+                .await
+                .unwrap(),
+        );
+        let res = r
+            .invoke(json!({ "content": "balance is 5200", "supersedes": old.to_string() }))
+            .await
+            .unwrap();
+        assert!(text_of(&res).starts_with("stored memory "), "{res:?}");
+        assert_eq!(store.superseded_by(old).await.unwrap(), Some(id_of(&res)));
     }
 
     #[test]
@@ -738,5 +1008,135 @@ mod tests {
         assert!(q.chars().count() <= QUOTE_CHARS + 1);
         assert!(q.ends_with('…'));
         assert_eq!(quote("a\n  b"), "a b");
+    }
+
+    /// A credential-shaped string. Assembled at runtime so this file
+    /// does not itself trip repository secret scanners.
+    fn aws_key() -> String {
+        format!("AKIA{}", "IOSFODNN7EXAMPLE")
+    }
+
+    #[tokio::test]
+    async fn secret_in_reject_mode_stores_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let r = Remember::new(Arc::clone(&s), make_scope()).with_secret_guard(SecretsMode::Reject);
+        let key = aws_key();
+        let res = r
+            .invoke(json!({ "content": format!("the deploy key is {key}") }))
+            .await
+            .unwrap();
+        assert!(res.is_error);
+        let meta = res.meta.as_ref().expect("error meta");
+        assert_eq!(meta["error"]["code"], "secret_detected");
+        assert_eq!(meta["error"]["pattern"], "aws_access_key_id");
+        assert!(!format!("{:?}{}", res.content, meta).contains(&key));
+        assert_eq!(s.len(), 0, "a rejected write must not store anything");
+    }
+
+    #[tokio::test]
+    async fn secret_in_warn_mode_is_stored_with_advisory() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let r = Remember::new(Arc::clone(&s), make_scope()).with_secret_guard(SecretsMode::Warn);
+        let res = r
+            .invoke(json!({ "content": format!("the deploy key is {}", aws_key()) }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let meta = res.meta.expect("expected a secret advisory");
+        assert_eq!(meta["secret_advisory"]["pattern"], "aws_access_key_id");
+        assert_eq!(meta["secret_advisory"]["high_confidence"], true);
+        assert_eq!(s.len(), 1);
+    }
+
+    /// Some hosts never show `_meta`, so the advisory is in the text too,
+    /// naming the stored id but never echoing the match.
+    #[tokio::test]
+    async fn warn_mode_advisory_is_also_in_the_reply_text() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let r = Remember::new(Arc::clone(&s), make_scope()).with_secret_guard(SecretsMode::Warn);
+        let key = aws_key();
+        let res = r
+            .invoke(json!({ "content": format!("the deploy key is {key}") }))
+            .await
+            .unwrap();
+        let text = match &res.content[0] {
+            crate::mcp::tools::ContentBlock::Text(t) => t.clone(),
+        };
+        let id = text
+            .strip_prefix("stored memory ")
+            .and_then(|t| t.split_whitespace().next())
+            .expect("stored id")
+            .to_owned();
+        assert!(
+            text.contains(&format!(
+                "warning: content matched credential pattern aws_access_key_id at char 18; \
+                 forget {id} if this is a real secret"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(&key));
+    }
+
+    /// Oversized content is refused for its size before the secret
+    /// guard ever scans it.
+    #[tokio::test]
+    async fn oversized_content_is_rejected_for_size_not_scanned_for_secrets() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let r = Remember::new(Arc::clone(&s), make_scope())
+            .with_max_chars(100)
+            .with_secret_guard(SecretsMode::Reject);
+        let res = r
+            .invoke(json!({ "content": format!("{} {}", "x".repeat(200), aws_key()) }))
+            .await
+            .unwrap();
+        assert!(res.is_error);
+        assert_eq!(res.meta.unwrap()["error"]["code"], "memory_too_large");
+        assert_eq!(s.len(), 0);
+    }
+
+    /// A long note that also holds a credential trips both advisories;
+    /// they must coexist in one `_meta` object.
+    #[tokio::test]
+    async fn secret_advisory_coexists_with_length_advisory() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let r = Remember::new(Arc::clone(&s), make_scope()).with_secret_guard(SecretsMode::Warn);
+        // 600+ chars lands in the advisory tier (500-2,000).
+        let content = format!("{} {}", "x".repeat(600), aws_key());
+        let res = r.invoke(json!({ "content": content })).await.unwrap();
+        assert!(!res.is_error);
+        let meta = res.meta.expect("expected both advisories");
+        assert!(
+            meta.get("length_advisory").is_some(),
+            "size advisory lost: {meta}"
+        );
+        assert!(
+            meta.get("secret_advisory").is_some(),
+            "secret advisory lost: {meta}"
+        );
+        assert_eq!(s.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn secret_in_off_mode_is_stored_without_advisory() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let r = Remember::new(Arc::clone(&s), make_scope()).with_secret_guard(SecretsMode::Off);
+        let res = r
+            .invoke(json!({ "content": format!("the deploy key is {}", aws_key()) }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let has_adv = res
+            .meta
+            .as_ref()
+            .map(|m| m.get("secret_advisory").is_some())
+            .unwrap_or(false);
+        assert!(!has_adv, "off mode must not scan: {:?}", res.meta);
+        assert_eq!(s.len(), 1);
     }
 }

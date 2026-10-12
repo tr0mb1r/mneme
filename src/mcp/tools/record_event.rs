@@ -34,8 +34,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use super::secret_guard::{self, Guard};
 use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
+use crate::config::SecretsMode;
 use crate::memory::episodic::{DEFAULT_RETRIEVAL_WEIGHT, EpisodicStore};
 use crate::memory::working::ActiveSession;
 use crate::scope::ScopeState;
@@ -67,8 +69,39 @@ similarity retrieval. Use `pin` (NOT this tool) for always-on rules. \
 Tool-call activity is auto-emitted by the server — do not duplicate.
 
 `kind` is free-form — agents can invent new kinds. `payload` is \
-JSON; mneme stores it verbatim. `scope` defaults to the active \
-scope; `retrieval_weight` defaults to 1.0 (range [0.0, 1.0]).";
+required and must carry content, e.g. `{\"content\": \"<what \
+happened>\"}`; put all text under `payload` (there is no top-level \
+`text` or `content` argument). An absent, null, empty, blank or \
+bare boolean/number payload is rejected. mneme stores the payload verbatim. `scope` \
+defaults to the active scope; `retrieval_weight` defaults to 1.0 \
+(range [0.0, 1.0]).";
+
+/// Text-bearing payload fields: an object holding only these, all
+/// blank, carries nothing worth storing.
+const TEXT_FIELDS: &[&str] = &["content", "text"];
+
+/// True when `payload` holds no content: absent/`null`, a bare boolean
+/// or number, a blank string, an empty array or object, or an object
+/// whose only keys are [`TEXT_FIELDS`] and all of them are `null` or
+/// blank.
+fn payload_is_empty(payload: &Value) -> bool {
+    match payload {
+        Value::Null | Value::Bool(_) | Value::Number(_) => true,
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(o) => {
+            o.is_empty()
+                || o.iter().all(|(k, v)| {
+                    TEXT_FIELDS.contains(&k.as_str())
+                        && match v {
+                            Value::Null => true,
+                            Value::String(s) => s.trim().is_empty(),
+                            _ => false,
+                        }
+                })
+        }
+    }
+}
 
 /// Kinds that trigger L1 mirroring (server pushes a matching turn).
 const MESSAGE_KINDS: &[&str] = &["user_message", "assistant_message"];
@@ -83,6 +116,8 @@ pub struct RecordEvent {
     /// prevent unbounded episodic exhaustion). Configured via
     /// `[budgets] max_remember_chars`.
     max_chars: usize,
+    /// `[guardrails] secrets`.
+    secrets: SecretsMode,
 }
 
 impl RecordEvent {
@@ -92,6 +127,7 @@ impl RecordEvent {
             scope_state,
             active_session: None,
             max_chars: DEFAULT_MAX_CHARS,
+            secrets: SecretsMode::default(),
         }
     }
 
@@ -111,10 +147,24 @@ impl RecordEvent {
         self.max_chars = max_chars;
         self
     }
+
+    /// Set `[guardrails] secrets`. Defaults to `reject`, so fixtures
+    /// that never call this still get the guard.
+    pub fn with_secret_guard(mut self, mode: SecretsMode) -> Self {
+        self.secrets = mode;
+        self
+    }
 }
 
 #[async_trait]
 impl Tool for RecordEvent {
+    /// An agent that passes `text=` / `content=` at the top level used
+    /// to get `payload: null` stored silently; the registry's unknown-
+    /// argument check now rejects it with this pointer.
+    fn unknown_args_hint(&self) -> Option<&'static str> {
+        Some("Put event text under payload: {\"content\": \"<what happened>\"}")
+    }
+
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "record_event",
@@ -130,7 +180,7 @@ impl Tool for RecordEvent {
                         "minLength": 1,
                     },
                     "payload": {
-                        "description": "Event content. JSON object preferred (kind-specific shape); strings and null also accepted. Stored verbatim.",
+                        "description": "Event content, required and non-empty. JSON object preferred, e.g. {\"content\": \"<what happened>\"} (kind-specific shape); a non-blank string is also accepted. Absent, null, empty or blank payloads are rejected. Stored verbatim.",
                     },
                     "tags": {
                         "type": "array",
@@ -148,7 +198,7 @@ impl Tool for RecordEvent {
                         "description": "Per-event ranking weight. Defaults to 1.0; lower for chatty/low-signal events to push them behind their peers.",
                     },
                 },
-                "required": ["kind"],
+                "required": ["kind", "payload"],
             }),
         }
     }
@@ -166,11 +216,21 @@ impl Tool for RecordEvent {
         }
 
         // ---------- payload ----------
-        // Accept any JSON value (object, string, null). Stored
-        // verbatim as a string per the EpisodicEvent schema.
+        // Any JSON value that carries content is accepted and stored
+        // verbatim as a string per the EpisodicEvent schema. Empty
+        // shapes are rejected below, right before the size gate.
         let payload_value = args.get("payload").cloned().unwrap_or(Value::Null);
         let payload_str = serde_json::to_string(&payload_value)
             .map_err(|e| ToolError::Internal(format!("encode payload: {e}")))?;
+
+        // ---------- empty-payload gate ----------
+        if payload_is_empty(&payload_value) {
+            return Err(ToolError::InvalidArguments(
+                "`payload` is required and must carry content; pass \
+                 {\"content\": \"<what happened>\"}"
+                    .into(),
+            ));
+        }
 
         // ---------- SEC-002 size gate ----------
         // Same classifier `remember` / `update` use, applied to the
@@ -190,6 +250,14 @@ impl Tool for RecordEvent {
             );
             return Ok(ToolResult::text(text).with_error().with_meta(meta));
         }
+
+        // ---------- secret guard ----------
+        // After the empty-payload and size gates, so a payload that is
+        // about to be rejected anyway is never regex-scanned.
+        let secret_advisory = match secret_guard::guard_value(self.secrets, &payload_value)? {
+            Guard::Reject(r) => return Ok(r),
+            g => g.into_advisory(),
+        };
 
         // ---------- scope (fallback to ScopeState::current) ----------
         let scope = args
@@ -265,7 +333,7 @@ impl Tool for RecordEvent {
         if let Some(meta) = size_tier::success_meta(tier, payload_len, self.max_chars) {
             result = result.with_meta(meta);
         }
-        Ok(result)
+        Ok(secret_guard::attach(result, secret_advisory, id))
     }
 }
 
@@ -296,6 +364,106 @@ mod tests {
         (tool, episodic, session)
     }
 
+    /// Run `args` through the tool and assert it is rejected as
+    /// `InvalidArguments` naming `payload`, with L3 untouched.
+    async fn assert_payload_rejected(args: Value) {
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let episodic = Arc::new(EpisodicStore::new(storage));
+        let t = RecordEvent::new(Arc::clone(&episodic), ScopeState::new("personal"));
+        let err = t.invoke(args.clone()).await.unwrap_err();
+        match err {
+            ToolError::InvalidArguments(m) => {
+                assert!(m.contains("payload"), "message should name payload: {m}");
+                assert!(
+                    m.contains("content"),
+                    "message should say what to pass: {m}"
+                );
+            }
+            other => panic!("expected InvalidArguments for {args}, got {other:?}"),
+        }
+        let events = episodic
+            .recall_recent(&RecentFilters::default(), 10)
+            .await
+            .unwrap();
+        assert!(events.is_empty(), "rejected call must not write: {args}");
+    }
+
+    #[tokio::test]
+    async fn absent_payload_is_rejected() {
+        assert_payload_rejected(json!({"kind": "milestone"})).await;
+    }
+
+    #[tokio::test]
+    async fn null_payload_is_rejected() {
+        assert_payload_rejected(json!({"kind": "milestone", "payload": null})).await;
+    }
+
+    #[tokio::test]
+    async fn blank_string_payload_is_rejected() {
+        assert_payload_rejected(json!({"kind": "milestone", "payload": ""})).await;
+        assert_payload_rejected(json!({"kind": "milestone", "payload": " \n\t "})).await;
+    }
+
+    #[tokio::test]
+    async fn empty_object_and_array_payloads_are_rejected() {
+        assert_payload_rejected(json!({"kind": "milestone", "payload": {}})).await;
+        assert_payload_rejected(json!({"kind": "milestone", "payload": []})).await;
+    }
+
+    #[tokio::test]
+    async fn bare_bool_and_number_payloads_are_rejected() {
+        for p in [json!(true), json!(false), json!(0), json!(42), json!(1.5)] {
+            assert_payload_rejected(json!({"kind": "milestone", "payload": p})).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bool_and_number_inside_an_object_still_count_as_content() {
+        let t = fixture_no_session();
+        for p in [json!({"ok": true}), json!({"count": 3})] {
+            let res = t
+                .invoke(json!({"kind": "milestone", "payload": p}))
+                .await
+                .unwrap();
+            assert!(!res.is_error);
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_text_fields_only_payload_is_rejected() {
+        for p in [
+            json!({"content": ""}),
+            json!({"text": "   "}),
+            json!({"content": "", "text": " "}),
+            json!({"content": null}),
+        ] {
+            assert_payload_rejected(json!({"kind": "milestone", "payload": p})).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_text_field_beside_other_content_is_accepted() {
+        let t = fixture_no_session();
+        let res = t
+            .invoke(json!({
+                "kind": "milestone",
+                "payload": {"content": "", "covers": ["01ABC"]},
+            }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+    }
+
+    #[tokio::test]
+    async fn non_blank_string_payload_is_accepted() {
+        let t = fixture_no_session();
+        let res = t
+            .invoke(json!({"kind": "milestone", "payload": "shipped v1"}))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+    }
+
     #[tokio::test]
     async fn missing_kind_is_rejected() {
         let t = fixture_no_session();
@@ -307,7 +475,7 @@ mod tests {
     async fn empty_kind_is_rejected() {
         let t = fixture_no_session();
         let err = t
-            .invoke(json!({"kind": "   ", "payload": {}}))
+            .invoke(json!({"kind": "   ", "payload": {"content": "x"}}))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)));
@@ -317,12 +485,16 @@ mod tests {
     async fn out_of_range_weight_is_rejected() {
         let t = fixture_no_session();
         let err = t
-            .invoke(json!({"kind": "decision", "retrieval_weight": 1.5}))
+            .invoke(
+                json!({"kind": "decision", "payload": {"content": "x"}, "retrieval_weight": 1.5}),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)));
         let err = t
-            .invoke(json!({"kind": "decision", "retrieval_weight": -0.1}))
+            .invoke(
+                json!({"kind": "decision", "payload": {"content": "x"}, "retrieval_weight": -0.1}),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)));
@@ -332,7 +504,7 @@ mod tests {
     async fn tags_must_be_string_array() {
         let t = fixture_no_session();
         let err = t
-            .invoke(json!({"kind": "observation", "tags": [1, 2]}))
+            .invoke(json!({"kind": "observation", "payload": {"content": "x"}, "tags": [1, 2]}))
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)));
@@ -488,11 +660,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (tool, episodic, session) = fixture_with_session(tmp.path().join("sessions"));
 
-        // Empty payload — L3 still records, L1 mirror skipped (no
-        // content to push, would be noise).
+        // Payload without `content` — L3 still records, L1 mirror
+        // skipped (no content to push, would be noise).
         tool.invoke(json!({
             "kind": "user_message",
-            "payload": {},
+            "payload": {"text": "x"},
         }))
         .await
         .unwrap();
@@ -622,6 +794,13 @@ mod tests {
         assert!(d.description.contains("summary"));
         // Schema requires kind, has retrieval_weight bounds.
         assert_eq!(d.input_schema["required"][0], "kind");
+        assert_eq!(d.input_schema["required"][1], "payload");
+        assert!(
+            !d.input_schema["properties"]["payload"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("null also accepted")
+        );
         assert_eq!(
             d.input_schema["properties"]["retrieval_weight"]["minimum"],
             0.0
@@ -630,5 +809,115 @@ mod tests {
             d.input_schema["properties"]["retrieval_weight"]["maximum"],
             1.0
         );
+    }
+
+    /// A credential-shaped string. Assembled at runtime so this file
+    /// does not itself trip repository secret scanners.
+    fn aws_key() -> String {
+        format!("AKIA{}", "IOSFODNN7EXAMPLE")
+    }
+
+    fn fixture_with_mode(mode: SecretsMode) -> (RecordEvent, Arc<EpisodicStore>) {
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let episodic = Arc::new(EpisodicStore::new(storage));
+        let tool = RecordEvent::new(Arc::clone(&episodic), ScopeState::new("personal"))
+            .with_secret_guard(mode);
+        (tool, episodic)
+    }
+
+    async fn stored_events(episodic: &EpisodicStore) -> usize {
+        episodic
+            .recall_recent(&RecentFilters::default(), 10)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn secret_in_reject_mode_records_nothing() {
+        let (t, episodic) = fixture_with_mode(SecretsMode::Reject);
+        let key = aws_key();
+        let res = t
+            .invoke(json!({
+                "kind": "milestone",
+                "payload": { "content": "rotated", "detail": { "key": key.clone() } },
+            }))
+            .await
+            .unwrap();
+        assert!(res.is_error);
+        let meta = res.meta.as_ref().expect("error meta");
+        assert_eq!(meta["error"]["code"], "secret_detected");
+        assert_eq!(meta["error"]["path"], "/detail/key");
+        assert!(!format!("{:?}{}", res.content, meta).contains(&key));
+        assert_eq!(stored_events(&episodic).await, 0);
+    }
+
+    #[tokio::test]
+    async fn secret_in_warn_mode_is_recorded_with_advisory() {
+        let (t, episodic) = fixture_with_mode(SecretsMode::Warn);
+        let res = t
+            .invoke(json!({
+                "kind": "milestone",
+                "payload": { "content": format!("key {}", aws_key()) },
+            }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let meta = res.meta.expect("expected a secret advisory");
+        assert_eq!(meta["secret_advisory"]["pattern"], "aws_access_key_id");
+        assert_eq!(meta["secret_advisory"]["path"], "/content");
+        assert_eq!(stored_events(&episodic).await, 1);
+        let crate::mcp::tools::ContentBlock::Text(text) = &res.content[0];
+        assert!(text.starts_with("recorded event "), "{text}");
+        assert!(
+            text.contains(
+                "warning: content matched credential pattern aws_access_key_id \
+                 at char 4 of /content;"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("if this is a real secret"), "{text}");
+        assert!(!text.contains(&aws_key()));
+    }
+
+    /// An oversized payload is refused for its size before the secret
+    /// guard scans it.
+    #[tokio::test]
+    async fn oversized_payload_is_rejected_for_size_not_scanned_for_secrets() {
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let episodic = Arc::new(EpisodicStore::new(storage));
+        let t = RecordEvent::new(Arc::clone(&episodic), ScopeState::new("personal"))
+            .with_max_chars(100)
+            .with_secret_guard(SecretsMode::Reject);
+        let res = t
+            .invoke(json!({
+                "kind": "milestone",
+                "payload": { "content": format!("{} {}", "x".repeat(200), aws_key()) },
+            }))
+            .await
+            .unwrap();
+        assert!(res.is_error);
+        assert_eq!(res.meta.unwrap()["error"]["code"], "memory_too_large");
+        assert_eq!(stored_events(&episodic).await, 0);
+    }
+
+    #[tokio::test]
+    async fn secret_in_off_mode_is_recorded_without_advisory() {
+        let (t, episodic) = fixture_with_mode(SecretsMode::Off);
+        let res = t
+            .invoke(json!({
+                "kind": "milestone",
+                "payload": { "content": format!("key {}", aws_key()) },
+            }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let has_adv = res
+            .meta
+            .as_ref()
+            .map(|m| m.get("secret_advisory").is_some())
+            .unwrap_or(false);
+        assert!(!has_adv, "off mode must not scan: {:?}", res.meta);
+        assert_eq!(stored_events(&episodic).await, 1);
     }
 }

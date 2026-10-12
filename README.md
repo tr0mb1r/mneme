@@ -36,7 +36,8 @@ work that the agent would otherwise forget.**
 - **Hermes Agent** (bare metal or Docker Compose) — see
   [`docs/HERMES_SETUP.md`](docs/HERMES_SETUP.md); `mneme init hermes`
   does the wiring, and [`deploy/compose/hermes/`](deploy/compose/hermes/)
-  is a ready-made mneme + Hermes stack.
+  is a ready-made mneme + Hermes stack. [`docs/HERMES_WITH_MNEME.md`](docs/HERMES_WITH_MNEME.md)
+  covers what mneme adds on top of Hermes' built-in memory.
 - **Containers / remote agents** — `mneme serve` speaks MCP Streamable
   HTTP with bearer-token auth; the repo's [`Dockerfile`](Dockerfile)
   runs it. See the [CLI surface](book/src/cli.md#mode-c--network-service-mneme-serve).
@@ -88,10 +89,14 @@ widens the HNSW probe so **filtered `recall` stops underfilling**, adds
 advisory on `remember`, `resources/templates/list`, and behaviour-hint
 annotations and titles on every tool — see
 [`book/src/release-notes-v1_3.md`](book/src/release-notes-v1_3.md).
-Unreleased: a **Streamable HTTP transport** (`mneme serve`, or
+v1.4 adds a **Streamable HTTP transport** (`mneme serve`, or
 `[http] enabled` on the daemon) so agents in other containers can
 connect, a `Dockerfile`, and **`mneme init hermes`** for Hermes Agent
-(local `mneme client` or remote `--url`).
+(local `mneme client` or remote `--url`). Unreleased: a **secret guard**
+on writes (`[guardrails] secrets`), exact-duplicate short-circuiting in
+`remember`, `record_event` requiring a payload, consolidation status in
+`stats`, and Hermes hook fixes (pins injected whole, compaction summaries
+recorded as events); see [`CHANGELOG.md`](CHANGELOG.md).
 Optional Claude Code lifecycle hooks
 (`SessionStart`/`PreCompact`/`Stop`) are documented in
 [`docs/CLAUDE_CODE_SETUP.md`](docs/CLAUDE_CODE_SETUP.md) §7 with

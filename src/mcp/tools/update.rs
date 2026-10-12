@@ -12,8 +12,10 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use ulid::Ulid;
 
+use super::secret_guard::{self, Guard};
 use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
+use crate::config::SecretsMode;
 use crate::ids::MemoryId;
 use crate::memory::semantic::{MemoryKind, SemanticStore, UpdatePatch};
 
@@ -34,6 +36,8 @@ pub struct Update {
     /// v2.1 §5.4). Mirrors `remember`'s ceiling so the contract is
     /// uniform across writes.
     max_chars: usize,
+    /// `[guardrails] secrets`.
+    secrets: SecretsMode,
 }
 
 impl Update {
@@ -41,12 +45,20 @@ impl Update {
         Self {
             store,
             max_chars: DEFAULT_MAX_CHARS,
+            secrets: SecretsMode::default(),
         }
     }
 
     /// Override the over-limit ceiling. Mirrors `Remember::with_max_chars`.
     pub fn with_max_chars(mut self, max_chars: usize) -> Self {
         self.max_chars = max_chars;
+        self
+    }
+
+    /// Set `[guardrails] secrets`. Defaults to `reject`, so fixtures
+    /// that never call this still get the guard.
+    pub fn with_secret_guard(mut self, mode: SecretsMode) -> Self {
+        self.secrets = mode;
         self
     }
 }
@@ -134,6 +146,17 @@ impl Tool for Update {
                 }
                 Some((tier, len))
             }
+            None => None,
+        };
+
+        // Secret guard: only when replacement content is present, and
+        // after the size gate so oversized content is rejected for its
+        // size without being regex-scanned first.
+        let secret_advisory = match &content {
+            Some(s) => match secret_guard::guard_text(self.secrets, s)? {
+                Guard::Reject(r) => return Ok(r),
+                g => g.into_advisory(),
+            },
             None => None,
         };
 
@@ -249,7 +272,16 @@ impl Tool for Update {
         {
             result = result.with_meta(meta);
         }
-        Ok(result)
+        // The advisory rides in `_meta` whenever the scan matched, even
+        // for an unknown id: the dispatcher keys its `tool_call`
+        // content redaction on it, and the flagged text is still in the
+        // arguments. The "forget <id>" note only makes sense when
+        // something was stored.
+        Ok(if existed {
+            secret_guard::attach(result, secret_advisory, memory_id)
+        } else {
+            secret_guard::attach_meta(result, secret_advisory)
+        })
     }
 }
 
@@ -525,5 +557,142 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, ToolError::InvalidArguments(_)));
         }
+    }
+
+    /// A credential-shaped string. Assembled at runtime so this file
+    /// does not itself trip repository secret scanners.
+    fn aws_key() -> String {
+        format!("AKIA{}", "IOSFODNN7EXAMPLE")
+    }
+
+    async fn seeded(tmp: &TempDir) -> (Arc<SemanticStore>, MemoryId) {
+        let s = store(tmp);
+        let id = s
+            .remember("original note", MemoryKind::Fact, vec![], "personal".into())
+            .await
+            .unwrap();
+        (s, id)
+    }
+
+    #[tokio::test]
+    async fn secret_in_reject_mode_leaves_the_memory_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let (s, id) = seeded(&tmp).await;
+        let u = Update::new(Arc::clone(&s)).with_secret_guard(SecretsMode::Reject);
+        let key = aws_key();
+        let res = u
+            .invoke(json!({ "id": id.to_string(), "content": format!("key is {key}") }))
+            .await
+            .unwrap();
+        assert!(res.is_error);
+        let meta = res.meta.as_ref().expect("error meta");
+        assert_eq!(meta["error"]["code"], "secret_detected");
+        assert!(!format!("{:?}{}", res.content, meta).contains(&key));
+        let item = s.get(id).await.unwrap().unwrap();
+        assert_eq!(item.content, "original note");
+    }
+
+    #[tokio::test]
+    async fn secret_in_warn_mode_is_stored_with_advisory() {
+        let tmp = TempDir::new().unwrap();
+        let (s, id) = seeded(&tmp).await;
+        let u = Update::new(Arc::clone(&s)).with_secret_guard(SecretsMode::Warn);
+        let content = format!("key is {}", aws_key());
+        let res = u
+            .invoke(json!({ "id": id.to_string(), "content": content }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let meta = res.meta.expect("expected a secret advisory");
+        assert_eq!(meta["secret_advisory"]["pattern"], "aws_access_key_id");
+        let item = s.get(id).await.unwrap().unwrap();
+        assert_eq!(item.content, content);
+        let crate::mcp::tools::ContentBlock::Text(text) = &res.content[0];
+        assert!(
+            text.contains(&format!(
+                "warning: content matched credential pattern aws_access_key_id at char 7; \
+                 forget {id} if this is a real secret"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(&aws_key()));
+    }
+
+    /// An update that matched no memory still reports the match in
+    /// `_meta` (the dispatcher redacts the automatic `tool_call` event
+    /// on it), but names no `forget <id>` since nothing was stored.
+    #[tokio::test]
+    async fn warn_mode_unknown_id_keeps_advisory_but_no_forget_note() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let u = Update::new(Arc::clone(&s)).with_secret_guard(SecretsMode::Warn);
+        let res = u
+            .invoke(json!({
+                "id": MemoryId::new().to_string(),
+                "content": format!("key is {}", aws_key()),
+            }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let meta = res.meta.expect("advisory must survive an unknown id");
+        assert_eq!(meta["secret_advisory"]["pattern"], "aws_access_key_id");
+        let crate::mcp::tools::ContentBlock::Text(text) = &res.content[0];
+        assert!(text.starts_with("no such memory "), "{text}");
+        assert!(!text.contains("warning:"), "{text}");
+        assert!(!text.contains("forget"), "{text}");
+    }
+
+    /// Oversized replacement content is refused for its size before the
+    /// secret guard scans it.
+    #[tokio::test]
+    async fn oversized_content_is_rejected_for_size_not_scanned_for_secrets() {
+        let tmp = TempDir::new().unwrap();
+        let (s, id) = seeded(&tmp).await;
+        let u = Update::new(Arc::clone(&s))
+            .with_max_chars(100)
+            .with_secret_guard(SecretsMode::Reject);
+        let res = u
+            .invoke(json!({
+                "id": id.to_string(),
+                "content": format!("{} {}", "x".repeat(200), aws_key()),
+            }))
+            .await
+            .unwrap();
+        assert!(res.is_error);
+        assert_eq!(res.meta.unwrap()["error"]["code"], "memory_too_large");
+    }
+
+    #[tokio::test]
+    async fn secret_in_off_mode_is_stored_without_advisory() {
+        let tmp = TempDir::new().unwrap();
+        let (s, id) = seeded(&tmp).await;
+        let u = Update::new(Arc::clone(&s)).with_secret_guard(SecretsMode::Off);
+        let content = format!("key is {}", aws_key());
+        let res = u
+            .invoke(json!({ "id": id.to_string(), "content": content }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let has_adv = res
+            .meta
+            .as_ref()
+            .map(|m| m.get("secret_advisory").is_some())
+            .unwrap_or(false);
+        assert!(!has_adv, "off mode must not scan: {:?}", res.meta);
+        let item = s.get(id).await.unwrap().unwrap();
+        assert_eq!(item.content, content);
+    }
+
+    /// Metadata-only updates carry no content to scan.
+    #[tokio::test]
+    async fn metadata_only_update_is_not_scanned() {
+        let tmp = TempDir::new().unwrap();
+        let (s, id) = seeded(&tmp).await;
+        let u = Update::new(Arc::clone(&s)).with_secret_guard(SecretsMode::Reject);
+        let res = u
+            .invoke(json!({ "id": id.to_string(), "tags": ["x"] }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
     }
 }

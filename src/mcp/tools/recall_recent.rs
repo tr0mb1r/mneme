@@ -153,6 +153,7 @@ impl Tool for RecallRecent {
             kind: args.get("kind").and_then(Value::as_str).map(String::from),
             since,
             until,
+            ..Default::default()
         };
         let events = self
             .store

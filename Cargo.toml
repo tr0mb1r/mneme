@@ -64,6 +64,9 @@ crc32c = "0.6"
 fs2 = "0.4"
 dirs = "5"
 toml = "0.8"
+# Secret-guard patterns (src/mcp/tools/secret_guard.rs). Already in the
+# tree via tokenizers, so this adds no new crate.
+regex = "1"
 # v1.1 daemon auth-token generation (ADR-0012 D3/D4). Already in the
 # transitive tree via tokio + candle deps; adding direct so the
 # fill_bytes API is reachable without re-exporting through one of those.

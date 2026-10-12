@@ -8,7 +8,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
+use super::secret_guard::{self, Guard};
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
+use crate::config::SecretsMode;
 use crate::memory::procedural::ProceduralStore;
 use crate::scope::ScopeState;
 
@@ -21,11 +23,24 @@ facts, and binding decisions; not for transient state.";
 pub struct Pin {
     store: Arc<ProceduralStore>,
     scope_state: Arc<ScopeState>,
+    /// `[guardrails] secrets`.
+    secrets: SecretsMode,
 }
 
 impl Pin {
     pub fn new(store: Arc<ProceduralStore>, scope_state: Arc<ScopeState>) -> Self {
-        Self { store, scope_state }
+        Self {
+            store,
+            scope_state,
+            secrets: SecretsMode::default(),
+        }
+    }
+
+    /// Set `[guardrails] secrets`. Defaults to `reject`, so fixtures
+    /// that never call this still get the guard.
+    pub fn with_secret_guard(mut self, mode: SecretsMode) -> Self {
+        self.secrets = mode;
+        self
     }
 }
 
@@ -63,6 +78,10 @@ impl Tool for Pin {
                 "`content` must not be empty".into(),
             ));
         }
+        let secret_advisory = match secret_guard::guard_text(self.secrets, content)? {
+            Guard::Reject(r) => return Ok(r),
+            g => g.into_advisory(),
+        };
 
         let tags = super::parse_tags_arg(args.get("tags"))?;
 
@@ -77,7 +96,11 @@ impl Tool for Pin {
             .pin(content.trim().to_owned(), tags, scope)
             .await
             .map_err(|e| ToolError::Internal(format!("pin failed: {e}")))?;
-        Ok(ToolResult::text(format!("pinned {id}")))
+        Ok(secret_guard::attach(
+            ToolResult::text(format!("pinned {id}")),
+            secret_advisory,
+            id,
+        ))
     }
 }
 
@@ -121,5 +144,74 @@ mod tests {
         }))
         .await
         .unwrap();
+    }
+
+    /// A credential-shaped string. Assembled at runtime so this file
+    /// does not itself trip repository secret scanners.
+    fn aws_key() -> String {
+        format!("AKIA{}", "IOSFODNN7EXAMPLE")
+    }
+
+    fn pin_with_mode(mode: SecretsMode) -> (Pin, Arc<ProceduralStore>, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let pin = Pin::new(Arc::clone(&store), ScopeState::new("personal")).with_secret_guard(mode);
+        (pin, store, tmp)
+    }
+
+    #[tokio::test]
+    async fn secret_in_reject_mode_pins_nothing() {
+        let (p, store, _tmp) = pin_with_mode(SecretsMode::Reject);
+        let key = aws_key();
+        let res = p
+            .invoke(json!({ "content": format!("always use key {key}") }))
+            .await
+            .unwrap();
+        assert!(res.is_error);
+        let meta = res.meta.as_ref().expect("error meta");
+        assert_eq!(meta["error"]["code"], "secret_detected");
+        assert!(!format!("{:?}{}", res.content, meta).contains(&key));
+        assert!(store.list(None).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn secret_in_warn_mode_is_pinned_with_advisory() {
+        let (p, store, _tmp) = pin_with_mode(SecretsMode::Warn);
+        let res = p
+            .invoke(json!({ "content": format!("always use key {}", aws_key()) }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let meta = res.meta.expect("expected a secret advisory");
+        assert_eq!(meta["secret_advisory"]["pattern"], "aws_access_key_id");
+        let pinned = store.list(None).unwrap();
+        assert_eq!(pinned.len(), 1);
+        let crate::mcp::tools::ContentBlock::Text(text) = &res.content[0];
+        assert!(
+            text.contains(&format!(
+                "warning: content matched credential pattern aws_access_key_id at char 15; \
+                 forget {} if this is a real secret",
+                pinned[0].id
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(&aws_key()));
+    }
+
+    #[tokio::test]
+    async fn secret_in_off_mode_is_pinned_without_advisory() {
+        let (p, store, _tmp) = pin_with_mode(SecretsMode::Off);
+        let res = p
+            .invoke(json!({ "content": format!("always use key {}", aws_key()) }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
+        let has_adv = res
+            .meta
+            .as_ref()
+            .map(|m| m.get("secret_advisory").is_some())
+            .unwrap_or(false);
+        assert!(!has_adv, "off mode must not scan: {:?}", res.meta);
+        assert_eq!(store.list(None).unwrap().len(), 1);
     }
 }

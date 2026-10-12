@@ -372,7 +372,7 @@ async fn auto_context_folds_in_remembered_memories() {
         "session template missing: {listed:?}"
     );
     assert!(
-        listed.contains(&"mneme://context{?q,scope,limit}"),
+        listed.contains(&"mneme://context{?q,scope,limit,kinds,exclude_kinds}"),
         "context template missing: {listed:?}"
     );
 

@@ -16,8 +16,12 @@
 //! - `GET /mcp` — `405`. The spec lets a server decline the standalone
 //!   SSE stream, and mneme has nothing to push.
 //! - `DELETE /mcp` — ends the session named by `Mcp-Session-Id`.
-//! - `GET /healthz` — unauthenticated liveness probe for container
-//!   health checks. Reveals nothing beyond "the process is up".
+//! - `GET /healthz` (alias `GET /health`) — unauthenticated liveness
+//!   probe for container health checks. Reveals nothing beyond "the
+//!   process is up".
+//! - `GET /version` — `{"version": "<crate version>"}`. Requires the
+//!   bearer token: version disclosure stays behind auth, unlike the
+//!   health probes.
 //!
 //! Sessions: an `initialize` request mints a fresh [`McpSession`]
 //! (with its own scope cell, same SEC-001 isolation as the daemon's
@@ -66,6 +70,11 @@ use crate::mcp::server::McpSession;
 pub const MCP_PATH: &str = "/mcp";
 /// Path of the unauthenticated liveness probe.
 pub const HEALTH_PATH: &str = "/healthz";
+/// Alias of [`HEALTH_PATH`]; agents and orchestrators guess this
+/// spelling at least as often as the Kubernetes-style one.
+pub const HEALTH_ALIAS_PATH: &str = "/health";
+/// Path of the authenticated version probe.
+pub const VERSION_PATH: &str = "/version";
 /// Session header name. HTTP header names are case-insensitive; the
 /// spec spells it `Mcp-Session-Id`.
 pub const SESSION_HEADER: &str = "mcp-session-id";
@@ -206,6 +215,8 @@ fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route(MCP_PATH, post(post_mcp).get(get_mcp).delete(delete_mcp))
         .route(HEALTH_PATH, get(health))
+        .route(HEALTH_ALIAS_PATH, get(health))
+        .route(VERSION_PATH, get(version))
         .layer(DefaultBodyLimit::max(MAX_FRAME_BYTES))
         .with_state(state)
 }
@@ -452,6 +463,28 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// `GET /version`. Behind the same origin and bearer checks as `/mcp`,
+/// so an unauthenticated scanner cannot fingerprint the build.
+async fn version(State(state): State<Arc<AppState>>, headers: HeaderMap) -> HttpResponse {
+    if let Err(r) = state.check_origin(&headers) {
+        return r.into_response();
+    }
+    if let Err(r) = state.check_auth(&headers) {
+        return r.into_response();
+    }
+    // `axum::Json` needs the `json` feature, which this build leaves
+    // off; the body is a fixed shape, so build it by hand.
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        format!("{{\"version\":\"{}\"}}", env!("CARGO_PKG_VERSION")),
+    )
+        .into_response()
+}
+
 fn session_id(headers: &HeaderMap) -> Result<&str, Reject> {
     headers
         .get(SESSION_HEADER)
@@ -655,6 +688,55 @@ mod tests {
         let req = Request::get(HEALTH_PATH).body(Body::empty()).unwrap();
         let resp = send(&f.app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_alias_answers_like_healthz() {
+        let f = fixture();
+        let a = send(
+            &f.app,
+            Request::get(HEALTH_PATH).body(Body::empty()).unwrap(),
+        )
+        .await;
+        let b = send(
+            &f.app,
+            Request::get(HEALTH_ALIAS_PATH).body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(a.status(), StatusCode::OK);
+        assert_eq!(b.status(), StatusCode::OK);
+        let a = axum::body::to_bytes(a.into_body(), 1024).await.unwrap();
+        let b = axum::body::to_bytes(b.into_body(), 1024).await.unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn version_requires_the_bearer_token() {
+        let f = fixture();
+        let resp = send(
+            &f.app,
+            Request::get(VERSION_PATH).body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let mut req = Request::get(VERSION_PATH).body(Body::empty()).unwrap();
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer nope"),
+        );
+        assert_eq!(send(&f.app, req).await.status(), StatusCode::UNAUTHORIZED);
+
+        let mut req = Request::get(VERSION_PATH).body(Body::empty()).unwrap();
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {TOKEN}")).unwrap(),
+        );
+        let resp = send(&f.app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]

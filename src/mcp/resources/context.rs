@@ -17,6 +17,13 @@
 //! | `q`     | Natural-language seed for the L4 semantic layer. Percent-decoded. |
 //! | `scope` | Restrict L0 / L3 / L4 to one scope. L1 turns are session-local and always included. |
 //! | `limit` | Semantic over-fetch before the budget pass trims. Clamped by the orchestrator. |
+//! | `kinds` | Comma-separated episodic kinds to include, and only those. Naming an auto-logged kind here (e.g. `tool_call`) opts back in to it. |
+//! | `exclude_kinds` | Comma-separated episodic kinds to hide, on top of the default exclusions. |
+//!
+//! By default the episodic section omits the auto-logged kinds
+//! (`tool_call`, `tool_call_failed`, `session_start`, `session_end`):
+//! in one deployment 56 of 61 context events were `tool_call` and ate
+//! most of the token budget. Pass `?kinds=tool_call` to see them.
 //!
 //! `query` is accepted as an alias for `q`. Unknown parameters are
 //! ignored rather than rejected — a host that appends a cache-buster
@@ -48,7 +55,7 @@ pub const URI: &str = "mneme://context";
 pub const URI_QUERY_PREFIX: &str = "mneme://context?";
 
 /// RFC 6570 form advertised in `resources/templates/list`.
-pub const URI_TEMPLATE: &str = "mneme://context{?q,scope,limit}";
+pub const URI_TEMPLATE: &str = "mneme://context{?q,scope,limit,kinds,exclude_kinds}";
 
 pub struct Context {
     orchestrator: Arc<Orchestrator>,
@@ -94,11 +101,23 @@ impl Context {
                 "q" | "query" => req.query = Some(decoded),
                 "scope" => req.scope = Some(decoded),
                 "limit" => req.semantic_limit = decoded.trim().parse::<usize>().ok(),
+                "kinds" => req.kinds = split_kinds(&decoded),
+                "exclude_kinds" => req.exclude_kinds = split_kinds(&decoded),
                 _ => {}
             }
         }
         req
     }
+}
+
+/// Split a comma-separated kind list, trimming blanks. Kinds are
+/// free-form strings, so no validation beyond dropping empties.
+fn split_kinds(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Minimal `application/x-www-form-urlencoded` decoder: `%XX` escapes
@@ -154,7 +173,10 @@ impl Resource for Context {
                           working-session turns + recent episodic events, packed inside \
                           the configured token budget. Append `?q=<text>` to also fold in \
                           semantically-similar long-term memories, and `?scope=<name>` to \
-                          restrict it to one scope.",
+                          restrict it to one scope. Auto-logged event kinds (`tool_call`, \
+                          `tool_call_failed`, `session_start`, `session_end`) are hidden by \
+                          default; `?kinds=a,b` includes only those kinds and \
+                          `?exclude_kinds=a,b` hides more.",
             mime_type: "application/json",
         }
     }
@@ -191,6 +213,11 @@ impl Resource for Context {
                 "scope": e.scope,
                 "payload": e.payload,
                 "tags": e.tags,
+                // Lets clients (the Hermes hook) honour weighting that
+                // agents apply themselves: an agent may down-weight or
+                // mark low-signal events, and they should not take
+                // startup space. Consolidation never changes the weight.
+                "retrieval_weight": e.retrieval_weight,
                 "last_accessed": e.last_accessed.to_rfc3339(),
                 "created_at": e.created_at.to_rfc3339(),
             })).collect::<Vec<_>>(),
@@ -212,6 +239,8 @@ impl Resource for Context {
             "request": {
                 "query": req.query,
                 "scope": req.scope,
+                "kinds": req.kinds,
+                "exclude_kinds": req.exclude_kinds,
             },
             "total_tokens": ctx.total_tokens,
             "max_tokens": self.budget.max_tokens,
@@ -333,6 +362,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_request_reads_kinds_and_exclude_kinds() {
+        let req = Context::parse_request(
+            "mneme://context?kinds=decision,%20summary,,&exclude_kinds=note%2Cobservation",
+        );
+        assert_eq!(req.kinds, vec!["decision", "summary"]);
+        assert_eq!(req.exclude_kinds, vec!["note", "observation"]);
+        let req = Context::parse_request("mneme://context?kinds=&exclude_kinds=,");
+        assert!(req.kinds.is_empty());
+        assert!(req.exclude_kinds.is_empty());
+    }
+
+    #[test]
+    fn template_advertises_the_kind_filters() {
+        assert!(URI_TEMPLATE.contains("kinds"));
+        assert!(URI_TEMPLATE.contains("exclude_kinds"));
+    }
+
+    #[test]
     fn parse_request_ignores_blank_values() {
         let req = Context::parse_request("mneme://context?q=&scope=%20");
         assert_eq!(req.query, None);
@@ -378,6 +425,30 @@ mod tests {
         // The echoed request lets a caller distinguish "no hits" from
         // "no query supplied".
         assert_eq!(v["request"]["query"], "how do we deploy");
+    }
+
+    #[tokio::test]
+    async fn episodic_rows_carry_retrieval_weight() {
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(backing));
+        episodic
+            .record_weighted("decision", "global", "{\"content\":\"x\"}", 0.25)
+            .await
+            .unwrap();
+        let orch = Arc::new(Orchestrator::new(semantic, procedural, episodic));
+        let ctx = Context::new(orch, TokenBudget::for_tests(2000));
+
+        let c = ctx.read("mneme://context").await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
+        let rows = v["episodic"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        let w = rows[0]["retrieval_weight"].as_f64().unwrap();
+        assert!((w - 0.25).abs() < 1e-6, "weight was {w}");
     }
 
     #[tokio::test]
@@ -434,6 +505,68 @@ mod tests {
         let sem = v["semantic"].as_array().unwrap();
         assert_eq!(sem.len(), 1);
         assert_eq!(sem[0]["scope"], "work");
+    }
+
+    async fn kind_fixture() -> (Context, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(backing));
+        for kind in ["tool_call", "tool_call_failed", "decision", "summary"] {
+            episodic
+                .record(kind, "work", "{\"content\":\"x\"}")
+                .await
+                .unwrap();
+        }
+        let orch = Arc::new(Orchestrator::new(semantic, procedural, episodic));
+        (Context::new(orch, TokenBudget::for_tests(2000)), tmp)
+    }
+
+    async fn episodic_kinds(ctx: &Context, uri: &str) -> Vec<String> {
+        let c = ctx.read(uri).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
+        let mut kinds: Vec<String> = v["episodic"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap().to_owned())
+            .collect();
+        kinds.sort();
+        kinds
+    }
+
+    #[tokio::test]
+    async fn default_read_has_no_tool_call_events() {
+        let (ctx, _tmp) = kind_fixture().await;
+        assert_eq!(
+            episodic_kinds(&ctx, "mneme://context").await,
+            vec!["decision", "summary"]
+        );
+    }
+
+    #[tokio::test]
+    async fn kinds_parameter_returns_the_requested_kinds() {
+        let (ctx, _tmp) = kind_fixture().await;
+        assert_eq!(
+            episodic_kinds(&ctx, "mneme://context?kinds=tool_call").await,
+            vec!["tool_call"]
+        );
+        // The echoed request shows how the read was interpreted.
+        let c = ctx.read("mneme://context?kinds=tool_call").await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c.text).unwrap();
+        assert_eq!(v["request"]["kinds"], serde_json::json!(["tool_call"]));
+    }
+
+    #[tokio::test]
+    async fn exclude_kinds_parameter_hides_decisions() {
+        let (ctx, _tmp) = kind_fixture().await;
+        assert_eq!(
+            episodic_kinds(&ctx, "mneme://context?exclude_kinds=decision").await,
+            vec!["summary"]
+        );
     }
 
     /// MCP correlates a `resources/read` reply to its request by URI,

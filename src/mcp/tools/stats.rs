@@ -8,21 +8,89 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::checkpoint_scheduler::CheckpointScheduler;
 use crate::memory::consolidation_scheduler::ConsolidationScheduler;
-use crate::memory::episodic::EpisodicStore;
+use crate::memory::episodic::{EpisodicStore, HotAgeSummary};
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
 use crate::scope::ScopeState;
 use crate::storage::archive::ColdArchive;
 
 const DESCRIPTION: &str = "Report memory store health: per-layer \
-counts, schema version, HNSW snapshot LSN. Use this when diagnosing \
-issues or confirming the memory subsystem is alive. Output JSON \
-matches the `mneme://stats` resource.";
+counts, server version, schema version, HNSW snapshot LSN, and \
+consolidation status (run counters, tier thresholds, age of the oldest \
+hot event, time to the next promotion). Use this when diagnosing issues \
+or confirming the memory subsystem is alive. Output JSON matches the \
+`mneme://stats` resource.";
+
+/// Round to two decimals; ages in days need no more precision and
+/// the shorter number is easier for an agent to read.
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
+/// Build the `consolidation` object shared by this tool and the
+/// `mneme://stats` resource, so the two cannot drift.
+///
+/// Besides the scheduler's run counters it answers "why is nothing
+/// promoted?": the configured thresholds, the age of the oldest hot
+/// event (on `last_accessed`, the field consolidation ages on), how
+/// many hot events are already eligible, and how long until the next
+/// one becomes so. With default thresholds nothing is promoted in the
+/// first 28 days, which looks like a broken scheduler without these.
+pub(crate) fn consolidation_json(
+    sched: &ConsolidationScheduler,
+    hot: &HotAgeSummary,
+    now: DateTime<Utc>,
+) -> Value {
+    let m = sched.metrics();
+    let p = sched.params();
+    let oldest_age_days = hot
+        .oldest_last_accessed
+        .map(|t| round2((now - t).num_milliseconds().max(0) as f64 / 86_400_000.0));
+    let next_promotion_in_days = oldest_age_days.map(|age| {
+        if hot.eligible > 0 {
+            0.0
+        } else {
+            round2((f64::from(p.hot_to_warm_days) - age).max(0.0))
+        }
+    });
+    json!({
+        "last_consolidation_at": m.last_consolidation_at.map(|d| d.to_rfc3339()),
+        "runs_total": m.runs_total,
+        "errors_total": m.errors_total,
+        "last_promoted_to_warm": m.last_promoted_to_warm,
+        "last_archived_to_cold": m.last_archived_to_cold,
+        "last_orphans_reclaimed": m.last_orphans_reclaimed,
+        "thresholds": {
+            "hot_to_warm_days": p.hot_to_warm_days,
+            "warm_to_cold_days": p.warm_to_cold_days,
+        },
+        "hot_oldest_age_days": oldest_age_days,
+        "hot_eligible_for_warm": hot.eligible,
+        "next_promotion_in_days": next_promotion_in_days,
+    })
+}
+
+/// One scan of the hot tier for both the `hot` count and the
+/// consolidation age fields. The eligibility cutoff comes from the
+/// scheduler's threshold when one is attached; without a scheduler
+/// the consolidation block is not emitted and the cutoff is moot.
+pub(crate) async fn hot_summary(
+    episodic: &EpisodicStore,
+    sched: Option<&ConsolidationScheduler>,
+    now: DateTime<Utc>,
+) -> crate::Result<HotAgeSummary> {
+    let cutoff = match sched {
+        Some(s) => now - chrono::Duration::days(i64::from(s.params().hot_to_warm_days)),
+        None => now,
+    };
+    episodic.hot_age_summary(cutoff).await
+}
 
 pub struct Stats {
     semantic: Arc<SemanticStore>,
@@ -100,11 +168,11 @@ impl Tool for Stats {
             .list(None)
             .map_err(|e| ToolError::Internal(format!("procedural list: {e}")))?
             .len();
-        let hot_count = self
-            .episodic
-            .count_hot()
+        let now = Utc::now();
+        let hot = hot_summary(&self.episodic, self.consolidation.as_deref(), now)
             .await
-            .map_err(|e| ToolError::Internal(format!("episodic count_hot: {e}")))?;
+            .map_err(|e| ToolError::Internal(format!("episodic hot_age_summary: {e}")))?;
+        let hot_count = hot.count;
         let warm_count = self
             .episodic
             .count_warm()
@@ -116,18 +184,10 @@ impl Tool for Stats {
             .map_err(|e| ToolError::Internal(format!("cold list_quarters: {e}")))?
             .len();
 
-        let consolidation = self.consolidation.as_ref().map(|s| {
-            let m = s.metrics();
-            json!({
-                "last_consolidation_at": m.last_consolidation_at
-                    .map(|d| d.to_rfc3339()),
-                "runs_total": m.runs_total,
-                "errors_total": m.errors_total,
-                "last_promoted_to_warm": m.last_promoted_to_warm,
-                "last_archived_to_cold": m.last_archived_to_cold,
-                "last_orphans_reclaimed": m.last_orphans_reclaimed,
-            })
-        });
+        let consolidation = self
+            .consolidation
+            .as_ref()
+            .map(|s| consolidation_json(s, &hot, now));
 
         let working = self.checkpoints.as_ref().map(|s| {
             let m = s.metrics();
@@ -144,6 +204,7 @@ impl Tool for Stats {
         });
 
         let body = json!({
+            "version": env!("CARGO_PKG_VERSION"),
             "schema_version": self.schema_version,
             "memories": {
                 "semantic": semantic_count,
@@ -315,5 +376,119 @@ mod tests {
         assert!(v["consolidation"].is_object());
         assert!(v["working"].is_object());
         assert_eq!(v["working"]["current_scope"], "test-scope");
+    }
+
+    fn disabled_scheduler(
+        backing: &Arc<dyn Storage>,
+        dir: &std::path::Path,
+    ) -> Arc<ConsolidationScheduler> {
+        ConsolidationScheduler::start(
+            Arc::clone(backing),
+            ColdArchive::new(dir),
+            ConsolidationParams {
+                hot_to_warm_days: 28,
+                warm_to_cold_days: 180,
+            },
+            SchedulerConfig::disabled(),
+            vec![],
+        )
+    }
+
+    async fn stats_with_scheduler(backing: Arc<dyn Storage>, tmp: &TempDir) -> Stats {
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&backing)));
+        let sched = disabled_scheduler(&backing, tmp.path());
+        Stats::new(
+            semantic,
+            procedural,
+            episodic,
+            ColdArchive::new(tmp.path()),
+            1,
+        )
+        .with_consolidation(sched)
+    }
+
+    #[tokio::test]
+    async fn version_is_reported() {
+        let tmp = TempDir::new().unwrap();
+        let stats = stats_with_scheduler(MemoryStorage::new(), &tmp).await;
+        let v: Value = serde_json::from_str(&text(stats.invoke(json!({})).await.unwrap())).unwrap();
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn consolidation_reports_thresholds_and_hot_ages() {
+        use crate::memory::consolidation::_record_backdated_for_tests;
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let now = Utc::now();
+        // 30 days old: past the 28-day threshold. 10 days old: not yet.
+        _record_backdated_for_tests(
+            &backing,
+            "k",
+            "p",
+            "\"a\"",
+            now - chrono::Duration::days(30),
+        )
+        .await
+        .unwrap();
+        _record_backdated_for_tests(
+            &backing,
+            "k",
+            "p",
+            "\"b\"",
+            now - chrono::Duration::days(10),
+        )
+        .await
+        .unwrap();
+        let stats = stats_with_scheduler(backing, &tmp).await;
+        let v: Value = serde_json::from_str(&text(stats.invoke(json!({})).await.unwrap())).unwrap();
+        let c = &v["consolidation"];
+        assert_eq!(c["thresholds"]["hot_to_warm_days"], 28);
+        assert_eq!(c["thresholds"]["warm_to_cold_days"], 180);
+        assert_eq!(c["hot_eligible_for_warm"], 1);
+        let age = c["hot_oldest_age_days"].as_f64().unwrap();
+        assert!((age - 30.0).abs() < 0.1, "age {age}");
+        assert_eq!(c["next_promotion_in_days"].as_f64().unwrap(), 0.0);
+        assert_eq!(v["memories"]["episodic"]["hot"], 2);
+    }
+
+    #[tokio::test]
+    async fn next_promotion_counts_down_when_nothing_is_eligible() {
+        use crate::memory::consolidation::_record_backdated_for_tests;
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        _record_backdated_for_tests(
+            &backing,
+            "k",
+            "p",
+            "\"a\"",
+            Utc::now() - chrono::Duration::days(3),
+        )
+        .await
+        .unwrap();
+        let stats = stats_with_scheduler(backing, &tmp).await;
+        let v: Value = serde_json::from_str(&text(stats.invoke(json!({})).await.unwrap())).unwrap();
+        let c = &v["consolidation"];
+        assert_eq!(c["hot_eligible_for_warm"], 0);
+        let age = c["hot_oldest_age_days"].as_f64().unwrap();
+        assert!((age - 3.0).abs() < 0.1, "age {age}");
+        let next = c["next_promotion_in_days"].as_f64().unwrap();
+        assert!((next - 25.0).abs() < 0.1, "next {next}");
+    }
+
+    #[tokio::test]
+    async fn empty_hot_tier_reports_null_ages() {
+        let tmp = TempDir::new().unwrap();
+        let stats = stats_with_scheduler(MemoryStorage::new(), &tmp).await;
+        let v: Value = serde_json::from_str(&text(stats.invoke(json!({})).await.unwrap())).unwrap();
+        let c = &v["consolidation"];
+        assert!(c["hot_oldest_age_days"].is_null());
+        assert!(c["next_promotion_in_days"].is_null());
+        assert_eq!(c["hot_eligible_for_warm"], 0);
+        assert_eq!(c["thresholds"]["hot_to_warm_days"], 28);
     }
 }

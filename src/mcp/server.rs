@@ -28,6 +28,7 @@ use super::resources::{
 use super::tools::{ToolRegistry, descriptor_to_json as tool_to_json};
 use super::transport::stdio::{FrameError, StdioTransport};
 use super::{PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
+use crate::config::AutoLogToolCalls;
 use crate::memory::checkpoint_scheduler::CheckpointScheduler;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::working::ActiveSession;
@@ -94,6 +95,9 @@ pub struct McpSession {
     /// default scope. Mirrors `[scopes] derive_from_roots`; off unless
     /// the user opted in, because it changes where writes land.
     derive_scope_from_roots: bool,
+    /// Which successful `tools/call`s are mirrored as `tool_call`
+    /// events. `[episodic] auto_log_tool_calls`; defaults to `writes`.
+    auto_log: AutoLogToolCalls,
     initialized: AtomicBool,
 }
 
@@ -112,6 +116,7 @@ impl McpSession {
             episodic: None,
             scope_state: None,
             derive_scope_from_roots: false,
+            auto_log: AutoLogToolCalls::default(),
             initialized: AtomicBool::new(false),
         }
     }
@@ -121,6 +126,14 @@ impl McpSession {
     /// `[scopes] derive_from_roots`.
     pub fn with_scope_from_roots(mut self, enabled: bool) -> Self {
         self.derive_scope_from_roots = enabled;
+        self
+    }
+
+    /// Builder hook: choose which tool calls are mirrored into L3 as
+    /// `tool_call` events. `cli::run` passes
+    /// `[episodic] auto_log_tool_calls`.
+    pub fn with_auto_log_tool_calls(mut self, mode: AutoLogToolCalls) -> Self {
+        self.auto_log = mode;
         self
     }
 
@@ -289,6 +302,7 @@ impl McpSession {
             self.checkpoint_scheduler.as_deref(),
             self.episodic.as_deref(),
             self.scope_state.as_deref(),
+            self.auto_log,
             id,
             params,
         )
@@ -372,6 +386,12 @@ where
     /// See [`McpSession::with_scope_from_roots`].
     pub fn with_scope_from_roots(mut self, enabled: bool) -> Self {
         self.session = self.session.with_scope_from_roots(enabled);
+        self
+    }
+
+    /// See [`McpSession::with_auto_log_tool_calls`].
+    pub fn with_auto_log_tool_calls(mut self, mode: AutoLogToolCalls) -> Self {
+        self.session = self.session.with_auto_log_tool_calls(mode);
         self
     }
 
@@ -738,7 +758,7 @@ mod tests {
             .map(|t| t["uriTemplate"].as_str().unwrap())
             .collect();
         assert!(
-            uris.contains(&"mneme://context{?q,scope,limit}"),
+            uris.contains(&"mneme://context{?q,scope,limit,kinds,exclude_kinds}"),
             "got {uris:?}"
         );
         // Templates carry `uriTemplate`, never `uri` — a client keying
@@ -817,6 +837,169 @@ mod tests {
         server.run().await.unwrap();
 
         assert_eq!(scope_state.current(), "global");
+    }
+
+    /// Run a read (`recall_recent`), a write (`forget` of a real
+    /// memory) and a failure (`no_such_tool`) through a production-wired
+    /// server in the given auto-log mode, and return the resulting
+    /// timeline as sorted `"kind:tool"` strings.
+    async fn timeline_for_mode(mode: AutoLogToolCalls) -> Vec<String> {
+        use crate::embed::Embedder;
+        use crate::embed::stub::StubEmbedder;
+        use crate::memory::checkpoint_scheduler::{CheckpointScheduler, CheckpointSchedulerConfig};
+        use crate::memory::episodic::{EpisodicStore, RecentFilters};
+        use crate::memory::procedural::ProceduralStore;
+        use crate::memory::semantic::{MemoryKind, SemanticStore};
+        use crate::memory::working::ActiveSession;
+        use crate::orchestrator::{Orchestrator, TokenBudget};
+        use crate::scope::ScopeState;
+        use crate::storage::archive::ColdArchive;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = crate::storage::memory_impl::MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&storage), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage)));
+        let orchestrator = Arc::new(Orchestrator::new(
+            Arc::clone(&semantic),
+            Arc::clone(&procedural),
+            Arc::clone(&episodic),
+        ));
+        let cold = ColdArchive::new(tmp.path());
+        let active_session = ActiveSession::open(tmp.path().join("sessions")).unwrap();
+        let checkpoint_scheduler = CheckpointScheduler::start(
+            Arc::clone(&active_session),
+            CheckpointSchedulerConfig::disabled(),
+        );
+        let scope_state = ScopeState::new("work");
+
+        // Seeded straight into the store so the only `tool_call`
+        // events on the timeline come from the calls below.
+        let id = semantic
+            .remember("cleanup target", MemoryKind::Fact, vec![], "work".into())
+            .await
+            .unwrap();
+
+        let mut input = String::new();
+        input.push_str(&req(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18"}),
+        ));
+        input.push_str(&notif("notifications/initialized"));
+        input.push_str(&req(
+            2,
+            "tools/call",
+            json!({"name": "recall_recent", "arguments": {}}),
+        ));
+        input.push_str(&req(
+            3,
+            "tools/call",
+            json!({"name": "forget", "arguments": {"id": id.to_string()}}),
+        ));
+        input.push_str(&req(
+            4,
+            "tools/call",
+            json!({"name": "no_such_tool", "arguments": {}}),
+        ));
+        input.push_str(&req(
+            5,
+            "tools/call",
+            json!({"name": "switch_scope", "arguments": {"scope": "work"}}),
+        ));
+
+        let transport = StdioTransport::new(input.as_bytes(), Vec::<u8>::new());
+        let mut server = Server::new(
+            transport,
+            Arc::new(ToolRegistry::defaults(
+                Arc::clone(&semantic),
+                Arc::clone(&procedural),
+                Arc::clone(&episodic),
+                Arc::clone(&storage),
+                cold.clone(),
+                1,
+            )),
+            Arc::new(ResourceRegistry::defaults(
+                semantic,
+                procedural,
+                Arc::clone(&episodic),
+                orchestrator,
+                cold,
+                1,
+                TokenBudget::for_tests(2000),
+            )),
+            storage,
+        )
+        .with_session(
+            active_session,
+            checkpoint_scheduler,
+            Arc::clone(&episodic),
+            scope_state,
+        )
+        .with_auto_log_tool_calls(mode);
+        server.run().await.unwrap();
+
+        let events = episodic
+            .recall_recent(&RecentFilters::default(), 50)
+            .await
+            .unwrap();
+        let mut out: Vec<String> = events
+            .iter()
+            .map(|e| {
+                let tool = e.payload_json().unwrap()["tool"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string();
+                format!("{}:{tool}", e.kind)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// `writes` (the default): reads leave no event (`recall_recent`;
+    /// likewise `summarize_session`, which is `readOnlyHint: true`),
+    /// while `forget` and `switch_scope` stay logged, and so do failures.
+    #[tokio::test]
+    async fn auto_log_writes_skips_reads_but_keeps_forget_and_failures() {
+        assert_eq!(
+            timeline_for_mode(AutoLogToolCalls::Writes).await,
+            vec![
+                "tool_call:forget",
+                "tool_call:switch_scope",
+                "tool_call_failed:no_such_tool",
+            ],
+        );
+    }
+
+    /// `all` restores the pre-1.5 behaviour: reads are mirrored too.
+    #[tokio::test]
+    async fn auto_log_all_mirrors_reads_and_writes() {
+        assert_eq!(
+            timeline_for_mode(AutoLogToolCalls::All).await,
+            vec![
+                "tool_call:forget",
+                "tool_call:recall_recent",
+                "tool_call:switch_scope",
+                "tool_call_failed:no_such_tool",
+            ],
+        );
+    }
+
+    /// `off` disables the mirror entirely, failures included.
+    #[tokio::test]
+    async fn auto_log_off_logs_nothing() {
+        assert!(timeline_for_mode(AutoLogToolCalls::Off).await.is_empty());
+    }
+
+    /// A session built without the builder defaults to `writes`.
+    #[test]
+    fn session_defaults_to_writes_mode() {
+        let (tools, resources, storage, _tmp) = bare_registries();
+        let session = McpSession::new(tools, resources, storage);
+        assert_eq!(session.auto_log, AutoLogToolCalls::Writes);
     }
 
     /// Closes the L3 producer gap. Until v0.2.3 the episodic hot
@@ -1192,7 +1375,6 @@ mod tests {
             "tools/call",
             json!({"name": "remember", "arguments": {
                 "content": "we use redb",
-                "kind": "fact",
                 "scope": "work",
                 "tags": ["storage"],
             }}),
@@ -1238,7 +1420,6 @@ mod tests {
         let payload = evt.payload_json().unwrap();
         assert_eq!(payload["tool"], "remember");
         assert_eq!(payload["content"], "we use redb");
-        assert_eq!(payload["kind"], "fact");
         assert_eq!(payload["scope"], "work");
         // `tags` was passed but is NOT in the per-tool extraction
         // table (ADR-0009 keeps the payload narrow); confirm it
@@ -1255,21 +1436,25 @@ mod tests {
         // someone adds a tool and forgets to add an entry to the
         // match in `tool_call_payload`.
 
-        // remember: content + kind + scope (tags excluded)
+        // remember: content + type + scope (tags excluded)
         let p = tool_call_payload(
             "remember",
-            &json!({"content": "x", "kind": "fact", "scope": "work", "tags": ["a"]}),
+            &json!({"content": "x", "type": "fact", "scope": "work", "tags": ["a"]}),
         );
         assert_eq!(p["tool"], "remember");
         assert_eq!(p["content"], "x");
-        assert_eq!(p["kind"], "fact");
+        assert_eq!(p["type"], "fact");
         assert_eq!(p["scope"], "work");
         assert!(p.get("tags").is_none());
 
-        // recall: query + k
-        let p = tool_call_payload("recall", &json!({"query": "redb", "k": 5, "scope": "x"}));
+        // recall: query + limit (`k` is not a recall argument)
+        let p = tool_call_payload(
+            "recall",
+            &json!({"query": "redb", "limit": 5, "k": 9, "scope": "x"}),
+        );
         assert_eq!(p["query"], "redb");
-        assert_eq!(p["k"], 5);
+        assert_eq!(p["limit"], 5);
+        assert!(p.get("k").is_none());
         assert!(
             p.get("scope").is_none(),
             "recall has no scope arg in extraction"

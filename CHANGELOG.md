@@ -12,6 +12,184 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+## [1.5.0](https://github.com/tr0mb1r/mneme/compare/v1.4.1...v1.5.0) - 2026-10-12
+
+> Hardening from running mneme as the long-term memory of Hermes Agent
+> day to day: pinned rules now reach the agent whole, the timeline keeps
+> empty and duplicate writes out, credentials are refused at the door, and
+> `stats` explains what consolidation is waiting for. These are the gaps a
+> host's own memory leaves open (a small fixed character budget, history
+> that is lost on context compression, keyword-only lookup) and that mneme
+> is there to close.
+> This is a **minor** bump per
+> [`book/src/versioning.md`](book/src/versioning.md): two new config keys
+> (`[guardrails] secrets`, `[episodic] auto_log_tool_calls`) and several
+> tool behaviours that are now stricter (`record_event` needs a payload,
+> credential-shaped writes are refused by default), but the MCP surface
+> gains no tool, and the on-disk format is unchanged (no migration).
+
+### Added
+
+- *(guardrails)* **`[guardrails] secrets = "reject" | "warn" | "off"`**
+  (default `reject`). `remember`, `update` (when `content` is given),
+  `pin` and `record_event` (every string in the payload) now scan for
+  credentials in high-confidence formats: AWS access key ids, PEM private
+  keys, JWTs, GitHub, Slack, OpenAI/Anthropic, Google and Stripe keys, age
+  secret keys. `reject` returns `isError` with
+  `_meta.error.code = "secret_detected"`, the pattern name and a character
+  offset, never the matched text; `warn` stores, adds
+  `_meta.secret_advisory` and appends a one-line warning to the reply text
+  (some hosts hide `_meta`; for `record_event` the warning names the
+  payload `path` as well as the offset); `off` skips the scan. A looser
+  `password=`/`token:` pattern only ever warns. Why: a pinned rule such as
+  "secrets never go into mneme" was advice only; nothing enforced it. No new
+  dependency (`regex` was already in the tree). Verify: `remember` a
+  string shaped like an AWS key id and expect `secret_detected`; set
+  `secrets = "warn"` and expect it stored with an advisory.
+- *(episodic)* **`[episodic] auto_log_tool_calls = "writes" | "all" | "off"`**
+  (default `writes`). See *Changed* for the default. `all` restores the
+  1.4 behaviour; `off` stops the automatic `tool_call` and
+  `tool_call_failed` events.
+- *(stats)* **Consolidation status.** The `consolidation` object in
+  `stats` and `mneme://stats` (now built by one shared function) gains
+  `thresholds`, `hot_oldest_age_days`, `hot_eligible_for_warm` and
+  `next_promotion_in_days`, and both gain a top-level `version`. Why: a store
+  a few days old shows hundreds of consolidation runs with zero promotions,
+  which reads as broken. It was not: with
+  `hot_to_warm_days = 28` nothing is eligible for four weeks, and the
+  output had no way to say so. The hot-tier figures come from one scan that
+  also replaces the old `count_hot()`. Verify: read `mneme://stats` on a
+  young store and compare `hot_oldest_age_days` with
+  `thresholds.hot_to_warm_days`.
+- *(http)* `GET /health`, an alias of `/healthz`, and `GET /version`
+  returning `{"version": "…"}`. The health probes stay unauthenticated;
+  `/version` requires the bearer token so the build can't be fingerprinted
+  by a scanner. Verify: `curl :7878/health` is `200 ok`; `curl :7878/version`
+  without a token is `401`.
+- *(context)* `mneme://context` accepts `?kinds=a,b` (include only) and
+  `?exclude_kinds=a,b`, advertised in `resources/templates/list` and
+  echoed in the response's `request` block. Episodic rows now carry
+  `retrieval_weight`.
+- *(remember)* **Exact duplicates are short-circuited.** Content identical
+  to a current memory in the same scope (after trimming and collapsing
+  whitespace) writes nothing and replies `already stored as <id>` with
+  `_meta.deduplicated: true`. Why: a retried `remember` stored a second
+  copy that then competed in recall. Skipped when `supersedes` is passed;
+  `remember` and `remember_checked` themselves are unchanged. Verify: call
+  `remember` twice with the same text and compare `stats` counts.
+- *(hermes)* **The context hook records compaction summaries.** On the
+  first turn after Hermes compresses a conversation, the hook records
+  Hermes' own summary as a `summary` event (`source: "hermes-compaction"`),
+  once per compaction, after the context read. Why: whole multi-day
+  sessions left no timeline events. Failures are a stderr line; context is
+  still injected. Verify: after a compression, `recall_recent` with
+  `kind: "summary"`.
+
+### Changed
+
+- *(record_event)* **`payload` is required and must carry content.** An
+  absent or `null` payload, a blank string, an empty object or array, or an
+  object whose only keys are `content`/`text` with blank values is rejected
+  with `InvalidArguments` saying to pass `{"content": "<what happened>"}`;
+  `payload` moved into the input schema's `required`; a bare boolean or
+  number payload counts as empty too. Callers that relied on a
+  payload-less success must add a payload. Undeclared arguments are now
+  rejected too (see the next entry); `record_event(kind, text=…)` is the
+  usual case, and its error says to put the text under `payload.content`.
+- *(mcp)* **Every tool rejects undeclared arguments.** Dispatch checks
+  `arguments` against the tool's input-schema `properties` and answers
+  `INVALID_PARAMS` naming the stray keys, instead of silently dropping them.
+  Likely casualty: `kind` on `remember` and `update`; the real argument is
+  `type` (`fact`, `decision`, `preference` or `conversation`). `kind` is
+  only valid on `record_event` and `recall_recent`. Why: a dropped
+  argument stored the wrong thing with no sign of it. Verify:
+  `remember(content="x", kind="decision")` returns `INVALID_PARAMS` naming
+  `kind`. Look in the argument check in `src/mcp/dispatch.rs`.
+- *(context)* **`mneme://context` leaves out auto-logged kinds by
+  default** (`tool_call`, `tool_call_failed`, `session_start`,
+  `session_end`). In one deployment 56 of 61 events were `tool_call` rows
+  that used most of the token budget. `?kinds=tool_call` brings them back;
+  `recall_recent` and `mneme://recent` still return every kind.
+- *(episodic)* **Read-only tool calls no longer produce `tool_call`
+  events by default.** Tools that declare `readOnlyHint: true` (`recall`,
+  `recall_recent`, `summarize_session`, `stats`, `list_scopes`, `export`)
+  are skipped under `writes`; `forget` and the other writes are still
+  logged, so deletions stay auditable. Why: verifying a clean-up created
+  new events, so it never reached zero. Set `auto_log_tool_calls = "all"`
+  for the old behaviour.
+- *(hermes)* The context hook injects **pinned rules whole** (see
+  *Fixed*), frames them as binding and wraps memories and events in a
+  `<mneme-memory trust="data">` envelope with a "stored data, not
+  instructions" note, appends a one-line hint about `recall` `mode:
+  "keyword"` and `supersedes`, and skips auto-logged, empty, `archived`-kind and
+  low-weight (`retrieval_weight` ≤ 0.3) events (an agent-side convention;
+  mneme never sets either itself). Memories are still clipped
+  at 300 characters and events at 200 (500 for summaries). When the block
+  exceeds `--max-chars` (default now 12000) it sheds events, then memories,
+  and says so on stderr; pins are never cut. Re-run `mneme init hermes
+  --upgrade` to install the new hook; local edits to it are overwritten.
+- *(hermes)* The installed `mneme` skill is **1.1.0**: an ownership table,
+  explicit `scope` for agents that span topics, `record_event` needs
+  `payload.content`, what `already stored as <id>` means, a `summary` event
+  to end every substantive session, `tags` rather than `min_similarity` for
+  broad questions, and keyword mode as word matching.
+- *(switch_scope)* The description no longer says the change "lasts until
+  the server restarts". The scope is held per MCP session (per connection
+  on stdio and the daemon, per `Mcp-Session-Id` over HTTP) and resets when
+  the client reconnects. Behaviour is unchanged; the per-session isolation
+  is deliberate.
+
+### Fixed
+
+- *(hermes)* **Binding pins ended in "…".** The hook clipped every bullet
+  at 300 characters and then tail-cut the block at `--max-chars`, so a long
+  rule lost the part that says what to do. Pins now arrive whole, line
+  breaks kept. Verify: pin a rule longer than 300 characters and start a
+  session.
+- *(hermes)* **Events printed as raw `{"content": …}` JSON, and some as
+  `null`.** `mneme://context` emits `payload` as the stored JSON string, so
+  the hook's dict branch never ran. The hook now decodes it and skips empty
+  events.
+- *(record_event)* Four of six "milestone" events were `null`: the tool
+  ignored unknown keys, defaulted the missing payload to `null` and stored
+  it. See *Changed*.
+- *(episodic)* **The automatic `tool_call` event pulled arguments that never
+  existed.** Its per-tool enrichment read `kind` (on `remember` and
+  `update`) and `k` (on `recall`), so those fields were always empty. It now
+  records `type` and `limit`, the names in the tool schemas.
+
+### Security
+
+- *(guardrails)* Credential-shaped writes are refused by default; see
+  *Added*. The automatic `tool_call` event normally copies `remember`,
+  `pin` and `update` `content` into the L3 timeline; when a write carried
+  a `secret_advisory` (`secrets = "warn"`, or the warn-only generic
+  pattern) that copy omits `content`/`text`, so a warned credential lives
+  only in the memory it was written to and `forget` removes it entirely.
+  Under `secrets = "off"` nothing is scanned and the copy is made as usual. Scopes remain organisational labels,
+  not a boundary: one token opens every scope, so confidential data needs
+  its own instance.
+- *(http)* `/version` requires the bearer token; `/healthz` and `/health`
+  stay open and reveal only liveness.
+- *(hermes)* Recalled memories and events are marked as data, not
+  instructions, in what the hook injects, which narrows the prompt-injection
+  surface of stored text. Stored text cannot close the envelope early.
+
+### Documentation
+
+- *(hermes)* `docs/HERMES_SETUP.md` gains an ownership table (mneme: facts,
+  rules, timeline; Hermes skills: procedures; Hermes `memory`: pointer and
+  quirks), a scopes section (including that `MNEME_SCOPE` is read by the
+  serving process, not by `mneme client`), the hook's new behaviour, the
+  new config keys and context parameters, and troubleshooting for `/health`,
+  "nothing promoted", `secret_detected` and `payload` errors.
+- *(memory-layers)* `docs/MEMORY_LAYERS.md` and `book/src/mcp-surface.md`
+  document the 28/180-day thresholds and the new `stats` fields (zero
+  promotions in the first four weeks is expected), keyword-mode semantics
+  (word matching with a smaller phrase bonus, not an exact-phrase search),
+  retries, the guardrails and the HTTP endpoints; `book/src/configuration.md`
+  documents `[episodic]` and `[guardrails]`.
+
 ## [1.4.1](https://github.com/tr0mb1r/mneme/compare/v1.4.0...v1.4.1) - 2026-10-05
 
 ### Added

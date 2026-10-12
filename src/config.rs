@@ -27,11 +27,15 @@ pub struct Config {
     #[serde(default)]
     pub budgets: BudgetsConfig,
     #[serde(default)]
+    pub guardrails: GuardrailsConfig,
+    #[serde(default)]
     pub checkpoints: CheckpointsConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub episodic: EpisodicConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -88,6 +92,65 @@ pub struct ScopesConfig {
     /// derivation — explicit beats inferred.
     #[serde(default)]
     pub derive_from_roots: bool,
+}
+
+/// Which successful `tools/call` invocations the server mirrors into
+/// the L3 timeline as `tool_call` events (ADR-0009).
+///
+/// The classification of "read" vs "write" comes from each tool's own
+/// `readOnlyHint` annotation, not a name list, so a newly added tool is
+/// sorted automatically.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoLogToolCalls {
+    /// Mirror nothing. `tool_call_failed` events are suppressed too.
+    Off,
+    /// Mirror every tool that is not `readOnlyHint: true`. `forget` is a
+    /// write, so deletions stay auditable. Reads (`recall`, `stats`, ...)
+    /// leave no event. The default.
+    #[default]
+    Writes,
+    /// Mirror every successful call, reads included (pre-1.5 behaviour).
+    All,
+}
+
+impl AutoLogToolCalls {
+    /// Whether a *successful* call to a tool with the given
+    /// `readOnlyHint` is mirrored as a `tool_call` event.
+    ///
+    /// Only `writes` mode consults `read_only`.
+    pub fn logs_success(self, read_only: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Writes => !read_only,
+            Self::All => true,
+        }
+    }
+
+    /// Whether failures are mirrored as `tool_call_failed` events.
+    /// Every mode except `off` keeps them: a failed call is rare and is
+    /// exactly what you want on the timeline when debugging.
+    pub fn logs_failures(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// The config-file spelling, for the starter template.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Writes => "writes",
+            Self::All => "all",
+        }
+    }
+}
+
+/// `[episodic]` -- L3 timeline behaviour.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EpisodicConfig {
+    /// Which tool calls are auto-logged as `tool_call` events. See
+    /// [`AutoLogToolCalls`]. Defaults to `writes`.
+    #[serde(default)]
+    pub auto_log_tool_calls: AutoLogToolCalls,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -172,6 +235,44 @@ pub struct BudgetsConfig {
     /// writes/updates are rejected.
     #[serde(default = "default_max_remember_chars")]
     pub max_remember_chars: usize,
+}
+
+/// `[guardrails]` — write-time checks applied by `remember`, `update`,
+/// `pin` and `record_event`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GuardrailsConfig {
+    /// What to do when a write contains a credential in a
+    /// high-confidence format (AWS key id, PEM private key, JWT, GitHub
+    /// / Slack / OpenAI / Anthropic / Google / Stripe tokens, age
+    /// secret key). `reject` (default) refuses the write with a
+    /// `secret_detected` error; `warn` stores it and adds a
+    /// `secret_advisory`; `off` skips the scan entirely.
+    #[serde(default)]
+    pub secrets: SecretsMode,
+}
+
+/// `[guardrails] secrets` setting.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretsMode {
+    /// Refuse the write. Default.
+    #[default]
+    Reject,
+    /// Store the write and attach a `secret_advisory`.
+    Warn,
+    /// No scan.
+    Off,
+}
+
+impl SecretsMode {
+    /// The value as written in `config.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SecretsMode::Reject => "reject",
+            SecretsMode::Warn => "warn",
+            SecretsMode::Off => "off",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -504,6 +605,7 @@ impl Config {
         let embed_device = toml_value(&self.embeddings.device);
         let scope_default = toml_value(&self.scopes.default);
         let schedule = toml_value(&self.consolidation.schedule);
+        let auto_log_tool_calls = toml_value(self.episodic.auto_log_tool_calls.as_str());
         let transport = toml_value(&self.mcp.transport);
         let daemon_log_level = toml_value(&self.daemon.log_level);
         let http_bind = toml_value(&self.http.bind);
@@ -552,6 +654,15 @@ default = {scope_default}
 # recall. $MNEME_SCOPE overrides both.
 derive_from_roots = {derive_from_roots}
 
+[episodic]
+# Which tool calls are mirrored into the timeline as `tool_call` events.
+#   "writes" - every tool except read-only ones (recall, stats, ...);
+#              `forget` and other writes stay auditable. Default.
+#   "all"    - also log reads.
+#   "off"    - log nothing, failures included.
+# Failed calls (`tool_call_failed`) are logged in "writes" and "all".
+auto_log_tool_calls = {auto_log_tool_calls}
+
 [consolidation]
 # L3 episodic tier transitions, in days.
 hot_to_warm_days = {hot_to_warm_days}
@@ -578,6 +689,17 @@ auto_context_token_budget = {auto_context_token_budget}
 # Writes above this are rejected; existing longer memories stay
 # readable.
 max_remember_chars = {max_remember_chars}
+
+[guardrails]
+# What `remember`, `update`, `pin` and `record_event` do when a write
+# contains a credential in a high-confidence format (AWS key id, PEM
+# private key, JWT, GitHub / Slack / OpenAI / Anthropic / Google /
+# Stripe token, age secret key).
+#   "reject" - refuse the write with a `secret_detected` error that
+#              names the pattern and offset, never the secret.
+#   "warn"   - store it and add a `secret_advisory` to the reply.
+#   "off"    - no scan at all.
+secrets = {secrets}
 
 [mcp]
 # Informational. Transports are picked by command: `mneme run`
@@ -618,6 +740,7 @@ max_files = {max_files}
             batch_size = self.embeddings.batch_size,
             scope_default = scope_default,
             derive_from_roots = self.scopes.derive_from_roots,
+            auto_log_tool_calls = auto_log_tool_calls,
             hot_to_warm_days = self.consolidation.hot_to_warm_days,
             warm_to_cold_days = self.consolidation.warm_to_cold_days,
             schedule = schedule,
@@ -628,6 +751,7 @@ max_files = {max_files}
             default_recall_limit = self.budgets.default_recall_limit,
             auto_context_token_budget = self.budgets.auto_context_token_budget,
             max_remember_chars = self.budgets.max_remember_chars,
+            secrets = toml_value(self.guardrails.secrets.as_str()),
             transport = transport,
             idle_timeout_minutes = self.daemon.idle_timeout_minutes,
             daemon_log_level = daemon_log_level,
@@ -660,11 +784,13 @@ mod tests {
         assert_eq!(c.consolidation.hot_to_warm_days, 28);
         assert_eq!(c.consolidation.warm_to_cold_days, 180);
         assert_eq!(c.scopes.default, "global");
+        assert_eq!(c.episodic.auto_log_tool_calls, AutoLogToolCalls::Writes);
         assert_eq!(c.mcp.transport, "stdio");
         assert_eq!(c.mcp.sse_port, 7878);
         assert_eq!(c.budgets.default_recall_limit, 10);
         assert_eq!(c.budgets.auto_context_token_budget, 4000);
         assert_eq!(c.budgets.max_remember_chars, 10_000);
+        assert_eq!(c.guardrails.secrets, SecretsMode::Reject);
         assert_eq!(c.daemon.idle_timeout_minutes, 30);
         assert_eq!(c.daemon.log_level, "default");
         assert!(!c.http.enabled);
@@ -679,6 +805,87 @@ mod tests {
         assert_eq!(c.checkpoints.hnsw_snapshot_minutes, 60);
         assert!(!c.telemetry.enabled);
         assert_eq!(c.logging.level, "info");
+    }
+
+    #[test]
+    fn auto_log_tool_calls_policy() {
+        use AutoLogToolCalls::{All, Off, Writes};
+        assert!(!Off.logs_success(false));
+        assert!(!Off.logs_success(true));
+        assert!(Writes.logs_success(false));
+        assert!(!Writes.logs_success(true));
+        assert!(All.logs_success(false));
+        assert!(All.logs_success(true));
+        assert!(!Off.logs_failures());
+        assert!(Writes.logs_failures());
+        assert!(All.logs_failures());
+    }
+
+    #[test]
+    fn auto_log_tool_calls_parses_every_mode_and_round_trips() {
+        for (text, want) in [
+            ("off", AutoLogToolCalls::Off),
+            ("writes", AutoLogToolCalls::Writes),
+            ("all", AutoLogToolCalls::All),
+        ] {
+            let c: Config =
+                toml::from_str(&format!("[episodic]\nauto_log_tool_calls = \"{text}\"\n")).unwrap();
+            assert_eq!(c.episodic.auto_log_tool_calls, want);
+
+            let mut c = Config::default();
+            c.episodic.auto_log_tool_calls = want;
+            let tmp = TempDir::new().unwrap();
+            let p = tmp.path().join("config.toml");
+            c.write_starter(&p).unwrap();
+            assert_eq!(Config::load(&p).unwrap(), c, "starter round-trip: {text}");
+            c.write(&p).unwrap();
+            assert_eq!(
+                Config::load(&p).unwrap(),
+                c,
+                "full write round-trip: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_log_tool_calls_rejects_unknown_value() {
+        let r: std::result::Result<Config, _> =
+            toml::from_str("[episodic]\nauto_log_tool_calls = \"sometimes\"\n");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn missing_episodic_section_defaults_to_writes() {
+        let c: Config = toml::from_str("[scopes]\ndefault = \"x\"\n").unwrap();
+        assert_eq!(c.episodic.auto_log_tool_calls, AutoLogToolCalls::Writes);
+    }
+
+    #[test]
+    fn guardrails_secrets_parses_every_mode_and_rejects_unknown() {
+        for (text, want) in [
+            ("reject", SecretsMode::Reject),
+            ("warn", SecretsMode::Warn),
+            ("off", SecretsMode::Off),
+        ] {
+            let c: Config = toml::from_str(&format!("[guardrails]\nsecrets = \"{text}\"\n"))
+                .expect("valid mode parses");
+            assert_eq!(c.guardrails.secrets, want);
+            assert_eq!(want.as_str(), text);
+        }
+        assert!(toml::from_str::<Config>("[guardrails]\nsecrets = \"nope\"\n").is_err());
+        // Absent section or key falls back to reject.
+        let c: Config = toml::from_str("").expect("empty config parses");
+        assert_eq!(c.guardrails.secrets, SecretsMode::Reject);
+    }
+
+    #[test]
+    fn guardrails_non_default_mode_round_trips_through_starter() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("config.toml");
+        let mut c = Config::default();
+        c.guardrails.secrets = SecretsMode::Warn;
+        c.write_starter(&p).unwrap();
+        assert_eq!(Config::load(&p).unwrap(), c);
     }
 
     #[test]

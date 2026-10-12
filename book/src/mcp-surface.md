@@ -14,12 +14,12 @@ serves.
 
 | Tool | Layer | Use when |
 |------|-------|----------|
-| `remember` | L4 semantic | The user shares a fact, decision, or preference that should persist across sessions. **Size guidance:** target under 500 chars; 500–2k accepted with a `length_advisory`, 2k–10k with a `length_warning`, over 10k rejected with a structured error. See [§Size guardrails](#size-guardrails) below. **Replacing a fact:** pass `supersedes` (an id or array of ids) and the old memories drop out of `recall` and auto-context while staying readable by id. When the nearest current memory has similarity ≥ 0.80 the reply names it, both in the text and in `_meta` (`related_memory`, or `duplicate_advisory` at ≥ 0.95). See [§Superseding and similarity advisories](#superseding-and-similarity-advisories). |
-| `update` | L4 semantic | The user revises an existing memory; re-embeds automatically when `content` changes. Also takes `supersedes`, to retire older memories after the fact (e.g. after `remember` reported a close match). |
+| `remember` | L4 semantic | The user shares a fact, decision, or preference that should persist across sessions. **Size guidance:** target under 500 chars; 500–2k accepted with a `length_advisory`, 2k–10k with a `length_warning`, over 10k rejected with a structured error. See [§Size guardrails](#size-guardrails) below. **Replacing a fact:** pass `supersedes` (an id or array of ids) and the old memories drop out of `recall` and auto-context while staying readable by id. When the nearest current memory has similarity ≥ 0.80 the reply names it, both in the text and in `_meta` (`related_memory`, or `duplicate_advisory` at ≥ 0.95). See [§Superseding and similarity advisories](#superseding-and-similarity-advisories). **Retries are safe:** content identical to a current memory in the same scope (ignoring leading/trailing and repeated whitespace) writes nothing and replies `already stored as <id>` with `_meta.deduplicated: true` — see [§Retries and exact duplicates](#retries-and-exact-duplicates). Content with a credential in a well-known format is rejected — see [§Write guardrails](#write-guardrails). |
+| `update` | L4 semantic | The user revises an existing memory; re-embeds automatically when `content` changes. Also takes `supersedes`, to retire older memories after the fact (e.g. after `remember` reported a close match). New `content` goes through the same [secret guard](#write-guardrails) as `remember`. |
 | `forget` | L4 semantic, L0 procedural, L3 episodic (hot+warm) | The user explicitly asks to remove a memory. `id=…` resolves the ULID across all three layers, first hit wins; cold-archive entries stay out of reach by design. Confirm before calling. |
-| `pin` | L0 procedural | A *rule* should surface on every recall context (e.g. "always use `uv`, not `pip`"). |
+| `pin` | L0 procedural | A *rule* should surface on every recall context (e.g. "always use `uv`, not `pip`"). Passes the [secret guard](#write-guardrails). To replace a rule, `unpin` the old one and `pin` the new. |
 | `unpin` | L0 procedural | A previously-pinned rule no longer applies. |
-| `record_event` | L3 episodic (+ L1 mirror for message kinds) | Capture a structured event with a free-form `kind`. Use `user_message`/`assistant_message` for conversation turns; `decision`/`milestone`/`pivot`/etc. for curated semantic events; `summary` after `summarize_session` to land a digest. See [§Event kinds](#event-kinds) below. |
+| `record_event` | L3 episodic (+ L1 mirror for message kinds) | Capture a structured event with a free-form `kind`. Use `user_message`/`assistant_message` for conversation turns; `decision`/`milestone`/`pivot`/etc. for curated semantic events; `summary` after `summarize_session` to land a digest. **`payload` is required** and must carry content, e.g. `{"content": "<what happened>"}`; there is no top-level `text` or `content` argument, a bare boolean or number payload counts as empty, and (as for every tool) undeclared arguments are rejected with `INVALID_PARAMS` naming the keys rather than ignored. See [§Event kinds](#event-kinds) below. |
 
 ### Memory reads
 
@@ -33,13 +33,13 @@ serves.
 | Tool | Use when |
 |------|----------|
 | `summarize_session` | End of a long working session, or fired by the `PreCompact` hook. Returns a prompt template the host LLM fills in; the agent then calls `record_event(kind="summary", ...)` to land the digest in L3 (and `remember` for any durable facts the digest surfaces). |
-| `switch_scope` | Set the session's default scope. After this call, write tools (`remember`, `pin`, `record_event`) without an explicit `scope` argument land in the new scope. Filter tools (`recall`, `recall_recent`, ...) are unaffected. |
+| `switch_scope` | Set the session's default scope. After this call, write tools (`remember`, `pin`, `record_event`) without an explicit `scope` argument land in the new scope. Filter tools (`recall`, `recall_recent`, ...) are unaffected. **Held per MCP session only** (one connection on stdio or the daemon, one `Mcp-Session-Id` over HTTP): it is not saved and resets to the configured default when the client reconnects or the server restarts. An agent that spans topics should pass `scope` on every write and filtered read. See [§Scopes](#scopes). |
 
 ### Diagnostics
 
 | Tool | Use when |
 |------|----------|
-| `stats` | Per-layer counts, schema version, scheduler health. Mirrors `mneme://stats`. |
+| `stats` | Per-layer counts, server `version`, schema version, scheduler health, and consolidation status (tier thresholds, age of the oldest hot event, days to the next promotion — see [§Consolidation status](#consolidation-status)). Mirrors `mneme://stats`. |
 | `list_scopes` | Show every distinct scope across all layers. |
 | `export` | Read-only JSON dump of every memory. Useful for `jq` or grepping. |
 
@@ -59,15 +59,15 @@ tool description recommends:
 | `preference` | `{"content": "<the way the user wants it>"}` | The user expressed a preference. |
 | `pivot` | `{"content": "<change>", "from": "<previous>", "to": "<new>"}` | A direction was changed. |
 | `observation` | `{"content": "<thing noticed>"}` | Something noticed worth recording. |
-| `summary` | `{"text": "<digest>", "covers": ["<event_id>", ...]}` | Output of the `summarize_session` workflow. |
+| `summary` | `{"text": "<digest>", "covers": ["<event_id>", ...]}` | Output of the `summarize_session` workflow. The Hermes context hook also records each compaction summary this way, with `"source": "hermes-compaction"`. |
 
 Server-emitted kinds (the agent never writes these — they appear in
 `recall_recent` results because the server records them on its own):
 
 | Kind | Trigger | Payload |
 |---|---|---|
-| `tool_call` | Successful `tools/call` dispatch | Per-tool value-bearing arg(s) only — no full args object (privacy) |
-| `tool_call_failed` | Errored `tools/call` dispatch | `{tool, error_kind, message}` (message truncated to 500 chars) |
+| `tool_call` | Successful `tools/call` dispatch, subject to `[episodic] auto_log_tool_calls` (default `writes`: read-only tools are not mirrored) | Per-tool value-bearing arg(s) only — no full args object (privacy). For `remember`, `pin` and `update` that includes `content`. |
+| `tool_call_failed` | Errored `tools/call` dispatch (not logged under `auto_log_tool_calls = "off"`) | `{tool, error_kind, message}` (message truncated to 500 chars). A secret-guard rejection records only `secret_detected`. |
 | `session_start` | `mneme run` boot | `{session_id, started_at, embedder, embed_dim, version, protocol}` |
 | `session_end` | Graceful shutdown | `{session_id, ended_at, clean_shutdown, turns_total, checkpoints_total}` |
 
@@ -80,10 +80,10 @@ between events travel inside the JSON payload (e.g. `"references":
 
 | URI | What it returns | When to read |
 |-----|----------------|--------------|
-| `mneme://stats` | JSON: per-layer counts, schema version, HNSW applied LSN, scheduler observability counters (consolidation + working blocks), and `memories.large_memory_count` (per-tier size distribution + IDs of over-limit entries — see [§Size guardrails](#size-guardrails)). | Diagnostics; first thing to read on any "mneme misbehaving" report. |
+| `mneme://stats` | JSON: server `version`, per-layer counts, schema version, HNSW applied LSN, scheduler observability counters (consolidation + working blocks; consolidation includes the tier thresholds and hot-tier ages), and `memories.large_memory_count` (per-tier size distribution + IDs of over-limit entries — see [§Size guardrails](#size-guardrails)). | Diagnostics; first thing to read on any "mneme misbehaving" report. |
 | `mneme://procedural` | JSON: every pinned item. | On session start — these are the binding rules. |
 | `mneme://recent` | JSON: most recent episodic events, newest-first. | "What was the last thing on this branch?" |
-| `mneme://context` | Pre-assembled prompt context: pinned rules + working-session turns + recent events, packed against a token budget. Append `?q=<text>` to fold in semantically-similar long-term memories and `?scope=<name>` to restrict to one scope — see [§Auto-context parameters](#auto-context-parameters). | On session start — single-call replacement for reading procedural + recent + recall separately. |
+| `mneme://context` | Pre-assembled prompt context: pinned rules + working-session turns + recent events, packed against a token budget. Append `?q=<text>` to fold in semantically-similar long-term memories and `?scope=<name>` to restrict to one scope. Auto-logged event kinds are left out unless asked for — see [§Auto-context parameters](#auto-context-parameters). | On session start — single-call replacement for reading procedural + recent + recall separately. |
 | `mneme://session/{id}` | JSON: a session's full state (turns + checkpoint metadata). The active session is served from in-memory state; past sessions load from disk. | Reviewing a prior session's turn log. |
 
 ## Resource templates (2)
@@ -93,7 +93,7 @@ A client that only reads `resources/list` will not see them.
 
 | URI template | What it returns |
 |---|---|
-| `mneme://context{?q,scope,limit}` | Auto-context, optionally seeded with a semantic query and/or restricted to a scope. |
+| `mneme://context{?q,scope,limit,kinds,exclude_kinds}` | Auto-context, optionally seeded with a semantic query, restricted to a scope, and filtered by event kind. |
 | `mneme://session/{id}` | A single session's full state. Substitute a session ULID. |
 
 ## Auto-context parameters
@@ -106,17 +106,31 @@ A client that only reads `resources/list` will not see them.
 | `q` (alias `query`) | Natural-language seed for the L4 semantic layer. Percent-encoded; `+` is accepted for space. Without it the `semantic` array is empty — a vector search needs something to be similar *to*. |
 | `scope` | Restricts L0 / L3 / L4 to one scope. L1 working turns are session-local and always included. |
 | `limit` | How many semantic candidates to over-fetch before the token-budget pass trims. Clamped server-side. |
+| `kinds` | Comma-separated event kinds. The `episodic` section then holds only these. Naming an auto-logged kind opts back in to it. |
+| `exclude_kinds` | Comma-separated event kinds to hide from `episodic`, in addition to the default exclusions. |
 
 ```
 mneme://context                             → L0 + L1 + L3
 mneme://context?q=how%20do%20we%20deploy     → + L4 semantic hits
 mneme://context?q=deploy&scope=work          → all four layers, work scope only
+mneme://context?kinds=decision,summary       → only those event kinds in L3
+mneme://context?kinds=tool_call              → the auto-logged rows, opted back in
 ```
+
+**Auto-logged kinds are hidden by default.** The `episodic` section omits
+`tool_call`, `tool_call_failed`, `session_start` and `session_end`: the
+server writes them itself, and in one deployment 56 of 61 context events
+were `tool_call` rows that used most of the token budget. A `kinds` list
+replaces that default exclusion (name `tool_call` to get it back);
+`exclude_kinds` adds to it. The filter runs inside the scan, so hidden rows
+do not use up the over-fetch window. `recall_recent` and `mneme://recent`
+are unaffected and return every kind. Each `episodic` row also carries its
+`retrieval_weight`.
 
 The response body has one array per layer (`procedural`, `working`,
 `episodic`, `semantic`), a `request` block echoing how the URI was
-interpreted (so "no hits" is distinguishable from "no query supplied"),
-and `total_tokens` / `max_tokens`. The reply's `uri` echoes exactly what
+interpreted (`query`, `scope`, `kinds`, `exclude_kinds`; so "no hits" is
+distinguishable from "no query supplied"), and `total_tokens` / `max_tokens`. The reply's `uri` echoes exactly what
 was requested, parameters included, so a client can correlate it.
 
 Parsing is deliberately lenient — an unknown key, a malformed `limit`,
@@ -146,7 +160,11 @@ which is wrong for most of this surface):
 
 `openWorldHint` is `false` everywhere: no tool path makes a network
 call. The additive writes are non-idempotent because each call mints a
-new ULID — calling `remember` twice stores two memories.
+new ULID. `remember` is the exception to "calls multiply": a repeat with
+identical content in the same scope is a no-op (see
+[§Retries and exact duplicates](#retries-and-exact-duplicates)), but the
+annotation stays `false` because that does not hold when `supersedes` is
+passed. `record_event` with the same arguments records a second event.
 
 Hosts use these to decide what needs a confirmation prompt. Before v1.3
 mneme emitted no annotations at all, so a host could not tell `forget`
@@ -191,6 +209,20 @@ the query it covers (IDF-weighted, so `live_bt.py` counts for far more
 than `the`), and +0.1 more if it contains the query as a contiguous
 phrase. Every filter, `min_similarity` included, applies to both kinds
 of hit.
+
+`mode: "keyword"` is **not an exact-phrase search**. It returns memories
+that share *any* word with the query (identifier parts count), best BM25
+match first, then ranks them by how much of the query each one covers; a
+contiguous run of the query's words earns only the smaller phrase bonus
+(0.1, against up to 0.2 for coverage).
+In keyword mode that evidence leads and cosine similarity only breaks
+ties. So `"D account"` puts a memory containing those words next to each
+other first, but a memory that only mentions `account` can still come
+back behind it. Use `keyword` when near-synonyms would be noise (an env
+var, an id, error text); keep `hybrid` otherwise. For a broad question
+("what do we know about billing?") filter by `tags` rather than
+`min_similarity`: the floor drops weak matches, which is the wrong trade
+when the answer is spread across loosely related memories.
 
 Measured on a corpus of realistic agent memories full of lookalikes
 (`live_bt.py` beside `live_mm.py` and `live_bt_old.py`, accounts A–G,
@@ -249,6 +281,93 @@ BGE-M3 on realistic agent memories, a paraphrased restatement scores
 fact about the same subject 0.55–0.79, and unrelated memories 0.36–0.48.
 Restatements and updates overlap completely, so mneme can't tell them
 apart; it points at the candidate and lets the agent decide.
+
+## Retries and exact duplicates
+
+A `remember` that times out or whose reply is lost tends to be retried.
+Instead of storing a second copy, `remember` looks at the 16 nearest
+existing memories (the dedup probe, `DEDUP_PROBE`; wider than the single
+closest hit the similarity advisory uses, so an exact twin is found even
+when other near-identical memories rank above it). If one of them is
+**current** (not superseded), in the **same scope**, and has identical
+content after trimming and collapsing runs of whitespace, nothing is
+written:
+
+```text
+already stored as 01K90…
+```
+
+with `_meta = {"deduplicated": true, "id": "01K90…"}`. The first memory's
+`type` and `tags` stand; the retry's are ignored. When the retry passed a
+`type`, or non-empty `tags`, that differ from the stored memory's, the
+reply says so:
+
+```text
+already stored as 01K90…; existing type/tags kept
+```
+
+The suffix appears only in that case. A plain retry, or one that repeats the
+same `type` and `tags` (or passes neither), gets the bare
+`already stored as <id>`. Different content,
+a different scope, or a superseded twin stores normally, and dedup is
+skipped when `supersedes` is passed. Two simultaneous identical calls can
+both land (the probe and the write are not one atomic step); a sequential
+retry cannot. There is no `idempotency_key` argument: this covers the
+retry case without one.
+
+## Write guardrails
+
+`remember`, `update` (when `content` is present), `pin` and `record_event`
+(every string inside `payload`) scan what they are given for credentials
+before writing. The reject list is deliberately narrow, fixed prefixes with
+long random bodies, so false positives stay rare:
+
+| Pattern name | Matches |
+|---|---|
+| `aws_access_key_id` | An AWS access key id. |
+| `pem_private_key` | A `-----BEGIN … PRIVATE KEY-----` header. |
+| `jwt` | A JSON Web Token (three base64url segments starting `eyJ`). |
+| `github_token` | A GitHub personal, OAuth, user, server or refresh token (`gh?_…`). |
+| `github_fine_grained_token` | A `github_pat_…` token. |
+| `slack_token` | A Slack `xox?-…` token. |
+| `openai_or_anthropic_key` | An OpenAI or Anthropic `sk-…` key. |
+| `google_api_key` | A Google `AIza…` API key. |
+| `stripe_key` | A Stripe secret or restricted key (`sk_`/`rk_` live or test). |
+| `age_secret_key` | An `AGE-SECRET-KEY-1…` key. |
+| `generic_credential_assignment` | `password`, `passwd`, `secret`, `token` or `api_key` followed by `:` or `=` and a value. **Warn-only: never rejects.** |
+
+The exact shapes are tuned over time; the names above are what the error
+and advisory report.
+
+`[guardrails] secrets` picks the behaviour (default `reject`; see
+[Configuration](./configuration.md#guardrails--write-time-checks)):
+
+- **`reject`** returns a soft error shaped like the size-tier rejection:
+  `isError: true`, a human-readable text, and
+
+  ```json
+  {"error": {"code": "secret_detected", "pattern": "github_token", "offset": 42}}
+  ```
+
+  `offset` counts characters from the start of the scanned string; for
+  `record_event` an extra `path` (for example `/content`) says which string.
+  The matched text is never echoed or logged, and the automatic
+  `tool_call_failed` event records only the code.
+- **`warn`** stores the write, adds `_meta.secret_advisory` with the
+  same `pattern` and `offset`, plus `high_confidence` and `message`, and
+  appends a one-line warning to the reply text naming the pattern, the
+  character offset and the memory id to `forget`, because some hosts never
+  show `_meta` to the model. For `record_event` the warning also names the
+  payload `path` (for example `at char 12 of /content`), so the agent can
+  tell which string matched.
+- **`off`** skips the scan, the generic pattern included.
+
+The automatic `tool_call` event normally copies the `content` of
+`remember`, `pin` and `update` calls into the timeline. When the write
+carried a `secret_advisory` (in `warn` mode, or the warn-only generic
+pattern in any scanning mode) that copy omits `content` and `text`, so the
+credential lives only in the memory it was written to and `forget` removes
+it entirely. Under `off` nothing is scanned and the copy is made as usual.
 
 ## Size guardrails
 
@@ -323,3 +442,55 @@ surfaces a problem in v1.2+, cache invalidation hooks into
 memoisation. `over_limit_ids` lets agents surface the offenders so
 the user can `recall` and trim them — never auto-modified
 (verbatim principle).
+
+## Consolidation status
+
+`stats` and `mneme://stats` share one `consolidation` object, built by the
+same function so they cannot drift. Besides the scheduler's run counters
+(`runs_total`, `errors_total`, `last_consolidation_at`,
+`last_promoted_to_warm`, `last_archived_to_cold`, `last_orphans_reclaimed`)
+it answers "why is nothing promoted?":
+
+| Field | Meaning |
+|---|---|
+| `thresholds` | `{"hot_to_warm_days": 28, "warm_to_cold_days": 180}` — the values in effect. |
+| `hot_oldest_age_days` | Age of the oldest hot event in days (two decimals), measured on `last_accessed`, the field consolidation ages on. `null` when the hot tier is empty. |
+| `hot_eligible_for_warm` | Hot events already at or past the threshold (`last_accessed <=` the cutoff, the comparison the pass uses). `0` when the tier is empty. |
+| `next_promotion_in_days` | Days until the oldest hot event becomes eligible: `hot_to_warm_days` minus `hot_oldest_age_days`, floored at 0, and `0` whenever something is eligible. `null` when the hot tier is empty. |
+
+With the defaults the first promotion cannot happen before an event is 28
+days old: hundreds of runs with `last_promoted_to_warm: 0` during the first
+four weeks are expected. The top level of both also carries `version`
+(the mneme crate version). The hot-tier figures come from the same single
+scan that produces the `hot` count.
+
+## Scopes
+
+A scope labels a memory, pin or event. Write tools without a `scope`
+argument use the session's current scope; `recall`, `recall_recent`, `forget`
+and `mneme://context` without one look across all scopes.
+
+- The current scope is held **per MCP session** and starts from
+  `MNEME_SCOPE`, then `[scopes] default` (or the client's roots with
+  `derive_from_roots`). `switch_scope` changes it for that session only, and
+  it resets on reconnect. `MNEME_SCOPE` is read by the process that serves
+  (`mneme run`, `mneme serve`, `mneme daemon`), not by `mneme client`.
+- Agents that span topics should pass `scope` explicitly on every write and
+  filtered read.
+- **Scopes are not a security boundary.** Any client holding the
+  token can read every scope, and there is one token per instance. For
+  confidential data, run a second instance with its own data directory and
+  token.
+
+## HTTP endpoints
+
+Beyond `POST /mcp` (and `DELETE /mcp`), the Streamable HTTP transport serves:
+
+| Endpoint | Auth | Answer |
+|---|---|---|
+| `GET /healthz` | none | `200 ok` — the process is up. |
+| `GET /health` | none | Alias of `/healthz` (added after 1.4.1). |
+| `GET /version` | bearer token | `{"version": "<crate version>"}`. |
+
+The health probes are open so orchestrators can use them without a secret;
+they disclose nothing but liveness. The version is behind the token.

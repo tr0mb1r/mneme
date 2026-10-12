@@ -325,7 +325,7 @@ call_tool record_event '{"kind":"assistant_message","payload":{"content":"via re
 call_tool record_event '{"kind":"decision","payload":{"content":"defer Homebrew automation post-1.0","reasoning":"low cadence + no review gate"}}' >/dev/null
 
 # record_event with bad weight is rejected
-RESP=$(call_tool record_event '{"kind":"observation","retrieval_weight":2.0}')
+RESP=$(call_tool record_event '{"kind":"observation","payload":{"content":"x"},"retrieval_weight":2.0}')
 ERR=$(jq -r '.error.message // ""' <<<"$RESP")
 [[ "$ERR" == *"retrieval_weight"* ]] \
     && ok "record_event rejects out-of-range retrieval_weight" \

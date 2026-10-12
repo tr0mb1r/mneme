@@ -132,10 +132,15 @@ again and append a fresh entry.
 
 ## Diagnosing scheduler health
 
-`mneme://stats` (or `mneme stats`) surfaces:
+The `stats` MCP tool and the `mneme://stats` resource surface (the
+`mneme stats` CLI does not print the `consolidation` block):
 
 - `consolidation.last_consolidation_at` — null until the first idle pass
 - `consolidation.runs_total` — successful pass count since boot
+- `consolidation.thresholds`, `hot_oldest_age_days`,
+  `hot_eligible_for_warm`, `next_promotion_in_days` — why nothing has
+  been promoted yet (nothing is promoted before an event is 28 days old
+  by default; zero promotions in the first four weeks is expected)
 - `working.session_id` — active session id; matches `mneme://session/{id}`
 - `working.checkpoints_total` — successful flush count
 
