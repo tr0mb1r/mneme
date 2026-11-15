@@ -27,6 +27,7 @@
 
 # Release notes
 
+- [v1.6](./release-notes-v1_6.md)
 - [v1.5](./release-notes-v1_5.md)
 - [v1.4](./release-notes-v1_4.md)
 - [v1.3](./release-notes-v1_3.md)

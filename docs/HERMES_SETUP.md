@@ -311,20 +311,67 @@ What goes into the block:
   inside a `<mneme-memory trust="data">` envelope, and stored text can't
   close the envelope early. Memories are shown on one line, clipped at
   300 characters (the id is shown so the agent can `recall` or `update`
-  it); events at 200, `summary` events at 500.
-- **Noise is skipped.** Events of the server's auto-logged kinds
-  (`tool_call`, `tool_call_failed`, `session_start`, `session_end`),
-  events with no text (a `null` or blank payload), events of kind
-  `archived`, and events with `retrieval_weight` of 0.3 or less never take
-  startup space. The last two honour an agent-side convention: mneme itself
-  never creates an `archived` event or lowers a weight, but an agent can
-  record a low-signal event with a low `retrieval_weight` (or mark it
-  `archived`) to keep it out of the startup block.
+  it). Events are shown as the server sent them.
+- **The server picks the events (mneme 1.6).** Up to 1.5 the hook did
+  its own filtering. The server now does it before the token budget is
+  spent: it leaves out its auto-logged kinds (`tool_call`,
+  `tool_call_failed`, `session_start`, `session_end`), events of kind
+  `archived`, and events with `retrieval_weight` at or below
+  `[auto_context] min_event_weight` (0.3); it drops near-duplicates,
+  prefers events that match the message, and clips payloads longer than
+  `event_clip_chars` (400), which the hook marks with ` …`. The hook
+  only skips events with no text and shows at most 15. Tune the
+  selection in `[auto_context]` on the server, not in the hook. A 1.6
+  hook against an older server shows whatever that server returns,
+  unfiltered, so upgrade the server first.
 - **A size cap that never touches pins.** The whole block is capped at
   `--max-chars` (default 12000). Past that the hook sheds events first,
   oldest first, then memories, lowest-ranked first, then clips what is
   left, and prints one line on stderr naming what it shed. If the pins
   alone exceed the cap they are still injected whole.
+
+### One scope per conversation
+
+By default the hook reads everything: every scope's memories and events
+compete for the block. If your Hermes threads map to mneme scopes (one
+per project, say), give the hook the map and it reads only the
+conversation's scope plus `global`:
+
+```sh
+mneme init hermes --upgrade --url http://mneme:7878/mcp \
+      --scope-map /opt/data/autonomy/threads.json
+```
+
+The hook's command gains `--scope-map <file>` (the path as the hook sees
+it, so the in-container path when Hermes runs in a container), and its
+read becomes `mneme://context?q=<message>&scope=<thread scope>,global`.
+Pins stored under `global` are returned as well as the thread's own.
+`MNEME_SCOPE_MAP` in the hook's environment works too, for a hook
+installed without the flag.
+
+The map is JSON, in any of these shapes:
+
+```json
+{"<thread id>": "trading"}
+{"<thread id>": {"scope": "trading", "title": "…"}}
+{"threads": {"<thread id>": "trading"}}
+[{"thread_id": "<thread id>", "scope": "trading"}]
+```
+
+The thread id is taken from the hook payload: the first of
+`extra.thread_id`, `extra.chat_id`, `extra.channel_id`,
+`extra.conversation_id`, `thread_id`, `session_id`, `extra.session_id`
+that has an entry in the map. `--scope-key extra.chat_id` (or
+`MNEME_SCOPE_KEY`) pins it to one field. `--shared-scope` replaces
+`global`; `--shared-scope ''` reads the thread's scope alone.
+
+- The file is read on each reload, so edits apply without reinstalling.
+- A conversation the map does not list gets the unscoped read. So does
+  every conversation when the file is missing or not valid JSON; the hook
+  says so on stderr.
+- This needs a mneme 1.6 server. An older one reads `trading,global` as a
+  single scope name and returns nothing for it.
+- Compaction summaries the hook records still land in the default scope.
 
 **Compaction summaries become timeline events.** When Hermes has just
 compressed the conversation and its summary (the `[CONTEXT COMPACTION`
@@ -388,8 +435,10 @@ Details:
 The hook uses the same resource an agent can read with
 `mcp_mneme_read_resource`. By default its `episodic` section leaves out
 the server's auto-logged kinds (`tool_call`, `tool_call_failed`,
-`session_start`, `session_end`), which otherwise crowd real events out of
-the token budget. Two query parameters change that:
+`session_start`, `session_end`), `archived` events and low-weight ones,
+which otherwise crowd real events out of the token budget. `scope=a,b`
+narrows the read to those scopes (global pins still come back). Two more
+query parameters change which kinds appear:
 
 | Parameter | Effect |
 |---|---|

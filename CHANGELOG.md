@@ -48,8 +48,25 @@ the work that landed before automation was wired up.
   warm on age alone. Nothing called `touch` before, so promotion was pure
   age.
 
+- **Hermes hook: one scope per conversation.** `mneme init hermes
+  --scope-map <file>` (or `MNEME_SCOPE_MAP`) gives the context hook a
+  JSON map from thread ids to scopes; it then reads
+  `mneme://context?q=…&scope=<thread scope>,global`. Without a map, or
+  for a thread the map does not list, the read is unscoped as before.
+  `--scope-key` and `--shared-scope` on the hook adjust the lookup.
+
 ### Changed
 
+- **The Hermes hook no longer filters events itself.** Its skip list
+  (auto-logged kinds, `archived`), weight floor (0.3) and 200-character
+  clip are removed: the server applies all three before the token
+  budget is spent, and the hook shows what it is given, at most 15
+  events, marking payloads the server clipped. A 1.6 hook against a
+  pre-1.6 server shows that server's unfiltered events, so upgrade the
+  server first. Re-run `mneme init hermes --upgrade` to install it.
+- The Hermes `mneme` skill is 1.2.0: `layers: ["semantic", "episodic"]`
+  for "what did we conclude", `since` / `until` on `recall` for time
+  questions, and `update(status: "archived")` to retire a fact.
 - The consolidation scheduler runs its passes through the server's
   shared episodic store rather than a private one, so the keyword index
   sees events leave for cold. Search results are also checked against
