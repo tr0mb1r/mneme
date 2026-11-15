@@ -2,6 +2,10 @@
 //! optionally filtered by scope, kind, or a `[since, until)` time
 //! window. Distinct from `recall` (semantic similarity); this surface
 //! is for "what just happened?" questions.
+//!
+//! Reads the hot tier, plus the warm tier when the window reaches
+//! past the hot-to-warm threshold or `include_warm` is true. Each
+//! row carries a `tier` field. The cold archive is not read.
 
 use std::sync::Arc;
 
@@ -11,7 +15,7 @@ use serde_json::{Value, json};
 use ulid::Ulid;
 
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
-use crate::memory::episodic::{EpisodicStore, RecentFilters};
+use crate::memory::episodic::{EpisodicStore, RecentFilters, WarmRead};
 
 const DESCRIPTION: &str = "Retrieve the most recent episodic events \
 (tool calls, user messages, checkpoints) from this and earlier \
@@ -25,7 +29,14 @@ window against `created_at`. Both accept an RFC3339 timestamp \
 millisecond timestamp is used. The server does not parse natural \
 language — convert phrases like 'last Tuesday' to RFC3339 yourself \
 before calling. When either bound is set, the `limit` cap rises to \
-1000 because the result is already window-bounded.";
+1000 because the result is already window-bounded. \
+\
+Events older than the hot-to-warm threshold (28 days by default) \
+live in the warm tier. It is read automatically when `since` is \
+older than that threshold or only `until` is set; pass \
+`include_warm: true` to read it on any call, `false` to never read \
+it. Each row has a `tier` field (`hot` or `warm`). Events already \
+moved to the cold archive are not returned.";
 
 const DEFAULT_LIMIT: u64 = 20;
 const MAX_LIMIT: u64 = 200;
@@ -93,6 +104,13 @@ impl Tool for RecallRecent {
                         "type": "string",
                         "description": "Upper bound (exclusive) on `created_at`. RFC3339 \
             timestamp or 26-char ULID."
+                    },
+                    "include_warm": {
+                        "type": "boolean",
+                        "description": "Also read the warm tier (events past the \
+            hot-to-warm threshold). Omit to let the server decide: warm is read when \
+            `since` is older than the threshold or only `until` is set. `true` always \
+            reads it, `false` never does."
                     }
                 }
             }),
@@ -126,6 +144,17 @@ impl Tool for RecallRecent {
             )));
         }
 
+        let warm = match args.get("include_warm") {
+            None | Some(Value::Null) => WarmRead::Auto,
+            Some(Value::Bool(true)) => WarmRead::Always,
+            Some(Value::Bool(false)) => WarmRead::Never,
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`include_warm` must be a boolean".into(),
+                ));
+            }
+        };
+
         let max_limit = if since.is_some() || until.is_some() {
             MAX_LIMIT_BOUNDED
         } else {
@@ -153,17 +182,19 @@ impl Tool for RecallRecent {
             kind: args.get("kind").and_then(Value::as_str).map(String::from),
             since,
             until,
+            warm,
             ..Default::default()
         };
         let events = self
             .store
-            .recall_recent(&filters, limit as usize)
+            .recall_recent_tiered(&filters, limit as usize)
             .await
             .map_err(|e| ToolError::Internal(format!("recall_recent failed: {e}")))?;
 
         let body: Vec<Value> = events
             .iter()
-            .map(|e| {
+            .map(|t| {
+                let e = &t.event;
                 json!({
                     "id": e.id.to_string(),
                     "kind": e.kind,
@@ -173,6 +204,7 @@ impl Tool for RecallRecent {
                     "retrieval_weight": e.retrieval_weight,
                     "last_accessed": e.last_accessed.to_rfc3339(),
                     "created_at": e.created_at.to_rfc3339(),
+                    "tier": t.tier.as_str(),
                 })
             })
             .collect();
@@ -451,6 +483,130 @@ mod tests {
         let (s, _tmp) = store();
         let tool = RecallRecent::new(s);
         let err = tool.invoke(json!({"limit": 500})).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    // ---------- Warm-tier tests ----------
+
+    /// Two hot rows (`hot-1d`, `hot-2d`) and three warm rows
+    /// (`warm-40d`, `warm-50d`, `warm-60d`); the kind names the age.
+    async fn tool_with_hot_and_warm() -> RecallRecent {
+        use crate::memory::consolidation::_record_backdated_for_tests;
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let s = Arc::new(EpisodicStore::new(Arc::clone(&backing)));
+        let now = Utc::now();
+        for d in [1, 2] {
+            let at = now - chrono::Duration::days(d);
+            _record_backdated_for_tests(&backing, &format!("hot-{d}d"), "g", "\"h\"", at)
+                .await
+                .unwrap();
+        }
+        for d in [40, 50, 60] {
+            let at = now - chrono::Duration::days(d);
+            let id = _record_backdated_for_tests(&backing, &format!("warm-{d}d"), "g", "\"w\"", at)
+                .await
+                .unwrap();
+            assert!(s.promote_to_warm(id).await.unwrap());
+        }
+        RecallRecent::new(s)
+    }
+
+    async fn kinds_and_tiers(tool: &RecallRecent, args: Value) -> Vec<(String, String)> {
+        let v: Vec<Value> = serde_json::from_str(&text(tool.invoke(args).await.unwrap())).unwrap();
+        v.iter()
+            .map(|e| {
+                (
+                    e["kind"].as_str().unwrap().to_owned(),
+                    e["tier"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+        rows.iter()
+            .map(|(k, t)| ((*k).to_owned(), (*t).to_owned()))
+            .collect()
+    }
+
+    const ALL_FIVE: &[(&str, &str)] = &[
+        ("hot-1d", "hot"),
+        ("hot-2d", "hot"),
+        ("warm-40d", "warm"),
+        ("warm-50d", "warm"),
+        ("warm-60d", "warm"),
+    ];
+    const HOT_TWO: &[(&str, &str)] = &[("hot-1d", "hot"), ("hot-2d", "hot")];
+
+    #[tokio::test]
+    async fn since_older_than_hot_window_returns_warm_rows() {
+        let tool = tool_with_hot_and_warm().await;
+        let since = (Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+        let got = kinds_and_tiers(&tool, json!({ "since": since })).await;
+        assert_eq!(got, pairs(ALL_FIVE));
+    }
+
+    #[tokio::test]
+    async fn old_closed_window_returns_the_warm_rows_inside_it() {
+        let tool = tool_with_hot_and_warm().await;
+        let now = Utc::now();
+        let got = kinds_and_tiers(
+            &tool,
+            json!({
+                "since": (now - chrono::Duration::days(55)).to_rfc3339(),
+                "until": (now - chrono::Duration::days(35)).to_rfc3339(),
+            }),
+        )
+        .await;
+        assert_eq!(got, pairs(&[("warm-40d", "warm"), ("warm-50d", "warm")]));
+    }
+
+    #[tokio::test]
+    async fn include_warm_false_with_recent_window_returns_hot_only() {
+        let tool = tool_with_hot_and_warm().await;
+        let since = (Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+        let got = kinds_and_tiers(&tool, json!({ "since": since, "include_warm": false })).await;
+        assert_eq!(got, pairs(HOT_TWO));
+    }
+
+    #[tokio::test]
+    async fn include_warm_false_wins_over_an_old_since() {
+        let tool = tool_with_hot_and_warm().await;
+        let since = (Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+        let got = kinds_and_tiers(&tool, json!({ "since": since, "include_warm": false })).await;
+        assert_eq!(got, pairs(HOT_TWO));
+    }
+
+    #[tokio::test]
+    async fn no_arguments_stays_hot_only_and_include_warm_true_adds_warm() {
+        let tool = tool_with_hot_and_warm().await;
+        assert_eq!(kinds_and_tiers(&tool, json!({})).await, pairs(HOT_TWO));
+        assert_eq!(
+            kinds_and_tiers(&tool, json!({ "include_warm": true })).await,
+            pairs(ALL_FIVE)
+        );
+        // Same call again: same order.
+        assert_eq!(
+            kinds_and_tiers(&tool, json!({ "include_warm": true })).await,
+            pairs(ALL_FIVE)
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_applies_to_the_merged_hot_and_warm_result() {
+        let tool = tool_with_hot_and_warm().await;
+        let got = kinds_and_tiers(&tool, json!({ "include_warm": true, "limit": 3 })).await;
+        assert_eq!(got, pairs(&ALL_FIVE[..3]));
+    }
+
+    #[tokio::test]
+    async fn include_warm_wrong_type_rejected() {
+        let (s, _tmp) = store();
+        let tool = RecallRecent::new(s);
+        let err = tool
+            .invoke(json!({"include_warm": "yes"}))
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
 }

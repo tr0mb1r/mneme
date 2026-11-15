@@ -175,7 +175,23 @@ Eligible events that never move mean the idle gate hasn't closed: every
 The pass is idempotent and crash-safe: hot→warm writes the new key
 before deleting the old; warm→cold writes the cold bundle (atomic
 temp+rename) before deleting warm rows. A `kill -9` mid-pass leaves
-duplicates that the next run cleans up.
+duplicates that the next run cleans up. Until it does, readers return
+such a row once (the hot copy) and `forget` removes both copies.
+
+**Reading each tier.**
+
+| Tier | Read by |
+|---|---|
+| hot (`epi:`) | `recall_recent`, `mneme://recent`, `mneme://context`, `summarize_session`, `export` |
+| warm (`wepi:`) | `recall_recent` when `since` is older than `hot_to_warm_days`, when only `until` is set, or with `include_warm: true`; `export` (tool and `mneme export`) by default; `forget` by id |
+| cold (`cold/*.zst`) | no tool. `mneme backup` copies the files. |
+
+Rows from `recall_recent` and `export` carry `"tier": "hot"` or
+`"tier": "warm"`. Before 1.5.2 nothing read the warm tier, so an event
+dropped out of every read path at 28 days and `export` was not a
+complete backup. `export` still leaves out the cold tier: for a full
+copy use `mneme backup`, which tars the data dir and so restores every
+row into the tier it was in.
 
 **Designed schedule.** `[consolidation] schedule = "idle"` in the
 default config — meant to run when the server is idle. v1.0 honours

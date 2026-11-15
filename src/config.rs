@@ -329,8 +329,12 @@ fn default_embed_device() -> String {
 fn default_batch_size() -> usize {
     32
 }
+/// Default `[consolidation] hot_to_warm_days`. Public so the
+/// episodic store can fall back to it when no config is threaded in.
+pub const DEFAULT_HOT_TO_WARM_DAYS: u32 = 28;
+
 fn default_hot_to_warm_days() -> u32 {
-    28
+    DEFAULT_HOT_TO_WARM_DAYS
 }
 fn default_warm_to_cold_days() -> u32 {
     180

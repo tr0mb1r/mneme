@@ -7,6 +7,16 @@
 //! writer would race the consolidation scheduler. Stop the server
 //! first (`mneme stop`).
 //!
+//! The episodic layer covers the hot and warm tiers; each row has a
+//! `tier` key. Until 1.5.2 only the hot tier was dumped, so an export
+//! kept as a backup lost every event older than `hot_to_warm_days`.
+//! The cold archive (`<root>/cold/*.zst`) is not included; `mneme
+//! backup` captures it.
+//!
+//! There is no import command. To restore, use `mneme backup` /
+//! `mneme restore`, which copy the data dir byte-for-byte and so keep
+//! every row in the tier it was in.
+//!
 //! Two formats:
 //! * `--format json` (default) — one pretty-printed object with three
 //!   top-level keys (`procedural`, `episodic`, `semantic`).
@@ -153,15 +163,19 @@ fn collect_procedural(store: &ProceduralStore, scope: Option<&str>) -> Result<Ve
         .collect())
 }
 
+/// Hot and warm episodic rows, newest first, each tagged with its
+/// tier.
 async fn collect_episodic(store: &EpisodicStore, scope: Option<&str>) -> Result<Vec<Value>> {
-    let mut events = store.list_all().await?;
+    let mut events = store.list_hot_and_warm(true).await?;
     if let Some(s) = scope {
-        events.retain(|e| e.scope == s);
+        events.retain(|t| t.event.scope == s);
     }
     Ok(events
         .into_iter()
-        .map(|e| {
+        .map(|t| {
+            let e = t.event;
             json!({
+                "tier": t.tier.as_str(),
                 "id": e.id.to_string(),
                 "kind": e.kind,
                 "scope": e.scope,
@@ -351,6 +365,88 @@ mod tests {
         assert_eq!(layers.epi_json.len(), 1);
         assert_eq!(layers.proc_json.len(), 1);
         assert_eq!(layers.proc_json[0]["content"], "sealed rule");
+    }
+
+    /// The 1.5.2 bug: `mneme export` read the hot tier only, so the
+    /// weekly export-as-backup dropped every warm row. Drives the
+    /// real `collect_all` path against an on-disk redb.
+    #[test]
+    fn export_includes_warm_rows() {
+        use crate::crypto::keyring::InMemoryKekStore;
+        use crate::memory::consolidation::_record_backdated_for_tests;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("episodic")).unwrap();
+        std::fs::create_dir_all(root.join("procedural")).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (hot, warm) = {
+            let storage: Arc<dyn Storage> = RedbStorage::open(&root.join("episodic")).unwrap();
+            rt.block_on(async {
+                let episodic = EpisodicStore::new(Arc::clone(&storage));
+                let now = Utc::now();
+                for d in [1, 2] {
+                    _record_backdated_for_tests(
+                        &storage,
+                        &format!("hot-{d}d"),
+                        "work",
+                        "\"h\"",
+                        now - chrono::Duration::days(d),
+                    )
+                    .await
+                    .unwrap();
+                }
+                for (d, scope) in [(40, "work"), (50, "personal"), (60, "work")] {
+                    let id = _record_backdated_for_tests(
+                        &storage,
+                        &format!("warm-{d}d"),
+                        scope,
+                        "\"w\"",
+                        now - chrono::Duration::days(d),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(episodic.promote_to_warm(id).await.unwrap());
+                }
+                storage.flush().await.unwrap();
+                (
+                    episodic.count_hot().await.unwrap(),
+                    episodic.count_warm().await.unwrap(),
+                )
+            })
+        };
+        assert_eq!((hot, warm), (2, 3));
+
+        let layers = collect_all(root, None, &InMemoryKekStore::new()).unwrap();
+        assert_eq!(layers.epi_json.len(), hot + warm);
+        let got: Vec<(&str, &str)> = layers
+            .epi_json
+            .iter()
+            .map(|r| (r["kind"].as_str().unwrap(), r["tier"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("hot-1d", "hot"),
+                ("hot-2d", "hot"),
+                ("warm-40d", "warm"),
+                ("warm-50d", "warm"),
+                ("warm-60d", "warm"),
+            ]
+        );
+
+        // Second run: same rows, same order.
+        let again = collect_all(root, None, &InMemoryKekStore::new()).unwrap();
+        assert_eq!(again.epi_json, layers.epi_json);
+
+        // Scope filter reaches warm rows too.
+        let personal = collect_all(root, Some("personal"), &InMemoryKekStore::new()).unwrap();
+        assert_eq!(personal.epi_json.len(), 1);
+        assert_eq!(personal.epi_json[0]["kind"], "warm-50d");
     }
 
     #[tokio::test]

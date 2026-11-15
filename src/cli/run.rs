@@ -295,7 +295,10 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
         )
     })?;
     let procedural = Arc::new(ProceduralStore::open_with_crypto(&root, data_aead.clone())?);
-    let episodic = Arc::new(EpisodicStore::new(Arc::clone(&storage_dyn)));
+    let episodic = Arc::new(
+        EpisodicStore::new(Arc::clone(&storage_dyn))
+            .with_hot_to_warm_days(config.consolidation.hot_to_warm_days),
+    );
     let auto_context_budget = TokenBudget::from_config(&config.budgets);
     let cold = crate::storage::archive::ColdArchive::new_with_crypto(&root, data_aead.clone());
 

@@ -12,6 +12,33 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Warm-tier events are readable again.** Consolidation moves an
+  episodic event from `epi:` to `wepi:` after `hot_to_warm_days` (28),
+  and no read path looked there, so the event was gone from
+  `recall_recent` and from `export` until it reached the cold archive.
+  In one store a `recall_recent(since, until)` window over seven weeks
+  returned 7 hot rows with 344 warm rows present.
+  - `recall_recent` reads the warm tier when `since` is older than
+    `hot_to_warm_days`, when only `until` is set, or when the new
+    `include_warm: true` is passed. `include_warm: false` keeps a call
+    hot only. A call with no time bound is unchanged (hot only).
+    Ordering and the `limit` caps are unchanged; the limit applies to
+    the merged result.
+  - `export` (the MCP tool and `mneme export`) includes warm rows by
+    default. A backup taken with it was silently missing every event
+    older than 28 days. The tool takes `include_warm: false` for the old
+    hot-only output; the CLI has no opt-out.
+  - Rows from both carry `"tier": "hot"` or `"tier": "warm"`.
+  - The cold archive is still not read by any tool; `mneme backup`
+    copies it.
+- **`forget` removes an event from both tiers.** A crash between the two
+  writes of a hot-to-warm move leaves the row under both prefixes until
+  the next consolidation pass. `forget` stopped at the hot copy, which
+  did not matter while the warm tier was unreadable; with warm reads the
+  leftover copy would have come back. Readers return such a row once.
+
 ## [1.5.0](https://github.com/tr0mb1r/mneme/compare/v1.4.1...v1.5.0) - 2026-10-12
 
 > Hardening from running mneme as the long-term memory of Hermes Agent

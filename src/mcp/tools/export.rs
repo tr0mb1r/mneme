@@ -7,6 +7,11 @@
 //! it captures the on-disk state byte-for-byte (incl. cold-tier
 //! zstd archives, the WAL, the snapshot). `export` is for
 //! human-readable, host-LLM-readable shape.
+//!
+//! The `episodic` array covers the hot and warm tiers (each row has a
+//! `tier` field). Until 1.5.2 it was hot only, so an export taken as
+//! a backup lost every event older than `hot_to_warm_days`. The cold
+//! archive is still not included.
 
 use std::sync::Arc;
 
@@ -23,8 +28,12 @@ use crate::storage::Storage;
 const DESCRIPTION: &str = "Export every memory the agent currently \
 holds as one JSON document, optionally filtered by scope. Use this \
 for human-readable inspection or for piping to `jq` / external \
-scripts. For at-rest, full-fidelity copies use the `mneme backup` \
-CLI command instead.";
+scripts. Episodic events come from the hot and warm tiers (each row \
+has a `tier` field); pass `include_warm: false` for hot only. Events \
+in the cold archive are not included. Each layer is capped at \
+`limit_per_layer` rows, newest first, so raise it (max 5000) for a \
+complete dump. For at-rest, full-fidelity copies use the \
+`mneme backup` CLI command instead.";
 
 /// Default cap on rows per layer when the caller doesn't pass
 /// `limit`. Picked low enough that an LLM context fits the response.
@@ -67,6 +76,11 @@ impl Tool for Export {
                         "minimum": 1,
                         "maximum": 5000,
                         "description": "Max rows to include per layer. Defaults to 200."
+                    },
+                    "include_warm": {
+                        "type": "boolean",
+                        "description": "Include warm-tier episodic events (older than the \
+            hot-to-warm threshold). Defaults to true."
                     }
                 }
             }),
@@ -92,6 +106,16 @@ impl Tool for Export {
             ));
         }
 
+        let include_warm = match args.get("include_warm") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`include_warm` must be a boolean".into(),
+                ));
+            }
+        };
+
         // L0 procedural.
         let proc_items = self
             .procedural
@@ -111,20 +135,22 @@ impl Tool for Export {
             })
             .collect();
 
-        // L3 episodic — newest first.
+        // L3 episodic — hot and warm, newest first.
         let mut all_episodic = self
             .episodic
-            .list_all()
+            .list_hot_and_warm(include_warm)
             .await
-            .map_err(|e| ToolError::Internal(format!("episodic list_all: {e}")))?;
+            .map_err(|e| ToolError::Internal(format!("episodic list: {e}")))?;
         if let Some(ref s) = scope_filter {
-            all_episodic.retain(|e| &e.scope == s);
+            all_episodic.retain(|t| &t.event.scope == s);
         }
         let epi_json: Vec<Value> = all_episodic
             .into_iter()
             .take(limit)
-            .map(|e| {
+            .map(|t| {
+                let e = t.event;
                 json!({
+                    "tier": t.tier.as_str(),
                     "id": e.id.to_string(),
                     "kind": e.kind,
                     "scope": e.scope,
@@ -273,6 +299,93 @@ mod tests {
         };
         let v: Value = serde_json::from_str(&text).unwrap();
         assert!(v["semantic"].as_array().unwrap().len() <= 2);
+    }
+
+    /// Fixture plus three events promoted to warm. The fixture
+    /// already holds one hot event, so episodic is 1 hot + 3 warm.
+    async fn fixture_with_warm() -> (Export, Arc<SemanticStore>, TempDir) {
+        use crate::memory::consolidation::_record_backdated_for_tests;
+        let (e, semantic, tmp) = fixture().await;
+        let now = chrono::Utc::now();
+        for d in [40, 50, 60] {
+            let id = _record_backdated_for_tests(
+                &e.storage,
+                &format!("warm-{d}d"),
+                "personal",
+                "\"w\"",
+                now - chrono::Duration::days(d),
+            )
+            .await
+            .unwrap();
+            assert!(e.episodic.promote_to_warm(id).await.unwrap());
+        }
+        (e, semantic, tmp)
+    }
+
+    async fn episodic_rows(e: &Export, args: Value) -> Vec<Value> {
+        let res = e.invoke(args).await.unwrap();
+        let text = match &res.content[0] {
+            crate::mcp::tools::ContentBlock::Text(t) => t.clone(),
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        v["episodic"].as_array().unwrap().clone()
+    }
+
+    /// The 1.5.2 bug: export called `list_all()` (hot only), so a
+    /// backup silently dropped every warm row.
+    #[tokio::test]
+    async fn export_includes_warm_rows_by_default() {
+        let (e, _semantic, _tmp) = fixture_with_warm().await;
+        let hot = e.episodic.count_hot().await.unwrap();
+        let warm = e.episodic.count_warm().await.unwrap();
+        assert_eq!((hot, warm), (1, 3));
+
+        let rows = episodic_rows(&e, json!({})).await;
+        assert_eq!(rows.len(), hot + warm);
+        // Newest first across tiers, each row tagged.
+        let got: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r["kind"].as_str().unwrap(), r["tier"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("k", "hot"),
+                ("warm-40d", "warm"),
+                ("warm-50d", "warm"),
+                ("warm-60d", "warm"),
+            ]
+        );
+        // Stable across calls.
+        assert_eq!(episodic_rows(&e, json!({})).await, rows);
+    }
+
+    #[tokio::test]
+    async fn export_include_warm_false_is_hot_only() {
+        let (e, _semantic, _tmp) = fixture_with_warm().await;
+        let rows = episodic_rows(&e, json!({ "include_warm": false })).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["tier"], "hot");
+    }
+
+    #[tokio::test]
+    async fn export_scope_filter_and_limit_apply_to_warm_rows() {
+        let (e, _semantic, _tmp) = fixture_with_warm().await;
+        assert!(
+            episodic_rows(&e, json!({ "scope": "work" }))
+                .await
+                .is_empty()
+        );
+        let rows = episodic_rows(&e, json!({ "limit_per_layer": 2 })).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["kind"], "warm-40d");
+    }
+
+    #[tokio::test]
+    async fn export_include_warm_wrong_type_rejected() {
+        let (e, _, _tmp) = fixture().await;
+        let err = e.invoke(json!({ "include_warm": 1 })).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
     }
 
     #[tokio::test]

@@ -44,12 +44,18 @@
 //!
 //! # Tiers
 //!
-//! `EpisodicStore` is the *hot* tier only. The consolidation task
-//! (Phase 4 §3, lands in `memory::consolidation`) walks this prefix
-//! periodically and migrates aged-out events to a warm SQLite-style
-//! flat file or a cold zstd archive (see `storage::archive`). This
-//! module exposes only the writer/reader against the hot tier; the
-//! migration logic owns its own scan loop.
+//! `EpisodicStore` writes to the *hot* tier (`epi:`). The
+//! consolidation task (`memory::consolidation`) walks that prefix
+//! periodically and rekeys aged-out events to the *warm* tier
+//! (`wepi:`, same redb), then later folds them into a cold zstd
+//! archive (see `storage::archive`).
+//!
+//! Reads cover hot and warm. [`EpisodicStore::recall_recent`] scans
+//! the warm prefix when asked to ([`WarmRead::Always`]) or, by
+//! default, when the requested time window reaches back past the
+//! hot-to-warm threshold ([`WarmRead::Auto`]).
+//! [`EpisodicStore::list_hot_and_warm`] is the full-dump reader used
+//! by `export`. The cold archive is not read from here.
 
 use std::sync::Arc;
 
@@ -71,6 +77,53 @@ pub const EPI_KEY_PREFIX: &[u8] = b"epi:";
 /// in the same redb so a single `Storage` handle can serve both
 /// tiers; reads merge results from both prefixes.
 pub const WARM_KEY_PREFIX: &[u8] = b"wepi:";
+
+/// Which live tier a row was read from. Surfaced on `recall_recent`
+/// and `export` rows so a caller can tell an aged-out event from a
+/// current one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Hot,
+    Warm,
+}
+
+impl Tier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::Hot => "hot",
+            Tier::Warm => "warm",
+        }
+    }
+}
+
+/// An event plus the tier it was read from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TieredEvent {
+    pub event: EpisodicEvent,
+    pub tier: Tier,
+}
+
+/// Whether [`EpisodicStore::recall_recent`] scans the warm tier.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WarmRead {
+    /// Scan warm only when the time window can contain warm rows:
+    /// `since` is older than `now - hot_to_warm_days`, or only
+    /// `until` is set (the window is open to the past). A call with
+    /// no time bound stays hot-only, so "what just happened?" reads
+    /// cost what they did before.
+    ///
+    /// The rule is exact for a constant threshold: a row is promoted
+    /// on `last_accessed <= now - hot_to_warm_days` and
+    /// `created_at <= last_accessed`, so no warm row is newer than
+    /// the cutoff. If the threshold was raised after rows were
+    /// promoted, pass [`WarmRead::Always`] to reach the younger ones.
+    #[default]
+    Auto,
+    /// Always scan warm.
+    Always,
+    /// Never scan warm (the pre-1.5.2 behaviour).
+    Never,
+}
 
 /// Default `retrieval_weight` when the caller doesn't specify one.
 /// Equal-weight events sort purely by recency.
@@ -147,6 +200,42 @@ pub struct RecentFilters {
     pub exclude_kinds_static: &'static [&'static str],
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
+    /// Warm-tier policy; [`WarmRead::Auto`] by default.
+    pub warm: WarmRead,
+}
+
+impl RecentFilters {
+    fn matches(&self, event: &EpisodicEvent) -> bool {
+        if let Some(ref s) = self.scope
+            && &event.scope != s
+        {
+            return false;
+        }
+        if let Some(ref k) = self.kind
+            && &event.kind != k
+        {
+            return false;
+        }
+        if !self.kinds.is_empty() && !self.kinds.contains(&event.kind) {
+            return false;
+        }
+        if self.exclude_kinds.contains(&event.kind)
+            || self.exclude_kinds_static.contains(&event.kind.as_str())
+        {
+            return false;
+        }
+        if let Some(since) = self.since
+            && event.created_at < since
+        {
+            return false;
+        }
+        if let Some(until) = self.until
+            && event.created_at >= until
+        {
+            return false;
+        }
+        true
+    }
 }
 
 /// Single-scan summary of the hot tier's age profile, produced by
@@ -165,7 +254,8 @@ pub struct HotAgeSummary {
     pub eligible: usize,
 }
 
-/// Hot-tier reader/writer against the redb-backed [`Storage`] handle.
+/// Reader/writer against the redb-backed [`Storage`] handle. Writes
+/// go to the hot tier; reads cover hot and warm.
 ///
 /// Cheap to construct (just clones the `Arc<dyn Storage>`) — call
 /// sites can hold one per request if that simplifies threading.
@@ -177,6 +267,9 @@ pub struct EpisodicStore {
     /// own `promote_to_warm` / `delete_warm` paths don't bump this so
     /// the scheduler can't mistake itself for fresh user activity.
     activity: Arc<ActivityCounter>,
+    /// The consolidation threshold, used only to decide when a
+    /// [`WarmRead::Auto`] read has to look at the warm tier.
+    hot_to_warm_days: u32,
 }
 
 impl EpisodicStore {
@@ -184,6 +277,31 @@ impl EpisodicStore {
         Self {
             storage,
             activity: ActivityCounter::new(),
+            hot_to_warm_days: crate::config::DEFAULT_HOT_TO_WARM_DAYS,
+        }
+    }
+
+    /// Set the hot-to-warm threshold from `[consolidation]
+    /// hot_to_warm_days` so [`WarmRead::Auto`] matches what the
+    /// consolidation pass actually does. Defaults to
+    /// [`crate::config::DEFAULT_HOT_TO_WARM_DAYS`].
+    pub fn with_hot_to_warm_days(mut self, days: u32) -> Self {
+        self.hot_to_warm_days = days;
+        self
+    }
+
+    /// Resolve the warm policy of `filters` against the clock.
+    fn reads_warm(&self, filters: &RecentFilters, now: DateTime<Utc>) -> bool {
+        match filters.warm {
+            WarmRead::Always => true,
+            WarmRead::Never => false,
+            WarmRead::Auto => match (filters.since, filters.until) {
+                (Some(since), _) => {
+                    since < now - chrono::Duration::days(i64::from(self.hot_to_warm_days))
+                }
+                (None, Some(_)) => true,
+                (None, None) => false,
+            },
         }
     }
 
@@ -297,50 +415,44 @@ impl EpisodicStore {
     /// created_at DESC)` and returns the top `limit`.
     ///
     /// `limit == 0` returns an empty `Vec` (not an error).
+    ///
+    /// Reads the warm tier as well when `filters.warm` says so (see
+    /// [`WarmRead`]). Use [`recall_recent_tiered`](Self::recall_recent_tiered)
+    /// to learn which tier each row came from.
     pub async fn recall_recent(
         &self,
         filters: &RecentFilters,
         limit: usize,
     ) -> Result<Vec<EpisodicEvent>> {
+        Ok(self
+            .recall_recent_tiered(filters, limit)
+            .await?
+            .into_iter()
+            .map(|t| t.event)
+            .collect())
+    }
+
+    /// [`recall_recent`](Self::recall_recent) with each row tagged
+    /// by tier. Same filters, ordering and `limit` semantics: hot and
+    /// warm rows are merged before the sort, so the cap applies to
+    /// the combined result.
+    ///
+    /// A row present under both prefixes (a crash between the two
+    /// writes of `promote_to_warm`) is returned once, as hot.
+    pub async fn recall_recent_tiered(
+        &self,
+        filters: &RecentFilters,
+        limit: usize,
+    ) -> Result<Vec<TieredEvent>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let raw = self.storage.scan_prefix(EPI_KEY_PREFIX).await?;
-        let mut events: Vec<EpisodicEvent> = Vec::with_capacity(raw.len());
-        for (_k, v) in raw {
-            let event: EpisodicEvent = postcard::from_bytes(&v)
-                .map_err(|e| MnemeError::Storage(format!("decode EpisodicEvent: {e}")))?;
-            if let Some(ref s) = filters.scope
-                && &event.scope != s
-            {
-                continue;
-            }
-            if let Some(ref k) = filters.kind
-                && &event.kind != k
-            {
-                continue;
-            }
-            if !filters.kinds.is_empty() && !filters.kinds.contains(&event.kind) {
-                continue;
-            }
-            if filters.exclude_kinds.contains(&event.kind)
-                || filters.exclude_kinds_static.contains(&event.kind.as_str())
-            {
-                continue;
-            }
-            if let Some(since) = filters.since
-                && event.created_at < since
-            {
-                continue;
-            }
-            if let Some(until) = filters.until
-                && event.created_at >= until
-            {
-                continue;
-            }
-            events.push(event);
-        }
+        let include_warm = self.reads_warm(filters, Utc::now());
+        let mut events = self
+            .scan_tiers(include_warm, |e| filters.matches(e))
+            .await?;
         events.sort_by(|a, b| {
+            let (a, b) = (&a.event, &b.event);
             // Primary: most-recently-touched wins.
             b.last_accessed
                 .cmp(&a.last_accessed)
@@ -357,7 +469,67 @@ impl EpisodicStore {
                 // Final deterministic tiebreaker.
                 .then_with(|| b.created_at.cmp(&a.created_at))
         });
-        Ok(events.into_iter().take(limit).collect())
+        events.truncate(limit);
+        Ok(events)
+    }
+
+    /// Scan the hot prefix, and the warm prefix when `include_warm`,
+    /// keeping rows that pass `keep`. Hot rows come first in the
+    /// returned `Vec`; a warm row whose id is also in the hot tier is
+    /// dropped (the hot copy is the one `touch` keeps current).
+    async fn scan_tiers(
+        &self,
+        include_warm: bool,
+        keep: impl Fn(&EpisodicEvent) -> bool,
+    ) -> Result<Vec<TieredEvent>> {
+        let raw = self.storage.scan_prefix(EPI_KEY_PREFIX).await?;
+        let mut out: Vec<TieredEvent> = Vec::with_capacity(raw.len());
+        let mut hot_ids: std::collections::HashSet<EventId> = std::collections::HashSet::new();
+        for (_k, v) in raw {
+            let event: EpisodicEvent = postcard::from_bytes(&v)
+                .map_err(|e| MnemeError::Storage(format!("decode EpisodicEvent: {e}")))?;
+            if include_warm {
+                hot_ids.insert(event.id);
+            }
+            if keep(&event) {
+                out.push(TieredEvent {
+                    event,
+                    tier: Tier::Hot,
+                });
+            }
+        }
+        if include_warm {
+            for (_k, v) in self.storage.scan_prefix(WARM_KEY_PREFIX).await? {
+                let event: EpisodicEvent = postcard::from_bytes(&v)
+                    .map_err(|e| MnemeError::Storage(format!("decode warm EpisodicEvent: {e}")))?;
+                if !hot_ids.contains(&event.id) && keep(&event) {
+                    out.push(TieredEvent {
+                        event,
+                        tier: Tier::Warm,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every event in the hot and warm tiers, newest first by
+    /// `created_at` (ties broken by id, newest first, so the order
+    /// does not depend on which tier a row sits in). Used by `export`:
+    /// a dump that stopped at the hot tier dropped every event older
+    /// than the hot-to-warm threshold.
+    ///
+    /// Pass `include_warm = false` for the hot tier alone. The cold
+    /// archive is never read here.
+    pub async fn list_hot_and_warm(&self, include_warm: bool) -> Result<Vec<TieredEvent>> {
+        let mut out = self.scan_tiers(include_warm, |_| true).await?;
+        out.sort_by(|a, b| {
+            b.event
+                .created_at
+                .cmp(&a.event.created_at)
+                .then_with(|| b.event.id.cmp(&a.event.id))
+        });
+        Ok(out)
     }
 
     /// Strict reverse-chronological iteration over the hot tier,
@@ -387,8 +559,8 @@ impl EpisodicStore {
         self.storage.delete(&epi_key(&id)).await
     }
 
-    /// Agent-driven point delete: remove an event from whichever live
-    /// tier holds it (hot, then warm). Returns `true` if anything was
+    /// Agent-driven point delete: remove an event from every live
+    /// tier that holds it (hot and warm). Returns `true` if anything was
     /// deleted, `false` if the id wasn't present in either tier.
     ///
     /// Cold-archive entries are intentionally not reachable from here
@@ -398,17 +570,18 @@ impl EpisodicStore {
     /// migrated past the warm tier the agent should treat it as
     /// out-of-scope until v1.1's daemon channel.
     pub async fn forget(&self, id: EventId) -> Result<bool> {
-        let hot = epi_key(&id);
-        if self.storage.get(&hot).await?.is_some() {
-            self.storage.delete(&hot).await?;
-            return Ok(true);
+        // Check both tiers rather than stopping at the first hit: a
+        // crash inside `promote_to_warm` can leave the row under both
+        // prefixes, and warm rows are readable, so a leftover warm
+        // copy would bring a forgotten event back.
+        let mut found = false;
+        for key in [epi_key(&id), warm_key(&id)] {
+            if self.storage.get(&key).await?.is_some() {
+                self.storage.delete(&key).await?;
+                found = true;
+            }
         }
-        let warm = warm_key(&id);
-        if self.storage.get(&warm).await?.is_some() {
-            self.storage.delete(&warm).await?;
-            return Ok(true);
-        }
-        Ok(false)
+        Ok(found)
     }
 
     /// Lookup an event in either the hot or warm tier. Returns `None`
@@ -894,5 +1067,241 @@ mod tests {
         let hits = s.recall_recent(&RecentFilters::default(), 5).await.unwrap();
         assert_eq!(hits[0].id, fresh, "fresh event must outrank aged one");
         assert!(hits.iter().any(|e| e.id == aged));
+    }
+}
+
+/// Warm-tier reads (1.5.2). Kept apart from `tests` above so the two
+/// can grow independently.
+#[cfg(test)]
+mod warm_read_tests {
+    use super::*;
+    use crate::storage::memory_impl::MemoryStorage;
+    use chrono::Duration;
+
+    fn store() -> EpisodicStore {
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        EpisodicStore::new(storage)
+    }
+
+    /// Write a hot row whose `created_at` and `last_accessed` are
+    /// both `at`.
+    async fn seed_at(s: &EpisodicStore, payload: &str, at: DateTime<Utc>) -> EventId {
+        let event = EpisodicEvent {
+            id: EventId::new(),
+            kind: "note".into(),
+            scope: "p".into(),
+            payload: payload.into(),
+            tags: vec![],
+            retrieval_weight: DEFAULT_RETRIEVAL_WEIGHT,
+            last_accessed: at,
+            created_at: at,
+        };
+        let value = postcard::to_allocvec(&event).unwrap();
+        s.storage.put(&epi_key(&event.id), &value).await.unwrap();
+        event.id
+    }
+
+    /// Two hot rows (1 and 2 days old) and three warm rows (40, 50,
+    /// 60 days old). Returns `(hot_ids, warm_ids)`, each newest first.
+    async fn two_hot_three_warm(s: &EpisodicStore) -> (Vec<EventId>, Vec<EventId>) {
+        let now = Utc::now();
+        let mut hot = Vec::new();
+        for d in [1, 2] {
+            hot.push(seed_at(s, "\"hot\"", now - Duration::days(d)).await);
+        }
+        let mut warm = Vec::new();
+        for d in [40, 50, 60] {
+            let id = seed_at(s, "\"warm\"", now - Duration::days(d)).await;
+            assert!(s.promote_to_warm(id).await.unwrap());
+            warm.push(id);
+        }
+        (hot, warm)
+    }
+
+    fn ids(rows: &[TieredEvent]) -> Vec<EventId> {
+        rows.iter().map(|t| t.event.id).collect()
+    }
+
+    #[tokio::test]
+    async fn since_older_than_hot_window_returns_warm_rows() {
+        let s = store();
+        let (hot, warm) = two_hot_three_warm(&s).await;
+        let filters = RecentFilters {
+            since: Some(Utc::now() - Duration::days(90)),
+            ..Default::default()
+        };
+        let rows = s.recall_recent_tiered(&filters, 100).await.unwrap();
+        // Ordering is unchanged (last_accessed DESC), so hot rows
+        // lead and warm rows follow, each newest first.
+        let expected: Vec<EventId> = hot.iter().chain(warm.iter()).copied().collect();
+        assert_eq!(ids(&rows), expected);
+        assert!(rows[..2].iter().all(|t| t.tier == Tier::Hot));
+        assert!(rows[2..].iter().all(|t| t.tier == Tier::Warm));
+
+        // The untiered wrapper returns the same rows.
+        let plain = s.recall_recent(&filters, 100).await.unwrap();
+        assert_eq!(plain.iter().map(|e| e.id).collect::<Vec<_>>(), expected);
+    }
+
+    /// The q49 shape from the field report: a closed window that
+    /// lies entirely in the warm tier.
+    #[tokio::test]
+    async fn closed_old_window_returns_only_the_warm_rows_inside_it() {
+        let s = store();
+        let (_hot, warm) = two_hot_three_warm(&s).await;
+        let now = Utc::now();
+        let filters = RecentFilters {
+            since: Some(now - Duration::days(55)),
+            until: Some(now - Duration::days(35)),
+            ..Default::default()
+        };
+        let rows = s.recall_recent_tiered(&filters, 100).await.unwrap();
+        assert_eq!(ids(&rows), vec![warm[0], warm[1]]);
+    }
+
+    #[tokio::test]
+    async fn recent_window_and_unbounded_calls_stay_hot_only() {
+        let s = store();
+        let (hot, _warm) = two_hot_three_warm(&s).await;
+
+        let recent = RecentFilters {
+            since: Some(Utc::now() - Duration::days(7)),
+            ..Default::default()
+        };
+        let rows = s.recall_recent_tiered(&recent, 100).await.unwrap();
+        assert_eq!(ids(&rows), hot);
+
+        let unbounded = s
+            .recall_recent_tiered(&RecentFilters::default(), 100)
+            .await
+            .unwrap();
+        assert_eq!(ids(&unbounded), hot);
+    }
+
+    #[tokio::test]
+    async fn warm_never_overrides_an_old_since() {
+        let s = store();
+        let (hot, _warm) = two_hot_three_warm(&s).await;
+        let filters = RecentFilters {
+            since: Some(Utc::now() - Duration::days(90)),
+            warm: WarmRead::Never,
+            ..Default::default()
+        };
+        let rows = s.recall_recent_tiered(&filters, 100).await.unwrap();
+        assert_eq!(ids(&rows), hot);
+    }
+
+    #[tokio::test]
+    async fn warm_always_reads_warm_without_a_time_bound() {
+        let s = store();
+        let (hot, warm) = two_hot_three_warm(&s).await;
+        let filters = RecentFilters {
+            warm: WarmRead::Always,
+            ..Default::default()
+        };
+        let rows = s.recall_recent_tiered(&filters, 100).await.unwrap();
+        let expected: Vec<EventId> = hot.iter().chain(warm.iter()).copied().collect();
+        assert_eq!(ids(&rows), expected);
+    }
+
+    #[tokio::test]
+    async fn until_only_window_reads_warm() {
+        let s = store();
+        let (_hot, warm) = two_hot_three_warm(&s).await;
+        let filters = RecentFilters {
+            until: Some(Utc::now() - Duration::days(30)),
+            ..Default::default()
+        };
+        let rows = s.recall_recent_tiered(&filters, 100).await.unwrap();
+        assert_eq!(ids(&rows), warm);
+    }
+
+    #[tokio::test]
+    async fn limit_caps_the_merged_result() {
+        let s = store();
+        let (hot, warm) = two_hot_three_warm(&s).await;
+        let filters = RecentFilters {
+            warm: WarmRead::Always,
+            ..Default::default()
+        };
+        let rows = s.recall_recent_tiered(&filters, 3).await.unwrap();
+        assert_eq!(ids(&rows), vec![hot[0], hot[1], warm[0]]);
+    }
+
+    #[tokio::test]
+    async fn auto_follows_the_configured_threshold() {
+        let s = store().with_hot_to_warm_days(100);
+        let (hot, warm) = two_hot_three_warm(&s).await;
+        // 90 days back is inside a 100-day hot window: no warm scan.
+        let inside = RecentFilters {
+            since: Some(Utc::now() - Duration::days(90)),
+            ..Default::default()
+        };
+        assert_eq!(
+            ids(&s.recall_recent_tiered(&inside, 100).await.unwrap()),
+            hot
+        );
+        let outside = RecentFilters {
+            since: Some(Utc::now() - Duration::days(101)),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.recall_recent_tiered(&outside, 100).await.unwrap().len(),
+            hot.len() + warm.len()
+        );
+    }
+
+    /// `promote_to_warm` writes the warm key before deleting the hot
+    /// one. A crash in between leaves the row under both prefixes;
+    /// readers must return it once.
+    #[tokio::test]
+    async fn row_in_both_tiers_is_returned_once_as_hot() {
+        let s = store();
+        let id = seed_at(&s, "\"dup\"", Utc::now() - Duration::days(40)).await;
+        let bytes = s.storage.get(&epi_key(&id)).await.unwrap().unwrap();
+        s.storage.put(&warm_key(&id), &bytes).await.unwrap();
+
+        let filters = RecentFilters {
+            warm: WarmRead::Always,
+            ..Default::default()
+        };
+        let rows = s.recall_recent_tiered(&filters, 100).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tier, Tier::Hot);
+
+        let all = s.list_hot_and_warm(true).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].tier, Tier::Hot);
+    }
+
+    #[tokio::test]
+    async fn forget_removes_a_row_left_in_both_tiers() {
+        let s = store();
+        let id = seed_at(&s, "\"dup\"", Utc::now() - Duration::days(40)).await;
+        let bytes = s.storage.get(&epi_key(&id)).await.unwrap().unwrap();
+        s.storage.put(&warm_key(&id), &bytes).await.unwrap();
+
+        assert!(s.forget(id).await.unwrap());
+        assert!(s.list_hot_and_warm(true).await.unwrap().is_empty());
+        assert!(!s.forget(id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn list_hot_and_warm_is_newest_first_across_tiers() {
+        let s = store();
+        let (hot, warm) = two_hot_three_warm(&s).await;
+        let all = s.list_hot_and_warm(true).await.unwrap();
+        let expected: Vec<EventId> = hot.iter().chain(warm.iter()).copied().collect();
+        assert_eq!(ids(&all), expected);
+        assert_eq!(
+            all.len(),
+            s.count_hot().await.unwrap() + s.count_warm().await.unwrap()
+        );
+
+        // Same call twice gives the same order.
+        assert_eq!(ids(&s.list_hot_and_warm(true).await.unwrap()), expected);
+
+        let hot_only = s.list_hot_and_warm(false).await.unwrap();
+        assert_eq!(ids(&hot_only), hot);
     }
 }

@@ -26,7 +26,7 @@ serves.
 | Tool | Layer | Use when |
 |------|-------|----------|
 | `recall` | L4 semantic | Hybrid search — meaning *and* exact words, fused, so both questions and exact names (`live_bt.py`, "D account", an env var, an error string) work. `mode` picks `hybrid` (default), `semantic`, or `keyword`; each row says which search found it in `match` (`semantic` / `keyword` / `both`). See [§Hybrid recall](#hybrid-recall). Filter with `scope`, `type`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). Superseded memories are left out unless `include_superseded: true`, in which case they come after every current match and carry `superseded_by`. |
-| `recall_recent` | L3 episodic | "What did we just do?" — time-ordered events (tool calls, lifecycle events, conversation, decisions). Optional `since` / `until` bound the result to a `[since, until)` window against `created_at` (RFC3339 or 26-char ULID); when either bound is set, `limit` caps at 1000 instead of 200. The server does not parse natural language — convert phrases like "last Tuesday" to RFC3339 client-side before calling. |
+| `recall_recent` | L3 episodic | "What did we just do?" — time-ordered events (tool calls, lifecycle events, conversation, decisions). Optional `since` / `until` bound the result to a `[since, until)` window against `created_at` (RFC3339 or 26-char ULID); when either bound is set, `limit` caps at 1000 instead of 200. The server does not parse natural language — convert phrases like "last Tuesday" to RFC3339 client-side before calling. Reads the hot tier, and the warm tier too when the window can reach it: `since` older than `hot_to_warm_days` (28 by default), or `until` set without `since`. `include_warm: true` reads warm on any call, `false` never does. Each row has `tier` (`hot` / `warm`). Events already in the cold archive are not returned. See [§Warm-tier reads](#warm-tier-reads). |
 
 ### Session helpers
 
@@ -41,7 +41,7 @@ serves.
 |------|----------|
 | `stats` | Per-layer counts, server `version`, schema version, scheduler health, and consolidation status (tier thresholds, age of the oldest hot event, days to the next promotion — see [§Consolidation status](#consolidation-status)). Mirrors `mneme://stats`. |
 | `list_scopes` | Show every distinct scope across all layers. |
-| `export` | Read-only JSON dump of every memory. Useful for `jq` or grepping. |
+| `export` | Read-only JSON dump of every memory. Useful for `jq` or grepping. The `episodic` array covers the hot and warm tiers, newest first, each row with `tier`; `include_warm: false` gives hot only. Each layer is capped at `limit_per_layer` (default 200, max 5000). Cold-archive events are not included. |
 
 ### Event kinds
 
@@ -143,6 +143,41 @@ session with no memory at all.
 > `remember` could reach auto-context. The `working` section was also
 > missing from the body while its turns were still charged against the
 > token budget. Both fixed; the query parameters are new.
+
+## Warm-tier reads
+
+Consolidation moves an event from the hot tier to the warm tier once its
+`last_accessed` is `hot_to_warm_days` old (28 by default). Up to 1.5.1
+every read stopped at the hot tier, so those events could not be read
+back: a `recall_recent` window over an older month returned only the few
+rows that were still hot, and `export` left the warm rows out of what
+looked like a full dump.
+
+From 1.5.2:
+
+| Call | Tiers read |
+|---|---|
+| `recall_recent` with no `since` / `until` | hot |
+| `recall_recent` with `since` newer than `hot_to_warm_days` ago | hot |
+| `recall_recent` with `since` older than that | hot + warm |
+| `recall_recent` with `until` only | hot + warm |
+| `recall_recent` with `include_warm: true` | hot + warm, whatever the window |
+| `recall_recent` with `include_warm: false` | hot, whatever the window |
+| `export` (tool and `mneme export`) | hot + warm |
+| `export` tool with `include_warm: false` | hot |
+
+Ordering and limits are unchanged. `recall_recent` still sorts by
+`last_accessed` (newest first), so hot rows come before warm ones, and
+`limit` applies to the merged result. `export` sorts by `created_at`,
+newest first. Rows carry `"tier": "hot"` or `"tier": "warm"`.
+
+The automatic rule uses the threshold in effect now. If you raised
+`hot_to_warm_days` after events were promoted, some warm events are
+younger than the new threshold; pass `include_warm: true` to reach them.
+
+`mneme://recent`, `mneme://context` and `summarize_session` are still
+hot only. Events in the cold archive (`warm_to_cold_days`, 180 by
+default) are not returned by any tool; `mneme backup` copies them.
 
 ## Tool annotations
 
