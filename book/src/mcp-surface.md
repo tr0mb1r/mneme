@@ -43,6 +43,45 @@ serves.
 | `list_scopes` | Show every distinct scope across all layers. |
 | `export` | Read-only JSON dump of every memory. Useful for `jq` or grepping. The `episodic` array covers the hot and warm tiers, newest first, each row with `tier`; `include_warm: false` gives hot only. Each layer is capped at `limit_per_layer` (default 200, max 5000). Cold-archive events are not included. |
 
+### L1 is session-local
+
+The working session (L1) is the conversation in progress: the messages
+an agent records with `record_event` and one `tool` turn per write. It is
+what the `working` section of `mneme://context` shows and what
+`stats` → `working.turns_total` counts.
+
+Each MCP session has its own:
+
+| Transport | One working session per |
+|---|---|
+| `mneme run` (stdio) | process |
+| `mneme daemon` (Unix socket) | accepted connection |
+| HTTP (`mneme serve`, or the daemon with `[http] enabled`) | `Mcp-Session-Id` |
+
+So two agents on one daemon never see each other's turns, and
+`turns_total` describes one conversation. Up to 1.5.x the daemon and the
+HTTP listener shared a single working session between all clients:
+agent A's turns were served to agent B in `mneme://context`. Stored
+memories (L0, L3, L4) are shared as before; only L1 and the current
+scope are per session.
+
+Lifecycle:
+
+- A working session starts empty when the client connects (HTTP: on
+  `initialize`). It is checkpointed to
+  `~/.mneme/sessions/<session_id>.snapshot` on the `[checkpoints]`
+  cadence, by its own scheduler.
+- It ends when the connection closes, when the HTTP client sends
+  `DELETE /mcp`, when an idle HTTP session expires
+  (`[http] session_idle_minutes`), or when the server stops. In every
+  case the turns not yet on disk are flushed first; `DELETE /mcp`
+  replies only after the flush.
+- A session that never recorded a turn writes no snapshot, so health
+  probes and clients that only read leave no files behind.
+- An HTTP client that reconnects gets a new `Mcp-Session-Id` and a new,
+  empty working session. Earlier ones stay readable as
+  `mneme://session/{id}`.
+
 ### Forgetting and the timeline
 
 `remember`, `pin` and `update` each mirror their `content` into an L3
@@ -176,7 +215,7 @@ A client that only reads `resources/list` will not see them.
 | Param | Effect |
 |---|---|
 | `q` (alias `query`) | Natural-language seed for the L4 semantic layer. Percent-encoded; `+` is accepted for space. Without it the `semantic` array is empty — a vector search needs something to be similar *to*. |
-| `scope` | Restricts L0 / L3 / L4 to one scope. L1 working turns are session-local and always included. |
+| `scope` | Restricts L0 / L3 / L4 to one scope. L1 working turns are [session-local](#l1-is-session-local) and always included. |
 | `limit` | How many semantic candidates to over-fetch before the token-budget pass trims. Clamped server-side. |
 | `kinds` | Comma-separated event kinds. The `episodic` section then holds only these. Naming an auto-logged kind opts back in to it. |
 | `exclude_kinds` | Comma-separated event kinds to hide from `episodic`, in addition to the default exclusions. |

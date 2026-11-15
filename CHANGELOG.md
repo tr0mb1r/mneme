@@ -70,6 +70,17 @@ the work that landed before automation was wired up.
   `readOnlyHint` push a turn now, the rule `auto_log_tool_calls = "writes"`
   already uses for the timeline. Not configurable yet.
 
+- **L1 working memory is per session on the daemon and over HTTP.** Every
+  daemon connection and every HTTP `Mcp-Session-Id` now has its own
+  working session and checkpoint scheduler. They used to share the
+  process's single session, so one agent's turns appeared in every other
+  agent's `mneme://context` and `turns_total` mixed all clients, although
+  the docs said "L1 working turns are session-local". A client's session
+  is flushed and its scheduler stopped when the connection closes, on
+  `DELETE /mcp` (before the 204), when an idle HTTP session is evicted and
+  at shutdown. A session that recorded no turn writes no snapshot. stdio
+  (`mneme run`) is unchanged.
+
 ### Added
 
 - Successful `remember`, `pin` and `update` calls report the id of the

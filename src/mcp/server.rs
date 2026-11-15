@@ -101,6 +101,11 @@ pub struct McpSession {
     /// (`[episodic] auto_log_tool_calls`, `log_tool_call_values`) and
     /// the L1 turn (`[working] record_tool_turns`).
     policy: DispatchPolicy,
+    /// `true` when `session` / `checkpoint_scheduler` were opened for
+    /// this MCP session alone (daemon connection, HTTP session) and so
+    /// end with it; `false` for the process-lifetime pair `mneme run`
+    /// shares with its single stdio client and shuts down itself.
+    owns_working_session: bool,
     initialized: AtomicBool,
 }
 
@@ -120,6 +125,7 @@ impl McpSession {
             scope_state: None,
             derive_scope_from_roots: false,
             policy: DispatchPolicy::default(),
+            owns_working_session: false,
             initialized: AtomicBool::new(false),
         }
     }
@@ -145,6 +151,38 @@ impl McpSession {
     pub fn with_dispatch_policy(mut self, policy: DispatchPolicy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Mark the working session passed to [`with_session`](Self::with_session)
+    /// as belonging to this MCP session only, so [`close`](Self::close)
+    /// ends it.
+    pub fn with_owned_working_session(mut self, owned: bool) -> Self {
+        self.owns_working_session = owned;
+        self
+    }
+
+    /// End this MCP session: stop its checkpoint scheduler and, if the
+    /// working session recorded any turn, write the final snapshot.
+    /// A no-op unless the session owns its working session. Idempotent.
+    ///
+    /// The HTTP transport calls this when a session is deleted, expires
+    /// or the listener stops; without it a per-session scheduler would
+    /// keep ticking and the last turns before the client left would
+    /// never reach disk.
+    pub async fn close(&self) {
+        if !self.owns_working_session {
+            return;
+        }
+        if let Some(scheduler) = &self.checkpoint_scheduler
+            && let Err(e) = scheduler.shutdown_if_used().await
+        {
+            tracing::warn!(error = %e, "closing working session: final checkpoint failed");
+        }
+    }
+
+    /// The working session's id, when one is attached.
+    pub fn working_session_id(&self) -> Option<crate::ids::SessionId> {
+        self.session.as_ref().map(|s| s.id())
     }
 
     /// Builder hook: attach the production runtime wiring so each
