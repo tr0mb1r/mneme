@@ -12,6 +12,48 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+### Added
+
+- **`recall` can search recorded events.** `layers: ["semantic",
+  "episodic"]` adds keyword search over the L3 events whose kind is in
+  `[episodic] index_kinds` (decisions, milestones, lessons, summaries
+  and the like; not `tool_call`). Until now an event could be listed by
+  time but not found by what it said, so anything recorded with
+  `record_event` and never copied into a memory was invisible to
+  `recall`. Rows from both layers carry `layer` and `rank` and are
+  ordered by `rank`; an event that contains every query word ranks like
+  a memory at similarity 0.65. Events of kind `archived` or with
+  `retrieval_weight` ≤ 0.3 are demoted, not hidden. The default is still
+  `["semantic"]`, with the same rows in the same order as before.
+- **`recall` takes `since` / `until`** (RFC3339 or ULID, with
+  `time_field`), applied after the search with the search widened until
+  the window is filled. In 1.5.2 these were unknown arguments that
+  pointed at `recall_recent`. `scope` accepts several scopes separated by
+  commas. `include_archived` is accepted.
+- **`include_cold`** on `recall_recent` and `export`, and `mneme export
+  --include-cold`: read the cold archive too. Opt-in because it
+  decompresses quarterly bundles; `recall_recent` opens only the quarters
+  that overlap the window and reads at most 1000 cold rows. Rows are
+  tagged `"tier": "cold"`.
+- **`[consolidation] cold_exempt_kinds`** is honoured: events of those
+  kinds (`archived`, `summary`, `milestone`, `lesson`, `decision` by
+  default) stay in the warm tier instead of being archived, so they stay
+  searchable and forgettable. `[]` restores the old behaviour.
+- **`[episodic] touch_on_recall`** is honoured: hot events returned by
+  `recall` get their `last_accessed` refreshed, after the response and at
+  most once per 24 hours each, so events still in use are not moved to
+  warm on age alone. Nothing called `touch` before, so promotion was pure
+  age.
+
+### Changed
+
+- The consolidation scheduler runs its passes through the server's
+  shared episodic store rather than a private one, so the keyword index
+  sees events leave for cold. Search results are also checked against
+  storage, and an index entry whose row is gone is dropped.
+- `[recall] stemming = "en"` is accepted by the config but not yet
+  implemented; keyword search still matches exact tokens.
+
 ### Security
 
 - Dependencies refreshed for RustSec advisories reported against the
@@ -84,6 +126,17 @@ the work that landed before automation was wired up.
   `readOnlyHint` push a turn now, the rule `auto_log_tool_calls = "writes"`
   already uses for the timeline. Not configurable yet.
 
+- **L1 working memory is per session on the daemon and over HTTP.** Every
+  daemon connection and every HTTP `Mcp-Session-Id` now has its own
+  working session and checkpoint scheduler. They used to share the
+  process's single session, so one agent's turns appeared in every other
+  agent's `mneme://context` and `turns_total` mixed all clients, although
+  the docs said "L1 working turns are session-local". A client's session
+  is flushed and its scheduler stopped when the connection closes, on
+  `DELETE /mcp` (before the 204), when an idle HTTP session is evicted and
+  at shutdown. A session that recorded no turn writes no snapshot. stdio
+  (`mneme run`) is unchanged.
+
 ### Added
 
 - **Auto-context ranks events against the query.** With `?q=`, the
@@ -124,6 +177,18 @@ the work that landed before automation was wired up.
 - Successful `remember`, `pin` and `update` calls report the id of the
   memory they stored or changed as `_meta.id`, and their `tool_call` event
   records it as `memory_id`.
+
+- `[working] record_tool_turns` (`"writes"` default, `"all"`, `"off"`):
+  which successful tool calls add an L1 working turn. `"writes"` is the
+  1.5.2 behaviour, now configurable; `"all"` restores a turn per call.
+- `[episodic] log_tool_call_values` (`"full"` default, `"ids"`, `"off"`):
+  how much of a call's arguments a `tool_call` event keeps. `"ids"` keeps
+  the tool name, ids and scope and replaces `content` with its length and
+  an 8-hex-digit SHA-256 prefix; `"off"` keeps the tool name only.
+  `forget` redaction works in every mode.
+- `mneme init` writes the 1.6 sections into the starter `config.toml`,
+  with comments: `[working]`, `[auto_context]`, and the new `[episodic]`
+  and `[consolidation]` keys.
 
 ### Changed
 
@@ -1091,9 +1156,4 @@ formula, public release pipeline).
 ### Documentation
 
 - Issue and PR templates added under `.github/`.
-- `CONTRIBUTING.md` durability-path policy made concrete:
-  `scripts/manual_test.sh --stub` is the floor for any change
-  touching WAL / redb / HNSW / backup-restore.
-
-[0.2.1]: https://github.com/tr0mb1r/mneme/releases/tag/v0.2.1
-[0.2.0]: https://github.com/tr0mb1r/mneme/releases/tag/v0.2.0
+- `CONTRIBUT

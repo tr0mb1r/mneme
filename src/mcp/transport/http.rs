@@ -187,10 +187,18 @@ where
         "transport=http: listening on http://{local}{MCP_PATH}"
     );
     let sweeper = tokio::spawn(sweep_loop(Arc::clone(&state)));
-    let result = axum::serve(listener, build_router(state))
+    let result = axum::serve(listener, build_router(Arc::clone(&state)))
         .with_graceful_shutdown(shutdown)
         .await;
     sweeper.abort();
+    // Sessions still open when the listener stops are closed here, so
+    // their working turns are flushed before the process exits.
+    let open = state.drain();
+    let count = open.len();
+    close_all(open).await;
+    if count > 0 {
+        tracing::info!(closed = count, "transport=http: closed open sessions");
+    }
     tracing::info!("transport=http: listener stopped");
     result
 }
@@ -226,8 +234,10 @@ async fn sweep_loop(state: Arc<AppState>) {
     loop {
         tick.tick().await;
         let evicted = state.evict_idle();
-        if evicted > 0 {
-            tracing::info!(evicted, "transport=http: swept idle sessions");
+        let count = evicted.len();
+        close_all(evicted).await;
+        if count > 0 {
+            tracing::info!(evicted = count, "transport=http: swept idle sessions");
         }
     }
 }
@@ -239,12 +249,31 @@ impl AppState {
         self.sessions.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    fn evict_idle(&self) -> usize {
-        let ttl = self.session_idle_ttl;
-        let mut map = self.lock();
-        let before = map.len();
-        map.retain(|_, e| e.last_seen.elapsed() < ttl);
-        before - map.len()
+    /// Remove every session idle for longer than the TTL and return
+    /// them. The caller must [`close_all`] (or [`close_detached`]) what
+    /// comes back: removal alone would drop a session's working turns
+    /// unflushed and leave its checkpoint scheduler to be reaped by
+    /// `Drop` only.
+    fn evict_idle(&self) -> Vec<Arc<McpSession>> {
+        Self::take_idle(&mut self.lock(), self.session_idle_ttl)
+    }
+
+    fn take_idle(map: &mut HashMap<String, Entry>, ttl: Duration) -> Vec<Arc<McpSession>> {
+        let expired: Vec<String> = map
+            .iter()
+            .filter(|(_, e)| e.last_seen.elapsed() >= ttl)
+            .map(|(id, _)| id.clone())
+            .collect();
+        expired
+            .iter()
+            .filter_map(|id| map.remove(id))
+            .map(|e| e.session)
+            .collect()
+    }
+
+    /// Remove and return every session (listener shutdown).
+    fn drain(&self) -> Vec<Arc<McpSession>> {
+        self.lock().drain().map(|(_, e)| e.session).collect()
     }
 
     fn check_origin(&self, headers: &HeaderMap) -> Result<(), Reject> {
@@ -311,9 +340,10 @@ impl AppState {
     }
 
     fn create_session(&self) -> Result<(String, Arc<McpSession>), Reject> {
-        let ttl = self.session_idle_ttl;
         let mut map = self.lock();
-        map.retain(|_, e| e.last_seen.elapsed() < ttl);
+        // Expired sessions make room first. They are closed off this
+        // request's path: their flush must not delay the new client.
+        close_detached(Self::take_idle(&mut map, self.session_idle_ttl));
         if map.len() >= self.max_sessions {
             tracing::warn!(
                 max = self.max_sessions,
@@ -346,7 +376,7 @@ impl AppState {
                 Ok(Arc::clone(&e.session))
             }
             Some(_) => {
-                map.remove(id);
+                close_detached(map.remove(id).map(|e| e.session).into_iter().collect());
                 Err(Reject(
                     StatusCode::NOT_FOUND,
                     "session expired; re-initialize",
@@ -447,15 +477,34 @@ async fn delete_mcp(State(state): State<Arc<AppState>>, headers: HeaderMap) -> H
         Ok(id) => id,
         Err(r) => return r.into_response(),
     };
-    let mut map = state.lock();
-    if map.remove(id).is_some() {
-        tracing::info!(
-            active = map.len(),
-            "transport=http: session closed by client"
-        );
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        plain(StatusCode::NOT_FOUND, "unknown session")
+    let (removed, active) = {
+        let mut map = state.lock();
+        (map.remove(id), map.len())
+    };
+    match removed {
+        Some(entry) => {
+            // Flushed before the reply: once the client sees 204 its
+            // working turns are on disk and its scheduler has stopped.
+            entry.session.close().await;
+            tracing::info!(active, "transport=http: session closed by client");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => plain(StatusCode::NOT_FOUND, "unknown session"),
+    }
+}
+
+/// Close sessions that were removed from the table, one after another.
+async fn close_all(sessions: Vec<Arc<McpSession>>) {
+    for session in sessions {
+        session.close().await;
+    }
+}
+
+/// Close removed sessions on a background task, for callers that hold
+/// the table lock or must not wait for a flush.
+fn close_detached(sessions: Vec<Arc<McpSession>>) {
+    if !sessions.is_empty() {
+        tokio::spawn(close_all(sessions));
     }
 }
 
@@ -548,6 +597,9 @@ mod tests {
     use super::*;
     use crate::mcp::resources::ResourceRegistry;
     use crate::mcp::tools::ToolRegistry;
+    use crate::memory::checkpoint_scheduler::{CheckpointSchedulerConfig, WorkingSessionFactory};
+    use crate::memory::working::ActiveSession;
+    use crate::scope::ScopeState;
     use crate::storage::Storage;
     use axum::body::Body;
     use axum::http::{Method, Request};
@@ -558,7 +610,50 @@ mod tests {
 
     struct Fixture {
         app: Router,
+        /// Where working-session snapshots land.
+        sessions_dir: std::path::PathBuf,
         _tmp: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        /// Number of working-session snapshots on disk.
+        fn snapshots(&self) -> usize {
+            std::fs::read_dir(&self.sessions_dir)
+                .map(|d| d.count())
+                .unwrap_or(0)
+        }
+    }
+
+    /// One successful `tools/call`; returns the JSON-RPC response.
+    async fn tool(app: &Router, session: &str, name: &str, args: Value) -> Value {
+        let body = json!({
+            "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": {"name": name, "arguments": args}
+        });
+        let v = body_json(send(app, post(&body, Some(session))).await).await;
+        assert_eq!(v["result"]["isError"], false, "{name}: {v}");
+        v
+    }
+
+    /// The `working` section of `mneme://context` for one session.
+    async fn working_turns(app: &Router, session: &str) -> Value {
+        let body = json!({
+            "jsonrpc": "2.0", "id": 9, "method": "resources/read",
+            "params": {"uri": "mneme://context"}
+        });
+        let v = body_json(send(app, post(&body, Some(session))).await).await;
+        let text = v["result"]["contents"][0]["text"].as_str().unwrap();
+        serde_json::from_str::<Value>(text).unwrap()["working"].clone()
+    }
+
+    fn delete(session: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::DELETE)
+            .uri(MCP_PATH)
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(SESSION_HEADER, session)
+            .body(Body::empty())
+            .unwrap()
     }
 
     fn options(token: TokenSource) -> HttpOptions {
@@ -593,32 +688,51 @@ mod tests {
             Arc::clone(&episodic),
         ));
         let cold = ColdArchive::new(tmp.path());
-        let tools = Arc::new(ToolRegistry::defaults(
-            Arc::clone(&semantic),
-            Arc::clone(&procedural),
-            Arc::clone(&episodic),
-            Arc::clone(&storage),
-            cold.clone(),
-            1,
-        ));
-        let resources = Arc::new(ResourceRegistry::defaults(
-            semantic,
-            procedural,
-            episodic,
-            orchestrator,
-            cold,
-            1,
-            TokenBudget::for_tests(2000),
-        ));
+        // As in `cli::run`: every session gets its own working session,
+        // scheduler, registries and an orchestrator pointed at its turns.
+        let sessions_dir = tmp.path().join("sessions");
+        let working = WorkingSessionFactory::new(
+            sessions_dir.clone(),
+            None,
+            CheckpointSchedulerConfig::production(),
+        );
         let factory: SessionFactory = Arc::new(move || {
-            McpSession::new(
-                Arc::clone(&tools),
-                Arc::clone(&resources),
+            let (session, scheduler) = working.open().unwrap();
+            let scope = ScopeState::new("personal");
+            let tools = Arc::new(ToolRegistry::defaults_with_schedulers(
+                Arc::clone(&semantic),
+                Arc::clone(&procedural),
+                Arc::clone(&episodic),
                 Arc::clone(&storage),
-            )
+                cold.clone(),
+                1,
+                None,
+                Some(Arc::clone(&scheduler)),
+                Arc::clone(&scope),
+                Some(Arc::clone(&session)),
+                crate::mcp::tools::size_tier::DEFAULT_MAX_CHARS,
+                crate::config::SecretsMode::default(),
+            ));
+            let resources = Arc::new(ResourceRegistry::defaults(
+                Arc::clone(&semantic),
+                Arc::clone(&procedural),
+                Arc::clone(&episodic),
+                Arc::new(
+                    (*orchestrator)
+                        .clone()
+                        .with_active_session(Arc::clone(&session)),
+                ),
+                cold.clone(),
+                1,
+                TokenBudget::for_tests(2000),
+            ));
+            McpSession::new(tools, resources, Arc::clone(&storage))
+                .with_session(session, scheduler, Arc::clone(&episodic), scope)
+                .with_owned_working_session(true)
         });
         Fixture {
             app: router(&opts, factory),
+            sessions_dir,
             _tmp: tmp,
         }
     }
@@ -828,6 +942,164 @@ mod tests {
         assert!(v["result"]["tools"].is_array());
     }
 
+    /// L1 working turns belong to the session that produced them.
+    #[tokio::test]
+    async fn working_turns_are_isolated_between_sessions() {
+        let f = fixture();
+        let a = open_session(&f.app).await;
+        let b = open_session(&f.app).await;
+
+        let said = "which tulip varieties did we order";
+        tool(
+            &f.app,
+            &a,
+            "record_event",
+            json!({"kind": "user_message", "payload": {"content": said}}),
+        )
+        .await;
+        tool(&f.app, &a, "remember", json!({"content": "Queen of Night"})).await;
+
+        let turns_a = working_turns(&f.app, &a).await;
+        assert!(turns_a.to_string().contains(said), "{turns_a}");
+        assert_eq!(working_turns(&f.app, &b).await, json!([]));
+
+        let turns_total = |v: Value| {
+            let text = v["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            serde_json::from_str::<Value>(&text).unwrap()["working"]["turns_total"].clone()
+        };
+        // record_event: the message turn and the tool turn; remember: one.
+        assert_eq!(turns_total(tool(&f.app, &a, "stats", json!({})).await), 3);
+        assert_eq!(turns_total(tool(&f.app, &b, "stats", json!({})).await), 0);
+
+        // B's own turns appear in B only.
+        tool(&f.app, &b, "pin", json!({"content": "water on Mondays"})).await;
+        let turns_b = working_turns(&f.app, &b).await;
+        assert_eq!(turns_b.as_array().unwrap().len(), 1, "{turns_b}");
+        assert!(!turns_b.to_string().contains("tulip"));
+        assert_eq!(working_turns(&f.app, &a).await, turns_a);
+    }
+
+    /// DELETE flushes the session's turns before it answers; a session
+    /// that never recorded a turn leaves no file behind.
+    #[tokio::test]
+    async fn delete_flushes_the_working_session_only_if_it_has_turns() {
+        let f = fixture();
+        let used = open_session(&f.app).await;
+        let unused = open_session(&f.app).await;
+        tool(&f.app, &used, "remember", json!({"content": "x marks it"})).await;
+        tool(&f.app, &unused, "recall", json!({"query": "x"})).await;
+        assert_eq!(
+            f.snapshots(),
+            0,
+            "one turn is below the checkpoint threshold"
+        );
+
+        assert_eq!(
+            send(&f.app, delete(&unused)).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(f.snapshots(), 0, "no turns, no snapshot");
+        assert_eq!(
+            send(&f.app, delete(&used)).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(f.snapshots(), 1, "DELETE must flush before replying");
+    }
+
+    /// A session that expires is closed like a deleted one: its turns
+    /// are flushed. Both expiry paths are covered: the request that
+    /// finds its own session expired, and the `initialize` that makes
+    /// room in the table.
+    #[tokio::test]
+    async fn expired_sessions_are_flushed() {
+        let mut opts = options(TokenSource::Static(TOKEN.into()));
+        opts.session_idle_ttl = Duration::from_millis(400);
+        let f = fixture_with(opts);
+        let wait_for = |n: usize| {
+            let f = &f;
+            async move {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while f.snapshots() != n {
+                    assert!(Instant::now() < deadline, "expected {n} snapshot(s)");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+
+        let first = open_session(&f.app).await;
+        tool(&f.app, &first, "remember", json!({"content": "first"})).await;
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let ping = json!({"jsonrpc": "2.0", "id": 2, "method": "ping"});
+        let resp = send(&f.app, post(&ping, Some(&first))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        wait_for(1).await;
+
+        let second = open_session(&f.app).await;
+        tool(&f.app, &second, "remember", json!({"content": "second"})).await;
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        open_session(&f.app).await;
+        wait_for(2).await;
+    }
+
+    /// The sweeper's path, and listener shutdown.
+    #[tokio::test]
+    async fn swept_and_drained_sessions_are_flushed() {
+        let mut opts = options(TokenSource::Static(TOKEN.into()));
+        opts.session_idle_ttl = Duration::from_millis(400);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let working = WorkingSessionFactory::new(
+            tmp.path().to_path_buf(),
+            None,
+            CheckpointSchedulerConfig::production(),
+        );
+        let storage: Arc<dyn Storage> = crate::storage::memory_impl::MemoryStorage::new();
+        let opened: Arc<Mutex<Vec<Arc<ActiveSession>>>> = Arc::default();
+        let factory: SessionFactory = {
+            let opened = Arc::clone(&opened);
+            Arc::new(move || {
+                let (session, scheduler) = working.open().unwrap();
+                opened.lock().unwrap().push(Arc::clone(&session));
+                McpSession::new(
+                    Arc::new(ToolRegistry::new()),
+                    Arc::new(ResourceRegistry::new()),
+                    Arc::clone(&storage),
+                )
+                .with_session(
+                    session,
+                    scheduler,
+                    Arc::new(crate::memory::episodic::EpisodicStore::new(Arc::clone(
+                        &storage,
+                    ))),
+                    ScopeState::new("personal"),
+                )
+                .with_owned_working_session(true)
+            })
+        };
+        let state = new_state(&opts, factory);
+        let snapshots = || std::fs::read_dir(tmp.path()).unwrap().count();
+
+        state.create_session().map_err(|_| ()).unwrap();
+        state.create_session().map_err(|_| ()).unwrap();
+        opened.lock().unwrap()[0].push_turn("user", "swept");
+        assert!(state.evict_idle().is_empty(), "not idle yet");
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let evicted = state.evict_idle();
+        assert_eq!(evicted.len(), 2);
+        close_all(evicted).await;
+        assert_eq!(snapshots(), 1, "only the session with a turn is written");
+
+        state.create_session().map_err(|_| ()).unwrap();
+        opened.lock().unwrap()[2].push_turn("user", "drained");
+        let open = state.drain();
+        assert_eq!(open.len(), 1);
+        close_all(open).await;
+        assert_eq!(snapshots(), 2);
+        assert!(state.lock().is_empty());
+    }
+
     #[tokio::test]
     async fn missing_session_header_is_bad_request() {
         let f = fixture();
@@ -848,15 +1120,7 @@ mod tests {
     async fn delete_ends_the_session() {
         let f = fixture();
         let id = open_session(&f.app).await;
-        let del = || {
-            Request::builder()
-                .method(Method::DELETE)
-                .uri(MCP_PATH)
-                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
-                .header(SESSION_HEADER, &id)
-                .body(Body::empty())
-                .unwrap()
-        };
+        let del = || delete(&id);
         assert_eq!(send(&f.app, del()).await.status(), StatusCode::NO_CONTENT);
         assert_eq!(send(&f.app, del()).await.status(), StatusCode::NOT_FOUND);
         let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});

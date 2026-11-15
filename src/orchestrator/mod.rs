@@ -340,41 +340,29 @@ impl Orchestrator {
         query: Option<&str>,
     ) -> Result<(Vec<EpisodicEvent>, Option<HashMap<EventId, f32>>)> {
         let min_weight = self.auto_context.min_event_weight;
-        // One filter per requested scope (`RecentFilters` takes a
-        // single scope), or one unscoped filter.
-        let scopes: Vec<Option<String>> = if req.scope.is_empty() {
-            vec![None]
-        } else {
-            req.scope.iter().cloned().map(Some).collect()
+        // Filtering happens inside `recall_recent`'s scan so excluded
+        // rows never occupy the over-fetch window. An explicit include
+        // list opts back in to the default exclusions; without one
+        // they apply on top of the caller's list.
+        let filters = RecentFilters {
+            scopes: req.scope.clone(),
+            kinds: req.kinds.clone(),
+            exclude_kinds: req.exclude_kinds.clone(),
+            exclude_kinds_static: if req.kinds.is_empty() {
+                DEFAULT_EXCLUDED_KINDS
+            } else {
+                &[]
+            },
+            ..Default::default()
         };
 
         let mut events: Vec<EpisodicEvent> = Vec::new();
         let mut seen: HashSet<EventId> = HashSet::new();
-        let mut recent: Vec<EpisodicEvent> = Vec::new();
-        for scope in &scopes {
-            // Filtering happens inside `recall_recent`'s scan so
-            // excluded rows never occupy the over-fetch window. An
-            // explicit include list opts back in to the default
-            // exclusions; without one they apply on top of the
-            // caller's list.
-            let filters = recent_filters(req, scope.clone());
-            recent.extend(
-                self.episodic
-                    .recall_recent(&filters, EPISODIC_FETCH * EPISODIC_WEIGHT_OVERFETCH)
-                    .await?,
-            );
-        }
+        let mut recent = self
+            .episodic
+            .recall_recent(&filters, EPISODIC_FETCH * EPISODIC_WEIGHT_OVERFETCH)
+            .await?;
         recent.retain(|e| e.retrieval_weight > min_weight);
-        if scopes.len() > 1 {
-            // Re-establish `recall_recent`'s order across the scopes.
-            recent.sort_by(|a, b| {
-                b.last_accessed
-                    .cmp(&a.last_accessed)
-                    .then(b.retrieval_weight.total_cmp(&a.retrieval_weight))
-                    .then(b.created_at.cmp(&a.created_at))
-                    .then(b.id.0.cmp(&a.id.0))
-            });
-        }
         recent.truncate(EPISODIC_FETCH);
         for e in recent {
             if seen.insert(e.id) {
@@ -386,19 +374,16 @@ impl Orchestrator {
             return Ok((events, None));
         };
 
-        for scope in &scopes {
-            let filters = recent_filters(req, scope.clone());
-            match self.episodic.search(q, EPISODIC_FETCH, &filters).await {
-                Ok(hits) => {
-                    for (e, _) in hits {
-                        if e.retrieval_weight > min_weight && seen.insert(e.id) {
-                            events.push(e);
-                        }
+        match self.episodic.search(q, EPISODIC_FETCH, &filters).await {
+            Ok(hits) => {
+                for (e, _) in hits {
+                    if e.retrieval_weight > min_weight && seen.insert(e.id) {
+                        events.push(e);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "episodic search failed; using recent events only");
-                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "episodic search failed; using recent events only");
             }
         }
 
@@ -449,21 +434,6 @@ impl Orchestrator {
             turns = turns.split_off(turns.len() - WORKING_FETCH);
         }
         Ok(turns)
-    }
-}
-
-/// The episodic filter for one scope of a request.
-fn recent_filters(req: &ContextRequest, scope: Option<String>) -> RecentFilters {
-    RecentFilters {
-        scope,
-        kinds: req.kinds.clone(),
-        exclude_kinds: req.exclude_kinds.clone(),
-        exclude_kinds_static: if req.kinds.is_empty() {
-            DEFAULT_EXCLUDED_KINDS
-        } else {
-            &[]
-        },
-        ..Default::default()
     }
 }
 

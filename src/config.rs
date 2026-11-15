@@ -169,6 +169,17 @@ pub enum LogToolCallValues {
     Off,
 }
 
+impl LogToolCallValues {
+    /// The config-file spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Ids => "ids",
+            Self::Off => "off",
+        }
+    }
+}
+
 /// `[episodic]` -- L3 timeline behaviour.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -279,6 +290,15 @@ pub enum RecordToolTurns {
 }
 
 impl RecordToolTurns {
+    /// The config-file spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Writes => "writes",
+            Self::All => "all",
+            Self::Off => "off",
+        }
+    }
+
     /// Whether a successful call to a tool with this `readOnlyHint`
     /// pushes a working turn.
     pub fn records(self, read_only: bool) -> bool {
@@ -792,6 +812,21 @@ impl Config {
         let scope_default = toml_value(&self.scopes.default);
         let schedule = toml_value(&self.consolidation.schedule);
         let auto_log_tool_calls = toml_value(self.episodic.auto_log_tool_calls.as_str());
+        let str_list = |items: &[String]| {
+            format!(
+                "[{}]",
+                items
+                    .iter()
+                    .map(|i| toml_value(i))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let index_kinds = str_list(&self.episodic.index_kinds);
+        let cold_exempt_kinds = str_list(&self.consolidation.cold_exempt_kinds);
+        let pin_scopes = str_list(&self.auto_context.pin_scopes);
+        let log_tool_call_values = toml_value(self.episodic.log_tool_call_values.as_str());
+        let record_tool_turns = toml_value(self.working.record_tool_turns.as_str());
         let transport = toml_value(&self.mcp.transport);
         let daemon_log_level = toml_value(&self.daemon.log_level);
         let http_bind = toml_value(&self.http.bind);
@@ -848,6 +883,62 @@ derive_from_roots = {derive_from_roots}
 #   "off"    - log nothing, failures included.
 # Failed calls (`tool_call_failed`) are logged in "writes" and "all".
 auto_log_tool_calls = {auto_log_tool_calls}
+# How much of a call's arguments a `tool_call` event keeps.
+#   "full" - the values as passed, `content` included. Default. `forget`
+#            redacts the events that mirrored a forgotten memory.
+#   "ids"  - tool name, ids and scope; `content` is replaced by its
+#            length and an 8-hex-digit SHA-256 prefix. Queries, kinds and
+#            limits are dropped.
+#   "off"  - the tool name only.
+log_tool_call_values = {log_tool_call_values}
+# Event kinds whose text is indexed for keyword search, so `recall` with
+# `layers` and query-seeded auto-context can find them. `tool_call` rows
+# are deliberately not indexed.
+index_kinds = {index_kinds}
+# Refresh `last_accessed` on events that `recall` returns, so events that
+# keep being used stay in the hot tier. Set false for read-only runs
+# (evaluations, CI) that must not write.
+touch_on_recall = {touch_on_recall}
+
+[working]
+# Which successful tool calls add a turn to the L1 working session.
+#   "writes" - tools that change something. Default. Lookups (recall,
+#              recall_recent, stats, ...) are not conversation.
+#   "all"    - every call (the behaviour up to 1.5.1).
+#   "off"    - none; only messages recorded with `record_event` are turns.
+record_tool_turns = {record_tool_turns}
+
+[auto_context]
+# How mneme://context scores and packs the layers. Shares are fractions
+# of [budgets] auto_context_token_budget.
+#
+# Long-term memories lose rank with age, measured from their last
+# update: half-life in days (0 = no decay) and the floor the factor
+# never goes below, so age only breaks near-ties in relevance. `recall`
+# itself is not decayed.
+semantic_half_life_days = {semantic_half_life_days}
+semantic_recency_floor = {semantic_recency_floor}
+# Largest share events (L3) may take, and the share reserved for
+# long-term memories (L4) -- or `semantic_min_items` rows, whichever is
+# smaller in tokens.
+episodic_max_share = {episodic_max_share}
+semantic_min_share = {semantic_min_share}
+semantic_min_items = {semantic_min_items}
+# Largest share working-session turns (L1) may take.
+working_max_share = {working_max_share}
+# With a query: weight of plain recency (0.0 = rank events by query
+# match only, 1.0 = by recency only).
+episodic_query_mix = {episodic_query_mix}
+# Events are clipped to this many characters and charged at that size.
+event_clip_chars = {event_clip_chars}
+# Events at or below this retrieval weight are left out.
+min_event_weight = {min_event_weight}
+# At most this many events of one kind, so one chatty kind cannot fill
+# the section.
+max_events_per_kind = {max_events_per_kind}
+# Pin scopes always included next to the requested scope, so a scoped
+# read keeps the global rules. [] = only the requested scope's pins.
+pin_scopes = {pin_scopes}
 
 [consolidation]
 # L3 episodic tier transitions, in days.
@@ -856,6 +947,10 @@ warm_to_cold_days = {warm_to_cold_days}
 # Only "idle" is implemented: the scheduler wakes every 5 minutes and
 # fires only if nothing was written in the previous window.
 schedule = {schedule}
+# Event kinds that stay in the warm tier instead of moving to the cold
+# archive, so they remain searchable and reachable by `forget`.
+# [] = every kind ages into cold.
+cold_exempt_kinds = {cold_exempt_kinds}
 
 [checkpoints]
 # L1 working-session flush cadence: whichever trigger fires first.
@@ -927,6 +1022,22 @@ max_files = {max_files}
             scope_default = scope_default,
             derive_from_roots = self.scopes.derive_from_roots,
             auto_log_tool_calls = auto_log_tool_calls,
+            log_tool_call_values = log_tool_call_values,
+            index_kinds = index_kinds,
+            touch_on_recall = self.episodic.touch_on_recall,
+            record_tool_turns = record_tool_turns,
+            semantic_half_life_days = toml_float(self.auto_context.semantic_half_life_days),
+            semantic_recency_floor = toml_float(self.auto_context.semantic_recency_floor),
+            episodic_max_share = toml_float(self.auto_context.episodic_max_share),
+            semantic_min_share = toml_float(self.auto_context.semantic_min_share),
+            semantic_min_items = self.auto_context.semantic_min_items,
+            working_max_share = toml_float(self.auto_context.working_max_share),
+            episodic_query_mix = toml_float(self.auto_context.episodic_query_mix),
+            event_clip_chars = self.auto_context.event_clip_chars,
+            min_event_weight = toml_float(self.auto_context.min_event_weight),
+            max_events_per_kind = self.auto_context.max_events_per_kind,
+            pin_scopes = pin_scopes,
+            cold_exempt_kinds = cold_exempt_kinds,
             hot_to_warm_days = self.consolidation.hot_to_warm_days,
             warm_to_cold_days = self.consolidation.warm_to_cold_days,
             schedule = schedule,
@@ -953,6 +1064,13 @@ max_files = {max_files}
             max_files = self.logging.max_files,
         )
     }
+}
+
+/// Render an `f32` as a TOML float that parses back to the same `f32`.
+/// `{:?}` gives the shortest such decimal and always carries a `.` or an
+/// exponent, so `90.0` does not become the integer `90`.
+fn toml_float(v: f32) -> String {
+    format!("{v:?}")
 }
 
 #[cfg(test)]
@@ -1172,6 +1290,86 @@ mod tests {
         let p = tmp.path().join("config.toml");
         c.write_starter(&p).unwrap();
         assert_eq!(Config::load(&p).unwrap(), c);
+    }
+
+    /// Every 1.6 key the template lists must carry a non-default value
+    /// through a write and a load, lists and floats included.
+    #[test]
+    fn starter_template_round_trips_the_1_6_sections() {
+        let mut c = Config::default();
+        c.episodic.log_tool_call_values = LogToolCallValues::Ids;
+        c.episodic.index_kinds = vec!["decision".into(), "it's".into()];
+        c.episodic.touch_on_recall = false;
+        c.working.record_tool_turns = RecordToolTurns::All;
+        c.consolidation.cold_exempt_kinds = vec![];
+        c.auto_context = AutoContextConfig {
+            semantic_half_life_days: 0.0,
+            semantic_recency_floor: 0.6,
+            episodic_max_share: 0.25,
+            semantic_min_share: 0.4,
+            semantic_min_items: 7,
+            working_max_share: 0.1,
+            episodic_query_mix: 1.0,
+            event_clip_chars: 200,
+            min_event_weight: 0.05,
+            max_events_per_kind: 3,
+            pin_scopes: vec![],
+            include_demoted: false,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("config.toml");
+        c.write_starter(&p).unwrap();
+        assert_eq!(Config::load(&p).unwrap(), c);
+    }
+
+    /// The template documents each 1.6 section, and leaves out the keys
+    /// that do nothing until 1.7 (relations) or are still experimental.
+    #[test]
+    fn starter_template_lists_the_1_6_sections() {
+        let text = Config::default().starter_toml();
+        for expected in [
+            "[working]",
+            "record_tool_turns = \"writes\"",
+            "[auto_context]",
+            "pin_scopes = [\"global\"]",
+            "semantic_half_life_days = 90.0",
+            "semantic_recency_floor = 0.75",
+            "log_tool_call_values = \"full\"",
+            "touch_on_recall = true",
+            "index_kinds = [\"decision\"",
+            "cold_exempt_kinds = [\"archived\"",
+        ] {
+            assert!(text.contains(expected), "starter config lacks `{expected}`");
+        }
+        for reserved in ["include_demoted", "demote_margin", "[recall]", "stemming"] {
+            assert!(
+                !text.contains(reserved),
+                "starter config lists `{reserved}`, which has no effect yet"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_enums_parse_their_config_spellings() {
+        for (text, values, turns) in [
+            ("full", LogToolCallValues::Full, RecordToolTurns::Writes),
+            ("ids", LogToolCallValues::Ids, RecordToolTurns::All),
+            ("off", LogToolCallValues::Off, RecordToolTurns::Off),
+        ] {
+            let doc = format!(
+                "[episodic]\nlog_tool_call_values = \"{text}\"\n\
+                 [working]\nrecord_tool_turns = \"{}\"\n",
+                turns.as_str()
+            );
+            let c: Config = toml::from_str(&doc).unwrap();
+            assert_eq!(c.episodic.log_tool_call_values, values);
+            assert_eq!(values.as_str(), text);
+            assert_eq!(c.working.record_tool_turns, turns);
+        }
+        assert!(toml::from_str::<Config>("[working]\nrecord_tool_turns = \"reads\"\n").is_err());
+        assert!(RecordToolTurns::Writes.records(false) && !RecordToolTurns::Writes.records(true));
+        assert!(RecordToolTurns::All.records(true) && !RecordToolTurns::Off.records(false));
     }
 
     #[test]

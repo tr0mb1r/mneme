@@ -5,8 +5,15 @@
 //! ```bash
 //! MNEME_DATA_DIR=/tmp/foo cargo run --example seed_storage -- write 10
 //! MNEME_DATA_DIR=/tmp/foo cargo run --example seed_storage -- read
+//! MNEME_DATA_DIR=/tmp/bar cargo run --example seed_storage -- corpus
 //! ```
 //!
+//! - `corpus` fills a fresh data directory with the synthetic corpus the
+//!   structural quality tests use (`tests/common/corpus.rs`): 300 facts
+//!   in 6 scopes, 10 stale/current pairs, 20 curated events, 60 warm
+//!   events and 6 pins, all deterministic. Vectors come from the stub
+//!   embedder, so serve the directory with `MNEME_EMBEDDER=stub mneme run`
+//!   to poke at it; a real model re-embeds everything on first boot.
 //! - `write N` populates the dir with N plaintext rows under
 //!   `RedbStorage::open` (legacy plaintext path).
 //! - `read` opens via `crypto::boot::open_episodic_storage`, which
@@ -23,6 +30,9 @@ use mneme::memory::procedural::ProceduralStore;
 use mneme::storage::Storage;
 use mneme::storage::redb_impl::RedbStorage;
 use std::path::PathBuf;
+
+#[path = "../tests/common/corpus.rs"]
+mod corpus;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -94,7 +104,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  {} {} {:?}", p.id, p.content, p.tags);
             }
         }
-        other => return Err(format!("unknown command: {other:?}; use `write N` or `read`").into()),
+        "corpus" => {
+            use mneme::embed::Embedder;
+            use mneme::embed::stub::StubEmbedder;
+            use mneme::memory::episodic::EpisodicStore;
+            use mneme::memory::semantic::{SemanticStore, SnapshotConfig};
+            use std::sync::Arc;
+
+            mneme::cli::init::init_at(&root)?;
+            let keyring = OsKeyring::new();
+            let (storage, aead) =
+                mneme::crypto::boot::open_episodic_storage_and_aead(&root, &keyring)?;
+            let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::new());
+            let semantic = SemanticStore::open_with_crypto(
+                &root,
+                Arc::clone(&storage),
+                embedder,
+                SnapshotConfig::disabled(),
+                aead.clone(),
+            )?;
+            let procedural = ProceduralStore::open_with_crypto(&root, aead)?;
+            let episodic = EpisodicStore::new(Arc::clone(&storage));
+
+            let c = corpus::seed(&semantic, &procedural, &episodic).await?;
+            semantic.shutdown().await?;
+            storage.flush().await?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "data_dir": root.display().to_string(),
+                    "scopes": corpus::SCOPES,
+                    "facts": c.facts.len(),
+                    "id_heavy_facts": c.id_heavy().count(),
+                    "stale_current_pairs": c.pairs.len(),
+                    "semantic_rows": c.semantic_rows(),
+                    "curated_events_hot": c.curated.len(),
+                    "events_warm": c.warm.len(),
+                    "pins": c.pins.len(),
+                    "pins_global": c.pins_in("global").count(),
+                })
+            );
+        }
+        other => {
+            return Err(
+                format!("unknown command: {other:?}; use `write N`, `read` or `corpus`").into(),
+            );
+        }
     }
     Ok(())
 }

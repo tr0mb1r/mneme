@@ -90,6 +90,16 @@ temp+rename per checkpoint). Single file per session.
 - `session_interval_turns = 5` — and at least every 5 turns.
 - Whichever fires first.
 
+**L1 is session-local.** Every MCP session has its own working
+session and its own checkpoint scheduler: one per `mneme run` process
+(stdio), one per accepted daemon connection, one per HTTP
+`Mcp-Session-Id`. Agents sharing a daemon share L0, L3 and L4, never
+L1. (Up to 1.5.x the daemon and HTTP transports shared one working
+session between all clients.) A per-client session is flushed and its
+scheduler stopped when the connection closes, on `DELETE /mcp`, when an
+idle HTTP session is evicted, and at server shutdown; a session with no
+turns writes no snapshot.
+
 **What runs today:**
 > `cli::run` spawns a `CheckpointScheduler` that writes the active
 > session to `~/.mneme/sessions/<session_id>.snapshot` on the first
@@ -188,11 +198,24 @@ such a row once (the hot copy) and `forget` removes both copies.
 | Tier | Read by |
 |---|---|
 | hot (`epi:`) | `recall_recent`, `mneme://recent`, `mneme://context`, `summarize_session`, `export` |
-| warm (`wepi:`) | `recall_recent` when `since` is older than `hot_to_warm_days`, when only `until` is set, or with `include_warm: true`; `export` (tool and `mneme export`) by default; `forget` by id |
-| cold (`cold/*.zst`) | no tool. `mneme backup` copies the files. |
+| warm (`wepi:`) | `recall_recent` when `since` is older than `hot_to_warm_days`, when only `until` is set, or with `include_warm: true`; `export` (tool and `mneme export`) by default; `recall` with `layers` containing `episodic`; `forget` by id |
+| cold (`cold/*.zst`) | `recall_recent` and `export` with `include_cold: true`, `mneme export --include-cold`. Not searched by `recall`. `mneme backup` copies the files. |
 
-Rows from `recall_recent` and `export` carry `"tier": "hot"` or
-`"tier": "warm"`. Before 1.5.2 nothing read the warm tier, so an event
+Rows from `recall_recent` and `export` carry `"tier": "hot"`,
+`"warm"` or `"cold"`.
+
+**Searching L3.** Events are not embedded, but the ones whose kind is in
+`[episodic] index_kinds` are covered by an in-memory keyword index
+(BM25, the same code as L4's lexical half) over the hot and warm tiers.
+`recall(layers=["semantic","episodic"])` merges those matches with L4's
+on one `rank` scale. The index is built from redb on first use and kept
+in step on record, forget and consolidation; nothing extra is written
+to disk. A row's move from hot to warm does not change it. Kinds in
+`[consolidation] cold_exempt_kinds` never go to cold, so a decision
+stays searchable however old it gets; everything else leaves the index
+when it is archived. Hot events that `recall` returns get their
+`last_accessed` refreshed (at most daily, `[episodic] touch_on_recall`),
+which is what keeps a still-used event from being promoted on age. Before 1.5.2 nothing read the warm tier, so an event
 dropped out of every read path at 28 days and `export` was not a
 complete backup. `export` still leaves out the cold tier: for a full
 copy use `mneme backup`, which tars the data dir and so restores every

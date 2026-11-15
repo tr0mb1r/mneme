@@ -328,6 +328,7 @@ mod tests {
             ConsolidationParams {
                 hot_to_warm_days: 28,
                 warm_to_cold_days: 180,
+                cold_exempt_kinds: Vec::new(),
             },
             SchedulerConfig::disabled(),
             vec![],
@@ -360,6 +361,7 @@ mod tests {
             ConsolidationParams {
                 hot_to_warm_days: 28,
                 warm_to_cold_days: 180,
+                cold_exempt_kinds: Vec::new(),
             },
             SchedulerConfig::disabled(),
             vec![],
@@ -388,6 +390,7 @@ mod tests {
             ConsolidationParams {
                 hot_to_warm_days: 28,
                 warm_to_cold_days: 180,
+                cold_exempt_kinds: Vec::new(),
             },
             SchedulerConfig::disabled(),
             vec![],

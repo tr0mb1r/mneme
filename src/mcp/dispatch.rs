@@ -1,4 +1,4 @@
-use crate::config::AutoLogToolCalls;
+use crate::config::{AutoLogToolCalls, Config, LogToolCallValues, RecordToolTurns};
 use crate::mcp::jsonrpc::{Id, Response, error_codes};
 use crate::mcp::server::FAILED_MESSAGE_CAP;
 use crate::mcp::tools::{ContentBlock, ToolError, ToolRegistry, ToolResult};
@@ -8,6 +8,92 @@ use crate::memory::semantic::normalise_content;
 use crate::memory::working::ActiveSession;
 use crate::scope::ScopeState;
 use serde_json::{Value, json};
+
+/// What a successful `tools/call` leaves behind besides its result:
+/// the three settings the dispatcher consults, bundled so a session
+/// carries one value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DispatchPolicy {
+    /// `[episodic] auto_log_tool_calls`: which calls are mirrored to L3.
+    pub auto_log: AutoLogToolCalls,
+    /// `[episodic] log_tool_call_values`: how much of the arguments a
+    /// mirrored `tool_call` event keeps.
+    pub log_values: LogToolCallValues,
+    /// `[working] record_tool_turns`: which calls push an L1 turn.
+    pub tool_turns: RecordToolTurns,
+}
+
+impl DispatchPolicy {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            auto_log: config.episodic.auto_log_tool_calls,
+            log_values: config.episodic.log_tool_call_values,
+            tool_turns: config.working.record_tool_turns,
+        }
+    }
+}
+
+impl From<AutoLogToolCalls> for DispatchPolicy {
+    /// Everything else at its default; for fixtures that only vary the
+    /// auto-log mode.
+    fn from(auto_log: AutoLogToolCalls) -> Self {
+        Self {
+            auto_log,
+            ..Self::default()
+        }
+    }
+}
+
+/// First 8 hex characters of SHA-256 over `content`, exactly as passed.
+/// Enough to tell "the same text was written twice" on the timeline; not
+/// a commitment anyone should rely on.
+fn content_sha256_8(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(content.as_bytes());
+    digest.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Reduce a full `tool_call` payload to what `[episodic]
+/// log_tool_call_values` allows.
+///
+/// * `full`: unchanged.
+/// * `ids`: the tool name, the ids (`id`, `memory_id`), the scope
+///   (`scope`, `new_scope`), and for a write that carried `content` its
+///   length in characters and an 8-hex-digit SHA-256 prefix, in place of
+///   the text. Queries, kinds and limits are dropped. A payload whose
+///   content was already removed because the secret guard flagged it
+///   gets no hash either.
+/// * `off`: the tool name only.
+///
+/// `forget` needs nothing from the text to redact these rows: in `ids`
+/// mode they are found by `memory_id`/`id` like any other, and lose the
+/// hash and length; in `off` mode there is nothing in them to redact.
+pub fn apply_log_values(mode: LogToolCallValues, payload: Value) -> Value {
+    const KEPT_IN_IDS: [&str; 5] = ["tool", "id", "memory_id", "scope", "new_scope"];
+    let Value::Object(full) = payload else {
+        return payload;
+    };
+    match mode {
+        LogToolCallValues::Full => Value::Object(full),
+        LogToolCallValues::Ids => {
+            let mut out = serde_json::Map::new();
+            for key in KEPT_IN_IDS {
+                if let Some(v) = full.get(key) {
+                    out.insert(key.to_owned(), v.clone());
+                }
+            }
+            if let Some(content) = full.get("content").and_then(Value::as_str) {
+                out.insert("content_sha256".into(), json!(content_sha256_8(content)));
+                out.insert("content_len".into(), json!(content.chars().count()));
+            }
+            Value::Object(out)
+        }
+        LogToolCallValues::Off => match full.get("tool") {
+            Some(tool) => json!({ "tool": tool }),
+            None => json!({}),
+        },
+    }
+}
 
 /// Build the L3 `tool_call` event payload for a successful invocation.
 /// Per ADR-0009: extract only the per-tool value-bearing arg(s);
@@ -273,21 +359,6 @@ async fn emit_tool_call_failed(
     }
 }
 
-/// Whether a successful call to a tool with the given `readOnlyHint`
-/// pushes an L1 working turn (`role = "tool"`, content = the tool name).
-///
-/// Reads do not. A turn per call made looking something up count as
-/// conversation: a read-only evaluation run moved `turns_total` from 361
-/// to 1026, each of those turns took a slot in the working-memory window
-/// that auto-context shows the model, and every fifth one triggered a
-/// session checkpoint with nothing new in it. It is the same rule
-/// `auto_log_tool_calls = "writes"` applies to the L3 mirror.
-///
-/// Fixed at "writes" for now; 1.6 makes it `[working] record_tool_turns`.
-fn records_tool_turn(read_only: bool) -> bool {
-    !read_only
-}
-
 /// Dispatch a `tools/call` request: extract name/args, look up the
 /// tool in the registry, invoke it, and return the appropriate
 /// JSON-RPC response. Also handles L3 event emission for both
@@ -302,10 +373,11 @@ pub async fn handle_tools_call(
     checkpoint_scheduler: Option<&CheckpointScheduler>,
     episodic: Option<&EpisodicStore>,
     scope_state: Option<&ScopeState>,
-    auto_log: AutoLogToolCalls,
+    policy: DispatchPolicy,
     id: Id,
     params: Option<Value>,
 ) -> Response {
+    let auto_log = policy.auto_log;
     let params = match params {
         Some(p) => p,
         None => {
@@ -357,8 +429,14 @@ pub async fn handle_tools_call(
             // Both the L1 turn and the L3 mirror are decided by the
             // tool's own `readOnlyHint` (cached at registration), so a
             // newly added tool is classified without touching this code.
+            //
+            // L1: `[working] record_tool_turns`, default `writes`. A turn
+            // per lookup made reading count as conversation: a read-only
+            // evaluation run moved `turns_total` from 361 to 1026, each
+            // turn took a slot in the working window auto-context shows
+            // the model, and every fifth one wrote an empty checkpoint.
             let read_only = tools.is_read_only(&name).unwrap_or(false);
-            if records_tool_turn(read_only)
+            if policy.tool_turns.records(read_only)
                 && let (Some(session), Some(sched)) = (session, checkpoint_scheduler)
             {
                 session.push_turn("tool", &name);
@@ -382,6 +460,9 @@ pub async fn handle_tools_call(
                 {
                     obj.insert("memory_id".to_owned(), json!(memory_id));
                 }
+                // Last, so the hash is never taken of content the secret
+                // guard already removed.
+                let payload = apply_log_values(policy.log_values, payload);
                 if let Err(e) = episodic.record_json("tool_call", &scope, &payload).await {
                     tracing::warn!(
                         error = %e,
@@ -442,11 +523,15 @@ mod tests {
         registry: ToolRegistry,
         episodic: Arc<EpisodicStore>,
         scope_state: Arc<ScopeState>,
-        auto_log: AutoLogToolCalls,
+        policy: DispatchPolicy,
     }
 
     impl Rig {
         fn new(secrets: SecretsMode, auto_log: AutoLogToolCalls) -> Self {
+            Self::with_policy(secrets, auto_log.into())
+        }
+
+        fn with_policy(secrets: SecretsMode, policy: DispatchPolicy) -> Self {
             let tmp = tempfile::TempDir::new().unwrap();
             let backing: Arc<dyn Storage> = MemoryStorage::new();
             let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
@@ -474,7 +559,7 @@ mod tests {
                 registry,
                 episodic,
                 scope_state,
-                auto_log,
+                policy,
             }
         }
 
@@ -485,7 +570,7 @@ mod tests {
                 None,
                 Some(&self.episodic),
                 Some(&self.scope_state),
-                self.auto_log,
+                self.policy,
                 Id::Number(1),
                 Some(json!({"name": tool, "arguments": args})),
             )
@@ -774,7 +859,7 @@ mod tests {
                     Some(sched),
                     Some(&rig.episodic),
                     Some(&rig.scope_state),
-                    rig.auto_log,
+                    rig.policy,
                     Id::Number(1),
                     Some(json!({"name": tool, "arguments": args})),
                 )
@@ -832,6 +917,197 @@ mod tests {
         assert!(turns.iter().all(|t| t.role == "tool"));
 
         sched.shutdown().await.unwrap();
+    }
+
+    /// `[working] record_tool_turns`: `all` restores a turn per call,
+    /// `off` records none; `writes` is covered above.
+    #[tokio::test]
+    async fn record_tool_turns_all_and_off() {
+        use crate::memory::checkpoint_scheduler::CheckpointSchedulerConfig;
+
+        for (mode, expected) in [(RecordToolTurns::All, 3), (RecordToolTurns::Off, 0)] {
+            let rig = Rig::with_policy(
+                SecretsMode::Reject,
+                DispatchPolicy {
+                    tool_turns: mode,
+                    ..DispatchPolicy::default()
+                },
+            );
+            let sessions = tempfile::TempDir::new().unwrap();
+            let session = ActiveSession::open(sessions.path().to_path_buf()).unwrap();
+            let sched = CheckpointScheduler::start(
+                Arc::clone(&session),
+                CheckpointSchedulerConfig::disabled(),
+            );
+            for (tool, args) in [
+                ("remember", json!({"content": "we use redb"})),
+                ("recall", json!({"query": "redb"})),
+                ("stats", json!({})),
+            ] {
+                let resp = handle_tools_call(
+                    &rig.registry,
+                    Some(&session),
+                    Some(&sched),
+                    Some(&rig.episodic),
+                    Some(&rig.scope_state),
+                    rig.policy,
+                    Id::Number(1),
+                    Some(json!({"name": tool, "arguments": args})),
+                )
+                .await;
+                assert!(resp.error.is_none(), "{tool}: {:?}", resp.error);
+            }
+            assert_eq!(session.turns_total(), expected, "{mode:?}");
+            sched.shutdown().await.unwrap();
+        }
+    }
+
+    fn values_rig(log_values: LogToolCallValues) -> Rig {
+        Rig::with_policy(
+            SecretsMode::Warn,
+            DispatchPolicy {
+                auto_log: AutoLogToolCalls::All,
+                log_values,
+                ..DispatchPolicy::default()
+            },
+        )
+    }
+
+    /// `log_tool_call_values = "ids"`: who and which memory, never what.
+    #[tokio::test]
+    async fn ids_mode_keeps_ids_scope_hash_and_length_only() {
+        let rig = values_rig(LogToolCallValues::Ids);
+        let mem = rig
+            .write(
+                "remember",
+                json!({"content": SECRET_V1, "kind": "decision", "scope": "private"}),
+            )
+            .await;
+        rig.write("update", json!({"id": mem, "content": SECRET_V2}))
+            .await;
+        rig.ok("recall", json!({"query": "locker combination", "limit": 3}))
+            .await;
+        rig.ok("switch_scope", json!({"scope": "other"})).await;
+        rig.ok(
+            "record_event",
+            json!({"kind": "decision", "payload": {"content": BYSTANDER}}),
+        )
+        .await;
+
+        let events = rig.tool_call_payloads().await;
+        let by_tool = |tool: &str| {
+            events
+                .iter()
+                .find(|e| e["tool"] == tool)
+                .unwrap_or_else(|| panic!("no {tool} row in {events:?}"))
+                .clone()
+        };
+        assert_eq!(
+            by_tool("remember"),
+            json!({
+                "tool": "remember",
+                "scope": "private",
+                "memory_id": mem,
+                "content_sha256": content_sha256_8(SECRET_V1),
+                "content_len": SECRET_V1.chars().count(),
+            })
+        );
+        assert_eq!(
+            by_tool("update"),
+            json!({
+                "tool": "update",
+                "id": mem,
+                "memory_id": mem,
+                "content_sha256": content_sha256_8(SECRET_V2),
+                "content_len": SECRET_V2.chars().count(),
+            })
+        );
+        assert_eq!(by_tool("recall"), json!({"tool": "recall"}));
+        assert_eq!(
+            by_tool("switch_scope"),
+            json!({"tool": "switch_scope", "new_scope": "other"})
+        );
+        assert_eq!(by_tool("record_event"), json!({"tool": "record_event"}));
+        assert_no_trace(&rig, SECRET_V1).await;
+        assert_no_trace(&rig, SECRET_V2).await;
+        assert_eq!(content_sha256_8("abc"), "ba7816bf");
+
+        // forget still finds the rows, by id, and takes the hash and
+        // length with it.
+        let result = rig.ok("forget", json!({"id": mem})).await;
+        assert_eq!(result["_meta"]["redacted_tool_calls"], 2);
+        let events = rig.tool_call_payloads().await;
+        let about: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["memory_id"] == mem.as_str())
+            .collect();
+        assert_eq!(about.len(), 2);
+        for e in about {
+            assert_eq!(e["redacted"], "forgotten");
+            assert!(e.get("content_sha256").is_none() && e.get("content_len").is_none());
+        }
+    }
+
+    /// A write the secret guard flagged leaves no hash of the secret.
+    #[tokio::test]
+    async fn ids_mode_takes_no_hash_of_flagged_content() {
+        let rig = values_rig(LogToolCallValues::Ids);
+        let mem = rig
+            .write(
+                "remember",
+                json!({"content": format!("deploy key {}", aws_key())}),
+            )
+            .await;
+        let events = rig.tool_call_payloads().await;
+        assert_eq!(
+            events[0],
+            json!({"tool": "remember", "memory_id": mem}),
+            "{events:?}"
+        );
+    }
+
+    /// `log_tool_call_values = "off"`: the tool name and nothing else, so
+    /// there is nothing for `forget` to redact, and nothing left over.
+    #[tokio::test]
+    async fn off_mode_keeps_the_tool_name_only() {
+        let rig = values_rig(LogToolCallValues::Off);
+        let mem = rig.write("remember", json!({"content": SECRET_V1})).await;
+        rig.write("update", json!({"id": mem, "content": SECRET_V2}))
+            .await;
+        rig.write("pin", json!({"content": BYSTANDER})).await;
+        rig.ok("recall", json!({"query": "locker"})).await;
+        let mut events = rig.tool_call_payloads().await;
+        events.reverse();
+        assert_eq!(
+            events,
+            [
+                json!({"tool": "remember"}),
+                json!({"tool": "update"}),
+                json!({"tool": "pin"}),
+                json!({"tool": "recall"}),
+            ]
+        );
+
+        let result = rig.ok("forget", json!({"id": mem})).await;
+        assert!(result.get("_meta").is_none(), "{result}");
+        assert_no_trace(&rig, SECRET_V1).await;
+        assert_no_trace(&rig, SECRET_V2).await;
+    }
+
+    /// `full` is the default and is what every other test here runs under.
+    #[test]
+    fn full_mode_is_the_default_and_changes_nothing() {
+        assert_eq!(
+            DispatchPolicy::default().log_values,
+            LogToolCallValues::Full
+        );
+        let payload = json!({"tool": "remember", "content": "x", "kind": "fact"});
+        assert_eq!(
+            apply_log_values(LogToolCallValues::Full, payload.clone()),
+            payload
+        );
+        let from_config = DispatchPolicy::from_config(&Config::default());
+        assert_eq!(from_config, DispatchPolicy::default());
     }
 
     #[test]
@@ -954,23 +1230,14 @@ mod tests {
         }
     }
 
+    /// `recall` takes `since` / `until` itself since 1.6, so the 1.5.2
+    /// hint that sent callers to `recall_recent` is gone. A stray key
+    /// still gets the plain unknown-argument error.
     #[tokio::test]
-    async fn recall_since_until_points_at_recall_recent() {
+    async fn recall_stray_argument_gets_the_plain_error() {
         let rig = Rig::new(SecretsMode::Reject, AutoLogToolCalls::Writes);
-        let msg = invalid_params(
-            &rig,
-            "recall",
-            json!({"query": "x", "since": "2026-09-01T00:00:00Z", "until": "2026-10-19T00:00:00Z"}),
-        )
-        .await;
-        assert!(
-            msg.contains("unexpected argument(s) `since`, `until`"),
-            "{msg}"
-        );
-        assert_eq!(msg.matches("call `recall_recent`").count(), 1, "{msg}");
-
-        // Any other stray key gets the plain error, without the hint.
         let msg = invalid_params(&rig, "recall", json!({"query": "x", "k": 3})).await;
+        assert!(msg.contains("unexpected argument(s) `k`"), "{msg}");
         assert!(!msg.contains("recall_recent"), "{msg}");
     }
 

@@ -410,8 +410,9 @@ pub struct RecallFilters {
     /// Keep only memories whose [`Self::time_field`] timestamp is at or
     /// after this instant.
     pub since: Option<DateTime<Utc>>,
-    /// Keep only memories whose [`Self::time_field`] timestamp is at or
-    /// before this instant.
+    /// Keep only memories whose [`Self::time_field`] timestamp is
+    /// strictly before this instant: the window is half-open,
+    /// `[since, until)`, as for `recall_recent`.
     pub until: Option<DateTime<Utc>>,
     /// Which timestamp `since` / `until` compare against.
     pub time_field: TimeField,
@@ -450,7 +451,7 @@ impl RecallFilters {
     }
 
     fn in_time_window(&self, ts: DateTime<Utc>) -> bool {
-        self.since.is_none_or(|s| ts >= s) && self.until.is_none_or(|u| ts <= u)
+        self.since.is_none_or(|s| ts >= s) && self.until.is_none_or(|u| ts < u)
     }
 
     /// Apply every populated predicate to one candidate.
@@ -3840,17 +3841,16 @@ mod tests {
                 "{mode:?}"
             );
         }
-        // Bounds are inclusive.
-        assert_eq!(
-            ids(RecallFilters {
-                since: Some(revised),
-                until: Some(revised),
-                time_field: TimeField::UpdatedAt,
-                ..Default::default()
-            })
-            .await,
-            vec![edited]
-        );
+        // The window is half-open: `since` is included, `until` is not.
+        let window = |since, until| RecallFilters {
+            since: Some(since),
+            until: Some(until),
+            time_field: TimeField::UpdatedAt,
+            ..Default::default()
+        };
+        let ms = chrono::Duration::milliseconds(1);
+        assert_eq!(ids(window(revised, revised + ms)).await, vec![edited]);
+        assert!(ids(window(revised - ms, revised)).await.is_empty());
     }
 
     /// `rank` is similarity plus keyword evidence on every path.

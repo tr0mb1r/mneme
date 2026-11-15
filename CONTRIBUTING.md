@@ -25,6 +25,18 @@ Thanks for your interest. This document is short on purpose.
   home (`mem:` prefix in redb + HNSW). Don't blur layers.
 - **Stay in Mneme's lane.** No code embedding, no knowledge graph, no
   SaaS. The README's "What it isn't" section is the source of truth.
+- **Recall and auto-context changes are checked structurally.**
+  `tests/quality_structural.rs` runs on every PR against a synthetic
+  corpus (`tests/common/corpus.rs`; no model, stub embedder): scoped reads
+  keep global pins, layers stay within their budget shares, warm events
+  are reachable, `forget` leaves no text behind, working memory is per
+  session, canonical calls raise no argument errors, reads add no turns,
+  context is deterministic. If you change ranking, packing or the tool
+  surface, extend the corpus or the checks in the same PR. A test marked
+  `#[ignore = "needs ..."]` there is the acceptance test for work in
+  progress; un-ignore it when that work lands. To look at the corpus:
+  `MNEME_DATA_DIR=/tmp/c cargo run --example seed_storage -- corpus`,
+  then `MNEME_EMBEDDER=stub MNEME_DATA_DIR=/tmp/c mneme run`.
 
 ## Style
 
@@ -38,20 +50,27 @@ Thanks for your interest. This document is short on purpose.
   before review.
 - Changes that touch hot-path code (`src/memory/`, `src/index/`,
   `src/storage/`, `src/orchestrator/`, `src/mcp/`) trip the
-  `.github/workflows/perf.yml` regression gate. Any p95 latency that
-  slips > 10 % vs `benches/baselines/v0_2_6.json` blocks merge per
-  release-planning v2.1 §6.2. Run locally with:
+  `.github/workflows/perf.yml` regression gate. It benchmarks the base
+  commit and your change on the same runner and blocks merge if a
+  hot-path median (p50) slows by more than 15 %. Run the same comparison
+  locally:
 
   ```sh
+  git stash; git checkout main
+  cargo bench --bench remember --bench recall \
+              --bench cold_start --bench auto_context -- --quick
+  python3 benches/baselines/extract_baseline.py /tmp/base.json --corpus 1000
+  rm -rf target/criterion; git checkout -; git stash pop
   cargo bench --bench remember --bench recall \
               --bench cold_start --bench auto_context -- --quick
   python3 benches/baselines/extract_baseline.py /tmp/this.json --corpus 1000
-  python3 benches/baselines/compare.py benches/baselines/v0_2_6.json /tmp/this.json
+  python3 benches/baselines/compare.py /tmp/base.json /tmp/this.json \
+          --metric p50_ns --tolerance-pct 15
   ```
 
   If the regression is justified (e.g. v1.1 daemon-mode network hop),
-  update the baseline JSON in the same commit and explain the trade
-  in the description.
+  explain the trade in the PR description; an admin merges it through
+  the ruleset bypass.
 
 ## Commits
 

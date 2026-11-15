@@ -347,7 +347,9 @@ impl ToolRegistry {
                 .with_max_chars(max_remember_chars)
                 .with_secret_guard(secrets),
         ));
-        r.register(Arc::new(recall::Recall::new(Arc::clone(&semantic))));
+        r.register(Arc::new(
+            recall::Recall::new(Arc::clone(&semantic)).with_episodic(Arc::clone(&episodic)),
+        ));
         r.register(Arc::new(forget::Forget::new(
             Arc::clone(&semantic),
             Arc::clone(&procedural),
@@ -365,9 +367,9 @@ impl ToolRegistry {
         ));
         r.register(Arc::new(unpin::Unpin::new(Arc::clone(&procedural))));
         // L3 — episodic memory.
-        r.register(Arc::new(recall_recent::RecallRecent::new(Arc::clone(
-            &episodic,
-        ))));
+        r.register(Arc::new(
+            recall_recent::RecallRecent::new(Arc::clone(&episodic)).with_cold(cold.clone()),
+        ));
         r.register(Arc::new(summarize_session::SummarizeSession::new(
             Arc::clone(&episodic),
         )));
@@ -392,7 +394,7 @@ impl ToolRegistry {
             Arc::clone(&semantic),
             Arc::clone(&procedural),
             Arc::clone(&episodic),
-            cold,
+            cold.clone(),
             schema_version,
         );
         if let Some(sched) = consolidation {
@@ -409,7 +411,9 @@ impl ToolRegistry {
             Arc::clone(&episodic),
             Arc::clone(&storage),
         )));
-        r.register(Arc::new(export::Export::new(procedural, episodic, storage)));
+        r.register(Arc::new(
+            export::Export::new(procedural, episodic, storage).with_cold(cold),
+        ));
         r
     }
 
@@ -770,7 +774,7 @@ mod tests {
             None,
             None,
             None,
-            AutoLogToolCalls::Off,
+            AutoLogToolCalls::Off.into(),
             Id::Number(1),
             Some(json!({"name": name, "arguments": arguments})),
         )
@@ -931,7 +935,7 @@ mod tests {
                 None,
                 None,
                 None,
-                AutoLogToolCalls::Writes,
+                AutoLogToolCalls::Writes.into(),
                 Id::Number(n),
                 Some(json!({"name": "counting", "arguments": {}})),
             )
