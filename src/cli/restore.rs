@@ -288,7 +288,6 @@ mod tests {
     /// pointing outside the data dir, then writes a file *through* it,
     /// must be refused — and must not write anything outside `root`.
     /// Guards the CWE-22 symlink-escape fix in `restore_at`.
-    #[cfg(unix)]
     #[test]
     fn restore_refuses_symlink_escape() {
         // The "victim" location an attacker wants to write into, well

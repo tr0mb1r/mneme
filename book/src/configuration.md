@@ -70,6 +70,19 @@ default_recall_limit       = 10
 auto_context_token_budget  = 4000
 max_remember_chars         = 10000
 
+[auto_context]
+semantic_half_life_days = 90     # 0 = no decay for memories
+semantic_recency_floor  = 0.75
+episodic_max_share      = 0.35
+semantic_min_share      = 0.30
+semantic_min_items      = 5
+working_max_share       = 0.05
+episodic_query_mix      = 0.3
+event_clip_chars        = 400    # 0 = do not clip
+min_event_weight        = 0.3
+max_events_per_kind     = 6      # 0 = no cap
+pin_scopes              = ["global"]
+
 [guardrails]
 secrets = "reject"              # or "warn" / "off"
 
@@ -496,13 +509,14 @@ written from then on; it does not rewrite existing rows.
 |---|---|
 | **Type** | array of strings |
 | **Default** | `["decision", "milestone", "lesson", "summary", "resolution", "problem", "pivot", "observation", "archived"]` |
-| **Affects** | which event kinds are keyword-indexed |
+| **Affects** | which event kinds `recall(layers=[…, "episodic"])` and query-conditioned auto-context can find |
 | **Since** | 1.6.0 |
 
-Events of these kinds can be found by their words: by `recall` when it is
-asked for the episodic layer, and by auto-context when a query is given.
-`tool_call` and message kinds are left out on purpose; add a kind of your
-own here if you record curated events under another name.
+Events of these kinds are keyword-indexed (in memory, hot and warm
+tiers). The text indexed is `payload.content`, else `payload.text`, plus
+the tags. `tool_call` and the message kinds are left out by default:
+they are many, and they repeat text that is already stored elsewhere.
+Changing the list takes effect on restart, when the index is rebuilt.
 
 ### `touch_on_recall`
 
@@ -510,11 +524,16 @@ own here if you record curated events under another name.
 |---|---|
 | **Type** | boolean |
 | **Default** | `true` |
-| **Affects** | whether events returned by `recall` refresh their `last_accessed` |
+| **Affects** | whether `recall` refreshes `last_accessed` on the events it returns |
 | **Since** | 1.6.0 |
 
-Events that keep being used stay in the hot tier. Set it to `false` for
-runs that must not write anything (evaluations, CI).
+Consolidation moves an event to warm once its `last_accessed` is
+`hot_to_warm_days` old. With this on, a hot event returned by `recall`
+has its `last_accessed` set to now, so events that keep being used stay
+hot. The write happens after the response is sent and at most once per
+24 hours per event; warm events are never rewritten. Set it to `false`
+for runs that must not write on reads (evaluations, CI): `recall` then
+changes nothing.
 
 ---
 
@@ -544,31 +563,6 @@ up in the `working` section of `mneme://context`, counts towards
 Each MCP session has its own working session: one per stdio process, one
 per daemon connection, one per HTTP `Mcp-Session-Id`. See
 [L1 is session-local](./mcp-surface.md#l1-is-session-local).
-
----
-
-## `[auto_context]` — how `mneme://context` is packed
-
-Since 1.6.0. Shares are fractions of
-`[budgets] auto_context_token_budget`. The behaviour these keys tune is
-described in [MCP surface](./mcp-surface.md); the table is the reference.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `semantic_half_life_days` | `90.0` | Half-life of a long-term memory's freshness, measured from its last update. `0` turns the decay off. Auto-context only; `recall` ranking is not decayed. |
-| `semantic_recency_floor` | `0.75` | The freshness factor never goes below this, so age only breaks near-ties in relevance. |
-| `episodic_max_share` | `0.35` | Largest share of the budget events (L3) may take. |
-| `semantic_min_share` | `0.3` | Share reserved for long-term memories (L4)… |
-| `semantic_min_items` | `5` | …or this many rows, whichever is smaller in tokens. |
-| `working_max_share` | `0.05` | Largest share working-session turns (L1) may take. |
-| `episodic_query_mix` | `0.3` | With a query: the weight of plain recency against query match when ranking events (`0.0` = match only, `1.0` = recency only). |
-| `event_clip_chars` | `400` | Events are clipped to this many characters and charged at the clipped size. |
-| `min_event_weight` | `0.3` | Events at or below this retrieval weight are left out. |
-| `max_events_per_kind` | `6` | At most this many events of one kind. |
-| `pin_scopes` | `["global"]` | Pin scopes always included next to the requested scope, so a scoped read keeps the global rules. `[]` restores the pre-1.6 behaviour (only the requested scope's pins). |
-
-`include_demoted` also loads but has no effect until memory relations
-arrive in 1.7; `mneme init` does not write it.
 
 ---
 
@@ -605,7 +599,25 @@ Warm events older than this get archived to
 `<root>/cold/<YYYY-Qn>.zst` (zstd-compressed JSON bundles) and
 deleted from the warm tier. Cold lookups are still possible via
 `storage::archive::ColdArchive::find_anywhere(id)` but are off the
-hot path — they're for forensics, not auto-context.
+hot path — they're for forensics, not auto-context. `recall_recent` and
+`export` read them with `include_cold: true`; `recall` does not search
+them.
+
+### `cold_exempt_kinds`
+
+| | |
+|---|---|
+| **Type** | array of strings |
+| **Default** | `["archived", "summary", "milestone", "lesson", "decision"]` |
+| **Affects** | which event kinds stay in the warm tier for good |
+| **Since** | 1.6.0 |
+
+Events of these kinds are never archived to cold, however old. They stay
+in redb, so `recall` keeps finding them and `forget` can still delete
+them (cold bundles are never rewritten). The cost is that redb keeps
+growing with them; these are the low-volume kinds. `[]` restores the
+pre-1.6 behaviour, where every kind is archived at `warm_to_cold_days`.
+Events already in the cold archive are not brought back.
 
 ### `schedule`
 
@@ -627,20 +639,6 @@ options:
 Future modes (`"every_<n>m"`, cron expressions, `"on_demand"`)
 are tracked for post-v1.1.x. Anything other than `"idle"` today
 logs a warning and falls back to `"idle"` cadence.
-
-### `cold_exempt_kinds`
-
-| | |
-|---|---|
-| **Type** | array of strings |
-| **Default** | `["archived", "summary", "milestone", "lesson", "decision"]` |
-| **Affects** | which event kinds never move from warm to the cold archive |
-| **Since** | 1.6.0 |
-
-Cold quarter bundles are compact and immutable: events in them are not
-searchable and `forget` cannot reach them. Curated kinds are few and are
-the ones worth finding a year later, so they stay in the warm tier. `[]`
-restores the pre-1.6 behaviour, where every kind ages into cold.
 
 ---
 
@@ -667,9 +665,12 @@ one. `recall` callers can override per-call up to a hard cap of
 | **Affects** | `mneme://context` total payload size |
 
 Total token budget for the auto-context resource. The orchestrator
-greedy-packs the four memory layers (procedural / working / episodic
-/ semantic) up to this ceiling, with per-layer minimums protecting
-each layer from being starved.
+packs the four memory layers (procedural / working / episodic /
+semantic) up to this ceiling. How the budget is divided between them is
+set in [`[auto_context]`](#auto_context--how-mnemecontext-is-scored-and-packed).
+
+Pinned items are never trimmed. If they alone are larger than this
+budget, the context exceeds it and holds nothing else.
 
 The default 4000 is calibrated for a ~32K-token model context window
 where you want to spend ~12% on agent memory. Bump for larger
@@ -708,6 +709,76 @@ Raise this only when you have a specific need (research notes, long
 runbooks). The advisory + warning meta will still surface above
 500/2,000 chars; tightening the ceiling moves only the rejection
 threshold.
+
+---
+
+## `[auto_context]` — how `mneme://context` is scored and packed
+
+All keys are optional; a config file without the section gets the
+defaults below. Scoring and packing are described in
+[MCP surface §Scoring](./mcp-surface.md#scoring-auto-context).
+
+### Layer shares
+
+Fractions of `[budgets] auto_context_token_budget`. Values outside
+`0.0`–`1.0` are clamped.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `episodic_max_share` | `0.35` | Most of the budget episodic events may take. |
+| `working_max_share` | `0.05` | Most of the budget working-session turns may take. |
+| `semantic_min_share` | `0.30` | Reserved for semantic rows before the other layers are packed. |
+| `semantic_min_items` | `5` | The reserve is this many rows instead, when they are fewer tokens than `semantic_min_share`. |
+
+Pinned items have no share: they are always kept. Semantic rows have no
+ceiling: they take whatever events and turns leave. The shares need not
+add up to 1.
+
+To give events more room, raise `episodic_max_share`; at `1.0` they are
+limited only by the semantic reserve and the pins, which is close to how
+the budget was split before 1.6.
+
+### Freshness of memories
+
+| Key | Default | Meaning |
+|---|---|---|
+| `semantic_half_life_days` | `90` | Half-life of a memory's freshness, measured from its last content edit (`updated_at`). `0` turns decay off. |
+| `semantic_recency_floor` | `0.75` | Lowest value the freshness factor can take. |
+
+A memory's auto-context score is `rank × 0.7 × max(floor, 2^(−age/half_life))`.
+With the defaults a memory never loses more than a quarter of its score to
+age. These keys affect `mneme://context` only; `recall` does not decay.
+
+### Event selection
+
+| Key | Default | Meaning |
+|---|---|---|
+| `episodic_query_mix` | `0.3` | β. With a `?q=` seed an event scores `recency × (β + (1−β)·lex)`, where `lex` is how much of the query it contains. `1.0` ignores the query; `0.0` removes events that share nothing with it from contention. |
+| `event_clip_chars` | `400` | Payloads longer than this are clipped and the row is marked `truncated`. `0` turns clipping off. |
+| `min_event_weight` | `0.3` | Events with `retrieval_weight` at or below this are left out. |
+| `max_events_per_kind` | `6` | At most this many events of one kind. `0` means no cap. |
+
+Events of kind `archived` are always left out unless the read names them
+with `?kinds=archived`.
+
+### `pin_scopes`
+
+| | |
+|---|---|
+| **Type** | array of strings |
+| **Default** | `["global"]` |
+| **Affects** | Which pins a scoped `mneme://context` read returns |
+
+A read of `mneme://context?scope=a,b` returns the pins stored under `a`
+and `b`, plus the pins stored under every scope listed here. A read with
+no `scope` returns every pin and ignores this key.
+
+Before 1.6 a scoped read returned only the pins of that scope, so naming
+a scope dropped the global rules. Set `pin_scopes = []` to restore that.
+
+### `include_demoted`
+
+Reserved for 1.7. Has no effect.
 
 ---
 

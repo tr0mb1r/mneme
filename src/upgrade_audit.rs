@@ -97,20 +97,10 @@ fn run_dir(root: &Path) -> PathBuf {
     root.join("run")
 }
 
-#[cfg(unix)]
 fn set_run_dir_perms(dir: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(0o700);
     std::fs::set_permissions(dir, perms)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_run_dir_perms(_dir: &Path) -> Result<()> {
-    // Windows ACLs are managed when the daemon binds the named pipe;
-    // the directory itself inherits the user's profile permissions
-    // (which are already user-owned), so no explicit chmod is needed
-    // here.
     Ok(())
 }
 
@@ -256,7 +246,6 @@ mod tests {
         assert!(!log.contains("over-limit memory IDs"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn run_dir_gets_0700_perms_after_audit() {
         use std::os::unix::fs::PermissionsExt;

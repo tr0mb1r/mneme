@@ -24,7 +24,7 @@ recover if you change machines, and what's deliberately out of scope.
 | Attacker with the disk AND the keyring AND the mnemonic | ❌ |
 
 Encryption at rest is one layer. For lost-laptop scenarios it pairs
-well with FileVault (macOS), LUKS (Linux), and BitLocker (Windows) —
+well with FileVault (macOS) and LUKS (Linux) —
 mneme strongly recommends enabling those too.
 
 ## Architecture

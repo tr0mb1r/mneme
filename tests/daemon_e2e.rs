@@ -2,11 +2,6 @@
 //! A.M3 (multi-client + SIGTERM-driven shutdown). Per
 //! release-planning v2.1 §3.9 + ADR-0012, these are release gates
 //! for the daemon-mode track.
-//!
-//! Linux + macOS only (cfg(unix)) — Windows named-pipe support is M4
-//! per ADR-0012 D2/D9.
-
-#![cfg(unix)]
 
 use std::path::Path;
 use std::process::Stdio;

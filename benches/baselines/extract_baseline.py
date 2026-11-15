@@ -11,10 +11,17 @@ Run after `cargo bench --bench remember --bench recall
 
 Usage:
   python3 benches/baselines/extract_baseline.py <output_path> [--corpus N]
+                                                [--criterion-root DIR]
 
 `--corpus N` filters to bench ids that contain `n=<N>` so a single
 baseline file is one corpus size; omit to include everything criterion
 wrote.
+
+`--criterion-root DIR` reads criterion output from DIR instead of
+`target/criterion` (criterion writes wherever `CRITERION_HOME` points).
+The `git` block then describes the checkout DIR is in, if it is in one,
+so a base commit benchmarked from its own worktree is labelled as
+itself.
 
 This script does NOT shell out to cargo. It only reads existing
 target/criterion/ output. See benches/baselines/README.md for how
@@ -58,7 +65,7 @@ def per_iter_ns(sample: dict) -> list[float]:
     return [t / i for t, i in zip(times, iters) if i > 0]
 
 
-def find_new_dirs(corpus: int | None) -> list[Path]:
+def find_new_dirs(corpus: int | None, root: Path = CRITERION_ROOT) -> list[Path]:
     """Walk target/criterion for `*/new/` dirs holding both jsons.
 
     `corpus` filters *corpus-parameterised* benches to a single size so
@@ -71,11 +78,11 @@ def find_new_dirs(corpus: int | None) -> list[Path]:
     What the filter excluded is printed to stderr rather than silently
     dropped, so a surprising bench count in the output is traceable.
     """
-    if not CRITERION_ROOT.is_dir():
-        sys.exit(f"no criterion output at {CRITERION_ROOT} — run cargo bench first")
+    if not root.is_dir():
+        sys.exit(f"no criterion output at {root} — run cargo bench first")
     found: list[Path] = []
     skipped: list[str] = []
-    for sample in CRITERION_ROOT.rglob("new/sample.json"):
+    for sample in root.rglob("new/sample.json"):
         new_dir = sample.parent
         if not (new_dir / "estimates.json").is_file():
             continue
@@ -120,15 +127,23 @@ def summarize(new_dir: Path) -> dict:
     }
 
 
-def git_describe() -> dict:
+def git_describe(cwd: Path = REPO_ROOT) -> dict:
     def run(*args: str) -> str:
-        return subprocess.check_output(args, cwd=REPO_ROOT, text=True).strip()
+        return subprocess.check_output(
+            args, cwd=cwd, text=True, stderr=subprocess.DEVNULL
+        ).strip()
 
-    return {
-        "branch": run("git", "rev-parse", "--abbrev-ref", "HEAD"),
-        "sha": run("git", "rev-parse", "HEAD"),
-        "describe": run("git", "describe", "--tags", "--always", "--dirty"),
-    }
+    try:
+        return {
+            "branch": run("git", "rev-parse", "--abbrev-ref", "HEAD"),
+            "sha": run("git", "rev-parse", "HEAD"),
+            "describe": run("git", "describe", "--tags", "--always", "--dirty"),
+        }
+    except (subprocess.CalledProcessError, OSError):
+        # A criterion root outside any checkout: label it with this one.
+        if cwd != REPO_ROOT:
+            return git_describe(REPO_ROOT)
+        raise
 
 
 def main() -> None:
@@ -136,9 +151,15 @@ def main() -> None:
     ap.add_argument("output", help="Where to write the baseline JSON.")
     ap.add_argument("--corpus", type=int, default=None,
                     help="Filter to bench ids containing n=<corpus>.")
+    ap.add_argument("--criterion-root", type=Path, default=CRITERION_ROOT,
+                    help="Criterion output dir (default: target/criterion).")
+    ap.add_argument("--git-from", type=Path, default=None,
+                    help="Checkout the `git` block describes (default: the "
+                         "one --criterion-root is in, else this one).")
     args = ap.parse_args()
 
-    new_dirs = find_new_dirs(args.corpus)
+    root = args.criterion_root.resolve()
+    new_dirs = find_new_dirs(args.corpus, root)
     if not new_dirs:
         filt = f" with corpus n={args.corpus}" if args.corpus else ""
         sys.exit(f"no criterion benches found{filt}")
@@ -146,12 +167,16 @@ def main() -> None:
     benches = {bench_label(d): summarize(d) for d in new_dirs}
     payload = {
         "captured_at": datetime.now(timezone.utc).isoformat(),
-        "git": git_describe(),
+        "git": git_describe(args.git_from or root),
         "host": {
             "uname": os.uname().sysname + " " + os.uname().release,
             "arch": os.uname().machine,
         },
-        "criterion_root": str(CRITERION_ROOT.relative_to(REPO_ROOT)),
+        "criterion_root": (
+            str(root.relative_to(REPO_ROOT))
+            if root.is_relative_to(REPO_ROOT)
+            else str(root)
+        ),
         "corpus_filter": args.corpus,
         "benches": benches,
     }

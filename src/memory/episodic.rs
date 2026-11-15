@@ -56,14 +56,38 @@
 //! hot-to-warm threshold ([`WarmRead::Auto`]).
 //! [`EpisodicStore::list_hot_and_warm`] is the full-dump reader used
 //! by `export`. The cold archive is not read from here.
+//!
+//! # Keyword index
+//!
+//! L3 events are not embedded (ADR-0007), so until 1.6 they could be
+//! listed by time but not searched by content. The store now keeps an
+//! in-memory [`KeywordIndex`] over the hot and warm events whose kind is
+//! in `[episodic] index_kinds` (decisions, milestones, lessons and the
+//! like; `tool_call` rows are left out on purpose). The indexed text is
+//! `payload.content`, else `payload.text`, plus the tags; see
+//! [`indexable_text`].
+//!
+//! The index is built from storage on first use and kept in step by
+//! `record_full`, `forget`, `rewrite_payloads` and the consolidation
+//! deletes. Moving a row hot → warm does not touch it: the index is
+//! keyed by event id, which does not change. Nothing is written to
+//! disk. Clones of a store share one index.
+//!
+//! [`EpisodicStore::search`] confirms every index hit against storage
+//! and drops entries whose row is gone, so an index that has drifted
+//! (a row removed through another `EpisodicStore` over the same
+//! storage, say) repairs itself instead of returning ghosts.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::ids::EventId;
 use crate::memory::activity::ActivityCounter;
+use crate::memory::keyword::KeywordIndex;
 use crate::storage::Storage;
 use crate::{MnemeError, Result};
 
@@ -78,13 +102,15 @@ pub const EPI_KEY_PREFIX: &[u8] = b"epi:";
 /// tiers; reads merge results from both prefixes.
 pub const WARM_KEY_PREFIX: &[u8] = b"wepi:";
 
-/// Which live tier a row was read from. Surfaced on `recall_recent`
-/// and `export` rows so a caller can tell an aged-out event from a
-/// current one.
+/// Which tier a row was read from. Surfaced on `recall_recent` and
+/// `export` rows so a caller can tell an aged-out event from a current
+/// one. The store itself only ever returns `Hot` and `Warm`; `Cold`
+/// tags rows a tool read from the cold archive on request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Hot,
     Warm,
+    Cold,
 }
 
 impl Tier {
@@ -92,6 +118,7 @@ impl Tier {
         match self {
             Tier::Hot => "hot",
             Tier::Warm => "warm",
+            Tier::Cold => "cold",
         }
     }
 }
@@ -101,6 +128,51 @@ impl Tier {
 pub struct TieredEvent {
     pub event: EpisodicEvent,
     pub tier: Tier,
+}
+
+/// `recall_recent`'s order: `last_accessed` newest first, then higher
+/// `retrieval_weight`, then `created_at` newest first.
+pub fn recency_order(a: &EpisodicEvent, b: &EpisodicEvent) -> std::cmp::Ordering {
+    // Primary: most-recently-touched wins.
+    b.last_accessed
+        .cmp(&a.last_accessed)
+        // Secondary: higher retrieval_weight wins among equally-recent
+        // peers. f32 comparison can produce NaN; treat NaN as ::Equal so
+        // we don't panic on pathological inputs (record_weighted already
+        // rejects out-of-range values, so this is defensive).
+        .then_with(|| {
+            b.retrieval_weight
+                .partial_cmp(&a.retrieval_weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        // Final deterministic tiebreaker.
+        .then_with(|| b.created_at.cmp(&a.created_at))
+}
+
+/// `export`'s order: `created_at` newest first, ties broken by id
+/// (newest first) so the order does not depend on a row's tier.
+pub fn newest_first(a: &EpisodicEvent, b: &EpisodicEvent) -> std::cmp::Ordering {
+    b.created_at
+        .cmp(&a.created_at)
+        .then_with(|| b.id.cmp(&a.id))
+}
+
+/// Append `cold` rows, tagged [`Tier::Cold`], to rows read from redb.
+/// A cold row whose id is already in `live` is dropped: warm → cold
+/// writes the bundle before deleting the warm row, so a crash in
+/// between leaves the event in both, and the redb copy is the one that
+/// can still be forgotten.
+pub fn with_cold_rows(mut live: Vec<TieredEvent>, cold: Vec<EpisodicEvent>) -> Vec<TieredEvent> {
+    let seen: std::collections::HashSet<EventId> = live.iter().map(|t| t.event.id).collect();
+    live.extend(
+        cold.into_iter()
+            .filter(|e| !seen.contains(&e.id))
+            .map(|event| TieredEvent {
+                event,
+                tier: Tier::Cold,
+            }),
+    );
+    live
 }
 
 /// Whether [`EpisodicStore::recall_recent`] scans the warm tier.
@@ -123,6 +195,88 @@ pub enum WarmRead {
     Always,
     /// Never scan warm (the pre-1.5.2 behaviour).
     Never,
+}
+
+/// Minimum age of `last_accessed` before
+/// [`EpisodicStore::touch_if_stale`] writes a new one when called from
+/// `recall`. A touch is a WAL-synced write made on behalf of a read, so
+/// an event recalled many times a day is refreshed at most once a day.
+pub const RECALL_TOUCH_DEBOUNCE_HOURS: i64 = 24;
+
+/// How many times [`EpisodicStore`] rebuilds its keyword index when
+/// writes keep landing during the build, before it keeps what it has.
+const INDEX_BUILD_ATTEMPTS: usize = 8;
+
+/// The text of `event` that the keyword index covers: `payload.content`
+/// if the payload is a JSON object with that string field, else
+/// `payload.text`, else every top-level string value of the object; a
+/// payload that is a bare JSON string, or not JSON at all, is used
+/// whole. Tags are appended, one per line, so a tag is searchable too.
+pub fn indexable_text(event: &EpisodicEvent) -> String {
+    use serde_json::Value;
+    let mut text = match serde_json::from_str::<Value>(&event.payload) {
+        Ok(Value::Object(map)) => {
+            let field = |name: &str| map.get(name).and_then(Value::as_str).map(str::to_owned);
+            field("content")
+                .or_else(|| field("text"))
+                .unwrap_or_else(|| {
+                    map.values()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+        }
+        Ok(Value::String(s)) => s,
+        _ => event.payload.clone(),
+    };
+    for tag in &event.tags {
+        text.push('\n');
+        text.push_str(tag);
+    }
+    text
+}
+
+/// One lexical match from [`EpisodicStore::search_tiered`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct LexicalHit {
+    pub event: EpisodicEvent,
+    pub tier: Tier,
+    /// IDF-weighted share of the query the event contains, in `(0, 1]`;
+    /// the number [`EpisodicStore::lex_scores`] reports.
+    pub coverage: f32,
+    /// BM25 score, only meaningful against other hits of the same query.
+    pub bm25: f32,
+}
+
+/// The lazily built keyword index plus a counter of writes, shared by
+/// every clone of a store.
+#[derive(Default)]
+struct SharedIndex {
+    inner: RwLock<Option<KeywordIndex<EventId>>>,
+    /// Bumped, under the write lock, by every change to the indexed
+    /// rows. A build compares it before its storage scan and at install
+    /// time and starts over if a write slipped in between.
+    generation: AtomicU64,
+}
+
+impl SharedIndex {
+    fn read<T>(&self, f: impl FnOnce(Option<&KeywordIndex<EventId>>) -> T) -> T {
+        let guard = self.inner.read().unwrap_or_else(|p| p.into_inner());
+        f(guard.as_ref())
+    }
+
+    /// Note a change and apply it to the index if one is built.
+    fn mutate(&self, f: impl FnOnce(&mut KeywordIndex<EventId>)) {
+        let mut guard = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(idx) = guard.as_mut() {
+            f(idx);
+        }
+    }
+}
+
+fn default_index_kinds() -> Arc<[String]> {
+    crate::config::EpisodicConfig::default().index_kinds.into()
 }
 
 /// Default `retrieval_weight` when the caller doesn't specify one.
@@ -202,13 +356,27 @@ pub struct RecentFilters {
     pub until: Option<DateTime<Utc>>,
     /// Warm-tier policy; [`WarmRead::Auto`] by default.
     pub warm: WarmRead,
+    /// Include-only list of scopes: when non-empty an event passes only
+    /// if its scope equals one of these. Combines (AND) with `scope`.
+    pub scopes: Vec<String>,
+    /// Every tag listed here must be on the event (AND, exact,
+    /// case-sensitive), as for `recall`'s `tags`. Empty: no constraint.
+    pub tags: Vec<String>,
 }
 
 impl RecentFilters {
-    fn matches(&self, event: &EpisodicEvent) -> bool {
+    /// Whether `event` passes every populated filter. The `warm` policy
+    /// is not a row predicate and is not checked here.
+    pub fn matches(&self, event: &EpisodicEvent) -> bool {
         if let Some(ref s) = self.scope
             && &event.scope != s
         {
+            return false;
+        }
+        if !self.scopes.is_empty() && !self.scopes.contains(&event.scope) {
+            return false;
+        }
+        if !self.tags.iter().all(|t| event.tags.contains(t)) {
             return false;
         }
         if let Some(ref k) = self.kind
@@ -270,6 +438,13 @@ pub struct EpisodicStore {
     /// The consolidation threshold, used only to decide when a
     /// [`WarmRead::Auto`] read has to look at the warm tier.
     hot_to_warm_days: u32,
+    /// Keyword index over the events of `index_kinds`. `None` inside
+    /// until the first search builds it.
+    index: Arc<SharedIndex>,
+    /// `[episodic] index_kinds`.
+    index_kinds: Arc<[String]>,
+    /// `[episodic] touch_on_recall`. Read by the `recall` tool.
+    touch_on_recall: bool,
 }
 
 impl EpisodicStore {
@@ -278,7 +453,106 @@ impl EpisodicStore {
             storage,
             activity: ActivityCounter::new(),
             hot_to_warm_days: crate::config::DEFAULT_HOT_TO_WARM_DAYS,
+            index: Arc::new(SharedIndex::default()),
+            index_kinds: default_index_kinds(),
+            touch_on_recall: crate::config::EpisodicConfig::default().touch_on_recall,
         }
+    }
+
+    /// Set which event kinds the keyword index covers, from `[episodic]
+    /// index_kinds`. Call it while building the store: it starts a
+    /// fresh, unbuilt index, which is no longer shared with clones made
+    /// earlier.
+    pub fn with_index_kinds(mut self, kinds: Vec<String>) -> Self {
+        self.index_kinds = kinds.into();
+        self.index = Arc::new(SharedIndex::default());
+        self
+    }
+
+    /// Set `[episodic] touch_on_recall`: whether `recall` refreshes the
+    /// `last_accessed` of the episodic rows it returns.
+    pub fn with_touch_on_recall(mut self, on: bool) -> Self {
+        self.touch_on_recall = on;
+        self
+    }
+
+    /// `[episodic] touch_on_recall` as configured on this store.
+    pub fn touch_on_recall(&self) -> bool {
+        self.touch_on_recall
+    }
+
+    /// Whether events of `kind` are keyword-indexed.
+    pub fn is_indexed_kind(&self, kind: &str) -> bool {
+        self.index_kinds.iter().any(|k| k == kind)
+    }
+
+    /// Build the keyword index from storage if it is not built yet.
+    async fn ensure_index(&self) -> Result<()> {
+        for attempt in 1..=INDEX_BUILD_ATTEMPTS {
+            if self.index.read(|idx| idx.is_some()) {
+                return Ok(());
+            }
+            let generation = self.index.generation.load(Ordering::SeqCst);
+            let rows = self
+                .scan_tiers(true, |e| self.is_indexed_kind(&e.kind))
+                .await?;
+            // Strict coverage: this index is searched next to L4's, so
+            // a term it has never seen is a miss, not phrasing.
+            let mut built = KeywordIndex::strict();
+            for row in &rows {
+                built.insert(row.event.id, &indexable_text(&row.event));
+            }
+            if self.install_index(built, generation, attempt == INDEX_BUILD_ATTEMPTS) {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Install `built` unless a write landed since `generation` was
+    /// read (then the build is missing a row, which nothing would
+    /// repair, and the caller scans again). `last_attempt` installs
+    /// regardless. Returns whether an index is now in place.
+    fn install_index(
+        &self,
+        built: KeywordIndex<EventId>,
+        generation: u64,
+        last_attempt: bool,
+    ) -> bool {
+        let mut guard = self.index.inner.write().unwrap_or_else(|p| p.into_inner());
+        if guard.is_some() {
+            return true;
+        }
+        let raced = self.index.generation.load(Ordering::SeqCst) != generation;
+        if raced && !last_attempt {
+            return false;
+        }
+        if raced {
+            tracing::warn!(
+                "episodic keyword index built while writes kept landing; \
+                 rows written during the build may be unsearchable until restart"
+            );
+        }
+        *guard = Some(built);
+        true
+    }
+
+    /// Number of events in the keyword index, or `None` if it has not
+    /// been built yet. Diagnostics and tests.
+    pub fn indexed_len(&self) -> Option<usize> {
+        self.index.read(|idx| idx.map(KeywordIndex::len))
+    }
+
+    /// Look `id` up in hot, then warm, reporting the tier.
+    async fn find_tiered(&self, id: EventId) -> Result<Option<TieredEvent>> {
+        for (key, tier) in [(epi_key(&id), Tier::Hot), (warm_key(&id), Tier::Warm)] {
+            if let Some(bytes) = self.storage.get(&key).await? {
+                let event = postcard::from_bytes(&bytes)
+                    .map_err(|e| MnemeError::Storage(format!("decode EpisodicEvent {id}: {e}")))?;
+                return Ok(Some(TieredEvent { event, tier }));
+            }
+        }
+        Ok(None)
     }
 
     /// Set the hot-to-warm threshold from `[consolidation]
@@ -379,8 +653,35 @@ impl EpisodicStore {
         let value = postcard::to_allocvec(&event)
             .map_err(|e| MnemeError::Storage(format!("encode EpisodicEvent: {e}")))?;
         self.storage.put(&key, &value).await?;
+        if self.is_indexed_kind(&event.kind) {
+            self.index
+                .mutate(|idx| idx.insert(event.id, &indexable_text(&event)));
+        }
         self.activity.bump();
         Ok(event.id)
+    }
+
+    /// [`touch`](Self::touch), but only when the event is in the hot
+    /// tier and its `last_accessed` is at least `min_age` old. Returns
+    /// whether a write happened. A missing or warm id is `Ok(false)`:
+    /// this is the best-effort refresh `recall` runs after it has
+    /// answered, and a warm row is not pulled back to hot by a read.
+    pub async fn touch_if_stale(&self, id: EventId, min_age: chrono::Duration) -> Result<bool> {
+        let key = epi_key(&id);
+        let Some(bytes) = self.storage.get(&key).await? else {
+            return Ok(false);
+        };
+        let mut event: EpisodicEvent = postcard::from_bytes(&bytes)
+            .map_err(|e| MnemeError::Storage(format!("decode EpisodicEvent {id}: {e}")))?;
+        let now = Utc::now();
+        if now - event.last_accessed < min_age {
+            return Ok(false);
+        }
+        event.last_accessed = now;
+        let value = postcard::to_allocvec(&event)
+            .map_err(|e| MnemeError::Storage(format!("re-encode EpisodicEvent: {e}")))?;
+        self.storage.put(&key, &value).await?;
+        Ok(true)
     }
 
     /// Bump `last_accessed` to "now". Used by tools/resources that
@@ -414,31 +715,92 @@ impl EpisodicStore {
     /// `[episodic] index_kinds`) or share no token with the query are
     /// absent from the map; callers treat absent as `0.0`.
     ///
-    /// Contract between auto-context (W1) and the episodic keyword index
-    /// (W2). Until the index lands this returns an empty map.
-    pub async fn lex_scores(
-        &self,
-        query: &str,
-        ids: &[EventId],
-    ) -> Result<std::collections::HashMap<EventId, f32>> {
-        let _ = (query, ids);
-        Ok(std::collections::HashMap::new())
+    /// Coverage is measured against the whole index (a term is rare or
+    /// common across all indexed events, not across `ids`), so the
+    /// values agree with [`search`](Self::search).
+    pub async fn lex_scores(&self, query: &str, ids: &[EventId]) -> Result<HashMap<EventId, f32>> {
+        if ids.is_empty() || query.trim().is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.ensure_index().await?;
+        Ok(self.index.read(|idx| match idx {
+            Some(idx) => idx.coverage_of(query, ids),
+            None => HashMap::new(),
+        }))
     }
 
     /// Best lexical matches for `query` over hot + warm indexed events,
-    /// with `filters` applied, best first. The `f32` is the same
+    /// with `filters` applied, best (BM25) first. The `f32` is the same
     /// coverage score [`lex_scores`](Self::lex_scores) reports.
     ///
-    /// Contract between auto-context (W1) and the episodic keyword index
-    /// (W2). Until the index lands this returns no rows.
+    /// `filters.warm` is honoured as a tier filter: [`WarmRead::Never`]
+    /// keeps hot rows only; `Auto` and `Always` search both tiers (a
+    /// content search has no "recent" default to protect).
     pub async fn search(
         &self,
         query: &str,
         limit: usize,
         filters: &RecentFilters,
     ) -> Result<Vec<(EpisodicEvent, f32)>> {
-        let _ = (query, limit, filters);
-        Ok(Vec::new())
+        Ok(self
+            .search_tiered(query, limit, filters)
+            .await?
+            .into_iter()
+            .map(|h| (h.event, h.coverage))
+            .collect())
+    }
+
+    /// [`search`](Self::search) with the tier and BM25 score of each
+    /// hit.
+    ///
+    /// Every index hit is read back from storage before it is returned.
+    /// A hit whose row is gone is dropped from the result and from the
+    /// index, so drift heals on the next search that touches it.
+    pub async fn search_tiered(
+        &self,
+        query: &str,
+        limit: usize,
+        filters: &RecentFilters,
+    ) -> Result<Vec<LexicalHit>> {
+        if limit == 0 || query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        self.ensure_index().await?;
+        let candidates = self.index.read(|idx| match idx {
+            Some(idx) => idx.search(query, usize::MAX),
+            None => Vec::new(),
+        });
+        let mut out = Vec::new();
+        let mut gone = Vec::new();
+        for hit in candidates {
+            if out.len() >= limit {
+                break;
+            }
+            let Some(row) = self.find_tiered(hit.id).await? else {
+                gone.push(hit.id);
+                continue;
+            };
+            if filters.warm == WarmRead::Never && row.tier == Tier::Warm {
+                continue;
+            }
+            if !filters.matches(&row.event) {
+                continue;
+            }
+            out.push(LexicalHit {
+                event: row.event,
+                tier: row.tier,
+                coverage: hit.coverage,
+                bm25: hit.score,
+            });
+        }
+        if !gone.is_empty() {
+            self.index.mutate(|idx| {
+                for id in gone {
+                    idx.remove(id);
+                }
+            });
+        }
+        Ok(out)
     }
 
     /// Ranked recent events.
@@ -483,24 +845,7 @@ impl EpisodicStore {
         let mut events = self
             .scan_tiers(include_warm, |e| filters.matches(e))
             .await?;
-        events.sort_by(|a, b| {
-            let (a, b) = (&a.event, &b.event);
-            // Primary: most-recently-touched wins.
-            b.last_accessed
-                .cmp(&a.last_accessed)
-                // Secondary: higher retrieval_weight wins among
-                // equally-recent peers. f32 comparison can produce
-                // NaN; treat NaN as ::Equal so we don't panic on
-                // pathological inputs (record_weighted already
-                // rejects out-of-range values, so this is defensive).
-                .then_with(|| {
-                    b.retrieval_weight
-                        .partial_cmp(&a.retrieval_weight)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                // Final deterministic tiebreaker.
-                .then_with(|| b.created_at.cmp(&a.created_at))
-        });
+        events.sort_by(|a, b| recency_order(&a.event, &b.event));
         events.truncate(limit);
         Ok(events)
     }
@@ -555,12 +900,7 @@ impl EpisodicStore {
     /// archive is never read here.
     pub async fn list_hot_and_warm(&self, include_warm: bool) -> Result<Vec<TieredEvent>> {
         let mut out = self.scan_tiers(include_warm, |_| true).await?;
-        out.sort_by(|a, b| {
-            b.event
-                .created_at
-                .cmp(&a.event.created_at)
-                .then_with(|| b.event.id.cmp(&a.event.id))
-        });
+        out.sort_by(|a, b| newest_first(&a.event, &b.event));
         Ok(out)
     }
 
@@ -588,7 +928,17 @@ impl EpisodicStore {
     /// consolidation task once it has copied an event into a colder
     /// tier.
     pub async fn delete(&self, id: EventId) -> Result<()> {
-        self.storage.delete(&epi_key(&id)).await
+        self.storage.delete(&epi_key(&id)).await?;
+        self.unindex_unless_present(id, &warm_key(&id)).await
+    }
+
+    /// Drop `id` from the keyword index unless the row still exists
+    /// under `other_key` (the same event in the other tier).
+    async fn unindex_unless_present(&self, id: EventId, other_key: &[u8]) -> Result<()> {
+        if self.storage.get(other_key).await?.is_none() {
+            self.index.mutate(|idx| idx.remove(id));
+        }
+        Ok(())
     }
 
     /// Agent-driven point delete: remove an event from every live
@@ -613,6 +963,7 @@ impl EpisodicStore {
                 found = true;
             }
         }
+        self.index.mutate(|idx| idx.remove(id));
         Ok(found)
     }
 
@@ -652,6 +1003,11 @@ impl EpisodicStore {
                 let value = postcard::to_allocvec(&event)
                     .map_err(|e| MnemeError::Storage(format!("re-encode EpisodicEvent: {e}")))?;
                 self.storage.put(&key, &value).await?;
+                if self.is_indexed_kind(&event.kind) {
+                    // The old text must stop matching.
+                    self.index
+                        .mutate(|idx| idx.insert(event.id, &indexable_text(&event)));
+                }
                 rewritten += 1;
             }
         }
@@ -729,7 +1085,9 @@ impl EpisodicStore {
         Ok(out)
     }
 
-    /// Move an event from hot → warm. Idempotent on re-run.
+    /// Move an event from hot → warm. Idempotent on re-run. The keyword
+    /// index is keyed by id and is left alone: a warm row stays
+    /// searchable.
     pub async fn promote_to_warm(&self, id: EventId) -> Result<bool> {
         let hot_key = epi_key(&id);
         let Some(bytes) = self.storage.get(&hot_key).await? else {
@@ -746,7 +1104,8 @@ impl EpisodicStore {
     /// Drop a warm-tier row by id. Used by consolidation after the
     /// row has been folded into the cold archive.
     pub async fn delete_warm(&self, id: EventId) -> Result<()> {
-        self.storage.delete(&warm_key(&id)).await
+        self.storage.delete(&warm_key(&id)).await?;
+        self.unindex_unless_present(id, &epi_key(&id)).await
     }
 }
 
@@ -1490,5 +1849,439 @@ mod warm_read_tests {
 
         let hot_only = s.list_hot_and_warm(false).await.unwrap();
         assert_eq!(ids(&hot_only), hot);
+    }
+}
+
+/// Keyword index, `search` / `lex_scores`, and the debounced touch
+/// (1.6).
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+    use crate::storage::memory_impl::MemoryStorage;
+    use chrono::Duration;
+    use serde_json::json;
+
+    fn store() -> EpisodicStore {
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        EpisodicStore::new(storage)
+    }
+
+    async fn record(s: &EpisodicStore, kind: &str, content: &str) -> EventId {
+        s.record_json(kind, "p", &json!({ "content": content }))
+            .await
+            .unwrap()
+    }
+
+    async fn found(s: &EpisodicStore, query: &str) -> Vec<EventId> {
+        s.search(query, 50, &RecentFilters::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(e, _)| e.id)
+            .collect()
+    }
+
+    /// Backdate a hot row's `last_accessed` in place.
+    async fn age_hot_row(s: &EpisodicStore, id: EventId, days: i64) {
+        let key = epi_key(&id);
+        let bytes = s.storage.get(&key).await.unwrap().unwrap();
+        let mut e: EpisodicEvent = postcard::from_bytes(&bytes).unwrap();
+        e.last_accessed = Utc::now() - Duration::days(days);
+        s.storage
+            .put(&key, &postcard::to_allocvec(&e).unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn indexable_text_prefers_content_then_text_then_strings() {
+        let event = |payload: &str, tags: &[&str]| EpisodicEvent {
+            id: EventId::new(),
+            kind: "decision".into(),
+            scope: "p".into(),
+            payload: payload.into(),
+            tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+            retrieval_weight: 1.0,
+            last_accessed: Utc::now(),
+            created_at: Utc::now(),
+        };
+        assert_eq!(
+            indexable_text(&event(r#"{"content":"use redb","text":"ignored"}"#, &[])),
+            "use redb"
+        );
+        assert_eq!(
+            indexable_text(&event(r#"{"text":"weekly summary","covers":["a"]}"#, &[])),
+            "weekly summary"
+        );
+        // Neither field: every top-level string value.
+        assert_eq!(
+            indexable_text(&event(r#"{"choice":"redb","n":3}"#, &[])),
+            "redb"
+        );
+        // A bare JSON string, and a payload that is not JSON at all.
+        assert_eq!(indexable_text(&event(r#""plain note""#, &[])), "plain note");
+        assert_eq!(indexable_text(&event("not json", &[])), "not json");
+        // Tags are appended.
+        assert_eq!(
+            indexable_text(&event(r#"{"content":"use redb"}"#, &["storage", "adr"])),
+            "use redb\nstorage\nadr"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_index_kinds_are_indexed() {
+        let s = store();
+        let decision = record(&s, "decision", "switch the backtest to live_bt.py").await;
+        // Same words in an auto-logged row: must not be searchable.
+        record(&s, "tool_call", "remember live_bt.py backtest").await;
+        record(&s, "user_message", "what about live_bt.py").await;
+
+        assert_eq!(found(&s, "live_bt.py").await, vec![decision]);
+        assert_eq!(s.indexed_len(), Some(1));
+        assert!(s.is_indexed_kind("decision"));
+        assert!(!s.is_indexed_kind("tool_call"));
+    }
+
+    #[tokio::test]
+    async fn index_kinds_are_configurable() {
+        let s = store().with_index_kinds(vec!["note".into()]);
+        let note = record(&s, "note", "the gateway port is 4002").await;
+        record(&s, "decision", "gateway port moved").await;
+        assert_eq!(found(&s, "gateway port").await, vec![note]);
+    }
+
+    #[tokio::test]
+    async fn index_is_built_lazily_from_hot_and_warm_rows() {
+        let s = store();
+        let hot = record(&s, "lesson", "never deploy on Friday").await;
+        let warm = record(&s, "lesson", "deploy only after the smoke test").await;
+        assert!(s.promote_to_warm(warm).await.unwrap());
+        assert_eq!(
+            s.indexed_len(),
+            None,
+            "nothing built before the first search"
+        );
+
+        // Ids minted in the same millisecond are not ordered; compare
+        // as sets.
+        let mut got = found(&s, "deploy").await;
+        got.sort();
+        let mut want = vec![hot, warm];
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(s.indexed_len(), Some(2));
+
+        // Rows recorded after the build are searchable at once.
+        let later = record(&s, "milestone", "first deploy to production").await;
+        assert!(found(&s, "deploy").await.contains(&later));
+        assert_eq!(s.indexed_len(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn promote_to_warm_keeps_the_index_entry() {
+        let s = store();
+        let id = record(&s, "decision", "rotate the gateway token monthly").await;
+        assert_eq!(found(&s, "gateway token").await, vec![id]);
+
+        assert!(s.promote_to_warm(id).await.unwrap());
+        let hits = s
+            .search_tiered("gateway token", 5, &RecentFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].event.id, id);
+        assert_eq!(hits[0].tier, Tier::Warm);
+        assert_eq!(s.indexed_len(), Some(1));
+
+        // `WarmRead::Never` is a tier filter for search.
+        let hot_only = RecentFilters {
+            warm: WarmRead::Never,
+            ..Default::default()
+        };
+        assert!(
+            s.search("gateway token", 5, &hot_only)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_removes_the_index_entry() {
+        let s = store();
+        let hot = record(&s, "decision", "pin the compiler to 1.100").await;
+        let warm = record(&s, "decision", "pin the compiler in CI too").await;
+        s.promote_to_warm(warm).await.unwrap();
+        assert_eq!(found(&s, "compiler").await.len(), 2);
+
+        assert!(s.forget(hot).await.unwrap());
+        assert_eq!(found(&s, "compiler").await, vec![warm]);
+        assert!(s.forget(warm).await.unwrap());
+        assert!(found(&s, "compiler").await.is_empty());
+        assert_eq!(s.indexed_len(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn consolidation_deletes_unindex_but_not_while_the_other_tier_holds_the_row() {
+        let s = store();
+        let id = record(&s, "problem", "the importer drops rows with empty ids").await;
+        assert_eq!(found(&s, "importer").await, vec![id]);
+
+        // Mid-promotion: the row is under both prefixes. Deleting one
+        // copy must not make the event unsearchable.
+        let bytes = s.storage.get(&epi_key(&id)).await.unwrap().unwrap();
+        s.storage.put(&warm_key(&id), &bytes).await.unwrap();
+        s.delete(id).await.unwrap();
+        assert_eq!(found(&s, "importer").await, vec![id]);
+
+        // The last copy going (warm → cold) removes it.
+        s.delete_warm(id).await.unwrap();
+        assert_eq!(s.indexed_len(), Some(0));
+        assert!(found(&s, "importer").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clones_share_one_index() {
+        let s = store();
+        let clone = s.clone();
+        let id = record(&s, "decision", "ship the indexer behind a flag").await;
+        assert_eq!(found(&clone, "indexer").await, vec![id]);
+        let second = record(&clone, "decision", "remove the indexer flag").await;
+        let mut got = found(&s, "indexer").await;
+        got.sort();
+        let mut want = vec![id, second];
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    /// A row removed behind the index's back (another store over the
+    /// same storage) is not returned, and the stale entry is dropped.
+    #[tokio::test]
+    async fn search_drops_hits_whose_row_is_gone() {
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let s = EpisodicStore::new(Arc::clone(&storage));
+        let kept = record(&s, "lesson", "cache the embedder between runs").await;
+        let gone = record(&s, "lesson", "cache the tokenizer too").await;
+        assert_eq!(found(&s, "cache").await.len(), 2);
+
+        // A private store, as a consolidation pass without the shared
+        // handle would use: `s`'s index is not told.
+        let other = EpisodicStore::new(Arc::clone(&storage));
+        assert!(other.forget(gone).await.unwrap());
+        assert_eq!(s.indexed_len(), Some(2), "index has drifted");
+
+        assert_eq!(found(&s, "cache").await, vec![kept]);
+        assert_eq!(s.indexed_len(), Some(1), "and healed itself");
+    }
+
+    #[tokio::test]
+    async fn rewritten_payloads_are_reindexed() {
+        let s = store();
+        let id = record(&s, "observation", "the token is hunter2").await;
+        assert_eq!(found(&s, "hunter2").await, vec![id]);
+        let n = s
+            .rewrite_payloads("observation", |_| {
+                Some(json!({"content": "[redacted]"}).to_string())
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(found(&s, "hunter2").await.is_empty());
+        assert_eq!(found(&s, "redacted").await, vec![id]);
+    }
+
+    #[tokio::test]
+    async fn tags_are_searchable_and_filters_apply() {
+        let s = store();
+        let tagged = s
+            .record_full(
+                "decision",
+                "work",
+                &json!({"content": "use the new allocator"}).to_string(),
+                vec!["perf-2026".into()],
+                1.0,
+            )
+            .await
+            .unwrap();
+        let other = s
+            .record_full(
+                "milestone",
+                "home",
+                &json!({"content": "allocator benchmark done"}).to_string(),
+                vec![],
+                1.0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(found(&s, "perf-2026").await, vec![tagged]);
+
+        let search = |filters: RecentFilters| {
+            let s = &s;
+            async move {
+                s.search("allocator", 10, &filters)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|(e, _)| e.id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            search(RecentFilters {
+                scope: Some("home".into()),
+                ..Default::default()
+            })
+            .await,
+            vec![other]
+        );
+        assert_eq!(
+            search(RecentFilters {
+                scopes: vec!["work".into(), "nowhere".into()],
+                ..Default::default()
+            })
+            .await,
+            vec![tagged]
+        );
+        assert_eq!(
+            search(RecentFilters {
+                tags: vec!["perf-2026".into()],
+                ..Default::default()
+            })
+            .await,
+            vec![tagged]
+        );
+        assert_eq!(
+            search(RecentFilters {
+                kind: Some("milestone".into()),
+                ..Default::default()
+            })
+            .await,
+            vec![other]
+        );
+        assert!(
+            search(RecentFilters {
+                until: Some(Utc::now() - Duration::days(1)),
+                ..Default::default()
+            })
+            .await
+            .is_empty()
+        );
+        // The limit is applied after the filters.
+        assert_eq!(
+            s.search("allocator", 1, &RecentFilters::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            s.search("allocator", 0, &RecentFilters::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            s.search("  ", 5, &RecentFilters::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn lex_scores_are_coverage_in_unit_range() {
+        let s = store();
+        let full = record(&s, "decision", "rotate the gateway token every month").await;
+        let partial = record(&s, "decision", "the gateway listens on 4002").await;
+        let unrelated = record(&s, "lesson", "label the cables").await;
+        let unindexed = record(&s, "tool_call", "rotate gateway token").await;
+        let missing = EventId::new();
+        let ids = [full, partial, unrelated, unindexed, missing];
+
+        let scores = s.lex_scores("rotate gateway token", &ids).await.unwrap();
+        assert_eq!(scores.len(), 2, "{scores:?}");
+        assert_eq!(scores[&full], 1.0);
+        assert!(scores[&partial] > 0.0 && scores[&partial] < 1.0);
+        assert!(scores.values().all(|v| (0.0..=1.0).contains(v)));
+        assert!(!scores.contains_key(&unrelated));
+        assert!(!scores.contains_key(&unindexed));
+        assert!(!scores.contains_key(&missing));
+
+        // The same numbers `search` reports.
+        for (event, coverage) in s
+            .search("rotate gateway token", 10, &RecentFilters::default())
+            .await
+            .unwrap()
+        {
+            assert_eq!(scores[&event.id], coverage);
+        }
+
+        // A word only the phrasing shares scores nothing.
+        let stop = s.lex_scores("what is the plan", &ids).await.unwrap();
+        assert!(stop.is_empty(), "{stop:?}");
+        assert!(s.lex_scores("", &ids).await.unwrap().is_empty());
+        assert!(s.lex_scores("gateway", &[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn touch_if_stale_is_debounced_and_hot_only() {
+        let s = store();
+        let day = Duration::hours(RECALL_TOUCH_DEBOUNCE_HOURS);
+
+        // Fresh: last_accessed is seconds old, nothing is written.
+        let fresh = record(&s, "decision", "fresh").await;
+        let before = s.get(fresh).await.unwrap().unwrap().last_accessed;
+        assert!(!s.touch_if_stale(fresh, day).await.unwrap());
+        assert_eq!(s.get(fresh).await.unwrap().unwrap().last_accessed, before);
+
+        // Three days stale: one write, then debounced.
+        let stale = record(&s, "decision", "stale").await;
+        age_hot_row(&s, stale, 3).await;
+        assert!(s.touch_if_stale(stale, day).await.unwrap());
+        let touched = s.get(stale).await.unwrap().unwrap();
+        assert!(Utc::now() - touched.last_accessed < Duration::minutes(1));
+        assert!(!s.touch_if_stale(stale, day).await.unwrap());
+        assert_eq!(
+            s.get(stale).await.unwrap().unwrap().last_accessed,
+            touched.last_accessed
+        );
+        // created_at is not a touch's business.
+        assert_eq!(
+            touched.created_at,
+            s.get(stale).await.unwrap().unwrap().created_at
+        );
+
+        // Warm rows are not written, however stale.
+        let warm = record(&s, "decision", "warm").await;
+        age_hot_row(&s, warm, 60).await;
+        s.promote_to_warm(warm).await.unwrap();
+        let warm_before = s
+            .find_warm_or_hot(warm)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_accessed;
+        assert!(!s.touch_if_stale(warm, day).await.unwrap());
+        assert_eq!(
+            s.find_warm_or_hot(warm)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_accessed,
+            warm_before
+        );
+        assert_eq!(s.count_hot().await.unwrap(), 2, "not pulled back to hot");
+
+        // Unknown id: not an error.
+        assert!(!s.touch_if_stale(EventId::new(), day).await.unwrap());
+    }
+
+    #[test]
+    fn touch_on_recall_follows_the_config_default_and_the_builder() {
+        assert_eq!(
+            store().touch_on_recall(),
+            crate::config::EpisodicConfig::default().touch_on_recall
+        );
+        assert!(!store().with_touch_on_recall(false).touch_on_recall());
     }
 }

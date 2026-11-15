@@ -32,6 +32,17 @@ pub(crate) const MEM_KEY_PREFIX: &[u8] = b"mem:";
 /// new field would make every existing record undecodable.
 pub(crate) const SUP_KEY_PREFIX: &[u8] = b"sup:";
 
+/// Last content edit: `MTS_KEY_PREFIX || ulid_bytes` holds an `i64`
+/// big-endian count of milliseconds since the Unix epoch. Written only
+/// when `update` changes a memory's content; an absent row means the
+/// memory was never edited, so its `updated_at` is its `created_at`.
+/// A side table for the same reason as [`SUP_KEY_PREFIX`].
+pub(crate) const MTS_KEY_PREFIX: &[u8] = b"mts:";
+
+/// Lifecycle status: `ST_KEY_PREFIX || ulid_bytes` holds one byte and
+/// exists only for an archived memory. An absent row means active.
+pub(crate) const ST_KEY_PREFIX: &[u8] = b"st:";
+
 #[async_trait]
 pub trait Storage: Send + Sync {
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;

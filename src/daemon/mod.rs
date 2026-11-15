@@ -9,11 +9,8 @@
 //! [`TransportMode::DaemonServeMany`](crate::cli::run::TransportMode),
 //! which shares its entire boot path with `mneme run`.
 //!
-//! Cross-platform note: today only Unix domain sockets are
-//! implemented (`#[cfg(unix)]`). Windows named-pipe support is M4
-//! (release-planning §3.9). On a non-Unix build, [`bind_listener`]
-//! returns an error pointing at the M4 milestone — the daemon is
-//! Unix-only until then.
+//! The listener is a Unix domain socket; mneme supports Linux and
+//! macOS only.
 
 use std::process::{Child, Command, Stdio};
 
@@ -21,19 +18,16 @@ use crate::{MnemeError, Result};
 
 pub mod auth;
 
-#[cfg(unix)]
 pub mod listener;
 
-#[cfg(unix)]
 pub use listener::{Listener, ListenerError, bind_listener, socket_path, wait_for_socket};
 
 /// Spawn a detached `mneme daemon --foreground` child process.
 ///
 /// The child is detached from the controlling terminal via `setsid(2)`
-/// (Unix) or `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` (Windows)
 /// so it survives the spawning process's exit. Stdio is redirected to
-/// `/dev/null` (or `NUL` on Windows) — the daemon writes diagnostics
-/// to `~/.mneme/logs/mneme.log`.
+/// `/dev/null` — the daemon writes diagnostics to
+/// `~/.mneme/logs/mneme.log`.
 ///
 /// Returns the [`Child`] handle. The caller should immediately detach
 /// by [`drop`]ping it (or in daemon mode, printing the PID and
@@ -52,7 +46,6 @@ pub fn spawn_daemon_detached() -> Result<Child> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         unsafe {
@@ -63,14 +56,6 @@ pub fn spawn_daemon_detached() -> Result<Child> {
                 Ok(())
             });
         }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 
     cmd.spawn()

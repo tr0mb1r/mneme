@@ -481,14 +481,7 @@ impl WriterState {
     }
 }
 
-#[cfg(target_os = "linux")]
-const ENOSPC: i32 = 28;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-const ENOSPC: i32 = 28;
-#[cfg(windows)]
-const ENOSPC: i32 = 39; // ERROR_HANDLE_DISK_FULL on win32; rough mapping
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
-const ENOSPC: i32 = 28;
+const ENOSPC: i32 = libc::ENOSPC;
 
 fn writer_loop(
     mut state: WriterState,

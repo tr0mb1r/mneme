@@ -364,9 +364,7 @@ pub struct McpConfig {
 /// `[daemon]` — daemon-mode tuning per ADR-0012. Fully wired since
 /// v1.1.1: `mneme daemon` binds a Unix socket, gates each connection on
 /// the auth handshake, serves many clients concurrently, drains on
-/// SIGTERM, and auto-stops after `idle_timeout_minutes`. Windows
-/// named-pipe support is still outstanding (see
-/// `book/src/roadmap.md`), so on Windows only `mneme run` works.
+/// SIGTERM, and auto-stops after `idle_timeout_minutes`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DaemonConfig {
     /// Idle-timeout shutdown threshold (ADR-0012 D6). The daemon

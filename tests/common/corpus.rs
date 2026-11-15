@@ -373,6 +373,13 @@ pub async fn seed(
                 },
             )
             .await?;
+        // The two rows are written milliseconds apart, and auto-context
+        // freshness has a 90-day half-life, so on the real clock they
+        // would be equally fresh. Give the stale row the age it stands
+        // for: last touched four months ago.
+        semantic
+            .backdate_updated_at(stale, chrono::Utc::now() - chrono::Duration::days(120))
+            .await?;
         pairs.push(Pair {
             scope,
             subject,

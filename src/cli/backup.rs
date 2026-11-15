@@ -356,10 +356,6 @@ mod tests {
         assert!(!archive.exists() || std::fs::metadata(&archive).unwrap().len() == 0);
     }
 
-    // Symlink tests are gated to Unix because creating directory
-    // symlinks on Windows requires elevated privileges or
-    // developer-mode being on, neither of which is the default in CI.
-    #[cfg(unix)]
     #[test]
     fn backup_with_symlinked_subdir_does_not_eisdir() {
         // Regression for the EISDIR bug surfaced by the manual test
@@ -410,7 +406,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn backup_then_restore_preserves_symlink() {
         let tmp_root = TempDir::new().unwrap();

@@ -9,11 +9,6 @@
 //!    (typo `mneme.recal`, accidental rename, deleted line).
 //! 3. The `~/.claude/settings.json` snippet in `docs/CLAUDE_CODE_SETUP.md`
 //!    stops parsing as JSON or stops wiring all three events.
-//!
-//! Unix-only: the hooks are POSIX shell, and bash isn't on the Windows CI
-//! runner. Windows users wire the same nudge text via `*.cmd` if they need it.
-
-#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::process::Command;

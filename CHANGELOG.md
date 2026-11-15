@@ -12,6 +12,48 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+### Added
+
+- **`recall` can search recorded events.** `layers: ["semantic",
+  "episodic"]` adds keyword search over the L3 events whose kind is in
+  `[episodic] index_kinds` (decisions, milestones, lessons, summaries
+  and the like; not `tool_call`). Until now an event could be listed by
+  time but not found by what it said, so anything recorded with
+  `record_event` and never copied into a memory was invisible to
+  `recall`. Rows from both layers carry `layer` and `rank` and are
+  ordered by `rank`; an event that contains every query word ranks like
+  a memory at similarity 0.65. Events of kind `archived` or with
+  `retrieval_weight` ≤ 0.3 are demoted, not hidden. The default is still
+  `["semantic"]`, with the same rows in the same order as before.
+- **`recall` takes `since` / `until`** (RFC3339 or ULID, with
+  `time_field`), applied after the search with the search widened until
+  the window is filled. In 1.5.2 these were unknown arguments that
+  pointed at `recall_recent`. `scope` accepts several scopes separated by
+  commas. `include_archived` is accepted.
+- **`include_cold`** on `recall_recent` and `export`, and `mneme export
+  --include-cold`: read the cold archive too. Opt-in because it
+  decompresses quarterly bundles; `recall_recent` opens only the quarters
+  that overlap the window and reads at most 1000 cold rows. Rows are
+  tagged `"tier": "cold"`.
+- **`[consolidation] cold_exempt_kinds`** is honoured: events of those
+  kinds (`archived`, `summary`, `milestone`, `lesson`, `decision` by
+  default) stay in the warm tier instead of being archived, so they stay
+  searchable and forgettable. `[]` restores the old behaviour.
+- **`[episodic] touch_on_recall`** is honoured: hot events returned by
+  `recall` get their `last_accessed` refreshed, after the response and at
+  most once per 24 hours each, so events still in use are not moved to
+  warm on age alone. Nothing called `touch` before, so promotion was pure
+  age.
+
+### Changed
+
+- The consolidation scheduler runs its passes through the server's
+  shared episodic store rather than a private one, so the keyword index
+  sees events leave for cold. Search results are also checked against
+  storage, and an index entry whose row is gone is dropped.
+- `[recall] stemming = "en"` is accepted by the config but not yet
+  implemented; keyword search still matches exact tokens.
+
 ### Security
 
 - Dependencies refreshed for RustSec advisories reported against the
@@ -24,7 +66,13 @@ the work that landed before automation was wired up.
 
 - **Windows support.** mneme now supports Linux and macOS only. CI no
   longer builds or tests on Windows, and releases ship no Windows binary.
-  On a Windows machine, run mneme inside WSL2.
+  On a Windows machine, run mneme inside WSL2. The Windows-only code
+  is gone from the tree: the `cfg(windows)` / `cfg(not(unix))` arms
+  (the `mneme client` and daemon-transport stubs, the detached-spawn
+  flags, the `mneme stop` and lockfile fallbacks, the no-op permission
+  helpers), the `keyring` `windows-native` backend, and the Hermes
+  installer's `mneme run` fallback. A build for a non-Unix target now
+  fails with `mneme supports Linux and macOS only`.
 
 ### Fixed
 
@@ -115,6 +163,41 @@ the work that landed before automation was wired up.
   thresholds make it a gate; a nightly workflow runs it on a synthetic
   corpus.
 
+- **Auto-context ranks events against the query.** With `?q=`, the
+  `episodic` section of `mneme://context` is no longer the same 64 most
+  recent events for every prompt. Candidates are the recent window plus
+  the episodic index's matches for the query, scored
+  `weight × 0.8 × recency × (β + (1−β)·lexical coverage)` with
+  `[auto_context] episodic_query_mix` (β, default 0.3). Without `?q=`
+  the ranking is recency, as before.
+- **Auto-context event selection.** Exact duplicates (same kind and
+  payload, ignoring case and whitespace) and near-duplicates (token
+  Jaccard ≥ 0.6) are dropped, at most `max_events_per_kind` (6) events of
+  one kind are kept, and payloads are clipped to `event_clip_chars` (400)
+  with `"truncated": true` on the row. A clipped event is charged at its
+  clipped size. Events of kind `archived` and events with
+  `retrieval_weight` at or below `min_event_weight` (0.3) are left out;
+  `?kinds=archived` opts back in.
+- **`mneme://context?scope=a,b`.** `scope` takes a comma-separated set.
+  L3 and L4 are filtered to the set; L0 returns the pins of those scopes
+  plus `[auto_context] pin_scopes`.
+- `mneme://context` reports `layer_tokens` (tokens spent per layer), and
+  its `request` echo gains `scopes`, `pin_scopes` and `shares`. Semantic
+  rows gain `updated_at` and `rank`; episodic rows gain `truncated`.
+- **`updated_at` on memories.** `update` records when a memory's content
+  last changed. Changing only `kind`, `tags`, `scope` or `status`, or
+  writing the same text back, does not move it. A memory never edited
+  reports its `created_at`. `recall` rows and `export` carry it.
+- **Archiving a memory: `update(id, status: "archived")`.** An archived
+  memory keeps its id, content and vector but is left out of `recall`
+  and never appears in auto-context. `status: "active"` restores it.
+  `recall` rows and `export` carry `status`; `export` always includes
+  archived memories.
+- `recall` rows carry `rank`: similarity plus keyword evidence, on the
+  same scale in `hybrid`, `semantic` and `keyword` mode.
+- `export` (the MCP tool and `mneme export`) emits `superseded_by` on a
+  memory that has a supersession link. The links were never exported, so
+  a dump could not tell a current fact from a replaced one.
 - Successful `remember`, `pin` and `update` calls report the id of the
   memory they stored or changed as `_meta.id`, and their `tool_call` event
   records it as `memory_id`.
@@ -133,6 +216,35 @@ the work that landed before automation was wired up.
 
 ### Changed
 
+- **A scoped `mneme://context` read now also returns global pins.**
+  `?scope=myproject` used to return only the pins stored under
+  `myproject`, so naming a scope silently dropped every rule pinned under
+  `global`. A scoped read now returns the pins of the requested scopes
+  plus those of `[auto_context] pin_scopes` (default `["global"]`). Set
+  `pin_scopes = []` for the old behaviour. A read with no `scope` is
+  unchanged and returns every pin.
+- **Auto-context budget is split by layer shares, not a flat reserve.**
+  Each layer used to be guaranteed 1/16 of the budget and the rest went
+  by score, which events always won: in one store they took 77% of the
+  context and left room for two memories. Now, from `[auto_context]`:
+  pinned items are never trimmed; events take at most
+  `episodic_max_share` (0.35); working turns at most `working_max_share`
+  (0.05); and semantic rows have `semantic_min_share` (0.30) of the
+  budget, or `semantic_min_items` (5) rows if that is fewer tokens,
+  reserved before the other layers are packed, with no ceiling. A context
+  read with no `?q=` uses less of the budget than before, because events
+  stop at their share.
+- **Pinned items can exceed the auto-context budget.** They are never
+  trimmed. If the pins alone are larger than
+  `auto_context_token_budget`, `total_tokens` exceeds `max_tokens` and
+  the other layers are empty. The server logs a warning when pins use
+  more than 30% of the budget.
+- **Auto-context freshness for memories is measured from the last
+  edit**, with a 90-day half-life and a floor of 0.75
+  (`semantic_half_life_days`, `semantic_recency_floor`; `0` days turns
+  decay off). It was a 14-day half-life from `created_at`, under which a
+  six-week-old memory kept 13% of its score. `recall` ranking is not
+  decayed and is unchanged.
 - `forget`'s input schema declares only `id` (now `required`). `query` and
   `scope` were advertised as reserved while every call that used them
   failed; passing one is still `INVALID_PARAMS`, now with a hint to find

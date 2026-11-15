@@ -15,7 +15,7 @@ serves.
 | Tool | Layer | Use when |
 |------|-------|----------|
 | `remember` | L4 semantic | The user shares a fact, decision, or preference that should persist across sessions. Classify it with `kind` (`fact`, the default, `decision`, `preference` or `conversation`); see [§Argument names](#argument-names). **Size guidance:** target under 500 chars; 500–2k accepted with a `length_advisory`, 2k–10k with a `length_warning`, over 10k rejected with a structured error. See [§Size guardrails](#size-guardrails) below. **Replacing a fact:** pass `supersedes` (an id or array of ids) and the old memories drop out of `recall` and auto-context while staying readable by id. When the nearest current memory has similarity ≥ 0.80 the reply names it, both in the text and in `_meta` (`related_memory`, or `duplicate_advisory` at ≥ 0.95). See [§Superseding and similarity advisories](#superseding-and-similarity-advisories). **Retries are safe:** content identical to a current memory in the same scope (ignoring leading/trailing and repeated whitespace) writes nothing and replies `already stored as <id>` with `_meta.deduplicated: true` — see [§Retries and exact duplicates](#retries-and-exact-duplicates). Content with a credential in a well-known format is rejected — see [§Write guardrails](#write-guardrails). |
-| `update` | L4 semantic | The user revises an existing memory: any subset of `content`, `kind`, `tags`, `scope`. Re-embeds automatically when `content` changes. Also takes `supersedes`, to retire older memories after the fact (e.g. after `remember` reported a close match). New `content` goes through the same [secret guard](#write-guardrails) as `remember`. |
+| `update` | L4 semantic | The user revises an existing memory: any subset of `content`, `kind`, `tags`, `scope`, `status`. `status: "archived"` keeps a memory that is no longer current out of `recall` and auto-context without deleting it (`"active"` restores it) — see [§Edit time and archiving](#edit-time-and-archiving). Re-embeds automatically when `content` changes. Also takes `supersedes`, to retire older memories after the fact (e.g. after `remember` reported a close match). New `content` goes through the same [secret guard](#write-guardrails) as `remember`. |
 | `forget` | L4 semantic, L0 procedural, L3 episodic (hot+warm) | The user explicitly asks to remove a memory. `id=…` resolves the ULID across all three layers, first hit wins; cold-archive entries stay out of reach by design. The `tool_call` events that mirrored the memory's text are redacted in the same call — see [§Forgetting and the timeline](#forgetting-and-the-timeline). `id` is the only argument: there is no bulk delete by `query` or `scope` (find the ids with `recall` / `recall_recent` and forget them one at a time). Confirm before calling. |
 | `pin` | L0 procedural | A *rule* should surface on every recall context (e.g. "always use `uv`, not `pip`"). Passes the [secret guard](#write-guardrails). To replace a rule, `unpin` the old one and `pin` the new. |
 | `unpin` | L0 procedural | A previously-pinned rule no longer applies. |
@@ -25,8 +25,8 @@ serves.
 
 | Tool | Layer | Use when |
 |------|-------|----------|
-| `recall` | L4 semantic | Hybrid search — meaning *and* exact words, fused, so both questions and exact names (`live_bt.py`, "D account", an env var, an error string) work. `mode` picks `hybrid` (default), `semantic`, or `keyword`; each row says which search found it in `match` (`semantic` / `keyword` / `both`). See [§Hybrid recall](#hybrid-recall). Filter with `scope`, `kind`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). Superseded memories are left out unless `include_superseded: true`, in which case they come after every current match and carry `superseded_by`. |
-| `recall_recent` | L3 episodic | "What did we just do?" — time-ordered events (tool calls, lifecycle events, conversation, decisions). Optional `since` / `until` bound the result to a `[since, until)` window against `created_at` (RFC3339 or 26-char ULID); when either bound is set, `limit` caps at 1000 instead of 200. The server does not parse natural language — convert phrases like "last Tuesday" to RFC3339 client-side before calling. Reads the hot tier, and the warm tier too when the window can reach it: `since` older than `hot_to_warm_days` (28 by default), or `until` set without `since`. `include_warm: true` reads warm on any call, `false` never does. Each row has `tier` (`hot` / `warm`). Events already in the cold archive are not returned. See [§Warm-tier reads](#warm-tier-reads). |
+| `recall` | L4 semantic | Hybrid search — meaning *and* exact words, fused, so both questions and exact names (`live_bt.py`, "D account", an env var, an error string) work. `mode` picks `hybrid` (default), `semantic`, or `keyword`; each row says which search found it in `match` (`semantic` / `keyword` / `both`). See [§Hybrid recall](#hybrid-recall). Filter with `scope`, `kind`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). Superseded memories are left out unless `include_superseded: true`, in which case they come after every current match and carry `superseded_by`. `layers: ["semantic", "episodic"]` also searches recorded events by keyword (the default is `["semantic"]`); rows carry `layer` and are ordered by `rank`. `since` / `until` (RFC3339 or ULID) keep rows in a `[since, until)` window on `time_field` (`created_at` by default). `scope` takes one scope or several separated by commas. See [§Searching events](#searching-events). |
+| `recall_recent` | L3 episodic | "What did we just do?" — time-ordered events (tool calls, lifecycle events, conversation, decisions). Optional `since` / `until` bound the result to a `[since, until)` window against `created_at` (RFC3339 or 26-char ULID); when either bound is set, `limit` caps at 1000 instead of 200. The server does not parse natural language — convert phrases like "last Tuesday" to RFC3339 client-side before calling. Reads the hot tier, and the warm tier too when the window can reach it: `since` older than `hot_to_warm_days` (28 by default), or `until` set without `since`. `include_warm: true` reads warm on any call, `false` never does. Each row has `tier` (`hot` / `warm` / `cold`). Events in the cold archive are returned only with `include_cold: true` (slow; give a window; at most 1000 cold rows). See [§Warm and cold reads](#warm-and-cold-reads). |
 
 ### Session helpers
 
@@ -41,7 +41,7 @@ serves.
 |------|----------|
 | `stats` | Per-layer counts, server `version`, schema version, scheduler health, and consolidation status (tier thresholds, age of the oldest hot event, days to the next promotion — see [§Consolidation status](#consolidation-status)). Mirrors `mneme://stats`. |
 | `list_scopes` | Show every distinct scope across all layers. |
-| `export` | Read-only JSON dump of every memory. Useful for `jq` or grepping. The `episodic` array covers the hot and warm tiers, newest first, each row with `tier`; `include_warm: false` gives hot only. Each layer is capped at `limit_per_layer` (default 200, max 5000). Cold-archive events are not included. |
+| `export` | Read-only JSON dump of every memory. Useful for `jq` or grepping. The `episodic` array covers the hot and warm tiers, newest first, each row with `tier`; `include_warm: false` gives hot only. Each layer is capped at `limit_per_layer` (default 200, max 5000). Cold-archive events are included only with `include_cold: true`. |
 
 ### L1 is session-local
 
@@ -149,7 +149,6 @@ where to go instead:
 
 | Call | Reply |
 |---|---|
-| `recall` with `since` / `until` | `recall` ranks by relevance and has no time filter; call `recall_recent` with `since` / `until`. |
 | `forget` with `query` / `scope` | No bulk delete; find the ids with `recall` or `recall_recent` and call `forget` once per `id`. |
 | `remember` with `pinned: true` | `remember` does not pin; call `pin` to add an always-on rule. (`pinned: false` is accepted and does nothing.) |
 | `record_event` with `text` / `content` | Put the text under `payload`: `{"content": "…"}`. |
@@ -194,7 +193,7 @@ between events travel inside the JSON payload (e.g. `"references":
 | `mneme://stats` | JSON: server `version`, per-layer counts, schema version, HNSW applied LSN, scheduler observability counters (consolidation + working blocks; consolidation includes the tier thresholds and hot-tier ages), and `memories.large_memory_count` (per-tier size distribution + IDs of over-limit entries — see [§Size guardrails](#size-guardrails)). | Diagnostics; first thing to read on any "mneme misbehaving" report. |
 | `mneme://procedural` | JSON: every pinned item. | On session start — these are the binding rules. |
 | `mneme://recent` | JSON: most recent episodic events, newest-first. | "What was the last thing on this branch?" |
-| `mneme://context` | Pre-assembled prompt context: pinned rules + working-session turns + recent events, packed against a token budget. Append `?q=<text>` to fold in semantically-similar long-term memories and `?scope=<name>` to restrict to one scope. Auto-logged event kinds are left out unless asked for — see [§Auto-context parameters](#auto-context-parameters). | On session start — single-call replacement for reading procedural + recent + recall separately. |
+| `mneme://context` | Pre-assembled prompt context: pinned rules + working-session turns + recent events, packed against a token budget. Append `?q=<text>` to fold in semantically-similar long-term memories and rank events against the query, and `?scope=<name>` (or `?scope=a,b`) to restrict to those scopes. Auto-logged event kinds are left out unless asked for — see [§Auto-context parameters](#auto-context-parameters). | On session start — single-call replacement for reading procedural + recent + recall separately. |
 | `mneme://session/{id}` | JSON: a session's full state (turns + checkpoint metadata). The active session is served from in-memory state; past sessions load from disk. | Reviewing a prior session's turn log. |
 
 ## Resource templates (2)
@@ -215,15 +214,16 @@ A client that only reads `resources/list` will not see them.
 | Param | Effect |
 |---|---|
 | `q` (alias `query`) | Natural-language seed for the L4 semantic layer. Percent-encoded; `+` is accepted for space. Without it the `semantic` array is empty — a vector search needs something to be similar *to*. |
-| `scope` | Restricts L0 / L3 / L4 to one scope. L1 working turns are [session-local](#l1-is-session-local) and always included. |
+| `scope` | One scope, or a comma-separated set (`scope=a,b`). Restricts L3 / L4 to those scopes. L0 returns the pins of those scopes plus the always-on `[auto_context] pin_scopes` (default `global`). L1 working turns are [session-local](#l1-is-session-local) and always included. |
 | `limit` | How many semantic candidates to over-fetch before the token-budget pass trims. Clamped server-side. |
-| `kinds` | Comma-separated event kinds. The `episodic` section then holds only these. Naming an auto-logged kind opts back in to it. |
+| `kinds` | Comma-separated event kinds. The `episodic` section then holds only these. Naming a hidden kind opts back in to it. |
 | `exclude_kinds` | Comma-separated event kinds to hide from `episodic`, in addition to the default exclusions. |
 
 ```
 mneme://context                             → L0 + L1 + L3
 mneme://context?q=how%20do%20we%20deploy     → + L4 semantic hits
-mneme://context?q=deploy&scope=work          → all four layers, work scope only
+mneme://context?q=deploy&scope=work          → all four layers; work scope, plus global pins
+mneme://context?q=deploy&scope=work,infra    → two scopes, plus global pins
 mneme://context?kinds=decision,summary       → only those event kinds in L3
 mneme://context?kinds=tool_call              → the auto-logged rows, opted back in
 ```
@@ -238,11 +238,54 @@ do not use up the over-fetch window. `recall_recent` and `mneme://recent`
 are unaffected and return every kind. Each `episodic` row also carries its
 `retrieval_weight`.
 
+**Events the agent has marked as low-signal are hidden too.** Events of
+kind `archived`, and events whose `retrieval_weight` is at or below
+`[auto_context] min_event_weight` (0.3), are left out before the budget
+pass, so they are not charged for and then discarded by the client.
+`?kinds=archived` brings the first group back.
+
+**Which events are chosen.** Candidates are the 64 most recent events
+plus, when the read has `?q=`, the episodic index's best lexical matches
+for it (so an on-topic event from two months ago can be offered). They are
+ranked by the score in [§Scoring](#scoring-auto-context) and then thinned:
+
+1. exact duplicates (same kind and payload, ignoring case and whitespace)
+   are dropped;
+2. at most `max_events_per_kind` (6) events of one kind are kept;
+3. an event whose words overlap an already-kept one by Jaccard ≥ 0.6 is
+   dropped (events of fewer than six distinct words are exempt).
+
+**Long payloads are clipped.** A payload longer than `event_clip_chars`
+(400) is cut and the row carries `"truncated": true`; the budget is
+charged for the clipped text. When the payload is a JSON object, the cut
+is made inside its `content` (or `text`) field, so the payload still
+parses. Read the whole event with `recall_recent`.
+
+**Scopes and pins.** Before 1.6, `?scope=myproject` returned only the pins
+stored under `myproject`, so every rule pinned under `global` vanished
+from a scoped read. A scoped read now returns the pins of the requested
+scopes and of `[auto_context] pin_scopes`. Set `pin_scopes = []` to get the
+old behaviour. With no `scope`, every pin is returned, as before.
+
 The response body has one array per layer (`procedural`, `working`,
 `episodic`, `semantic`), a `request` block echoing how the URI was
-interpreted (`query`, `scope`, `kinds`, `exclude_kinds`; so "no hits" is
-distinguishable from "no query supplied"), and `total_tokens` / `max_tokens`. The reply's `uri` echoes exactly what
-was requested, parameters included, so a client can correlate it.
+interpreted (so "no hits" is distinguishable from "no query supplied"),
+`layer_tokens`, and `total_tokens` / `max_tokens`. The reply's `uri` echoes
+exactly what was requested, parameters included, so a client can correlate
+it.
+
+| `request` field | Meaning |
+|---|---|
+| `query` | The `q` seed, or `null`. |
+| `scopes` | The requested scope set; `[]` for none. |
+| `scope` | The requested scope when exactly one was given, else `null`. |
+| `pin_scopes` | Scopes whose pins are added to a scoped read. |
+| `kinds`, `exclude_kinds` | The event-kind filters. |
+| `shares` | The layer shares in force: `episodic_max`, `semantic_min`, `semantic_min_items`, `working_max`. |
+
+`layer_tokens` gives the tokens spent on `procedural`, `working`,
+`episodic` and `semantic`; they sum to `total_tokens`. Semantic rows carry
+`updated_at` and `rank` beside `similarity`.
 
 Parsing is deliberately lenient — an unknown key, a malformed `limit`,
 or a stray `&` yields a request that still assembles something useful.
@@ -255,7 +298,7 @@ session with no memory at all.
 > missing from the body while its turns were still charged against the
 > token budget. Both fixed; the query parameters are new.
 
-## Warm-tier reads
+## Warm and cold reads
 
 Consolidation moves an event from the hot tier to the warm tier once its
 `last_accessed` is `hot_to_warm_days` old (28 by default). Up to 1.5.1
@@ -274,21 +317,112 @@ From 1.5.2:
 | `recall_recent` with `until` only | hot + warm |
 | `recall_recent` with `include_warm: true` | hot + warm, whatever the window |
 | `recall_recent` with `include_warm: false` | hot, whatever the window |
+| `recall_recent` with `include_cold: true` (1.6) | hot + warm + cold, unless `include_warm: false` |
 | `export` (tool and `mneme export`) | hot + warm |
 | `export` tool with `include_warm: false` | hot |
+| `export` tool with `include_cold: true`, `mneme export --include-cold` (1.6) | hot + warm + cold |
+| `recall` with `layers` containing `episodic` (1.6) | hot + warm, events of `index_kinds` only |
 
 Ordering and limits are unchanged. `recall_recent` still sorts by
 `last_accessed` (newest first), so hot rows come before warm ones, and
 `limit` applies to the merged result. `export` sorts by `created_at`,
-newest first. Rows carry `"tier": "hot"` or `"tier": "warm"`.
+newest first. Rows carry `"tier": "hot"`, `"warm"` or `"cold"`.
+
+Reading the cold tier means decompressing quarterly zstd bundles, so it
+is never automatic. `recall_recent` opens only the quarters that overlap
+`since` / `until` and reads at most 1000 cold rows per call (the newest
+that pass the filters); without a window every quarter is a candidate.
+`export` counts cold rows toward `limit_per_layer`. An event found in
+both warm and cold (a crash between the two writes of the move) is
+returned once, as warm.
 
 The automatic rule uses the threshold in effect now. If you raised
 `hot_to_warm_days` after events were promoted, some warm events are
 younger than the new threshold; pass `include_warm: true` to reach them.
 
-`mneme://recent`, `mneme://context` and `summarize_session` are still
-hot only. Events in the cold archive (`warm_to_cold_days`, 180 by
-default) are not returned by any tool; `mneme backup` copies them.
+`mneme://recent` and `summarize_session` are still hot only. Events in
+the cold archive (`warm_to_cold_days`, 180 by default) are not searched
+by `recall`. Kinds listed in `[consolidation] cold_exempt_kinds`
+(`archived`, `summary`, `milestone`, `lesson`, `decision` by default)
+never go to cold, so they stay searchable; see
+[Configuration](./configuration.md).
+
+## Searching events
+
+L3 events have no embeddings, so `recall` used to find only what had
+been stored with `remember`. A decision written with `record_event` and
+never promoted to a memory could be listed by `recall_recent` if you
+knew when it happened, and not found by what it said.
+
+`recall` with `layers: ["semantic", "episodic"]` searches both. The
+episodic half is keyword search over the events whose kind is in
+`[episodic] index_kinds` (`decision`, `milestone`, `lesson`, `summary`,
+`resolution`, `problem`, `pivot`, `observation`, `archived` by default;
+`tool_call` and message kinds are left out). The text searched is
+`payload.content`, else `payload.text`, plus the tags. Hot and warm
+events are covered; cold ones are not.
+
+```json
+{ "query": "why did we move the cutover", "layers": ["semantic", "episodic"] }
+```
+
+An episodic row looks like this:
+
+```json
+{
+  "id": "01K…", "layer": "episodic", "kind": "decision",
+  "content": "moved the cutover to zeta-9", "tags": [], "scope": "work",
+  "created_at": "2026-09-14T10:02:11+00:00", "retrieval_weight": 1.0,
+  "tier": "warm", "match": "keyword", "score": null, "similarity": null,
+  "rank": 0.65
+}
+```
+
+Every row, from either layer, has `layer` and `rank`, and the list is
+ordered by `rank`. For a memory, `rank` is its similarity plus its
+keyword evidence. An event has no similarity, so its rank is built from
+the keyword evidence alone, scaled to the same range:
+
+```
+rank = 0.8 × (0.8125 × coverage² + 0.1 if the query is a phrase in it) × retrieval_weight
+```
+
+`coverage` is the share of the query's words the event contains, rare
+words counting for more. An event containing every query word ranks
+0.65, about where a memory at cosine similarity 0.65 would. Things to
+know:
+
+- The default is unchanged. Without `layers`, `recall` returns the same
+  rows in the same order as before 1.6.
+- A query word the events never use counts against coverage, and common
+  English question words (`what`, `the`, `did`, …) are ignored. Events
+  covering less than a quarter of the query are not returned.
+- Events of kind `archived`, and events recorded with
+  `retrieval_weight` 0.3 or less, are ranked at half: demoted, not
+  hidden.
+- `min_similarity` compares against an event's `rank`. `kind` keeps
+  events of the same kind name (`decision`). `tags`, `scope`, `since`
+  and `until` apply to both layers. `mode: "semantic"` returns no
+  events.
+- `content` is the searched text. The full payload is on
+  `recall_recent`.
+- Returned hot events have their `last_accessed` refreshed afterwards,
+  at most once per 24 hours per event, so events that keep being used
+  are not moved to warm on age alone. `[episodic] touch_on_recall =
+  false` turns that off. Warm events are returned but not rewritten.
+
+### Time window and scopes on `recall`
+
+`since` and `until` take an RFC3339 timestamp or a 26-character ULID,
+as on `recall_recent`, and bound the result to `[since, until)`. The
+filter is applied after the search, and the search is widened until the
+window is filled or the index is exhausted, so a narrow window does not
+come back short. `time_field` chooses `created_at` (default) or
+`updated_at`; events are never updated, so for them both mean
+`created_at`.
+
+`scope` accepts a comma-separated list (`"projectx,global"`); a row
+passes if it is in any of them.
 
 ## Tool annotations
 
@@ -316,23 +450,81 @@ Hosts use these to decide what needs a confirmation prompt. Before v1.3
 mneme emitted no annotations at all, so a host could not tell `forget`
 from `stats`.
 
-## Scoring weights (auto-context)
+## Scoring (auto-context)
 
-When the orchestrator assembles `mneme://context`, it scores items as
-`semantic_score × layer_weight × recency_decay`. The layer weights are:
+When the orchestrator assembles `mneme://context`, each layer is scored
+its own way:
 
-| Layer | Weight | Rationale |
-|-------|--------|-----------|
-| L0 Procedural | 1.0 | Anchors. Must appear at equal recency. |
-| L1 Working session | 0.9 | Most-recent context — what's actually happening now. |
-| L3 Episodic | 0.8 | Recent history. |
-| L4 Semantic | 0.7 | Long-term recall. |
+| Layer | Score | Notes |
+|-------|-------|-------|
+| L0 Procedural | — | Not scored. Every pin is kept. |
+| L1 Working session | `0.9 × recency` | Recency has a 14-day half-life. |
+| L3 Episodic | `retrieval_weight × 0.8 × recency × (β + (1−β)·lex)` | Recency: 14-day half-life on `last_accessed`. `lex` is the share of the query the event contains (IDF-weighted, 0 to 1), from the episodic keyword index. `β` is `episodic_query_mix` (0.3). With no `?q=`, `lex` is 1. |
+| L4 Semantic | `rank × 0.7 × freshness` | `rank` is similarity plus keyword evidence, the value `recall` reports. `freshness = max(floor, 2^(−age/half_life))`, age measured from `updated_at`, with `semantic_half_life_days` (90) and `semantic_recency_floor` (0.75). |
 
-Recency decay is a 14-day half-life. The per-layer reservation in the
-budget pass guarantees no single layer is starved by another.
+Scores order the rows *within* the budget; they do not decide how much
+each layer gets. That is the job of the layer shares:
 
-L4's weight applies only when the read carries a `?q=` seed; without one
-the layer contributes nothing to score against.
+| Layer | Share of `auto_context_token_budget` |
+|-------|--------------------------------------|
+| L0 Procedural | Never trimmed. |
+| L1 Working session | At most `working_max_share` (5%). |
+| L3 Episodic | At most `episodic_max_share` (35%). |
+| L4 Semantic | At least `semantic_min_share` (30%), or `semantic_min_items` (5) rows if that is fewer tokens. No ceiling. |
+
+Packing order: pins first; then the semantic reserve, best rows first;
+then everything else together, best score first, with events and turns
+stopping at their ceilings. Fresh events and turns outscore memories, so
+they fill their shares and memories take what is left. A row that does not
+fit is skipped and smaller rows after it are still tried.
+
+Pins are binding. If they alone exceed the budget, `total_tokens` is
+larger than `max_tokens` and the other layers are empty; the server logs a
+warning once pins pass 30% of the budget.
+
+L4 takes part only when the read carries a `?q=` seed. Without one the
+semantic section is empty and events are ranked by recency alone.
+
+> **Changed in v1.6.** Before 1.6 every layer was reserved 1/16 of the
+> budget and the remainder went by score. Memories decayed on a 14-day
+> half-life from `created_at`, so a six-week-old memory at similarity 0.58
+> scored 0.05 against 0.8 for a fresh event, and events were charged at
+> full payload size. In one store events took 77% of the context and two
+> memories fit. Events also ignored the query, so every prompt got the same
+> list.
+
+## Edit time and archiving
+
+A memory has two timestamps. `created_at` is when it was first stored and
+never changes. `updated_at` is when its **content** last changed through
+`update`. Changing only `kind`, `tags`, `scope` or `status`, or sending the
+same text again, leaves it alone. A memory that was never edited reports
+its `created_at`. `recall` rows, `mneme://context` semantic rows and
+`export` carry both.
+
+Auto-context measures a memory's freshness from `updated_at`, so a
+"current state" memory that is revised in place stays fresh. `recall` does
+not decay by age at all.
+
+`update(id, status: "archived")` marks a memory as no longer current
+without deleting it:
+
+| Surface | Archived memory |
+|---------|-----------------|
+| `recall` | Left out. |
+| `mneme://context` | Never included. |
+| `export` | Included, with `"status": "archived"`. |
+| `remember` | Not offered as a duplicate or related memory, and an identical new memory is stored rather than deduplicated against it. |
+| `update(id, status: "active")` | Restores it. |
+
+It keeps its id, content, vector and `updated_at`. Use `supersedes` when a
+newer memory replaces an old one, and `status: "archived"` when a fact
+simply stopped being current.
+
+Both values are stored beside the memory's row rather than in it (keys
+`mts:<id>` and `st:<id>`, present only for an edited or an archived
+memory), so stores written by earlier versions need no migration. `forget`
+removes them with the memory.
 
 ## Hybrid recall
 

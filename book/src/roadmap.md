@@ -11,8 +11,9 @@ they're outstanding, which is more useful than a version number.
 ## Platform gaps
 
 **Linux and macOS only.** Windows support was dropped after 1.5: there
-is no Windows binary, CI no longer builds or tests on Windows, and
-Windows-specific code paths are unmaintained. A Windows host can run
+is no Windows binary, CI no longer builds or tests on Windows, the
+Windows-specific code has been removed, and a Windows build stops with
+a compile error. A Windows host can run
 mneme inside WSL2 (it is Linux there), or reach a `mneme serve` running
 elsewhere over Streamable HTTP.
 

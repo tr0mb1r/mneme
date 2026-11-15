@@ -718,21 +718,60 @@ async fn kind_and_type_with_different_values_is_invalid_params() {
         .await;
     assert_eq!(resp["result"]["isError"], false, "{resp}");
 
-    // `recall` has no time filter; the error says where it lives.
-    let resp = client
-        .call(
+    // `recall` takes a time window itself since 1.6 (in 1.5.2 `since`
+    // was an unknown argument that pointed at `recall_recent`).
+    let rows = client
+        .call_json(
             13,
             "recall",
-            json!({ "query": "x", "since": "2026-09-01T00:00:00Z" }),
+            json!({ "query": "unambiguous", "since": "2026-09-01T00:00:00Z" }),
         )
         .await;
-    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+    let rows = client
+        .call_json(
+            14,
+            "recall",
+            json!({ "query": "unambiguous", "until": "2026-09-01T00:00:00Z" }),
+        )
+        .await;
+    assert_eq!(rows, json!([]));
+
+    // An event is found by `recall` only when the episodic layer is
+    // asked for.
+    let resp = client
+        .call(
+            15,
+            "record_event",
+            json!({ "kind": "decision", "payload": { "content": "moved the cutover to zeta-9" } }),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let rows = client
+        .call_json(
+            16,
+            "recall",
+            json!({ "query": "zeta-9", "layers": ["semantic", "episodic"] }),
+        )
+        .await;
+    let episodic: Vec<&Value> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["layer"] == "episodic")
+        .collect();
+    assert_eq!(episodic.len(), 1, "{rows}");
+    assert_eq!(episodic[0]["kind"], "decision");
+    assert_eq!(episodic[0]["content"], "moved the cutover to zeta-9");
+    let rows = client
+        .call_json(17, "recall", json!({ "query": "zeta-9" }))
+        .await;
     assert!(
-        resp["error"]["message"]
-            .as_str()
+        rows.as_array()
             .unwrap()
-            .contains("recall_recent"),
-        "{resp}"
+            .iter()
+            .all(|r| r["layer"] == "semantic"),
+        "{rows}"
     );
 
     drop(client.stdin);

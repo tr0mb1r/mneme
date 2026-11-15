@@ -60,7 +60,8 @@ use tokio::task::JoinHandle;
 use crate::Result;
 use crate::config::ConsolidationConfig;
 use crate::memory::activity::ActivityCounter;
-use crate::memory::consolidation::{ConsolidationParams, run as run_consolidation};
+use crate::memory::consolidation::{ConsolidationParams, run_with_store as run_consolidation};
+use crate::memory::episodic::EpisodicStore;
 use crate::memory::semantic::SemanticStore;
 use crate::storage::Storage;
 use crate::storage::archive::ColdArchive;
@@ -136,7 +137,10 @@ pub struct SchedulerMetrics {
 }
 
 struct SchedulerState {
-    storage: Arc<dyn Storage>,
+    /// The store each pass runs through. In production it is the one
+    /// the tools read through, so its keyword index sees rows leave for
+    /// cold.
+    episodic: Arc<EpisodicStore>,
     archive: ColdArchive,
     params: ConsolidationParams,
     tick_interval: Duration,
@@ -206,6 +210,22 @@ impl ConsolidationScheduler {
         Self::start_with_orphan_gc(storage, archive, params, config, activity, None)
     }
 
+    /// Like [`start_with_orphan_gc`](Self::start_with_orphan_gc), but
+    /// each pass runs through `episodic`, the store the rest of the
+    /// process shares, instead of a private one. That keeps the store's
+    /// keyword index in step when a pass archives rows to cold.
+    /// Production (`cli::run`) uses this.
+    pub fn start_with_shared_store(
+        episodic: Arc<EpisodicStore>,
+        archive: ColdArchive,
+        params: ConsolidationParams,
+        config: SchedulerConfig,
+        activity: Vec<Arc<ActivityCounter>>,
+        semantic: Option<Arc<SemanticStore>>,
+    ) -> Arc<Self> {
+        Self::spawn(episodic, archive, params, config, activity, semantic)
+    }
+
     /// Like [`start`](Self::start), plus an L4 handle so each pass also
     /// sweeps orphan vectors (see
     /// [`SemanticStore::gc_orphan_vectors`]).
@@ -221,8 +241,20 @@ impl ConsolidationScheduler {
         activity: Vec<Arc<ActivityCounter>>,
         semantic: Option<Arc<SemanticStore>>,
     ) -> Arc<Self> {
+        let episodic = Arc::new(EpisodicStore::new(storage));
+        Self::spawn(episodic, archive, params, config, activity, semantic)
+    }
+
+    fn spawn(
+        episodic: Arc<EpisodicStore>,
+        archive: ColdArchive,
+        params: ConsolidationParams,
+        config: SchedulerConfig,
+        activity: Vec<Arc<ActivityCounter>>,
+        semantic: Option<Arc<SemanticStore>>,
+    ) -> Arc<Self> {
         let state = Arc::new(SchedulerState {
-            storage,
+            episodic,
             archive,
             params,
             tick_interval: config.tick_interval,
@@ -262,7 +294,7 @@ impl ConsolidationScheduler {
     /// with. `stats` surfaces them next to the oldest hot event's age
     /// so "0 promoted" can be read against "nothing is old enough yet".
     pub fn params(&self) -> ConsolidationParams {
-        self.state.params
+        self.state.params.clone()
     }
 
     /// Stop the scheduler gracefully. Sets the shutdown flag, wakes
@@ -330,7 +362,7 @@ async fn scheduler_loop(state: Arc<SchedulerState>) {
 }
 
 async fn do_one_pass(state: &SchedulerState) -> Result<()> {
-    match run_consolidation(Arc::clone(&state.storage), &state.archive, state.params).await {
+    match run_consolidation(&state.episodic, &state.archive, &state.params).await {
         Ok(report) => {
             state
                 .last_consolidation_unix_ms
@@ -389,6 +421,7 @@ mod tests {
         ConsolidationParams {
             hot_to_warm_days: 28,
             warm_to_cold_days: 180,
+            cold_exempt_kinds: Vec::new(),
         }
     }
 

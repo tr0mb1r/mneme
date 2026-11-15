@@ -111,8 +111,10 @@ async fn eval_measures_the_seeded_corpus_and_writes_nothing() {
         &[
             "--min-l4-hit5",
             "0.95",
+            "--min-all-hit5",
+            "0.75",
             "--min-context-gold",
-            "0.80",
+            "0.85",
             "--max-context-stale-over-current",
             "0",
         ],
@@ -172,7 +174,7 @@ async fn eval_measures_the_seeded_corpus_and_writes_nothing() {
     assert_eq!(c["n"], 46);
     assert_eq!(c["gold_n"], 46);
     assert_eq!(c["over_budget"], serde_json::json!([]));
-    assert!(c["gold_rate"].as_f64().unwrap() >= 0.80, "{c}");
+    assert!(c["gold_rate"].as_f64().unwrap() >= 0.85, "{c}");
     assert_eq!(c["stale_over_current"]["count"], 0, "{c}");
     for layer in ["procedural", "working", "episodic", "semantic"] {
         let share = c["layer_shares"][layer].as_f64().unwrap();

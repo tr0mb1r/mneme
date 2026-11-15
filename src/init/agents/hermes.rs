@@ -47,8 +47,6 @@
 //! exact command in `$HERMES_HOME/shell-hooks-allowlist.json`, Hermes'
 //! documented manual-approval file. Running `mneme init hermes` is the
 //! approval; `--no-hook` opts out, `hermes hooks revoke` withdraws it.
-//! Skipped on Windows in local mode, where Hermes runs `mneme run`
-//! itself and a second instance can't share the store.
 //!
 //! Uninstall removes the entry, the skill, the marker block, the hook,
 //! its state, and its approval. Everything else in those files is
@@ -195,7 +193,7 @@ check `hermes mcp list` and run `/reload-mcp`.
 /// Where `mneme init hermes` connects Hermes to mneme.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Transport {
-    /// Spawn `mneme client` (or `mneme run` on Windows).
+    /// Spawn `mneme client`.
     Local,
     /// Connect to a Streamable HTTP endpoint.
     Remote { url: String, token_env: String },
@@ -261,8 +259,8 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Whether to install the hook for this transport.
-fn wants_hook(opts: &InstallOptions, t: &Transport) -> bool {
-    !opts.no_hook && (cfg!(unix) || matches!(t, Transport::Remote { .. }))
+fn wants_hook(opts: &InstallOptions) -> bool {
+    !opts.no_hook
 }
 
 fn hook_item(command: &str) -> Vec<String> {
@@ -295,12 +293,12 @@ fn run_at(mode: InstallMode, hermes_home: &Path, opts: &InstallOptions) -> Resul
     match mode {
         InstallMode::Install | InstallMode::Upgrade => {
             let t = transport(opts)?;
-            install(&paths, &t, wants_hook(opts, &t))
+            install(&paths, &t, wants_hook(opts))
         }
         InstallMode::Uninstall => uninstall(&paths),
         InstallMode::Show => {
             let t = transport(opts)?;
-            print_plan(&paths, &t, wants_hook(opts, &t));
+            print_plan(&paths, &t, wants_hook(opts));
             Ok(())
         }
     }
@@ -365,12 +363,9 @@ fn validate_env_name(name: &str) -> Result<(), AgentError> {
 fn entry_body(t: &Transport) -> Vec<String> {
     match t {
         Transport::Local => {
-            // `mneme client` needs Unix sockets; on Windows the host
-            // spawns its own `mneme run` instead.
-            let sub = if cfg!(unix) { "client" } else { "run" };
             vec![
                 "command: \"mneme\"".into(),
-                format!("args: [\"{sub}\"]"),
+                "args: [\"client\"]".into(),
                 format!("connect_timeout: {CONNECT_TIMEOUT_SECS}"),
             ]
         }
@@ -532,7 +527,6 @@ fn write_allowlist(path: &Path, data: &serde_json::Value) -> Result<(), AgentErr
     let text = serde_json::to_string_pretty(data)
         .map_err(|e| AgentError::Generic(format!("serialise allowlist: {e}")))?;
     assets::write_text(path, &(text + "\n"))?;
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -788,8 +782,7 @@ mod tests {
         let cfg = read(&tmp.path().join("config.yaml"));
         assert!(cfg.starts_with("mcp_servers:\n"), "{cfg}");
         assert!(cfg.contains("  mneme:\n    command: \"mneme\"\n"), "{cfg}");
-        let sub = if cfg!(unix) { "client" } else { "run" };
-        assert!(cfg.contains(&format!("    args: [\"{sub}\"]\n")), "{cfg}");
+        assert!(cfg.contains("    args: [\"client\"]\n"), "{cfg}");
         assert!(cfg.contains("connect_timeout: 120"));
         let skill = read(&tmp.path().join("skills/mneme/SKILL.md"));
         assert!(skill.starts_with("---\nname: mneme\n"));
@@ -1048,15 +1041,14 @@ mcp_servers:
         .unwrap();
         let script = tmp.path().join("agent-hooks").join("mneme-context.py");
         assert_eq!(read(&script), assets::HERMES_CONTEXT_HOOK);
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&script).unwrap().permissions().mode();
             assert!(mode & 0o111 != 0, "hook must be executable");
         }
         let cfg = read(&tmp.path().join("config.yaml"));
-        // Built with the same quoting as the installer: a Windows path has
-        // backslashes, so it gets shell-quoted and then YAML-escaped.
+        // Built with the same quoting as the installer: shell-quoted,
+        // then YAML-escaped.
         let command = format!(
             "{} --url http://mneme:7878/mcp --token-env MNEME_HTTP_TOKEN",
             shell_quote(&script.display().to_string())
@@ -1083,17 +1075,10 @@ mcp_servers:
         let tmp = TempDir::new().unwrap();
         run_at(InstallMode::Install, tmp.path(), &local()).unwrap();
         let cfg = read(&tmp.path().join("config.yaml"));
-        if cfg!(unix) {
-            assert!(
-                cfg.contains("mneme-context.py --command mneme --arg client\""),
-                "{cfg}"
-            );
-        } else {
-            assert!(
-                !cfg.contains("mneme-context.py"),
-                "no local hook on Windows"
-            );
-        }
+        assert!(
+            cfg.contains("mneme-context.py --command mneme --arg client\""),
+            "{cfg}"
+        );
     }
 
     #[test]

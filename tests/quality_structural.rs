@@ -719,7 +719,6 @@ fn pin_contents(corpus: &Corpus, scope: &str) -> BTreeSet<String> {
 /// A scoped read keeps the global rules. In the evaluation `scope=x`
 /// took the procedural section from 6 pins to 1 or 0.
 #[tokio::test]
-#[ignore = "needs W1 multi-scope"]
 async fn scoped_context_keeps_the_global_pins() {
     let h = Harness::new();
     let c = h.seed().await;
@@ -759,7 +758,6 @@ async fn scoped_context_keeps_the_global_pins() {
 /// starve long-term memories. In the evaluation L3 was charged 77% of
 /// the budget and two semantic rows fitted.
 #[tokio::test]
-#[ignore = "needs W1 layer shares"]
 async fn context_layers_stay_within_their_shares() {
     let h = Harness::new();
     let c = h.seed().await;
@@ -831,7 +829,6 @@ async fn context_layers_stay_within_their_shares() {
 /// it, in auto-context and in `recall` when asked for the episodic
 /// layer, whether the event is hot or warm.
 #[tokio::test]
-#[ignore = "needs W2 episodic index (recall layers) and W1 query-conditioned events"]
 async fn l3_only_answers_are_found_by_query() {
     let h = Harness::new();
     let c = h.seed().await;
@@ -849,7 +846,10 @@ async fn l3_only_answers_are_found_by_query() {
         let rows = client
             .json(
                 "recall",
-                json!({"query": event.answer_token, "layers": ["semantic", "episodic"], "limit": 5}),
+                // Episodic layer only: the stub embedder puts unrelated
+                // memories at a cosine near 1, which no event rank can
+                // beat, so a mixed list here would measure the stub.
+                json!({"query": event.answer_token, "layers": ["episodic"], "limit": 5}),
             )
             .await;
         assert!(
@@ -875,7 +875,6 @@ async fn l3_only_answers_are_found_by_query() {
 /// Of two memories about one subject, the one edited later comes first
 /// in auto-context.
 #[tokio::test]
-#[ignore = "needs W1 updated_at freshness"]
 async fn current_memory_outranks_the_stale_one_in_context() {
     let h = Harness::new();
     let c = h.seed().await;

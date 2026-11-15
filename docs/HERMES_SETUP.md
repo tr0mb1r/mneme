@@ -382,8 +382,6 @@ Details:
   enforces, so the hook gives up and fails open before Hermes kills it.
 - **Requirements.** Python 3 (Hermes itself runs on it) and nothing else:
   the script uses only the standard library.
-- **Windows, local mode:** not installed. There Hermes runs `mneme run`
-  itself, and a second instance can't open the same store.
 
 ### Reading `mneme://context` yourself
 
