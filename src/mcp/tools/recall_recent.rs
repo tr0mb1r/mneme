@@ -5,7 +5,10 @@
 //!
 //! Reads the hot tier, plus the warm tier when the window reaches
 //! past the hot-to-warm threshold or `include_warm` is true. Each
-//! row carries a `tier` field. The cold archive is not read.
+//! row carries a `tier` field. The cold archive is read only when
+//! `include_cold` is true: the quarterly bundles that overlap the
+//! window are decompressed, which is slow next to a redb scan, so it is
+//! never automatic.
 
 use std::sync::Arc;
 
@@ -15,7 +18,10 @@ use serde_json::{Value, json};
 use ulid::Ulid;
 
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
-use crate::memory::episodic::{EpisodicStore, RecentFilters, WarmRead};
+use crate::memory::episodic::{
+    EpisodicStore, RecentFilters, WarmRead, recency_order, with_cold_rows,
+};
+use crate::storage::archive::ColdArchive;
 
 const DESCRIPTION: &str = "Retrieve the most recent episodic events \
 (tool calls, user messages, checkpoints) from this and earlier \
@@ -35,27 +41,42 @@ Events older than the hot-to-warm threshold (28 days by default) \
 live in the warm tier. It is read automatically when `since` is \
 older than that threshold or only `until` is set; pass \
 `include_warm: true` to read it on any call, `false` to never read \
-it. Each row has a `tier` field (`hot` or `warm`). Events already \
-moved to the cold archive are not returned.";
+it. Each row has a `tier` field (`hot`, `warm` or `cold`). \
+\
+Events older still (180 days by default) are in the cold archive and \
+are returned only with `include_cold: true`, which also reads warm. \
+Give `since` / `until` with it: only the archive quarters that \
+overlap the window are opened, and at most 1000 cold rows are read.";
 
 const DEFAULT_LIMIT: u64 = 20;
 const MAX_LIMIT: u64 = 200;
 const MAX_LIMIT_BOUNDED: u64 = 1000;
+/// Most rows one call reads out of the cold archive.
+const MAX_COLD_ROWS: usize = 1000;
 
 pub struct RecallRecent {
     store: Arc<EpisodicStore>,
+    /// Cold archive for `include_cold`. `None` in fixtures built
+    /// without one; `include_cold: true` is then an error.
+    cold: Option<ColdArchive>,
 }
 
 impl RecallRecent {
     pub fn new(store: Arc<EpisodicStore>) -> Self {
-        Self { store }
+        Self { store, cold: None }
+    }
+
+    /// Attach the cold archive so `include_cold` can read it.
+    pub fn with_cold(mut self, cold: ColdArchive) -> Self {
+        self.cold = Some(cold);
+        self
     }
 }
 
 /// Parse an RFC3339 timestamp or a 26-char ULID into a `DateTime<Utc>`.
 /// ULIDs decode to their embedded millisecond timestamp — useful for
 /// passing an existing event id straight through as a bound.
-fn parse_time_bound(field: &str, raw: &str) -> Result<DateTime<Utc>, ToolError> {
+pub(super) fn parse_time_bound(field: &str, raw: &str) -> Result<DateTime<Utc>, ToolError> {
     if raw.len() == 26
         && let Ok(ulid) = Ulid::from_string(raw)
     {
@@ -111,6 +132,13 @@ impl Tool for RecallRecent {
             hot-to-warm threshold). Omit to let the server decide: warm is read when \
             `since` is older than the threshold or only `until` is set. `true` always \
             reads it, `false` never does."
+                    },
+                    "include_cold": {
+                        "type": "boolean",
+                        "description": "Also read the cold archive (events past the \
+            warm-to-cold threshold, 180 days by default). Defaults to false. Slow: \
+            pass `since` / `until` so only the overlapping quarters are opened. At \
+            most 1000 cold rows are read. Implies `include_warm` unless that is false."
                     }
                 }
             }),
@@ -155,6 +183,21 @@ impl Tool for RecallRecent {
             }
         };
 
+        let include_cold = match args.get("include_cold") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`include_cold` must be a boolean".into(),
+                ));
+            }
+        };
+        // A window that reaches the cold tier spans the warm one.
+        let warm = match (warm, include_cold) {
+            (WarmRead::Auto, true) => WarmRead::Always,
+            (w, _) => w,
+        };
+
         let max_limit = if since.is_some() || until.is_some() {
             MAX_LIMIT_BOUNDED
         } else {
@@ -185,11 +228,27 @@ impl Tool for RecallRecent {
             warm,
             ..Default::default()
         };
-        let events = self
+        let mut events = self
             .store
             .recall_recent_tiered(&filters, limit as usize)
             .await
             .map_err(|e| ToolError::Internal(format!("recall_recent failed: {e}")))?;
+        if include_cold {
+            let cold = self.cold.clone().ok_or_else(|| {
+                ToolError::Internal("`include_cold`: no cold archive attached".into())
+            })?;
+            let row_filter = filters.clone();
+            // Bundle reads are blocking file I/O plus zstd.
+            let cold_rows = tokio::task::spawn_blocking(move || {
+                cold.read_window(since, until, MAX_COLD_ROWS, |e| row_filter.matches(e))
+            })
+            .await
+            .map_err(|e| ToolError::Internal(format!("cold read task: {e}")))?
+            .map_err(|e| ToolError::Internal(format!("cold read failed: {e}")))?;
+            events = with_cold_rows(events, cold_rows);
+            events.sort_by(|a, b| recency_order(&a.event, &b.event));
+            events.truncate(limit as usize);
+        }
 
         let body: Vec<Value> = events
             .iter()
@@ -597,6 +656,131 @@ mod tests {
         let tool = tool_with_hot_and_warm().await;
         let got = kinds_and_tiers(&tool, json!({ "include_warm": true, "limit": 3 })).await;
         assert_eq!(got, pairs(&ALL_FIVE[..3]));
+    }
+
+    // ---------- Cold-archive tests ----------
+
+    /// The hot/warm fixture plus two events in the cold archive, 200
+    /// and 400 days old (two different quarters at any date).
+    async fn tool_with_all_three_tiers() -> (RecallRecent, TempDir) {
+        use crate::memory::episodic::{DEFAULT_RETRIEVAL_WEIGHT, EpisodicEvent};
+        let tmp = TempDir::new().unwrap();
+        let cold = ColdArchive::new(tmp.path());
+        let now = Utc::now();
+        let cold_events: Vec<EpisodicEvent> = [200, 400]
+            .into_iter()
+            .map(|d| {
+                let at = now - chrono::Duration::days(d);
+                EpisodicEvent {
+                    id: crate::ids::EventId::new(),
+                    kind: format!("cold-{d}d"),
+                    scope: "g".into(),
+                    payload: "\"c\"".into(),
+                    tags: vec![],
+                    retrieval_weight: DEFAULT_RETRIEVAL_WEIGHT,
+                    last_accessed: at,
+                    created_at: at,
+                }
+            })
+            .collect();
+        cold.append(&cold_events).unwrap();
+        (tool_with_hot_and_warm().await.with_cold(cold), tmp)
+    }
+
+    const ALL_SEVEN: &[(&str, &str)] = &[
+        ("hot-1d", "hot"),
+        ("hot-2d", "hot"),
+        ("warm-40d", "warm"),
+        ("warm-50d", "warm"),
+        ("warm-60d", "warm"),
+        ("cold-200d", "cold"),
+        ("cold-400d", "cold"),
+    ];
+
+    #[tokio::test]
+    async fn include_cold_returns_archived_rows() {
+        let (tool, _tmp) = tool_with_all_three_tiers().await;
+        // Off by default, whatever the window.
+        let since = (Utc::now() - chrono::Duration::days(500)).to_rfc3339();
+        assert_eq!(
+            kinds_and_tiers(&tool, json!({ "since": since })).await,
+            pairs(ALL_FIVE)
+        );
+        // On: cold rows follow, same ordering, each tagged; warm is
+        // read too without being asked for.
+        assert_eq!(
+            kinds_and_tiers(&tool, json!({ "since": since, "include_cold": true })).await,
+            pairs(ALL_SEVEN)
+        );
+        assert_eq!(
+            kinds_and_tiers(&tool, json!({ "include_cold": true })).await,
+            pairs(ALL_SEVEN)
+        );
+    }
+
+    #[tokio::test]
+    async fn include_cold_reads_only_the_window() {
+        let (tool, _tmp) = tool_with_all_three_tiers().await;
+        let now = Utc::now();
+        let got = kinds_and_tiers(
+            &tool,
+            json!({
+                "since": (now - chrono::Duration::days(250)).to_rfc3339(),
+                "until": (now - chrono::Duration::days(45)).to_rfc3339(),
+                "include_cold": true,
+            }),
+        )
+        .await;
+        assert_eq!(
+            got,
+            pairs(&[
+                ("warm-50d", "warm"),
+                ("warm-60d", "warm"),
+                ("cold-200d", "cold")
+            ])
+        );
+        // The kind filter reaches cold rows, and the limit caps the
+        // merged list.
+        assert_eq!(
+            kinds_and_tiers(&tool, json!({ "kind": "cold-400d", "include_cold": true })).await,
+            pairs(&[("cold-400d", "cold")])
+        );
+        assert_eq!(
+            kinds_and_tiers(&tool, json!({ "include_cold": true, "limit": 6 })).await,
+            pairs(&ALL_SEVEN[..6])
+        );
+        // An explicit `include_warm: false` still holds.
+        assert_eq!(
+            kinds_and_tiers(
+                &tool,
+                json!({ "include_cold": true, "include_warm": false })
+            )
+            .await,
+            pairs(&[
+                ("hot-1d", "hot"),
+                ("hot-2d", "hot"),
+                ("cold-200d", "cold"),
+                ("cold-400d", "cold")
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn include_cold_is_validated() {
+        let (s, _tmp) = store();
+        let tool = RecallRecent::new(s);
+        let err = tool
+            .invoke(json!({"include_cold": "yes"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+        // No archive attached.
+        let err = tool
+            .invoke(json!({"include_cold": true}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Internal(_)));
+        tool.invoke(json!({"include_cold": false})).await.unwrap();
     }
 
     #[tokio::test]

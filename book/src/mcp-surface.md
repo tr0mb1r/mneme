@@ -25,8 +25,8 @@ serves.
 
 | Tool | Layer | Use when |
 |------|-------|----------|
-| `recall` | L4 semantic | Hybrid search — meaning *and* exact words, fused, so both questions and exact names (`live_bt.py`, "D account", an env var, an error string) work. `mode` picks `hybrid` (default), `semantic`, or `keyword`; each row says which search found it in `match` (`semantic` / `keyword` / `both`). See [§Hybrid recall](#hybrid-recall). Filter with `scope`, `kind`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). Superseded memories are left out unless `include_superseded: true`, in which case they come after every current match and carry `superseded_by`. |
-| `recall_recent` | L3 episodic | "What did we just do?" — time-ordered events (tool calls, lifecycle events, conversation, decisions). Optional `since` / `until` bound the result to a `[since, until)` window against `created_at` (RFC3339 or 26-char ULID); when either bound is set, `limit` caps at 1000 instead of 200. The server does not parse natural language — convert phrases like "last Tuesday" to RFC3339 client-side before calling. Reads the hot tier, and the warm tier too when the window can reach it: `since` older than `hot_to_warm_days` (28 by default), or `until` set without `since`. `include_warm: true` reads warm on any call, `false` never does. Each row has `tier` (`hot` / `warm`). Events already in the cold archive are not returned. See [§Warm-tier reads](#warm-tier-reads). |
+| `recall` | L4 semantic | Hybrid search — meaning *and* exact words, fused, so both questions and exact names (`live_bt.py`, "D account", an env var, an error string) work. `mode` picks `hybrid` (default), `semantic`, or `keyword`; each row says which search found it in `match` (`semantic` / `keyword` / `both`). See [§Hybrid recall](#hybrid-recall). Filter with `scope`, `kind`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). Superseded memories are left out unless `include_superseded: true`, in which case they come after every current match and carry `superseded_by`. `layers: ["semantic", "episodic"]` also searches recorded events by keyword (the default is `["semantic"]`); rows carry `layer` and are ordered by `rank`. `since` / `until` (RFC3339 or ULID) keep rows in a `[since, until)` window on `time_field` (`created_at` by default). `scope` takes one scope or several separated by commas. See [§Searching events](#searching-events). |
+| `recall_recent` | L3 episodic | "What did we just do?" — time-ordered events (tool calls, lifecycle events, conversation, decisions). Optional `since` / `until` bound the result to a `[since, until)` window against `created_at` (RFC3339 or 26-char ULID); when either bound is set, `limit` caps at 1000 instead of 200. The server does not parse natural language — convert phrases like "last Tuesday" to RFC3339 client-side before calling. Reads the hot tier, and the warm tier too when the window can reach it: `since` older than `hot_to_warm_days` (28 by default), or `until` set without `since`. `include_warm: true` reads warm on any call, `false` never does. Each row has `tier` (`hot` / `warm` / `cold`). Events in the cold archive are returned only with `include_cold: true` (slow; give a window; at most 1000 cold rows). See [§Warm and cold reads](#warm-and-cold-reads). |
 
 ### Session helpers
 
@@ -41,7 +41,7 @@ serves.
 |------|----------|
 | `stats` | Per-layer counts, server `version`, schema version, scheduler health, and consolidation status (tier thresholds, age of the oldest hot event, days to the next promotion — see [§Consolidation status](#consolidation-status)). Mirrors `mneme://stats`. |
 | `list_scopes` | Show every distinct scope across all layers. |
-| `export` | Read-only JSON dump of every memory. Useful for `jq` or grepping. The `episodic` array covers the hot and warm tiers, newest first, each row with `tier`; `include_warm: false` gives hot only. Each layer is capped at `limit_per_layer` (default 200, max 5000). Cold-archive events are not included. |
+| `export` | Read-only JSON dump of every memory. Useful for `jq` or grepping. The `episodic` array covers the hot and warm tiers, newest first, each row with `tier`; `include_warm: false` gives hot only. Each layer is capped at `limit_per_layer` (default 200, max 5000). Cold-archive events are included only with `include_cold: true`. |
 
 ### L1 is session-local
 
@@ -149,7 +149,6 @@ where to go instead:
 
 | Call | Reply |
 |---|---|
-| `recall` with `since` / `until` | `recall` ranks by relevance and has no time filter; call `recall_recent` with `since` / `until`. |
 | `forget` with `query` / `scope` | No bulk delete; find the ids with `recall` or `recall_recent` and call `forget` once per `id`. |
 | `remember` with `pinned: true` | `remember` does not pin; call `pin` to add an always-on rule. (`pinned: false` is accepted and does nothing.) |
 | `record_event` with `text` / `content` | Put the text under `payload`: `{"content": "…"}`. |
@@ -255,7 +254,7 @@ session with no memory at all.
 > missing from the body while its turns were still charged against the
 > token budget. Both fixed; the query parameters are new.
 
-## Warm-tier reads
+## Warm and cold reads
 
 Consolidation moves an event from the hot tier to the warm tier once its
 `last_accessed` is `hot_to_warm_days` old (28 by default). Up to 1.5.1
@@ -274,21 +273,112 @@ From 1.5.2:
 | `recall_recent` with `until` only | hot + warm |
 | `recall_recent` with `include_warm: true` | hot + warm, whatever the window |
 | `recall_recent` with `include_warm: false` | hot, whatever the window |
+| `recall_recent` with `include_cold: true` (1.6) | hot + warm + cold, unless `include_warm: false` |
 | `export` (tool and `mneme export`) | hot + warm |
 | `export` tool with `include_warm: false` | hot |
+| `export` tool with `include_cold: true`, `mneme export --include-cold` (1.6) | hot + warm + cold |
+| `recall` with `layers` containing `episodic` (1.6) | hot + warm, events of `index_kinds` only |
 
 Ordering and limits are unchanged. `recall_recent` still sorts by
 `last_accessed` (newest first), so hot rows come before warm ones, and
 `limit` applies to the merged result. `export` sorts by `created_at`,
-newest first. Rows carry `"tier": "hot"` or `"tier": "warm"`.
+newest first. Rows carry `"tier": "hot"`, `"warm"` or `"cold"`.
+
+Reading the cold tier means decompressing quarterly zstd bundles, so it
+is never automatic. `recall_recent` opens only the quarters that overlap
+`since` / `until` and reads at most 1000 cold rows per call (the newest
+that pass the filters); without a window every quarter is a candidate.
+`export` counts cold rows toward `limit_per_layer`. An event found in
+both warm and cold (a crash between the two writes of the move) is
+returned once, as warm.
 
 The automatic rule uses the threshold in effect now. If you raised
 `hot_to_warm_days` after events were promoted, some warm events are
 younger than the new threshold; pass `include_warm: true` to reach them.
 
-`mneme://recent`, `mneme://context` and `summarize_session` are still
-hot only. Events in the cold archive (`warm_to_cold_days`, 180 by
-default) are not returned by any tool; `mneme backup` copies them.
+`mneme://recent` and `summarize_session` are still hot only. Events in
+the cold archive (`warm_to_cold_days`, 180 by default) are not searched
+by `recall`. Kinds listed in `[consolidation] cold_exempt_kinds`
+(`archived`, `summary`, `milestone`, `lesson`, `decision` by default)
+never go to cold, so they stay searchable; see
+[Configuration](./configuration.md).
+
+## Searching events
+
+L3 events have no embeddings, so `recall` used to find only what had
+been stored with `remember`. A decision written with `record_event` and
+never promoted to a memory could be listed by `recall_recent` if you
+knew when it happened, and not found by what it said.
+
+`recall` with `layers: ["semantic", "episodic"]` searches both. The
+episodic half is keyword search over the events whose kind is in
+`[episodic] index_kinds` (`decision`, `milestone`, `lesson`, `summary`,
+`resolution`, `problem`, `pivot`, `observation`, `archived` by default;
+`tool_call` and message kinds are left out). The text searched is
+`payload.content`, else `payload.text`, plus the tags. Hot and warm
+events are covered; cold ones are not.
+
+```json
+{ "query": "why did we move the cutover", "layers": ["semantic", "episodic"] }
+```
+
+An episodic row looks like this:
+
+```json
+{
+  "id": "01K…", "layer": "episodic", "kind": "decision",
+  "content": "moved the cutover to zeta-9", "tags": [], "scope": "work",
+  "created_at": "2026-09-14T10:02:11+00:00", "retrieval_weight": 1.0,
+  "tier": "warm", "match": "keyword", "score": null, "similarity": null,
+  "rank": 0.65
+}
+```
+
+Every row, from either layer, has `layer` and `rank`, and the list is
+ordered by `rank`. For a memory, `rank` is its similarity plus its
+keyword evidence. An event has no similarity, so its rank is built from
+the keyword evidence alone, scaled to the same range:
+
+```
+rank = 0.8 × (0.8125 × coverage² + 0.1 if the query is a phrase in it) × retrieval_weight
+```
+
+`coverage` is the share of the query's words the event contains, rare
+words counting for more. An event containing every query word ranks
+0.65, about where a memory at cosine similarity 0.65 would. Things to
+know:
+
+- The default is unchanged. Without `layers`, `recall` returns the same
+  rows in the same order as before 1.6.
+- A query word the events never use counts against coverage, and common
+  English question words (`what`, `the`, `did`, …) are ignored. Events
+  covering less than a quarter of the query are not returned.
+- Events of kind `archived`, and events recorded with
+  `retrieval_weight` 0.3 or less, are ranked at half: demoted, not
+  hidden.
+- `min_similarity` compares against an event's `rank`. `kind` keeps
+  events of the same kind name (`decision`). `tags`, `scope`, `since`
+  and `until` apply to both layers. `mode: "semantic"` returns no
+  events.
+- `content` is the searched text. The full payload is on
+  `recall_recent`.
+- Returned hot events have their `last_accessed` refreshed afterwards,
+  at most once per 24 hours per event, so events that keep being used
+  are not moved to warm on age alone. `[episodic] touch_on_recall =
+  false` turns that off. Warm events are returned but not rewritten.
+
+### Time window and scopes on `recall`
+
+`since` and `until` take an RFC3339 timestamp or a 26-character ULID,
+as on `recall_recent`, and bound the result to `[since, until)`. The
+filter is applied after the search, and the search is widened until the
+window is filled or the index is exhausted, so a narrow window does not
+come back short. `time_field` chooses `created_at` (default) or
+`updated_at`; events are never updated, so for them both mean
+`created_at`.
+
+`scope` accepts a comma-separated list (`"projectx,global"`); a row
+passes if it is in any of them.
 
 ## Tool annotations
 

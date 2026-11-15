@@ -10,8 +10,8 @@
 //! The episodic layer covers the hot and warm tiers; each row has a
 //! `tier` key. Until 1.5.2 only the hot tier was dumped, so an export
 //! kept as a backup lost every event older than `hot_to_warm_days`.
-//! The cold archive (`<root>/cold/*.zst`) is not included; `mneme
-//! backup` captures it.
+//! The cold archive (`<root>/cold/*.zst`) is included only with
+//! `--include-cold`; `mneme backup` always captures it.
 //!
 //! There is no import command. To restore, use `mneme backup` /
 //! `mneme restore`, which copy the data dir byte-for-byte and so keep
@@ -29,15 +29,16 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::crypto::{KekStore, OsKeyring};
-use crate::memory::episodic::EpisodicStore;
+use crate::memory::episodic::{EpisodicStore, newest_first, with_cold_rows};
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::MemoryItem;
 use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
+use crate::storage::archive::ColdArchive;
 use crate::storage::layout;
 use crate::{MnemeError, Result};
 
-pub fn execute(scope: Option<String>, format: String) -> Result<()> {
+pub fn execute(scope: Option<String>, format: String, include_cold: bool) -> Result<()> {
     let format = match format.to_ascii_lowercase().as_str() {
         "json" => Format::Json,
         "ndjson" => Format::Ndjson,
@@ -56,7 +57,7 @@ pub fn execute(scope: Option<String>, format: String) -> Result<()> {
         proc_json,
         epi_json,
         sem_json,
-    } = collect_all(&root, scope.as_deref(), &OsKeyring::new())?;
+    } = collect_all_with(&root, scope.as_deref(), &OsKeyring::new(), include_cold)?;
 
     match format {
         Format::Json => {
@@ -101,11 +102,23 @@ pub struct Layers {
 /// and the export dies before emitting a byte (regression fixed
 /// 2026-07-25).
 pub fn collect_all(root: &Path, scope: Option<&str>, keyring: &dyn KekStore) -> Result<Layers> {
+    collect_all_with(root, scope, keyring, false)
+}
+
+/// [`collect_all`], optionally with the cold archive's episodic events
+/// (`--include-cold`).
+pub fn collect_all_with(
+    root: &Path,
+    scope: Option<&str>,
+    keyring: &dyn KekStore,
+    include_cold: bool,
+) -> Result<Layers> {
     refuse_if_locked(root)?;
 
     let (storage, aead) = crate::crypto::boot::open_episodic_storage_and_aead(root, keyring)?;
     let procedural = ProceduralStore::open_with_crypto(root, aead.clone())?;
     let episodic = EpisodicStore::new(Arc::clone(&storage));
+    let cold = include_cold.then(|| ColdArchive::new_with_crypto(root, aead.clone()));
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -114,7 +127,7 @@ pub fn collect_all(root: &Path, scope: Option<&str>, keyring: &dyn KekStore) -> 
 
     Ok(Layers {
         proc_json: collect_procedural(&procedural, scope)?,
-        epi_json: runtime.block_on(collect_episodic(&episodic, scope))?,
+        epi_json: runtime.block_on(collect_episodic(&episodic, scope, cold.as_ref()))?,
         sem_json: runtime.block_on(collect_semantic(&storage, scope))?,
     })
 }
@@ -163,12 +176,23 @@ fn collect_procedural(store: &ProceduralStore, scope: Option<&str>) -> Result<Ve
         .collect())
 }
 
-/// Hot and warm episodic rows, newest first, each tagged with its
-/// tier.
-async fn collect_episodic(store: &EpisodicStore, scope: Option<&str>) -> Result<Vec<Value>> {
+/// Hot and warm episodic rows, plus the cold archive's when `cold` is
+/// given, newest first, each tagged with its tier.
+async fn collect_episodic(
+    store: &EpisodicStore,
+    scope: Option<&str>,
+    cold: Option<&ColdArchive>,
+) -> Result<Vec<Value>> {
     let mut events = store.list_hot_and_warm(true).await?;
     if let Some(s) = scope {
         events.retain(|t| t.event.scope == s);
+    }
+    if let Some(cold) = cold {
+        let cold_rows = cold.read_window(None, None, usize::MAX, |e| {
+            scope.is_none_or(|s| e.scope == s)
+        })?;
+        events = with_cold_rows(events, cold_rows);
+        events.sort_by(|a, b| newest_first(&a.event, &b.event));
     }
     Ok(events
         .into_iter()
@@ -283,7 +307,7 @@ mod tests {
         assert_eq!(proc_json.len(), 1);
         assert_eq!(proc_json[0]["content"], "never deploy on Friday");
 
-        let epi_json = collect_episodic(&episodic, None).await.unwrap();
+        let epi_json = collect_episodic(&episodic, None, None).await.unwrap();
         assert_eq!(epi_json.len(), 1);
         assert_eq!(epi_json[0]["kind"], "tool_call");
 
@@ -447,6 +471,31 @@ mod tests {
         let personal = collect_all(root, Some("personal"), &InMemoryKekStore::new()).unwrap();
         assert_eq!(personal.epi_json.len(), 1);
         assert_eq!(personal.epi_json[0]["kind"], "warm-50d");
+
+        // `--include-cold`: the archive's rows are appended, tagged.
+        let at = Utc::now() - chrono::Duration::days(300);
+        ColdArchive::new(root)
+            .append(&[crate::memory::episodic::EpisodicEvent {
+                id: crate::ids::EventId::new(),
+                kind: "cold-300d".into(),
+                scope: "work".into(),
+                payload: "\"c\"".into(),
+                tags: vec![],
+                retrieval_weight: 1.0,
+                last_accessed: at,
+                created_at: at,
+            }])
+            .unwrap();
+        let without = collect_all(root, None, &InMemoryKekStore::new()).unwrap();
+        assert_eq!(without.epi_json, layers.epi_json, "cold stays opt-in");
+        let with = collect_all_with(root, None, &InMemoryKekStore::new(), true).unwrap();
+        assert_eq!(with.epi_json.len(), hot + warm + 1);
+        let last = with.epi_json.last().unwrap();
+        assert_eq!(last["kind"], "cold-300d");
+        assert_eq!(last["tier"], "cold");
+        let scoped =
+            collect_all_with(root, Some("personal"), &InMemoryKekStore::new(), true).unwrap();
+        assert_eq!(scoped.epi_json.len(), 1);
     }
 
     #[tokio::test]
@@ -467,7 +516,9 @@ mod tests {
             .await
             .unwrap();
 
-        let work_only = collect_episodic(&episodic, Some("work")).await.unwrap();
+        let work_only = collect_episodic(&episodic, Some("work"), None)
+            .await
+            .unwrap();
         assert_eq!(work_only.len(), 1);
         assert_eq!(work_only[0]["scope"], "work");
     }
