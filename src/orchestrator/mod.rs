@@ -1011,4 +1011,67 @@ mod tests {
         let ids: Vec<_> = ctx.semantic.iter().map(|h| h.item.id).collect();
         assert_eq!(ids, vec![edited, untouched]);
     }
+
+    /// The real episodic index, not a fake score map. An on-topic event
+    /// older than the whole recency window is offered and ranked first,
+    /// and different queries get different event lists.
+    #[tokio::test]
+    async fn a_query_surfaces_on_topic_events_through_the_real_index() {
+        let (o, _tmp, a) = fresh_orchestrator();
+        let topics = ["gateway", "ledger", "scheduler", "importer"];
+        let mut on_topic = Vec::new();
+        // Oldest first: one decision per topic...
+        for topic in topics {
+            let id = a
+                .episodic
+                .record(
+                    "decision",
+                    "p",
+                    &format!("{{\"content\":\"the {topic} rollout was postponed to march\"}}"),
+                )
+                .await
+                .unwrap();
+            on_topic.push(id);
+        }
+        // ...then more than a full recency window of unrelated notes.
+        for i in 0..(EPISODIC_FETCH + 16) {
+            a.episodic
+                .record(
+                    ["observation", "lesson", "summary", "milestone"][i % 4],
+                    "p",
+                    &format!("{{\"content\":\"standup note {i}: nothing blocked today\"}}"),
+                )
+                .await
+                .unwrap();
+        }
+
+        // No query: recency only, none of the old decisions make it.
+        let plain = o
+            .build_context(None, None, TokenBudget::default())
+            .await
+            .unwrap();
+        assert!(!plain.episodic.is_empty());
+        assert!(plain.episodic.iter().all(|e| !on_topic.contains(&e.id)));
+
+        let mut lists = Vec::new();
+        for (topic, id) in topics.iter().zip(&on_topic) {
+            let ctx = o
+                .build_context(
+                    Some(&format!("{topic} rollout")),
+                    None,
+                    TokenBudget::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                ctx.episodic.first().map(|e| e.id),
+                Some(*id),
+                "`{topic} rollout` should lead with its decision"
+            );
+            lists.push(ctx.episodic.iter().map(|e| e.id).collect::<Vec<_>>());
+        }
+        lists.sort();
+        lists.dedup();
+        assert_eq!(lists.len(), topics.len(), "each query gets its own list");
+    }
 }
