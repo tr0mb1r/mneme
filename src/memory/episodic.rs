@@ -584,6 +584,48 @@ impl EpisodicStore {
         Ok(found)
     }
 
+    /// Rewrite, in place, the payload of every hot- and warm-tier event
+    /// of `kind` for which `rewrite` returns a replacement. Returns how
+    /// many rows were rewritten.
+    ///
+    /// Only `payload` changes: the row keeps its id, tier, scope, tags,
+    /// weight and both timestamps, so it sits where it sat on the
+    /// timeline and consolidation treats it exactly as before. Each
+    /// replacement goes through the same [`Storage::put`] as a new event
+    /// (WAL first, then redb; sealed per record when the store is
+    /// encrypted), so it is as durable as the row it replaces.
+    ///
+    /// This is the redaction primitive behind `forget`: the `tool_call`
+    /// rows that mirrored a forgotten memory's text are overwritten
+    /// rather than deleted, so the timeline still shows that a write
+    /// happened. Cold-archive bundles are immutable and are not touched.
+    /// It deliberately does not bump the activity counter: a redaction
+    /// is not new user activity for the consolidation scheduler.
+    pub async fn rewrite_payloads<F>(&self, kind: &str, mut rewrite: F) -> Result<usize>
+    where
+        F: FnMut(&EpisodicEvent) -> Option<String> + Send,
+    {
+        let mut rewritten = 0usize;
+        for prefix in [EPI_KEY_PREFIX, WARM_KEY_PREFIX] {
+            for (key, value) in self.storage.scan_prefix(prefix).await? {
+                let mut event: EpisodicEvent = postcard::from_bytes(&value)
+                    .map_err(|e| MnemeError::Storage(format!("decode EpisodicEvent: {e}")))?;
+                if event.kind != kind {
+                    continue;
+                }
+                let Some(payload) = rewrite(&event) else {
+                    continue;
+                };
+                event.payload = payload;
+                let value = postcard::to_allocvec(&event)
+                    .map_err(|e| MnemeError::Storage(format!("re-encode EpisodicEvent: {e}")))?;
+                self.storage.put(&key, &value).await?;
+                rewritten += 1;
+            }
+        }
+        Ok(rewritten)
+    }
+
     /// Lookup an event in either the hot or warm tier. Returns `None`
     /// if it's not in redb (callers can fall back to the cold archive
     /// via `storage::archive::ColdArchive::find_anywhere`).
@@ -1067,6 +1109,119 @@ mod tests {
         let hits = s.recall_recent(&RecentFilters::default(), 5).await.unwrap();
         assert_eq!(hits[0].id, fresh, "fresh event must outrank aged one");
         assert!(hits.iter().any(|e| e.id == aged));
+    }
+
+    #[tokio::test]
+    async fn rewrite_payloads_covers_hot_and_warm_and_keeps_everything_else() {
+        let s = store();
+        let hot = s.record("tool_call", "work", "hot secret").await.unwrap();
+        let warm = s.record("tool_call", "work", "warm secret").await.unwrap();
+        let other_kind = s.record("decision", "work", "hot secret").await.unwrap();
+        let untouched = s.record("tool_call", "work", "keep me").await.unwrap();
+        assert!(s.promote_to_warm(warm).await.unwrap());
+        let before_hot = s.get(hot).await.unwrap().unwrap();
+        let before_warm = s.find_warm_or_hot(warm).await.unwrap().unwrap();
+
+        let n = s
+            .rewrite_payloads("tool_call", |e| {
+                e.payload.contains("secret").then(|| "gone".to_owned())
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+
+        let after_hot = s.get(hot).await.unwrap().unwrap();
+        assert_eq!(after_hot.payload, "gone");
+        assert_eq!(
+            EpisodicEvent {
+                payload: before_hot.payload.clone(),
+                ..after_hot
+            },
+            before_hot,
+            "only the payload may change"
+        );
+        // The warm row is rewritten where it lives, not moved back to hot.
+        assert!(s.get(warm).await.unwrap().is_none());
+        let after_warm = s.find_warm_or_hot(warm).await.unwrap().unwrap();
+        assert_eq!(after_warm.payload, "gone");
+        assert_eq!(after_warm.created_at, before_warm.created_at);
+        assert_eq!(s.count_hot().await.unwrap(), 3);
+        assert_eq!(s.count_warm().await.unwrap(), 1);
+
+        assert_eq!(
+            s.get(other_kind).await.unwrap().unwrap().payload,
+            "hot secret"
+        );
+        assert_eq!(s.get(untouched).await.unwrap().unwrap().payload, "keep me");
+    }
+
+    /// The rewrite goes through the WAL like any other write, so it is
+    /// still there after the store is closed and reopened, and on an
+    /// encrypted store nothing readable reaches the backend.
+    #[test]
+    fn rewrite_payloads_survives_reopen_plain_and_encrypted() {
+        use crate::crypto::Dek;
+        use crate::storage::encrypted::EncryptedStorage;
+        use crate::storage::redb_impl::RedbStorage;
+
+        let marker = "the launch code is swordfish-7741";
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dek = Dek::generate().unwrap();
+        for encrypted in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let open = || -> Arc<dyn Storage> {
+                if encrypted {
+                    EncryptedStorage::open_redb(tmp.path(), &dek).unwrap()
+                } else {
+                    RedbStorage::open(tmp.path()).unwrap()
+                }
+            };
+
+            let (hot, warm) = rt.block_on(async {
+                let s = EpisodicStore::new(open());
+                let hot = s.record("tool_call", "work", marker).await.unwrap();
+                let warm = s.record("tool_call", "work", marker).await.unwrap();
+                assert!(s.promote_to_warm(warm).await.unwrap());
+                let n = s
+                    .rewrite_payloads("tool_call", |_| Some("redacted".to_owned()))
+                    .await
+                    .unwrap();
+                assert_eq!(n, 2);
+                (hot, warm)
+            });
+
+            rt.block_on(async {
+                let backing = open();
+                let s = EpisodicStore::new(Arc::clone(&backing));
+                for id in [hot, warm] {
+                    let e = s.find_warm_or_hot(id).await.unwrap().unwrap();
+                    assert_eq!(e.payload, "redacted", "encrypted={encrypted}");
+                }
+                assert_eq!(s.count_warm().await.unwrap(), 1);
+            });
+
+            if encrypted {
+                // Neither the original nor the replacement is readable
+                // in what the encrypted stack hands the backend.
+                rt.block_on(async {
+                    let raw = RedbStorage::open_encrypted(
+                        tmp.path(),
+                        Arc::new(crate::crypto::Aead::new(&dek)),
+                    )
+                    .unwrap();
+                    let rows = raw.scan_prefix(b"").await.unwrap();
+                    assert!(!rows.is_empty());
+                    for (_k, v) in rows {
+                        let text = String::from_utf8_lossy(&v);
+                        assert!(!text.contains("swordfish"));
+                        assert!(!text.contains("redacted"));
+                    }
+                });
+            }
+        }
     }
 }
 

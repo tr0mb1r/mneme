@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
-use crate::memory::semantic::{MemoryKind, RecallFilters, RecallMode, SemanticStore};
+use crate::memory::semantic::{RecallFilters, RecallMode, SemanticStore};
 
 const DESCRIPTION: &str = "Retrieve memories relevant to a query. \
 Use this when you need context the user previously shared but isn't in the \
@@ -37,6 +37,16 @@ impl Recall {
 
 #[async_trait]
 impl Tool for Recall {
+    fn unknown_arg_hint(&self, arg: &str) -> Option<&'static str> {
+        match arg {
+            "since" | "until" => Some(
+                "`recall` ranks stored memories by relevance and has no time filter; \
+                 for a time window call `recall_recent` with `since`/`until`",
+            ),
+            _ => None,
+        }
+    }
+
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "recall",
@@ -54,10 +64,15 @@ impl Tool for Recall {
                         "description": "Max results. Defaults to 10."
                     },
                     "scope": { "type": "string", "description": "Optional scope filter." },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["fact", "decision", "preference", "conversation"],
+                        "description": "Optional kind filter."
+                    },
                     "type": {
                         "type": "string",
                         "enum": ["fact", "decision", "preference", "conversation"],
-                        "description": "Optional type filter."
+                        "description": "Alias of `kind` (the older name). Pass one or the other."
                     },
                     "tags": {
                         "type": "array",
@@ -126,14 +141,8 @@ impl Tool for Recall {
             .get("scope")
             .and_then(Value::as_str)
             .map(|s| s.to_owned());
-        let kind = match args.get("type").and_then(Value::as_str) {
-            None => None,
-            Some(s) => Some(MemoryKind::parse(s).ok_or_else(|| {
-                ToolError::InvalidArguments(format!(
-                    "`type` must be one of fact|decision|preference|conversation, got `{s}`"
-                ))
-            })?),
-        };
+        // `kind`, or its alias `type`; both set and different is an error.
+        let kind = super::parse_kind_arg(&args)?;
 
         let tags = super::parse_tags_arg(args.get("tags"))?;
         let min_similarity = match args.get("min_similarity") {

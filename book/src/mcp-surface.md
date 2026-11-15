@@ -14,9 +14,9 @@ serves.
 
 | Tool | Layer | Use when |
 |------|-------|----------|
-| `remember` | L4 semantic | The user shares a fact, decision, or preference that should persist across sessions. **Size guidance:** target under 500 chars; 500–2k accepted with a `length_advisory`, 2k–10k with a `length_warning`, over 10k rejected with a structured error. See [§Size guardrails](#size-guardrails) below. **Replacing a fact:** pass `supersedes` (an id or array of ids) and the old memories drop out of `recall` and auto-context while staying readable by id. When the nearest current memory has similarity ≥ 0.80 the reply names it, both in the text and in `_meta` (`related_memory`, or `duplicate_advisory` at ≥ 0.95). See [§Superseding and similarity advisories](#superseding-and-similarity-advisories). **Retries are safe:** content identical to a current memory in the same scope (ignoring leading/trailing and repeated whitespace) writes nothing and replies `already stored as <id>` with `_meta.deduplicated: true` — see [§Retries and exact duplicates](#retries-and-exact-duplicates). Content with a credential in a well-known format is rejected — see [§Write guardrails](#write-guardrails). |
-| `update` | L4 semantic | The user revises an existing memory; re-embeds automatically when `content` changes. Also takes `supersedes`, to retire older memories after the fact (e.g. after `remember` reported a close match). New `content` goes through the same [secret guard](#write-guardrails) as `remember`. |
-| `forget` | L4 semantic, L0 procedural, L3 episodic (hot+warm) | The user explicitly asks to remove a memory. `id=…` resolves the ULID across all three layers, first hit wins; cold-archive entries stay out of reach by design. Confirm before calling. |
+| `remember` | L4 semantic | The user shares a fact, decision, or preference that should persist across sessions. Classify it with `kind` (`fact`, the default, `decision`, `preference` or `conversation`); see [§Argument names](#argument-names). **Size guidance:** target under 500 chars; 500–2k accepted with a `length_advisory`, 2k–10k with a `length_warning`, over 10k rejected with a structured error. See [§Size guardrails](#size-guardrails) below. **Replacing a fact:** pass `supersedes` (an id or array of ids) and the old memories drop out of `recall` and auto-context while staying readable by id. When the nearest current memory has similarity ≥ 0.80 the reply names it, both in the text and in `_meta` (`related_memory`, or `duplicate_advisory` at ≥ 0.95). See [§Superseding and similarity advisories](#superseding-and-similarity-advisories). **Retries are safe:** content identical to a current memory in the same scope (ignoring leading/trailing and repeated whitespace) writes nothing and replies `already stored as <id>` with `_meta.deduplicated: true` — see [§Retries and exact duplicates](#retries-and-exact-duplicates). Content with a credential in a well-known format is rejected — see [§Write guardrails](#write-guardrails). |
+| `update` | L4 semantic | The user revises an existing memory: any subset of `content`, `kind`, `tags`, `scope`. Re-embeds automatically when `content` changes. Also takes `supersedes`, to retire older memories after the fact (e.g. after `remember` reported a close match). New `content` goes through the same [secret guard](#write-guardrails) as `remember`. |
+| `forget` | L4 semantic, L0 procedural, L3 episodic (hot+warm) | The user explicitly asks to remove a memory. `id=…` resolves the ULID across all three layers, first hit wins; cold-archive entries stay out of reach by design. The `tool_call` events that mirrored the memory's text are redacted in the same call — see [§Forgetting and the timeline](#forgetting-and-the-timeline). `id` is the only argument: there is no bulk delete by `query` or `scope` (find the ids with `recall` / `recall_recent` and forget them one at a time). Confirm before calling. |
 | `pin` | L0 procedural | A *rule* should surface on every recall context (e.g. "always use `uv`, not `pip`"). Passes the [secret guard](#write-guardrails). To replace a rule, `unpin` the old one and `pin` the new. |
 | `unpin` | L0 procedural | A previously-pinned rule no longer applies. |
 | `record_event` | L3 episodic (+ L1 mirror for message kinds) | Capture a structured event with a free-form `kind`. Use `user_message`/`assistant_message` for conversation turns; `decision`/`milestone`/`pivot`/etc. for curated semantic events; `summary` after `summarize_session` to land a digest. **`payload` is required** and must carry content, e.g. `{"content": "<what happened>"}`; there is no top-level `text` or `content` argument, a bare boolean or number payload counts as empty, and (as for every tool) undeclared arguments are rejected with `INVALID_PARAMS` naming the keys rather than ignored. See [§Event kinds](#event-kinds) below. |
@@ -25,7 +25,7 @@ serves.
 
 | Tool | Layer | Use when |
 |------|-------|----------|
-| `recall` | L4 semantic | Hybrid search — meaning *and* exact words, fused, so both questions and exact names (`live_bt.py`, "D account", an env var, an error string) work. `mode` picks `hybrid` (default), `semantic`, or `keyword`; each row says which search found it in `match` (`semantic` / `keyword` / `both`). See [§Hybrid recall](#hybrid-recall). Filter with `scope`, `type`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). Superseded memories are left out unless `include_superseded: true`, in which case they come after every current match and carry `superseded_by`. |
+| `recall` | L4 semantic | Hybrid search — meaning *and* exact words, fused, so both questions and exact names (`live_bt.py`, "D account", an env var, an error string) work. `mode` picks `hybrid` (default), `semantic`, or `keyword`; each row says which search found it in `match` (`semantic` / `keyword` / `both`). See [§Hybrid recall](#hybrid-recall). Filter with `scope`, `kind`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). Superseded memories are left out unless `include_superseded: true`, in which case they come after every current match and carry `superseded_by`. |
 | `recall_recent` | L3 episodic | "What did we just do?" — time-ordered events (tool calls, lifecycle events, conversation, decisions). Optional `since` / `until` bound the result to a `[since, until)` window against `created_at` (RFC3339 or 26-char ULID); when either bound is set, `limit` caps at 1000 instead of 200. The server does not parse natural language — convert phrases like "last Tuesday" to RFC3339 client-side before calling. Reads the hot tier, and the warm tier too when the window can reach it: `since` older than `hot_to_warm_days` (28 by default), or `until` set without `since`. `include_warm: true` reads warm on any call, `false` never does. Each row has `tier` (`hot` / `warm`). Events already in the cold archive are not returned. See [§Warm-tier reads](#warm-tier-reads). |
 
 ### Session helpers
@@ -42,6 +42,74 @@ serves.
 | `stats` | Per-layer counts, server `version`, schema version, scheduler health, and consolidation status (tier thresholds, age of the oldest hot event, days to the next promotion — see [§Consolidation status](#consolidation-status)). Mirrors `mneme://stats`. |
 | `list_scopes` | Show every distinct scope across all layers. |
 | `export` | Read-only JSON dump of every memory. Useful for `jq` or grepping. The `episodic` array covers the hot and warm tiers, newest first, each row with `tier`; `include_warm: false` gives hot only. Each layer is capped at `limit_per_layer` (default 200, max 5000). Cold-archive events are not included. |
+
+### Forgetting and the timeline
+
+`remember`, `pin` and `update` each mirror their `content` into an L3
+`tool_call` event (unless `[episodic] auto_log_tool_calls = "off"`). Up
+to 1.5.1 `forget` deleted the memory and left those events alone, so the
+text stayed readable through `recall_recent`, `export` and auto-context.
+
+`forget(id)` now also rewrites every hot- and warm-tier `tool_call`
+event about that memory, in place, to:
+
+```json
+{"tool": "remember", "memory_id": "01M7…", "redacted": "forgotten", "at": "2026-11-15T10:42:07Z"}
+```
+
+The row keeps its id, timestamps, scope and tier, so the timeline still
+shows that a write happened and when; the content, kind and the scope
+argument are gone from the payload. `at` is when the redaction ran. The
+reply says how many rows were redacted, in the text and as
+`_meta.redacted_tool_calls`.
+
+A row is redacted when it is a `remember`, `pin` or `update` event and:
+
+- its `memory_id` is the forgotten id (rows written by 1.5.2 or later:
+  successful writes report the id as `_meta.id`, and the event records
+  it); or
+- its `id` is the forgotten id (every `update` row, old or new); or
+- it has neither, and its `content` equals the forgotten memory's
+  content after whitespace normalisation. This reaches `remember` / `pin`
+  rows written before `memory_id` existed.
+
+Limits, so you know what is and is not covered:
+
+- **Cold archive.** Events already folded into a cold quarter bundle are
+  not rewritten; the bundles are immutable.
+- **Legacy rows of an edited memory.** A pre-1.5.2 `remember` row whose
+  memory was later changed with `update` no longer equals the final text
+  and has no id, so it is not found. Its `update` rows are.
+- **Legacy match is by text.** A pre-1.5.2 row for a *different* memory
+  with identical content is redacted too.
+- **Already forgotten.** For a memory forgotten before 1.5.2, call
+  `forget` with its id again: the reply is `no such memory …`, and any
+  rows carrying that id (its `update` events) are still redacted. The
+  redaction runs on every `forget`, which also makes it safe to retry.
+- **Other event kinds.** Only `tool_call` rows are touched. An event you
+  wrote yourself with `record_event` that quotes the memory is a separate
+  item: `forget` it by its own id.
+
+### Argument names
+
+Every reply names a memory's class `kind` (`recall` rows, `export`,
+the resources), so that is the name to pass. `remember`, `update` and
+`recall` take **`kind`**, with **`type`** kept as an alias for clients
+written against 1.5.1 and earlier, where it was the only accepted name
+and a call with `kind` failed. Pass one or the other. Both with the same
+value is accepted; both with different values is `INVALID_PARAMS`
+("pass either kind or type"), not a silent pick.
+
+Undeclared arguments are rejected with `INVALID_PARAMS`, naming the stray
+keys and the accepted ones. A few commonly guessed arguments also say
+where to go instead:
+
+| Call | Reply |
+|---|---|
+| `recall` with `since` / `until` | `recall` ranks by relevance and has no time filter; call `recall_recent` with `since` / `until`. |
+| `forget` with `query` / `scope` | No bulk delete; find the ids with `recall` or `recall_recent` and call `forget` once per `id`. |
+| `remember` with `pinned: true` | `remember` does not pin; call `pin` to add an always-on rule. (`pinned: false` is accepted and does nothing.) |
+| `record_event` with `text` / `content` | Put the text under `payload`: `{"content": "…"}`. |
 
 ### Event kinds
 
@@ -66,7 +134,7 @@ Server-emitted kinds (the agent never writes these — they appear in
 
 | Kind | Trigger | Payload |
 |---|---|---|
-| `tool_call` | Successful `tools/call` dispatch, subject to `[episodic] auto_log_tool_calls` (default `writes`: read-only tools are not mirrored) | Per-tool value-bearing arg(s) only — no full args object (privacy). For `remember`, `pin` and `update` that includes `content`. |
+| `tool_call` | Successful `tools/call` dispatch, subject to `[episodic] auto_log_tool_calls` (default `writes`: read-only tools are not mirrored) | Per-tool value-bearing arg(s) only — no full args object (privacy). For `remember`, `pin` and `update` that includes `content`, plus `memory_id`: the id of the memory the write stored or changed. After `forget` of that memory the row is reduced to `{tool, memory_id, redacted: "forgotten", at}` — see [§Forgetting and the timeline](#forgetting-and-the-timeline). |
 | `tool_call_failed` | Errored `tools/call` dispatch (not logged under `auto_log_tool_calls = "off"`) | `{tool, error_kind, message}` (message truncated to 500 chars). A secret-guard rejection records only `secret_detected`. |
 | `session_start` | `mneme run` boot | `{session_id, started_at, embedder, embed_dim, version, protocol}` |
 | `session_end` | Graceful shutdown | `{session_id, ended_at, clean_shutdown, turns_total, checkpoints_total}` |

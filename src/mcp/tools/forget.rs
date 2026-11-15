@@ -1,11 +1,19 @@
 //! `forget` — agent-driven point delete by ULID across all live
 //! memory layers.
 //!
-//! The schema admits `id`, `query`, and `scope` to keep the v1 surface
-//! stable for the agent — but `query`/`scope` (bulk delete by search
-//! or by scope) need an orchestrator that lands later, so this
-//! implementation rejects them with a clear "not yet supported"
-//! message rather than pretending to act.
+//! The schema declares only `id`. `query` and `scope` (bulk delete by
+//! search or by scope) were advertised as "reserved" up to 1.5.1 while
+//! every call that used them failed; they are no longer in the schema,
+//! and a caller that still passes one gets the unknown-argument error
+//! plus a hint to look the ids up and forget them one at a time.
+//!
+//! Deleting the memory is half of forgetting it: `remember`, `pin` and
+//! `update` each mirror their `content` into an L3 `tool_call` event, so
+//! the text would otherwise stay on the timeline (and in `recall_recent`,
+//! `export` and auto-context). After the delete, `forget` rewrites every
+//! hot- and warm-tier `tool_call` event about that memory to
+//! `{"tool", "memory_id", "redacted": "forgotten", "at"}`; see
+//! [`redact_forgotten`] for which rows match.
 //!
 //! `forget(id=…)` resolves the ULID against L4 semantic, then L0
 //! procedural, then L3 episodic (hot+warm tiers) — first hit wins.
@@ -24,16 +32,22 @@ use ulid::Ulid;
 
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::ids::{EventId, MemoryId};
+use crate::mcp::dispatch::redact_forgotten;
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::SemanticStore;
 
 const DESCRIPTION: &str = "Delete a memory by ULID. Resolves across L4 \
 semantic, L0 procedural, and L3 episodic (hot + warm tiers); first \
-hit wins. Cold-archive entries are not reachable. `query` and `scope` \
-arguments are reserved for a future bulk-delete tool and currently \
-return an error. Deletion is permanent — confirm with the user before \
+hit wins. The `tool_call` timeline events that mirrored the memory's \
+content are redacted too. Cold-archive entries are not reachable. There is no bulk \
+delete: find the ids with `recall` or `recall_recent` and forget them \
+one at a time. Deletion is permanent — confirm with the user before \
 invoking.";
+
+/// What to do instead of the bulk delete `forget` never had.
+const BULK_HINT: &str = "bulk forget by `query`/`scope` is not supported; find the ids \
+with `recall` or `recall_recent` and call `forget` once per `id`";
 
 pub(crate) struct Forget {
     semantic: Arc<SemanticStore>,
@@ -57,6 +71,13 @@ impl Forget {
 
 #[async_trait]
 impl Tool for Forget {
+    fn unknown_arg_hint(&self, arg: &str) -> Option<&'static str> {
+        match arg {
+            "query" | "scope" => Some(BULK_HINT),
+            _ => None,
+        }
+    }
+
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "forget",
@@ -66,75 +87,120 @@ impl Tool for Forget {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": "Memory ULID." },
-                    "query": { "type": "string", "description": "Reserved — bulk delete by search is not yet supported." },
-                    "scope": { "type": "string", "description": "Reserved — bulk delete by scope is not yet supported." }
-                }
+                    "id": { "type": "string", "description": "Memory ULID." }
+                },
+                "required": ["id"]
             }),
         }
     }
 
     async fn invoke(&self, args: Value) -> Result<ToolResult, ToolError> {
-        let id = args.get("id").and_then(Value::as_str);
-        let query = args.get("query").and_then(Value::as_str);
-        let scope = args.get("scope").and_then(Value::as_str);
-
-        let count = [id, query, scope].iter().filter(|x| x.is_some()).count();
-        if count != 1 {
-            return Err(ToolError::InvalidArguments(
-                "exactly one of `id`, `query`, `scope` is required".into(),
-            ));
+        // The dispatcher rejects `query`/`scope` as undeclared before
+        // this runs; the check stays for callers that invoke the tool
+        // directly.
+        if args.get("query").is_some() || args.get("scope").is_some() {
+            return Err(ToolError::InvalidArguments(BULK_HINT.into()));
         }
-
-        if query.is_some() || scope.is_some() {
-            return Err(ToolError::InvalidArguments(
-                "bulk forget by `query`/`scope` is not yet supported; pass `id` instead".into(),
-            ));
-        }
-
-        let id_str = id.unwrap();
+        let id_str = args
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("`id` is required".into()))?;
         let ulid = Ulid::from_string(id_str)
             .map_err(|e| ToolError::InvalidArguments(format!("`id` is not a valid ULID: {e}")))?;
 
-        // L4 semantic first.
         let memory_id = MemoryId(ulid);
-        if self
+
+        // Read the text before it is gone: `tool_call` rows written
+        // before the dispatcher recorded `memory_id` can only be matched
+        // to this memory by their content.
+        let forgotten_content = self.content_of(memory_id).await?;
+
+        // L4 semantic, then L0 procedural, then L3 episodic (hot + warm
+        // tiers); first hit wins.
+        let event_id = EventId(ulid);
+        let outcome = if self
             .semantic
             .forget(memory_id)
             .await
             .map_err(|e| ToolError::Internal(format!("forget (semantic) failed: {e}")))?
         {
-            return Ok(ToolResult::text(format!(
-                "forgot semantic memory {memory_id}"
-            )));
-        }
-
-        // L0 procedural.
-        if self
+            format!("forgot semantic memory {memory_id}")
+        } else if self
             .procedural
             .unpin(memory_id)
             .await
             .map_err(|e| ToolError::Internal(format!("forget (procedural) failed: {e}")))?
         {
-            return Ok(ToolResult::text(format!(
-                "forgot procedural memory {memory_id}"
-            )));
-        }
-
-        // L3 episodic (hot + warm tiers).
-        let event_id = EventId(ulid);
-        if self
+            format!("forgot procedural memory {memory_id}")
+        } else if self
             .episodic
             .forget(event_id)
             .await
             .map_err(|e| ToolError::Internal(format!("forget (episodic) failed: {e}")))?
         {
-            return Ok(ToolResult::text(format!(
-                "forgot episodic event {event_id}"
-            )));
-        }
+            format!("forgot episodic event {event_id}")
+        } else {
+            format!("no such memory {memory_id}")
+        };
 
-        Ok(ToolResult::text(format!("no such memory {memory_id}")))
+        // The memory is gone; now the copies of its text that
+        // `remember`/`pin`/`update` left on the timeline. This runs
+        // whatever the outcome above, "no such memory" included: rows
+        // are matched by id, so calling `forget` again finishes a
+        // redaction that failed half-way, and scrubs the rows of a
+        // memory forgotten before this existed.
+        let at = chrono::Utc::now();
+        let redacted = self
+            .episodic
+            .rewrite_payloads("tool_call", |event| {
+                let payload = event.payload_json().ok()?;
+                let replacement =
+                    redact_forgotten(&payload, id_str, forgotten_content.as_deref(), at)?;
+                serde_json::to_string(&replacement).ok()
+            })
+            .await
+            .map_err(|e| {
+                ToolError::Internal(format!(
+                    "{outcome}, but redacting its tool_call events failed: {e}; \
+                     call forget with the same id again to retry"
+                ))
+            })?;
+
+        if redacted == 0 {
+            return Ok(ToolResult::text(outcome));
+        }
+        tracing::info!(
+            memory_id = %memory_id,
+            redacted,
+            "forget: redacted tool_call events that mirrored the memory"
+        );
+        Ok(ToolResult::text(format!(
+            "{outcome}; redacted {redacted} tool_call event(s) that mirrored its content"
+        ))
+        .with_meta(json!({ "redacted_tool_calls": redacted })))
+    }
+}
+
+impl Forget {
+    /// The text of the L4 memory or L0 pin with this id, if there is
+    /// one. L3 events are not looked up: no `tool_call` row mirrors an
+    /// event's payload.
+    async fn content_of(&self, id: MemoryId) -> Result<Option<String>, ToolError> {
+        if let Some(item) = self
+            .semantic
+            .get(id)
+            .await
+            .map_err(|e| ToolError::Internal(format!("forget (semantic) failed: {e}")))?
+        {
+            return Ok(Some(item.content));
+        }
+        Ok(self
+            .procedural
+            .list(None)
+            .map_err(|e| ToolError::Internal(format!("forget (procedural) failed: {e}")))?
+            .into_iter()
+            .find(|p| p.id == id)
+            .map(|p| p.content))
     }
 }
 

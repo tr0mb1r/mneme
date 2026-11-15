@@ -39,6 +39,50 @@ the work that landed before automation was wired up.
   did not matter while the warm tier was unreadable; with warm reads the
   leftover copy would have come back. Readers return such a row once.
 
+- `remember`, `update` and `recall` accept `kind` as the name of the
+  memory-kind argument, with `type` kept as an alias. Replies have always
+  called the field `kind`, so agents passed it back and the call failed
+  with "unexpected argument(s) `kind`". Passing both with different values
+  is `INVALID_PARAMS` ("pass either kind or type"). The mirrored
+  `tool_call` event records the value as `kind` whichever name was used.
+- `recall` with `since` / `until` now says to use `recall_recent` for a
+  time window, instead of only listing the accepted arguments.
+- `remember` with `pinned: true` is rejected with a pointer to `pin`. The
+  flag was never wired to the procedural layer: it was logged and dropped,
+  so the caller believed a rule had been pinned. `pinned: false` is still
+  accepted.
+
+- `forget` no longer leaves the memory's text on the timeline. `remember`,
+  `pin` and `update` mirror their `content` into `tool_call` events, and
+  `forget` deleted only the memory. It now also rewrites the matching hot-
+  and warm-tier `tool_call` events to
+  `{tool, memory_id, redacted: "forgotten", at}` and reports the count
+  (`_meta.redacted_tool_calls`). Rows are matched by `memory_id`, by `id`
+  (`update` rows), or, for rows written before 1.5.2, by content. Cold
+  archive bundles are not rewritten. See "Forgetting and the timeline" in
+  `book/src/mcp-surface.md`.
+
+- Read-only tool calls no longer push an L1 working turn. Every successful
+  `tools/call` used to add a `tool` turn, so `recall`, `recall_recent`,
+  `stats`, `list_scopes` and `export` inflated `turns_total`, filled the
+  working-memory window with tool names and triggered empty checkpoints (a
+  read-only evaluation run added 665 turns). Only tools that are not
+  `readOnlyHint` push a turn now, the rule `auto_log_tool_calls = "writes"`
+  already uses for the timeline. Not configurable yet.
+
+### Added
+
+- Successful `remember`, `pin` and `update` calls report the id of the
+  memory they stored or changed as `_meta.id`, and their `tool_call` event
+  records it as `memory_id`.
+
+### Changed
+
+- `forget`'s input schema declares only `id` (now `required`). `query` and
+  `scope` were advertised as reserved while every call that used them
+  failed; passing one is still `INVALID_PARAMS`, now with a hint to find
+  the ids and forget them one at a time.
+
 ## [1.5.0](https://github.com/tr0mb1r/mneme/compare/v1.4.1...v1.5.0) - 2026-10-12
 
 > Hardening from running mneme as the long-term memory of Hermes Agent
