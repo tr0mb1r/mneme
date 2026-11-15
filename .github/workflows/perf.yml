@@ -3,7 +3,7 @@ name: perf
 # v1.1 release-gate per release-planning v2.1 §6.2: any p95 regression
 # > 10 % vs the frozen `benches/baselines/<release>.json` blocks merge
 # unless explicitly justified. Runs only on Linux for measurement
-# stability — macOS / Windows runners give different numbers and
+# stability — macOS runners give different numbers and
 # would need their own per-platform baselines (deferred to v1.2 if
 # the cross-platform perf surface ever surfaces an actual issue).
 #

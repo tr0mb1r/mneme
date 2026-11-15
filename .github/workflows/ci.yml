@@ -38,11 +38,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows is included as the Phase 3 §3 fixture for spec §14 #6
-        # (Windows path quirks). Failures here are the canonical signal
-        # that std::fs::rename, lockfile semantics, or path resolution
-        # need a Windows-specific cfg branch.
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Linux and macOS are the supported platforms. Windows support
+        # was dropped after 1.5; it is no longer built or tested.
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable

@@ -12,9 +12,8 @@ brew install mneme
 
 Pre-built static binary — no Rust toolchain, no compile time.
 Available for Apple Silicon, Intel macOS, and aarch64 / x86_64 Linux
-(musl-static, glibc-portable). Windows is not distributed via
-Homebrew; use [`cargo install`](#2-cargo-install) or
-[from source](#3-from-source) instead.
+(musl-static, glibc-portable). mneme supports Linux and macOS only;
+on Windows, install it inside WSL2.
 
 Upgrades:
 
@@ -49,18 +48,9 @@ cargo install mneme-mcp   # cargo-install upgrades in place
 
 ## 3. From source
 
-For contributors, Windows users, or anyone who wants to pin a
+For contributors, or anyone who wants to pin a
 specific revision. The bundled installer is the fastest path to a
 working install:
-
-> **Windows: `mneme run` only.** `mneme daemon` and `mneme client`
-> require Unix domain sockets, and `mneme stop` is not implemented
-> there — so wire your MCP host with `args: ["run"]` instead of the
-> daemon-mode `args: ["client"]`, and stop the process with Task
-> Manager or `Stop-Process`. Everything else (`init`, `stats`,
-> `inspect`, `export`, `backup`, `restore`, the encryption
-> subcommands) works normally. Tracked in
-> [Roadmap](./roadmap.md#platform-gaps).
 
 ```sh
 git clone https://github.com/tr0mb1r/mneme && cd mneme
