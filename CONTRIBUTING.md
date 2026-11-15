@@ -25,6 +25,18 @@ Thanks for your interest. This document is short on purpose.
   home (`mem:` prefix in redb + HNSW). Don't blur layers.
 - **Stay in Mneme's lane.** No code embedding, no knowledge graph, no
   SaaS. The README's "What it isn't" section is the source of truth.
+- **Recall and auto-context changes are checked structurally.**
+  `tests/quality_structural.rs` runs on every PR against a synthetic
+  corpus (`tests/common/corpus.rs`; no model, stub embedder): scoped reads
+  keep global pins, layers stay within their budget shares, warm events
+  are reachable, `forget` leaves no text behind, working memory is per
+  session, canonical calls raise no argument errors, reads add no turns,
+  context is deterministic. If you change ranking, packing or the tool
+  surface, extend the corpus or the checks in the same PR. A test marked
+  `#[ignore = "needs ..."]` there is the acceptance test for work in
+  progress; un-ignore it when that work lands. To look at the corpus:
+  `MNEME_DATA_DIR=/tmp/c cargo run --example seed_storage -- corpus`,
+  then `MNEME_EMBEDDER=stub MNEME_DATA_DIR=/tmp/c mneme run`.
 
 ## Style
 
