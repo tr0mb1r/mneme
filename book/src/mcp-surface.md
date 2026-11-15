@@ -14,18 +14,18 @@ serves.
 
 | Tool | Layer | Use when |
 |------|-------|----------|
-| `remember` | L4 semantic | The user shares a fact, decision, or preference that should persist across sessions. Classify it with `kind` (`fact`, the default, `decision`, `preference` or `conversation`); see [§Argument names](#argument-names). **Size guidance:** target under 500 chars; 500–2k accepted with a `length_advisory`, 2k–10k with a `length_warning`, over 10k rejected with a structured error. See [§Size guardrails](#size-guardrails) below. **Replacing a fact:** pass `supersedes` (an id or array of ids) and the old memories drop out of `recall` and auto-context while staying readable by id. When the nearest current memory has similarity ≥ 0.80 the reply names it, both in the text and in `_meta` (`related_memory`, or `duplicate_advisory` at ≥ 0.95). See [§Superseding and similarity advisories](#superseding-and-similarity-advisories). **Retries are safe:** content identical to a current memory in the same scope (ignoring leading/trailing and repeated whitespace) writes nothing and replies `already stored as <id>` with `_meta.deduplicated: true` — see [§Retries and exact duplicates](#retries-and-exact-duplicates). Content with a credential in a well-known format is rejected — see [§Write guardrails](#write-guardrails). |
-| `update` | L4 semantic | The user revises an existing memory: any subset of `content`, `kind`, `tags`, `scope`, `status`. `status: "archived"` keeps a memory that is no longer current out of `recall` and auto-context without deleting it (`"active"` restores it) — see [§Edit time and archiving](#edit-time-and-archiving). Re-embeds automatically when `content` changes. Also takes `supersedes`, to retire older memories after the fact (e.g. after `remember` reported a close match). New `content` goes through the same [secret guard](#write-guardrails) as `remember`. |
+| `remember` | L4 semantic | The user shares a fact, decision, or preference that should persist across sessions. Classify it with `kind` (`fact`, the default, `decision`, `preference` or `conversation`); see [§Argument names](#argument-names). **Size guidance:** target under 500 chars; 500–2k accepted with a `length_advisory`, 2k–10k with a `length_warning`, over 10k rejected with a structured error. See [§Size guardrails](#size-guardrails) below. **Replacing a fact:** pass `supersedes` (an id or array of ids) and the old memories drop out of `recall` and auto-context while staying readable by id. When the nearest current memory has similarity ≥ 0.80 the reply names it, both in the text and in `_meta` (`related_memory`, or `duplicate_advisory` at ≥ 0.95). See [§Superseding and similarity advisories](#superseding-and-similarity-advisories). **Retries are safe:** content identical to a current memory in the same scope (ignoring leading/trailing and repeated whitespace) writes nothing and replies `already stored as <id>` with `_meta.deduplicated: true` — see [§Retries and exact duplicates](#retries-and-exact-duplicates). Content with a credential in a well-known format is rejected — see [§Write guardrails](#write-guardrails). **Relating facts:** `relations: [{type, id \| ref, reason}]` says this memory `refines`, `contradicts` or `supersedes` another, or what it is `evidence_for`; `provenance` and `source` say how it is known. See [§Relations](#relations) and [§Provenance](#provenance). |
+| `update` | L4 semantic | The user revises an existing memory: any subset of `content`, `kind`, `tags`, `scope`, `status`. `status: "archived"` keeps a memory that is no longer current out of `recall` and auto-context without deleting it (`"active"` restores it) — see [§Edit time and archiving](#edit-time-and-archiving). Re-embeds automatically when `content` changes. Also takes `supersedes`, to retire older memories after the fact (e.g. after `remember` reported a close match). New `content` goes through the same [secret guard](#write-guardrails) as `remember`. Takes `relations`, `provenance` and `source` like `remember`; relations are added, never removed, by an update. |
 | `forget` | L4 semantic, L0 procedural, L3 episodic (hot+warm) | The user explicitly asks to remove a memory. `id=…` resolves the ULID across all three layers, first hit wins; cold-archive entries stay out of reach by design. The `tool_call` events that mirrored the memory's text are redacted in the same call — see [§Forgetting and the timeline](#forgetting-and-the-timeline). `id` is the only argument: there is no bulk delete by `query` or `scope` (find the ids with `recall` / `recall_recent` and forget them one at a time). Confirm before calling. |
 | `pin` | L0 procedural | A *rule* should surface on every recall context (e.g. "always use `uv`, not `pip`"). Passes the [secret guard](#write-guardrails). To replace a rule, `unpin` the old one and `pin` the new. |
 | `unpin` | L0 procedural | A previously-pinned rule no longer applies. |
-| `record_event` | L3 episodic (+ L1 mirror for message kinds) | Capture a structured event with a free-form `kind`. Use `user_message`/`assistant_message` for conversation turns; `decision`/`milestone`/`pivot`/etc. for curated semantic events; `summary` after `summarize_session` to land a digest. **`payload` is required** and must carry content, e.g. `{"content": "<what happened>"}`; there is no top-level `text` or `content` argument, a bare boolean or number payload counts as empty, and (as for every tool) undeclared arguments are rejected with `INVALID_PARAMS` naming the keys rather than ignored. See [§Event kinds](#event-kinds) below. |
+| `record_event` | L3 episodic (+ L1 mirror for message kinds) | Capture a structured event with a free-form `kind`. Use `user_message`/`assistant_message` for conversation turns; `decision`/`milestone`/`pivot`/etc. for curated semantic events; `summary` after `summarize_session` to land a digest. **`payload` is required** and must carry content, e.g. `{"content": "<what happened>"}`; there is no top-level `text` or `content` argument, a bare boolean or number payload counts as empty, and (as for every tool) undeclared arguments are rejected with `INVALID_PARAMS` naming the keys rather than ignored. See [§Event kinds](#event-kinds) below. `promote: {type, tags}` also stores the event's text as a memory with an `evidence_for` link back to the event — see [§Promoting an event](#promoting-an-event). |
 
 ### Memory reads
 
 | Tool | Layer | Use when |
 |------|-------|----------|
-| `recall` | L4 semantic | Hybrid search — meaning *and* exact words, fused, so both questions and exact names (`live_bt.py`, "D account", an env var, an error string) work. `mode` picks `hybrid` (default), `semantic`, or `keyword`; each row says which search found it in `match` (`semantic` / `keyword` / `both`). See [§Hybrid recall](#hybrid-recall). Filter with `scope`, `kind`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). Superseded memories are left out unless `include_superseded: true`, in which case they come after every current match and carry `superseded_by`. `layers: ["semantic", "episodic"]` also searches recorded events by keyword (the default is `["semantic"]`); rows carry `layer` and are ordered by `rank`. `since` / `until` (RFC3339 or ULID) keep rows in a `[since, until)` window on `time_field` (`created_at` by default). `scope` takes one scope or several separated by commas. See [§Searching events](#searching-events). |
+| `recall` | L4 semantic | Hybrid search — meaning *and* exact words, fused, so both questions and exact names (`live_bt.py`, "D account", an env var, an error string) work. `mode` picks `hybrid` (default), `semantic`, or `keyword`; each row says which search found it in `match` (`semantic` / `keyword` / `both`). See [§Hybrid recall](#hybrid-recall). Filter with `scope`, `kind`, `tags` (a memory must carry *every* listed tag), and `min_similarity` (cosine floor, `1.0` = identical; omit to take the nearest `limit` however far away they are). Each row carries both `score` (cosine *distance*, lower is closer) and `similarity` (`1 - score`, the orientation `min_similarity` uses). Superseded memories are left out unless `include_superseded: true`, in which case they come after every current match and carry `superseded_by`. `layers: ["semantic", "episodic"]` also searches recorded events by keyword (the default is `["semantic"]`); rows carry `layer` and are ordered by `rank`. `since` / `until` (RFC3339 or ULID) keep rows in a `[since, until)` window on `time_field` (`created_at` by default). `scope` takes one scope or several separated by commas. See [§Searching events](#searching-events). A memory that a newer one refines or contradicts is returned lower down with `demoted: true`. `ref` returns the memories citing an external reference, `provenance` filters, `expand: 1` quotes linked memories — see [§Relations](#relations). |
 | `recall_recent` | L3 episodic | "What did we just do?" — time-ordered events (tool calls, lifecycle events, conversation, decisions). Optional `since` / `until` bound the result to a `[since, until)` window against `created_at` (RFC3339 or 26-char ULID); when either bound is set, `limit` caps at 1000 instead of 200. The server does not parse natural language — convert phrases like "last Tuesday" to RFC3339 client-side before calling. Reads the hot tier, and the warm tier too when the window can reach it: `since` older than `hot_to_warm_days` (28 by default), or `until` set without `since`. `include_warm: true` reads warm on any call, `false` never does. Each row has `tier` (`hot` / `warm` / `cold`). Events in the cold archive are returned only with `include_cold: true` (slow; give a window; at most 1000 cold rows). See [§Warm and cold reads](#warm-and-cold-reads). |
 
 ### Session helpers
@@ -580,6 +580,157 @@ startup (one pass over the stored memories) and kept current by every
 write. It exists only in memory, so it adds nothing to the data
 directory and nothing to encrypt.
 
+## Relations
+
+A memory can say how it stands to something else. Pass `relations` to
+`remember` or `update`:
+
+```json
+{"name": "remember", "arguments": {
+  "content": "Gateway listens on 9090 since the March move",
+  "relations": [
+    {"type": "refines", "id": "01K8Z…", "reason": "port changed in March"},
+    {"type": "evidence_for", "ref": "path:/etc/gateway.toml"}
+  ]}}
+```
+
+| Type | Use when | Effect on the target |
+|---|---|---|
+| `supersedes` | The new memory replaces the old one outright. | Hidden from `recall` and auto-context, as with the `supersedes` argument. |
+| `refines` | The new memory narrows, updates or corrects *part* of the old one. | Demoted: still returned, ranked lower. |
+| `contradicts` | The new memory disputes the old one. | Demoted, as for `refines`. |
+| `evidence_for` | The target is what this memory is based on. | None. |
+
+Each entry has a `type`, a target and an optional `reason` (at most 300
+characters). The target is an `id` or a `ref`:
+
+- `id` is a memory id. For `evidence_for` it may also be an event id.
+- `ref` is an external reference, `evidence_for` only: any string of up to
+  128 bytes, such as `research:pricing-study`, `path:/docs/adr-7.md` or
+  `kanban:t_142`. mneme stores it and matches it exactly; it does not
+  parse, resolve or check it.
+
+Input is validated before anything is written. An unknown `type`, both or
+neither of `id` and `ref`, an `id` that names nothing, a relation from a
+memory to itself, or a `reason` or `ref` over its limit is `INVALID_PARAMS`
+(-32602), and a rejected `remember` stores nothing. Writing a relation that
+already exists replaces its reason. There is no argument that removes a
+relation: forget the memory that carries it.
+
+### Demotion
+
+`supersedes` is all-or-nothing, which is why it goes unused for partial
+corrections: superseding a memory to fix one detail hides everything else
+it said. `refines` and `contradicts` push the older memory down instead.
+
+A memory is **demoted** while another memory refines or contradicts it and
+that memory is:
+
+- still stored,
+- current (not archived and not itself superseded), and
+- newer by `updated_at`.
+
+A demoted memory's keyword evidence is not counted and its `rank` is
+lowered by `[recall] demote_margin` (0.10), in `hybrid`, `semantic` and
+`keyword` mode alike. Its row carries `demoted: true`. This is what stops a
+stale fact from outranking the current one because the question happens to
+use the stale wording.
+
+Demotion is undone by forgetting or archiving the newer memory, or by
+revising the older one afterwards (its `updated_at` then passes the
+refiner's). `mneme://context` leaves demoted memories out; set
+`[auto_context] include_demoted = true` to keep them.
+
+### Relations on a row
+
+`recall` and `mneme://context` rows carry a `relations` object when the
+memory has any. Keys appear only when non-empty:
+
+| Key | Value |
+|---|---|
+| `superseded_by` | Id of the memory that replaced this one. |
+| `refined_by`, `contradicted_by` | `[{id, reason}]`: memories that refine or contradict this one. |
+| `refines`, `contradicts`, `supersedes` | `[{id, reason}]`: memories this one refines, contradicts or supersedes. |
+| `evidence` | What this memory cites: `{id}` for a memory, `{id, layer: "episodic"}` for an event, `{ref}` for a reference; each with `reason` if one was given. |
+
+A relation whose other end is a memory that has since been forgotten is
+not shown. `expand: 1` on `recall` adds `linked` to each row with
+relations: `[{id, layer, content}]`, the first 120 characters of every
+linked memory or event, so the agent can see what a relation points at
+without a second call.
+
+### Recall by reference
+
+`recall` with `ref` is a lookup, not a search: it returns the memories that
+have a relation to exactly that reference.
+
+```json
+{"name": "recall", "arguments": {"ref": "research:pricing-study"}}
+```
+
+`query` is optional with `ref`. Without it the rows are ordered newest
+edit first and `score`, `similarity` and `rank` are `null`; with it they
+are ordered by similarity to the query. `match` is `"ref"`. Scope, kind,
+tag, time-window, archived and provenance filters apply; `layers` and
+`mode` do not.
+
+### Storage
+
+Relations are stored beside the memory, not in it, so stores written by
+earlier versions need no migration: a forward row
+`rel:<from><type><tag><target>` and the same relation keyed from the
+target, `rrel:<tag><target><type><from>`, each holding the reason and
+creation time. `forget` removes a memory's relations in both directions.
+`export` lists the relations each memory carries; `mneme backup` copies
+them with the rest of the store.
+
+## Provenance
+
+`remember` and `update` take `provenance`, how the writer came to know the
+fact, and `source`, where from:
+
+| `provenance` | Meaning |
+|---|---|
+| `user_stated` | The user said it. |
+| `observed` | The agent saw it: a file, a tool result, a log. |
+| `inferred` | The agent concluded it. |
+| `imported` | Brought in from another system. |
+
+`source` is free-form (`telegram:…`, `research:…`, `tool:…`), at most 200
+characters, and needs `provenance`. Both are optional; a memory stored
+without them has none, which is every memory written before 1.7.
+
+Rows from `recall`, `mneme://context` and `export` carry `provenance` and
+`source` when set. `recall(provenance: "inferred")` keeps only memories
+with that value; memories with none, and events, never match. `stats`
+reports `memories.by_provenance`, with `unspecified` for the rest.
+
+Provenance does not affect ranking. It is there for review: "inferred,
+older than a month, never confirmed" is a list worth reading.
+
+## Promoting an event
+
+`record_event` with `promote` writes the event and, in the same call, a
+long-term memory holding the event's text:
+
+```json
+{"name": "record_event", "arguments": {
+  "kind": "decision",
+  "payload": {"content": "Ship the importer behind a flag"},
+  "promote": {"type": "decision", "tags": ["importer"]}}}
+```
+
+The memory takes the payload's `content` (or `text`), the event's scope,
+`promote.type` as its kind (default `fact`) and `promote.tags` (default:
+the event's tags). It carries an `evidence_for` relation to the event, and
+the reply reports its id in `_meta.promoted_memory_id`. Use it for an
+event whose outcome should stay findable by meaning after the timeline
+has moved on; events are only ever found by their words.
+
+Nothing is promoted unless asked: the agent decides what is worth keeping.
+If the same text is already a current memory in that scope, no second
+memory is written and the existing one gets the link to the new event.
+
 ## Superseding and similarity advisories
 
 Facts change: a balance moves, a decision is reversed, a port is
@@ -596,6 +747,10 @@ and exports still see it), but `recall` and `mneme://context` skip it
 unless `include_superseded: true`. Forgetting the replacement brings the
 original back, so a mistaken supersede is undone by forgetting the new
 memory.
+
+A `supersedes` argument is the same thing as a `supersedes` entry in
+`relations` without a reason; either way the link also appears in the
+rows' `relations`.
 
 To help the agent notice when it should supersede, every `remember`
 reply names the closest current memory once similarity reaches 0.80:

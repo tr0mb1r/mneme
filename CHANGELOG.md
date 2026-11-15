@@ -14,6 +14,46 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **Typed relations between memories.** `remember` and `update` take
+  `relations: [{type, id | ref, reason}]`. `refines` and `contradicts`
+  say a memory narrows, corrects or disputes an older one without
+  replacing it; `evidence_for` says what a memory is based on, which can
+  be a memory, an event, or an external reference string such as
+  `research:pricing-study` (opaque, at most 128 bytes); `supersedes` is
+  the existing hide-the-old-one link as a relation. `reason` is up to 300
+  characters. Bad input (unknown type, missing or unknown target, a
+  memory related to itself, a value over its limit) is `INVALID_PARAMS`
+  and nothing is written. Stored in side tables, so there is no schema
+  change and nothing to migrate.
+- **A refined or contradicted memory is demoted in `recall`, not
+  hidden.** While the newer memory is stored, current and more recently
+  edited, the older one loses its keyword evidence and `[recall]
+  demote_margin` (0.10) of rank in every mode, and its row carries
+  `demoted: true`. Forgetting or archiving the newer memory, or revising
+  the older one afterwards, undoes it. `mneme://context` leaves demoted
+  memories out unless `[auto_context] include_demoted = true`. Both
+  config keys existed since 1.6 without effect.
+- **`relations` on rows.** `recall` and `mneme://context` rows carry a
+  `relations` object (`superseded_by`, `refined_by`, `contradicted_by`,
+  `refines`, `contradicts`, `supersedes`, `evidence`) when the memory has
+  any; rows without relations are unchanged.
+- **`recall(ref: …)`** returns the memories that cite an external
+  reference. `query` is optional with it.
+- **`recall(expand: 1)`** adds `linked` to rows with relations: the id
+  and first 120 characters of each linked memory or event.
+- **Provenance.** `remember` and `update` take `provenance`
+  (`user_stated`, `observed`, `inferred`, `imported`) and `source` (free
+  text, at most 200 characters). Rows carry them, `recall(provenance: …)`
+  filters on them, and `stats` reports `memories.by_provenance`. Ranking
+  is not affected.
+- **`record_event(promote: {type, tags})`** also stores the event's text
+  as a long-term memory, with an `evidence_for` link from the memory to
+  the event. The memory id is returned as `_meta.promoted_memory_id`.
+- When `remember` reports a close existing memory, the note and the
+  advisory (`suggested_relation`) also show how to mark the new memory as
+  refining it.
+- `export` (the MCP tool and `mneme export`) emits each memory's
+  `provenance`, `source` and `relations`.
 - **`recall` can search recorded events.** `layers: ["semantic",
   "episodic"]` adds keyword search over the L3 events whose kind is in
   `[episodic] index_kinds` (decisions, milestones, lessons, summaries

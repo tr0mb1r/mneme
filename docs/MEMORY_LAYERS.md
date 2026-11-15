@@ -388,6 +388,36 @@ Unfiltered recall still issues exactly one probe.
 > → one byte, present only when archived), so the on-disk memory format
 > and `schema_version` are unchanged and `forget` removes them with the
 > memory. `recall` rows gain `rank`, `updated_at` and `status`.
+>
+> **Changed in v1.7.** A memory can carry typed relations and a
+> provenance.
+>
+> - **Relations.** `remember` / `update` take
+>   `relations: [{type, id | ref, reason}]` with type `supersedes`,
+>   `refines`, `contradicts` or `evidence_for`. The target is a memory,
+>   an event (`evidence_for` only) or an external reference string
+>   (`evidence_for` only, opaque, at most 128 bytes). `supersedes` hides
+>   the target as before. `refines` and `contradicts` *demote* it while
+>   the refiner is current and newer: it stays in `recall`, flagged
+>   `demoted`, with its keyword evidence dropped and its rank lowered by
+>   `[recall] demote_margin`; auto-context leaves it out unless
+>   `[auto_context] include_demoted`. `recall(ref=…)` returns the
+>   memories citing a reference; `recall(expand=1)` quotes linked
+>   memories.
+> - **Provenance.** `provenance` (`user_stated`, `observed`, `inferred`,
+>   `imported`) and a free-form `source`. Filterable in `recall`,
+>   counted in `stats`, no effect on ranking.
+> - **Storage.** More side tables, so still no change to the memory
+>   format or `schema_version`: `rel:<from><type><tag><target>` and its
+>   mirror `rrel:<tag><target><type><from>` hold a relation's reason and
+>   creation time, `prov:<id>` the provenance; each value is a version
+>   byte followed by postcard. `tag` distinguishes a memory id, an event
+>   id and a reference. `forget` removes a memory's relations in both
+>   directions and its provenance, and a relation whose source memory is
+>   gone is ignored on read.
+> - **From the timeline.** `record_event(promote: {type, tags})` stores
+>   the event's text as a memory with an `evidence_for` link to the
+>   event. Still agent-driven: nothing is promoted unless asked.
 
 ---
 

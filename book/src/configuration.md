@@ -778,7 +778,40 @@ a scope dropped the global rules. Set `pin_scopes = []` to restore that.
 
 ### `include_demoted`
 
-Reserved for 1.7. Has no effect.
+| | |
+|---|---|
+| **Type** | boolean |
+| **Default** | `false` |
+| **Affects** | Whether demoted memories appear in `mneme://context` |
+
+A memory that a current, newer memory `refines` or `contradicts` is
+demoted (see [MCP surface §Relations](./mcp-surface.md#demotion)).
+`recall` returns it lower down; auto-context leaves it out. Set this to
+`true` to keep such memories in the context block, ranked below the
+memory that refines them.
+
+---
+
+## `[recall]` — ranking knobs
+
+### `demote_margin`
+
+| | |
+|---|---|
+| **Type** | number |
+| **Default** | `0.10` |
+| **Affects** | How far a refined or contradicted memory drops in `recall` |
+
+Subtracted from the `rank` of a demoted memory, on the cosine-similarity
+scale; its keyword evidence is dropped as well. The default is about the
+gap between a right answer and a lookalike, so the older memory lands
+just below the one that refines it rather than at the bottom of the
+list. `0` keeps the rank and only drops the keyword evidence. Negative
+values are treated as `0`.
+
+### `stemming`
+
+Reserved. Has no effect yet.
 
 ---
 
