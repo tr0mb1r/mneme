@@ -908,3 +908,92 @@ async fn current_memory_outranks_the_stale_one_in_context() {
         }
     }
 }
+
+/// The evaluation's "stale over current" count, driven to zero by
+/// relations rather than by timestamps: once the current memory says
+/// it `refines` the stale one, `recall` puts it first in every mode and
+/// marks the stale row, and auto-context drops the stale row.
+///
+/// Each pair is identical to the stub embedder (same first byte, same
+/// length) and matches the query's words equally, so before the
+/// relation nothing but chance orders the two.
+#[tokio::test]
+async fn a_refines_relation_puts_the_current_memory_above_the_stale_one() {
+    let h = Harness::new();
+    let c = h.seed().await;
+    let client = h.connect().await;
+
+    for pair in &c.pairs {
+        client
+            .ok(
+                "update",
+                json!({
+                    "id": pair.current.to_string(),
+                    "relations": [{
+                        "type": "refines",
+                        "id": pair.stale.to_string(),
+                        "reason": "recounted on 2026-11-01",
+                    }],
+                }),
+            )
+            .await;
+    }
+
+    let mut stale_over_current = 0;
+    for pair in &c.pairs {
+        for mode in ["hybrid", "semantic", "keyword"] {
+            let rows = client
+                .json(
+                    "recall",
+                    json!({
+                        "query": format!("{} balance", pair.subject),
+                        "scope": pair.scope,
+                        "mode": mode,
+                        "limit": 50,
+                    }),
+                )
+                .await;
+            let rows = rows.as_array().unwrap();
+            let pos = |id: String| rows.iter().position(|r| r["id"] == id);
+            let cur = pos(pair.current.to_string());
+            let stale = pos(pair.stale.to_string());
+            assert!(
+                cur.is_some(),
+                "{} ({mode}): current memory missing",
+                pair.subject
+            );
+            // Demoted, not hidden.
+            let stale = stale
+                .unwrap_or_else(|| panic!("{} ({mode}): stale memory was hidden", pair.subject));
+            if stale < cur.unwrap() {
+                stale_over_current += 1;
+            }
+            let row = &rows[stale];
+            assert_eq!(row["demoted"], true, "{} ({mode})", pair.subject);
+            assert_eq!(
+                row["relations"]["refined_by"][0]["id"],
+                pair.current.to_string()
+            );
+            assert_eq!(
+                row["relations"]["refined_by"][0]["reason"],
+                "recounted on 2026-11-01"
+            );
+        }
+
+        // Auto-context carries the current one only.
+        let body = client
+            .read(&format!(
+                "mneme://context?q={}%20balance&scope={}",
+                pair.subject, pair.scope
+            ))
+            .await;
+        let in_context = ids(&body["semantic"]);
+        assert!(in_context.contains(&pair.current.to_string()));
+        assert!(
+            !in_context.contains(&pair.stale.to_string()),
+            "{}: the refined memory is in auto-context",
+            pair.subject
+        );
+    }
+    assert_eq!(stale_over_current, 0);
+}
