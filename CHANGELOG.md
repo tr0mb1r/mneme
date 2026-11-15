@@ -23,8 +23,11 @@ the work that landed before automation was wired up.
   `recall`. Rows from both layers carry `layer` and `rank` and are
   ordered by `rank`; an event that contains every query word ranks like
   a memory at similarity 0.65. Events of kind `archived` or with
-  `retrieval_weight` ≤ 0.3 are demoted, not hidden. The default is still
-  `["semantic"]`, with the same rows in the same order as before.
+  `retrieval_weight` ≤ 0.3 are demoted, not hidden. In `mode: "keyword"`
+  the layers are merged on keyword evidence measured the same way for
+  both, so an event that contains the query's distinctive words comes
+  before memories that share one common token with it. The default is
+  still `["semantic"]`, with the same rows in the same order as before.
 - **`recall` takes `since` / `until`** (RFC3339 or ULID, with
   `time_field`), applied after the search with the search widened until
   the window is filled. In 1.5.2 these were unknown arguments that

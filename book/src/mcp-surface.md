@@ -400,6 +400,15 @@ know:
 - Events of kind `archived`, and events recorded with
   `retrieval_weight` 0.3 or less, are ranked at half: demoted, not
   hidden.
+- With `mode: "keyword"` the layers are merged on keyword evidence, not
+  on `rank`. Similarity is not what that mode ranks by, so memories and
+  events are scored together for how much of the query each contains
+  (one weighting of the query's words for all of them), and an event
+  comes before a memory when it contains clearly more: `0.8 × event
+  evidence > memory evidence`. Ask "what was the outcome of study
+  kestrel-17?" and the event that says "study kestrel-17 closed" comes
+  before memories that merely contain `17`. With equal evidence the
+  memory is first. Memories keep the order they have without `layers`.
 - `min_similarity` compares against an event's `rank`. `kind` keeps
   events of the same kind name (`decision`). `tags`, `scope`, `since`
   and `until` apply to both layers. `mode: "semantic"` returns no

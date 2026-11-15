@@ -51,29 +51,23 @@ jobs:
             corpus --questions tests/fixtures/eval/questions.jsonl quality/questions.jsonl
 
       # Thresholds. Measured on the fixture when this gate was last
-      # calibrated (dev after the 1.6 auto-context and episodic-index
-      # work; identical over six fresh seedings), keyword mode, unscoped:
+      # calibrated (identical over six fresh seedings), keyword mode,
+      # unscoped:
       #
       #   L4 hit@5                      34/34 = 1.000   gate >= 0.95
-      #   all hit@5 (semantic+episodic) 36/46 = 0.783   gate >= 0.75
-      #                                 (a drop of more than 0.03 fails)
+      #   all hit@5 (semantic+episodic) 46/46 = 1.000   gate >= 0.95
+      #                                 (44/46 passes, 43/46 fails)
       #   context gold                  41/46 = 0.891   gate >= 0.85
       #                                 (40/46 passes, 39/46 fails)
       #   stale over current, context   0/10            gate <= 0
       #   stale over current, recall    10/10           NOT gated yet
       #
-      # Two known gaps the numbers show, neither gated:
-      #
-      # - Recall ranks the stale memory first for all ten latest-state
-      #   questions: the two memories of a pair score the same on
-      #   keywords and the tie goes to the older one. When recall prefers
-      #   the newer of two equal matches (plan W3), add
-      #   `--max-stale-over-current 0` below; until then that flag would
-      #   fail every night and teach people to ignore this job.
-      # - With both layers, none of the ten hot L3-only questions has its
-      #   event in the top five: memories that share one token with the
-      #   question outrank the event that shares three. That is why
-      #   all hit@5 is 0.783 and not higher; raise its gate when it moves.
+      # The one known gap, not gated: recall ranks the stale memory
+      # first for all ten latest-state questions. The two memories of a
+      # pair score the same on keywords and the tie goes to the older
+      # one. When recall prefers the newer of two equal matches, add
+      # `--max-stale-over-current 0` below; until then that flag would
+      # fail every night and teach people to ignore this job.
       #
       # Raise a threshold when the measured value rises; never lower one
       # to make a red run green without saying why in the commit.
@@ -85,7 +79,7 @@ jobs:
             --tag nightly \
             --gate-mode keyword \
             --min-l4-hit5 0.95 \
-            --min-all-hit5 0.75 \
+            --min-all-hit5 0.95 \
             --min-context-gold 0.85 \
             --max-context-stale-over-current 0
 

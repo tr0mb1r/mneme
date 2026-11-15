@@ -27,6 +27,33 @@
 //! one. `W_EPI_RECALL` is the general discount of an event against a
 //! curated memory.
 //!
+//! # Keyword mode
+//!
+//! That scale needs the cosine to mean something. In `mode = "keyword"`
+//! it is not what the caller asked to rank by: L4 orders its own rows by
+//! keyword evidence and uses similarity only to break ties. So the two
+//! layers are merged on evidence as well, and on *one* measure of it.
+//! The coverage each layer reports cannot be compared directly: each is
+//! a share of the query as its own index sees it, and a term the other
+//! layer has never seen is weighed differently by the two (dropped as
+//! phrasing by L4's index, counted at full rarity by L3's). For "what
+//! was the outcome of study kestrel-17?", a memory whose only match is
+//! `17` and the event that says "study kestrel-17 closed" would
+//! otherwise both look like good matches, each by its own account.
+//!
+//! [`shared_evidence`] therefore scores the candidates of both layers
+//! together: one set of query-term weights, one denominator. Then
+//!
+//! ```text
+//! memory key = coverage² + SHARED_PHRASE
+//! event key  = W_EPI_RECALL × (coverage² + SHARED_PHRASE) × retrieval_weight
+//! ```
+//!
+//! With the same evidence the memory comes first (it is curated, and
+//! `W_EPI_RECALL < 1`); an event that contains clearly more of the
+//! query than a memory does comes before it. The `rank` reported for a
+//! row is unchanged in every mode.
+//!
 //! Events of kind `archived`, and events the writer weighted at
 //! [`LOW_WEIGHT`] or less, are demoted (rank × [`EPI_DEMOTE_FACTOR`]),
 //! not hidden: they are still returned when little else matches.
@@ -69,6 +96,11 @@ pub const EPI_DEMOTE_FACTOR: f32 = 0.5;
 
 /// The kind `record_event` uses for "this is no longer current".
 pub const ARCHIVED_KIND: &str = "archived";
+
+/// What containing the query as a phrase is worth next to covering it
+/// (`coverage²`, at most 1) when the layers are merged on evidence. The
+/// ratio L4 uses: its phrase bonus over its keyword weight.
+pub const SHARED_PHRASE: f32 = 0.5;
 
 /// How many lexical candidates are read back from storage per recall.
 const EPI_FETCH: usize = 200;
@@ -221,7 +253,36 @@ pub async fn recall(
         }
         _ => Vec::new(),
     };
-    Ok(interleave(l4, l3, k))
+    Ok(interleave(query, req.filters.mode, l4, l3, k))
+}
+
+/// Lexical evidence for `query` in each of `texts`, measured the same
+/// way for all of them: `coverage² (+ SHARED_PHRASE)`.
+///
+/// The coverage is the IDF-weighted share of the query's terms a text
+/// contains, with rarity counted over `texts` themselves. They are the
+/// candidates of both layers for this one query, so a term most of
+/// them share separates nothing and weighs little, and the term only
+/// one of them has weighs most. Stopwords are left out of the query,
+/// and a term none of the texts contains lowers every score alike, so
+/// it never changes which of two texts has more evidence.
+pub fn shared_evidence(query: &str, texts: &[&str]) -> Vec<f32> {
+    let mut index: keyword::KeywordIndex<usize> = keyword::KeywordIndex::strict();
+    for (i, text) in texts.iter().enumerate() {
+        index.insert(i, text);
+    }
+    let ids: Vec<usize> = (0..texts.len()).collect();
+    let coverage = index.coverage_of(query, &ids);
+    let query_words = keyword::words(query);
+    texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let c = coverage.get(&i).copied().unwrap_or(0.0);
+            let phrase = keyword::contains_phrase(&keyword::words(text), &query_words);
+            c * c + if phrase { SHARED_PHRASE } else { 0.0 }
+        })
+        .collect()
 }
 
 /// The L4 half: one `SemanticStore::recall` under the request's scopes,
@@ -304,34 +365,73 @@ async fn episodic_hits(
     Ok(hits)
 }
 
-/// Merge the two best-first lists by rank into one of at most `k`.
+/// Merge the two best-first lists into one of at most `k`.
 ///
-/// Each list keeps its own order: a row is only ever compared with the
-/// head of the other list. So with no L3 rows the result is the L4 list
-/// untouched, and L4 rows never change places with each other whatever
-/// the ranks say. Superseded memories stay last, after every event,
-/// and only fill leftover room, as in an L4-only recall.
-fn interleave(l4: Vec<RecallHit>, l3: Vec<EpisodicHit>, k: usize) -> Vec<UnifiedHit> {
+/// Rows are compared on their rank, or in keyword mode on their shared
+/// lexical evidence (module docs). Each L4 row is only ever compared
+/// with the head of the event list: with no L3 rows the result is the
+/// L4 list untouched, and L4 rows never change places with each other
+/// whatever the keys say. Superseded memories stay last, after every
+/// event, and only fill leftover room, as in an L4-only recall.
+fn interleave(
+    query: &str,
+    mode: RecallMode,
+    l4: Vec<RecallHit>,
+    l3: Vec<EpisodicHit>,
+    k: usize,
+) -> Vec<UnifiedHit> {
     let (current, stale): (Vec<RecallHit>, Vec<RecallHit>) =
         l4.into_iter().partition(|h| h.superseded_by.is_none());
     let wrap = |hit: RecallHit| {
         let rank = semantic_rank(&hit);
         UnifiedHit::Semantic { hit, rank }
     };
+
+    // The merge key of every row.
+    let (memory_keys, event_keys): (Vec<f32>, Vec<f32>) =
+        if mode == RecallMode::Keyword && !l3.is_empty() {
+            let texts: Vec<&str> = current
+                .iter()
+                .map(|h| h.item.content.as_str())
+                .chain(l3.iter().map(|e| e.text.as_str()))
+                .collect();
+            let evidence = shared_evidence(query, &texts);
+            let (memories, events) = evidence.split_at(current.len());
+            let events = events
+                .iter()
+                .zip(&l3)
+                .map(|(ev, e)| {
+                    let demote = if e.demoted { EPI_DEMOTE_FACTOR } else { 1.0 };
+                    W_EPI_RECALL * ev * e.event.retrieval_weight * demote
+                })
+                .collect();
+            (memories.to_vec(), events)
+        } else {
+            (
+                current.iter().map(semantic_rank).collect(),
+                l3.iter().map(|e| e.rank).collect(),
+            )
+        };
+
+    // Events are free to reorder among themselves: best key first, the
+    // order they arrived in (rank, then newest) between equals.
+    let mut events: Vec<(EpisodicHit, f32)> = l3.into_iter().zip(event_keys).collect();
+    events.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
     let mut out = Vec::with_capacity(k);
-    let mut current = current.into_iter().peekable();
-    let mut l3 = l3.into_iter().peekable();
+    let mut current = current.into_iter().zip(memory_keys).peekable();
+    let mut events = events.into_iter().peekable();
     while out.len() < k {
-        let take_event = match (current.peek(), l3.peek()) {
-            (Some(memory), Some(event)) => event.rank > semantic_rank(memory),
+        let take_event = match (current.peek(), events.peek()) {
+            (Some((_, memory)), Some((_, event))) => event > memory,
             (None, Some(_)) => true,
             (Some(_), None) => false,
             (None, None) => break,
         };
         if take_event {
-            out.extend(l3.next().map(UnifiedHit::Episodic));
+            out.extend(events.next().map(|(e, _)| UnifiedHit::Episodic(e)));
         } else {
-            out.extend(current.next().map(wrap));
+            out.extend(current.next().map(|(h, _)| wrap(h)));
         }
     }
     let room = k.saturating_sub(out.len());
@@ -834,5 +934,185 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn keyword_both() -> RecallRequest {
+        RecallRequest {
+            layers: Layers::both(),
+            filters: RecallFilters {
+                mode: RecallMode::Keyword,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shared_evidence_uses_one_denominator_for_every_text() {
+        let query = "what was the outcome of study kestrel-17?";
+        let ev = shared_evidence(
+            query,
+            &[
+                "in ops the planner batch size is 66 (note 17)",
+                "study kestrel-17 closed: the scheduler change is rejected",
+                "study kestrel-18 closed: the indexer change is accepted",
+                "nothing in common",
+            ],
+        );
+        // The text with the distinctive terms has most of the evidence;
+        // sharing one number, or the generic words, has little.
+        assert!(ev[1] > 4.0 * ev[0], "{ev:?}");
+        assert!(ev[1] > 4.0 * ev[2], "{ev:?}");
+        assert_eq!(ev[3], 0.0);
+        // A phrase is worth SHARED_PHRASE on top of full coverage.
+        let ev = shared_evidence("kestrel-17 closed", &["study kestrel-17 closed today", "x"]);
+        assert!((ev[0] - (1.0 + SHARED_PHRASE)).abs() < 1e-6, "{ev:?}");
+        // Stopwords alone are no evidence.
+        let ev = shared_evidence("what was the port", &["what was the weather", "the port"]);
+        assert!(ev[1] > ev[0], "{ev:?}");
+        assert!(shared_evidence("anything", &[]).is_empty());
+    }
+
+    /// The failure this merge was written for. A question in natural
+    /// language about something only an event records; memories that
+    /// share one token with it must not push the event out.
+    #[tokio::test]
+    async fn keyword_mode_puts_a_full_match_event_above_partial_match_memories() {
+        let f = fixture();
+        for (i, component) in [
+            "planner", "notifier", "archiver", "gateway", "ledger", "cache",
+        ]
+        .iter()
+        .enumerate()
+        {
+            f.semantic
+                .remember(
+                    &format!("in ops the {component} batch size is {} (note 17)", 60 + i),
+                    MemoryKind::Fact,
+                    vec![],
+                    "p".into(),
+                )
+                .await
+                .unwrap();
+        }
+        let mut events = Vec::new();
+        for n in [17, 18, 19] {
+            let payload = serde_json::json!({
+                "content": format!("study kestrel-{n} closed: the scheduler change is rejected")
+            });
+            events.push(
+                f.episodic
+                    .record_json("decision", "p", &payload)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let query = "what was the outcome of study kestrel-17?";
+        let hits = recall(&f.semantic, Some(&f.episodic), query, 5, &keyword_both())
+            .await
+            .unwrap();
+        assert!(
+            matches!(&hits[0], UnifiedHit::Episodic(e) if e.event.id == events[0]),
+            "the event that answers the question comes first: {hits:?}"
+        );
+        // The memories are still there, in the order L4 alone gives.
+        let alone = recall(
+            &f.semantic,
+            None,
+            query,
+            5,
+            &RecallRequest {
+                layers: Layers::default(),
+                ..keyword_both()
+            },
+        )
+        .await
+        .unwrap();
+        let mixed_memories = memory_ids(&hits);
+        assert!(!mixed_memories.is_empty());
+        assert_eq!(
+            mixed_memories[..],
+            memory_ids(&alone)[..mixed_memories.len()]
+        );
+    }
+
+    /// The other direction: a memory that answers the query keeps its
+    /// place ahead of events that only share part of it, and with equal
+    /// evidence the memory comes first.
+    #[tokio::test]
+    async fn keyword_mode_keeps_a_matching_memory_ahead_of_weaker_events() {
+        let f = fixture();
+        let memory = f
+            .semantic
+            .remember(
+                "the ledger batch size in research is 40",
+                MemoryKind::Fact,
+                vec![],
+                "p".into(),
+            )
+            .await
+            .unwrap();
+        for text in [
+            "the ledger change is accepted for research",
+            "the ledger batch size in research is 40",
+            "the cache change is rejected for research",
+        ] {
+            f.episodic
+                .record_json("decision", "p", &serde_json::json!({ "content": text }))
+                .await
+                .unwrap();
+        }
+        let hits = recall(
+            &f.semantic,
+            Some(&f.episodic),
+            "what is the ledger batch size in research?",
+            5,
+            &keyword_both(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&hits[0], UnifiedHit::Semantic { hit, .. } if hit.item.id == memory),
+            "{hits:?}"
+        );
+        // The event with the same text is next; the partial ones follow.
+        let UnifiedHit::Episodic(second) = &hits[1] else {
+            panic!("{hits:?}")
+        };
+        assert_eq!(second.text, "the ledger batch size in research is 40");
+    }
+
+    /// Demotion and `retrieval_weight` still count when merging on
+    /// evidence.
+    #[tokio::test]
+    async fn keyword_mode_merge_respects_weight_and_demotion() {
+        let f = fixture();
+        let payload =
+            serde_json::json!({"content": "rotate the gateway token monthly"}).to_string();
+        let plain = f
+            .episodic
+            .record_full("decision", "p", &payload, vec![], 1.0)
+            .await
+            .unwrap();
+        let archived = f
+            .episodic
+            .record_full("archived", "p", &payload, vec![], 1.0)
+            .await
+            .unwrap();
+        let light = f
+            .episodic
+            .record_full("decision", "p", &payload, vec![], 0.6)
+            .await
+            .unwrap();
+        let hits = recall(
+            &f.semantic,
+            Some(&f.episodic),
+            "gateway token",
+            5,
+            &keyword_both(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(event_ids(&hits), vec![plain, light, archived]);
     }
 }
