@@ -4,6 +4,7 @@ use crate::mcp::server::FAILED_MESSAGE_CAP;
 use crate::mcp::tools::{ContentBlock, ToolError, ToolRegistry, ToolResult};
 use crate::memory::checkpoint_scheduler::CheckpointScheduler;
 use crate::memory::episodic::EpisodicStore;
+use crate::memory::semantic::normalise_content;
 use crate::memory::working::ActiveSession;
 use crate::scope::ScopeState;
 use serde_json::{Value, json};
@@ -108,6 +109,72 @@ pub fn tool_call_payload(name: &str, args: &Value) -> Value {
         _ => {}
     }
     p
+}
+
+/// The id of the memory a successful write stored or changed, as the
+/// tool reported it in `_meta.id` (see `ToolResult::with_id`).
+fn written_memory_id(result: &ToolResult) -> Option<&str> {
+    result.meta.as_ref()?.get("id")?.as_str()
+}
+
+/// Tools whose `tool_call` event mirrors a memory's text.
+fn mirrors_memory_content(tool: &str) -> bool {
+    matches!(tool, "remember" | "pin" | "update")
+}
+
+/// The replacement for a `tool_call` payload that mirrored a memory
+/// which has now been forgotten, or `None` when `payload` is not about
+/// that memory (or is already redacted).
+///
+/// `forget` deletes the memory, but `remember`/`pin`/`update` each left
+/// a copy of its text on the L3 timeline. A row matches when:
+///
+/// * `payload.memory_id == memory_id` — rows written since the
+///   dispatcher records the id of the memory a write produced;
+/// * `payload.id == memory_id` — every `update` row, old or new;
+/// * it carries neither id and its `content`, whitespace-normalised,
+///   equals `forgotten_content` — `remember`/`pin` rows from before
+///   `memory_id` existed. This is a match on text, so a legacy row for
+///   another memory with identical text is redacted too; losing a
+///   duplicate copy of text the user asked to forget is the safe side.
+///   A legacy `remember` row whose memory was later edited no longer
+///   equals the final text and is not found.
+///
+/// The replacement keeps what makes the row useful as history (which
+/// tool, which memory) and drops everything else, the scope and kind
+/// included: `{"tool", "memory_id", "redacted": "forgotten", "at"}`,
+/// where `at` is when the redaction happened.
+pub fn redact_forgotten(
+    payload: &Value,
+    memory_id: &str,
+    forgotten_content: Option<&str>,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Option<Value> {
+    let obj = payload.as_object()?;
+    let tool = obj.get("tool")?.as_str()?;
+    if !mirrors_memory_content(tool) || obj.contains_key("redacted") {
+        return None;
+    }
+    let field = |key: &str| obj.get(key).and_then(Value::as_str);
+    let by_id = field("memory_id") == Some(memory_id) || field("id") == Some(memory_id);
+    let by_legacy_content = || {
+        !obj.contains_key("memory_id")
+            && !obj.contains_key("id")
+            && match (field("content"), forgotten_content) {
+                (Some(row), Some(forgotten)) => {
+                    normalise_content(row) == normalise_content(forgotten)
+                }
+                _ => false,
+            }
+    };
+    (by_id || by_legacy_content()).then(|| {
+        json!({
+            "tool": tool,
+            "memory_id": memory_id,
+            "redacted": "forgotten",
+            "at": at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        })
+    })
 }
 
 /// True when the guard flagged the stored content (`warn` mode, or the
@@ -289,6 +356,16 @@ pub async fn handle_tools_call(
                 if has_secret_advisory(&result) {
                     redact_flagged_content(&mut payload);
                 }
+                // Tie the event to the memory it wrote, so a later
+                // `forget` of that memory can find and redact it. Not
+                // derivable from the arguments: `remember` and `pin`
+                // mint the id.
+                if mirrors_memory_content(&name)
+                    && let Some(memory_id) = written_memory_id(&result)
+                    && let Some(obj) = payload.as_object_mut()
+                {
+                    obj.insert("memory_id".to_owned(), json!(memory_id));
+                }
                 if let Err(e) = episodic.record_json("tool_call", &scope, &payload).await {
                     tracing::warn!(
                         error = %e,
@@ -410,6 +487,293 @@ mod tests {
                 .map(|e| e.payload_json().unwrap())
                 .collect()
         }
+    }
+
+    impl Rig {
+        /// A call that must succeed; returns the `tools/call` result.
+        async fn ok(&self, tool: &str, args: Value) -> Value {
+            let resp = self.call(tool, args).await;
+            assert!(resp.error.is_none(), "{tool}: {:?}", resp.error);
+            let result = resp.result.unwrap();
+            assert_eq!(result["isError"], false, "{tool}: {result}");
+            result
+        }
+
+        /// A successful write; returns the id it reported in `_meta`.
+        async fn write(&self, tool: &str, args: Value) -> String {
+            self.ok(tool, args).await["_meta"]["id"]
+                .as_str()
+                .expect("a write reports `_meta.id`")
+                .to_owned()
+        }
+
+        /// Raw payload text of every `tool_call` row, hot and warm.
+        async fn tool_call_rows(&self) -> Vec<String> {
+            let mut rows = self.episodic.list_all().await.unwrap();
+            rows.extend(self.episodic.list_warm().await.unwrap());
+            rows.into_iter()
+                .filter(|e| e.kind == "tool_call")
+                .map(|e| e.payload)
+                .collect()
+        }
+
+        /// Move every hot `tool_call` row for `tool` to the warm tier.
+        async fn age_to_warm(&self, tool: &str) -> usize {
+            let mut moved = 0;
+            for e in self.episodic.list_all().await.unwrap() {
+                if e.kind == "tool_call" && e.payload_json().unwrap()["tool"] == tool {
+                    assert!(self.episodic.promote_to_warm(e.id).await.unwrap());
+                    moved += 1;
+                }
+            }
+            moved
+        }
+    }
+
+    /// Panics if any `tool_call` row, hot or warm, still holds any
+    /// 20-character run of `content`.
+    async fn assert_no_trace(rig: &Rig, content: &str) {
+        let chars: Vec<char> = content.chars().collect();
+        assert!(chars.len() >= 20, "test content too short to window");
+        let rows = rig.tool_call_rows().await;
+        for window in chars.windows(20) {
+            let needle: String = window.iter().collect();
+            for row in &rows {
+                assert!(!row.contains(&needle), "`{needle}` survives in {row}");
+            }
+        }
+    }
+
+    const SECRET_V1: &str = "Mira's locker combination is 31-07-44 at the Riverside gym";
+    const SECRET_V2: &str = "Mira's locker combination changed to 08-19-62, same gym";
+    const BYSTANDER: &str = "the staging database listens on port 5433 behind the VPN";
+
+    #[tokio::test]
+    async fn successful_writes_record_the_memory_id() {
+        let rig = Rig::new(SecretsMode::Reject, AutoLogToolCalls::Writes);
+        let mem = rig.write("remember", json!({"content": SECRET_V1})).await;
+        let pin = rig.write("pin", json!({"content": BYSTANDER})).await;
+        rig.write("update", json!({"id": mem, "content": SECRET_V2}))
+            .await;
+        // An update that changed nothing wrote nothing: no `memory_id`.
+        rig.ok(
+            "update",
+            json!({"id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "content": "no such row"}),
+        )
+        .await;
+        // A retried remember resolves to the memory already stored.
+        let again = rig.write("remember", json!({"content": SECRET_V2})).await;
+        assert_eq!(again, mem);
+
+        let events = rig.tool_call_payloads().await;
+        let ids: Vec<(&str, Option<&str>)> = events
+            .iter()
+            .rev()
+            .map(|e| (e["tool"].as_str().unwrap(), e["memory_id"].as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("remember", Some(mem.as_str())),
+                ("pin", Some(pin.as_str())),
+                ("update", Some(mem.as_str())),
+                ("update", None),
+                ("remember", Some(mem.as_str())),
+            ]
+        );
+    }
+
+    /// F9: `forget` deleted the memory and left its full text in the
+    /// `tool_call` rows of the writes that created and edited it.
+    #[tokio::test]
+    async fn forget_redacts_the_tool_call_rows_in_hot_and_warm() {
+        let rig = Rig::new(SecretsMode::Reject, AutoLogToolCalls::Writes);
+        let mem = rig
+            .write(
+                "remember",
+                json!({"content": SECRET_V1, "kind": "fact", "scope": "private"}),
+            )
+            .await;
+        let other = rig.write("remember", json!({"content": BYSTANDER})).await;
+        // The remember rows age into the warm tier; the update stays hot.
+        assert_eq!(rig.age_to_warm("remember").await, 2);
+        rig.write("update", json!({"id": mem, "content": SECRET_V2}))
+            .await;
+        assert_eq!(rig.episodic.count_warm().await.unwrap(), 2);
+
+        let result = rig.ok("forget", json!({"id": mem})).await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("forgot semantic memory"), "{text}");
+        assert!(text.contains("redacted 2 tool_call event(s)"), "{text}");
+        assert_eq!(result["_meta"]["redacted_tool_calls"], 2);
+
+        assert_no_trace(&rig, SECRET_V1).await;
+        assert_no_trace(&rig, SECRET_V2).await;
+
+        // Rows stay where they were, in the documented shape.
+        assert_eq!(rig.episodic.count_warm().await.unwrap(), 2);
+        let redacted: Vec<Value> = rig
+            .tool_call_rows()
+            .await
+            .iter()
+            .map(|r| serde_json::from_str::<Value>(r).unwrap())
+            .filter(|p| p.get("redacted").is_some())
+            .collect();
+        assert_eq!(redacted.len(), 2);
+        for p in &redacted {
+            let mut keys: Vec<&str> = p.as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["at", "memory_id", "redacted", "tool"]);
+            assert_eq!(p["memory_id"], mem.as_str());
+            assert_eq!(p["redacted"], "forgotten");
+            chrono::DateTime::parse_from_rfc3339(p["at"].as_str().unwrap()).unwrap();
+        }
+        let mut tools: Vec<&str> = redacted
+            .iter()
+            .map(|p| p["tool"].as_str().unwrap())
+            .collect();
+        tools.sort_unstable();
+        assert_eq!(tools, ["remember", "update"]);
+
+        // The other memory's row is untouched, and so is the audit row
+        // of the forget itself.
+        let rows = rig.tool_call_rows().await;
+        assert!(rows.iter().any(|r| r.contains(BYSTANDER)));
+        assert!(rows.iter().any(|r| {
+            let p: Value = serde_json::from_str(r).unwrap();
+            p == json!({"tool": "forget", "id": mem})
+        }));
+        let still = rig.ok("recall", json!({"query": "staging database"})).await;
+        assert!(
+            still["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&other)
+        );
+    }
+
+    #[tokio::test]
+    async fn forget_redacts_a_pin_and_the_update_of_a_missing_memory() {
+        let rig = Rig::new(SecretsMode::Reject, AutoLogToolCalls::Writes);
+        let pin = rig.write("pin", json!({"content": SECRET_V1})).await;
+        let result = rig.ok("forget", json!({"id": pin})).await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("forgot procedural memory"), "{text}");
+        assert_eq!(result["_meta"]["redacted_tool_calls"], 1);
+        assert_no_trace(&rig, SECRET_V1).await;
+
+        // An update of an id that does not exist stored nothing, but its
+        // row still mirrors the text; forgetting that id clears it.
+        let ghost = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        rig.ok("update", json!({"id": ghost, "content": SECRET_V2}))
+            .await;
+        let result = rig.ok("forget", json!({"id": ghost})).await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("no such memory"), "{text}");
+        assert_eq!(result["_meta"]["redacted_tool_calls"], 1);
+        assert_no_trace(&rig, SECRET_V2).await;
+
+        // Nothing left to do the second time.
+        let result = rig.ok("forget", json!({"id": ghost})).await;
+        assert!(result.get("_meta").is_none(), "{result}");
+    }
+
+    /// Rows written before `memory_id` existed carry only the content.
+    /// They are matched by text, whitespace-normalised, in both tiers.
+    #[tokio::test]
+    async fn forget_redacts_legacy_rows_by_content() {
+        let rig = Rig::new(SecretsMode::Reject, AutoLogToolCalls::Off);
+        let mem = rig.write("remember", json!({"content": SECRET_V1})).await;
+        assert!(rig.tool_call_rows().await.is_empty());
+
+        let legacy =
+            |content: &str| json!({"tool": "remember", "content": content, "type": "fact"});
+        let spaced = SECRET_V1.replace(' ', "  ");
+        let hot = rig
+            .episodic
+            .record_json("tool_call", "work", &legacy(&format!("  {spaced}\n")))
+            .await
+            .unwrap();
+        let warm = rig
+            .episodic
+            .record_json("tool_call", "work", &legacy(SECRET_V1))
+            .await
+            .unwrap();
+        assert!(rig.episodic.promote_to_warm(warm).await.unwrap());
+        // Different text, and a row that already belongs to another id.
+        rig.episodic
+            .record_json("tool_call", "work", &legacy(BYSTANDER))
+            .await
+            .unwrap();
+        rig.episodic
+            .record_json(
+                "tool_call",
+                "work",
+                &json!({"tool": "remember", "content": SECRET_V1, "memory_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"}),
+            )
+            .await
+            .unwrap();
+        // Same text under another event kind is not a tool_call mirror.
+        rig.episodic
+            .record_json("note", "work", &legacy(SECRET_V1))
+            .await
+            .unwrap();
+
+        let result = rig.ok("forget", json!({"id": mem})).await;
+        assert_eq!(result["_meta"]["redacted_tool_calls"], 2);
+        for id in [hot, warm] {
+            let p = rig
+                .episodic
+                .find_warm_or_hot(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload_json()
+                .unwrap();
+            assert_eq!(p["redacted"], "forgotten", "{p}");
+            assert_eq!(p["memory_id"], mem.as_str());
+            assert!(p.get("content").is_none() && p.get("type").is_none());
+        }
+        let rows = rig.tool_call_rows().await;
+        assert_eq!(rows.iter().filter(|r| r.contains("31-07-44")).count(), 1);
+        assert!(rows.iter().any(|r| r.contains(BYSTANDER)));
+    }
+
+    #[test]
+    fn redact_forgotten_leaves_unrelated_and_already_redacted_rows() {
+        let at = chrono::Utc::now();
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let no = |p: Value| assert!(redact_forgotten(&p, id, Some("text"), at).is_none(), "{p}");
+        // Not a writer, even though the id matches.
+        no(json!({"tool": "forget", "id": id}));
+        no(json!({"tool": "unpin", "id": id}));
+        no(json!({"tool": "recall", "query": "text"}));
+        // Another memory.
+        no(json!({"tool": "update", "id": "01BX5ZZKBKACTAV9WEVGEMMVRZ", "content": "text"}));
+        no(json!({"tool": "remember", "content": "other text"}));
+        // Already done.
+        no(json!({"tool": "remember", "memory_id": id, "redacted": "forgotten", "at": "x"}));
+        // Not an object.
+        no(json!("text"));
+        // Without the forgotten text there is no legacy match.
+        assert!(
+            redact_forgotten(
+                &json!({"tool": "remember", "content": "text"}),
+                id,
+                None,
+                at
+            )
+            .is_none()
+        );
+        assert!(
+            redact_forgotten(
+                &json!({"tool": "pin", "content": " text "}),
+                id,
+                Some("text"),
+                at
+            )
+            .is_some()
+        );
     }
 
     /// Call `tool` under `secrets` with auto-logging on `all`, and

@@ -272,7 +272,7 @@ impl Tool for Update {
         // arguments. The "forget <id>" note only makes sense when
         // something was stored.
         Ok(if existed {
-            secret_guard::attach(result, secret_advisory, memory_id)
+            secret_guard::attach(result.with_id(memory_id), secret_advisory, memory_id)
         } else {
             secret_guard::attach_meta(result, secret_advisory)
         })
@@ -487,7 +487,8 @@ mod tests {
             .invoke(json!({ "id": id.to_string(), "tags": ["x"] }))
             .await
             .unwrap();
-        assert!(res.meta.is_none());
+        // Just the id of the memory that changed.
+        assert_eq!(res.meta, Some(json!({ "id": id.to_string() })));
     }
 
     #[tokio::test]

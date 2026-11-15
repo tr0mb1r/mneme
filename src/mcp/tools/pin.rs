@@ -97,7 +97,7 @@ impl Tool for Pin {
             .await
             .map_err(|e| ToolError::Internal(format!("pin failed: {e}")))?;
         Ok(secret_guard::attach(
-            ToolResult::text(format!("pinned {id}")),
+            ToolResult::text(format!("pinned {id}")).with_id(id),
             secret_advisory,
             id,
         ))

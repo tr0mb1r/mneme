@@ -317,7 +317,11 @@ impl Tool for Remember {
         if !meta.is_empty() {
             result = result.with_meta(Value::Object(meta));
         }
-        Ok(secret_guard::attach(result, secret_advisory, id))
+        Ok(secret_guard::attach(
+            result.with_id(id),
+            secret_advisory,
+            id,
+        ))
     }
 }
 
@@ -454,7 +458,16 @@ mod tests {
             .invoke(json!({ "content": "CI runs on ubuntu-latest only" }))
             .await
             .unwrap();
-        assert!(first.meta.is_none(), "first write should carry no advisory");
+        assert_eq!(
+            first
+                .meta
+                .as_ref()
+                .and_then(Value::as_object)
+                .map(|m| m.len()),
+            Some(1),
+            "first write should carry its id and no advisory: {:?}",
+            first.meta
+        );
 
         let second = r
             .invoke(json!({ "content": "CI runs on ubuntu-latest only." }))
@@ -612,7 +625,13 @@ mod tests {
         let r = Remember::new(store(&tmp), make_scope());
         let res = r.invoke(json!({ "content": "short fact" })).await.unwrap();
         assert!(!res.is_error);
-        assert!(res.meta.is_none(), "small content must not carry size meta");
+        let meta = res.meta.expect("a stored memory reports its id");
+        assert!(meta["id"].is_string());
+        assert_eq!(
+            meta.as_object().map(|m| m.len()),
+            Some(1),
+            "small content must not carry size meta: {meta}"
+        );
     }
 
     /// Content in [500, 2_000): stored with `length_advisory` meta.

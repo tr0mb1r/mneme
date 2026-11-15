@@ -398,7 +398,7 @@ pub enum RememberOutcome {
 
 /// Trim and collapse runs of internal whitespace, so a retry that
 /// differs only in spacing still counts as the same content.
-fn normalise_content(s: &str) -> String {
+pub(crate) fn normalise_content(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

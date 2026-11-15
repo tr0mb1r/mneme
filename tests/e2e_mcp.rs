@@ -738,3 +738,56 @@ async fn kind_and_type_with_different_values_is_invalid_params() {
     drop(client.stdin);
     let _ = timeout(Duration::from_secs(5), child.wait()).await.unwrap();
 }
+
+/// `forget` used to delete the memory and leave its full text in the
+/// `tool_call` events that `remember` and `update` mirrored to the
+/// timeline.
+#[tokio::test]
+async fn forget_leaves_no_copy_of_the_content_on_the_timeline() {
+    let (mut child, _tmp, mut client) = connected().await;
+    let first = "Mira's locker combination is 31-07-44 at the Riverside gym";
+    let second = "Mira's locker combination changed to 08-19-62, same gym";
+
+    let resp = client
+        .call(10, "remember", json!({ "content": first, "kind": "fact" }))
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let id = resp["result"]["_meta"]["id"]
+        .as_str()
+        .expect("remember reports the id in _meta")
+        .to_owned();
+    let resp = client
+        .call(11, "update", json!({ "id": id, "content": second }))
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+
+    let timeline_args = json!({ "kind": "tool_call", "limit": 50 });
+    let before = client
+        .call(20, "recall_recent", timeline_args.clone())
+        .await;
+    let before = before["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        before.contains("31-07-44") && before.contains("08-19-62"),
+        "{before}"
+    );
+
+    let resp = client.call(12, "forget", json!({ "id": id })).await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    assert_eq!(resp["result"]["_meta"]["redacted_tool_calls"], 2, "{resp}");
+
+    let after = client.call(21, "recall_recent", timeline_args).await;
+    let after = after["result"]["content"][0]["text"].as_str().unwrap();
+    for content in [first, second] {
+        let chars: Vec<char> = content.chars().collect();
+        for window in chars.windows(20) {
+            let needle: String = window.iter().collect();
+            assert!(!after.contains(&needle), "`{needle}` survives in {after}");
+        }
+    }
+    // The rows are still there, as history without the text.
+    assert_eq!(after.matches("forgotten").count(), 2, "{after}");
+    assert!(after.contains(&id), "{after}");
+
+    drop(client.stdin);
+    let _ = timeout(Duration::from_secs(5), child.wait()).await.unwrap();
+}

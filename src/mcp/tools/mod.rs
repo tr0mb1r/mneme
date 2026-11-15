@@ -185,6 +185,23 @@ impl ToolResult {
         self
     }
 
+    /// Record the id of the memory a write stored or changed as
+    /// `_meta.id`, next to whatever advisories are already there.
+    ///
+    /// Clients get the id without parsing the reply text, and the
+    /// dispatcher copies it into the mirrored `tool_call` event as
+    /// `memory_id`, which is what lets `forget` find and redact that
+    /// event later.
+    pub fn with_id(mut self, id: impl std::fmt::Display) -> Self {
+        let mut meta = match self.meta.take() {
+            Some(Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        meta.insert("id".into(), Value::String(id.to_string()));
+        self.meta = Some(Value::Object(meta));
+        self
+    }
+
     pub fn with_error(mut self) -> Self {
         self.is_error = true;
         self

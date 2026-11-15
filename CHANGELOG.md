@@ -27,6 +27,22 @@ the work that landed before automation was wired up.
   so the caller believed a rule had been pinned. `pinned: false` is still
   accepted.
 
+- `forget` no longer leaves the memory's text on the timeline. `remember`,
+  `pin` and `update` mirror their `content` into `tool_call` events, and
+  `forget` deleted only the memory. It now also rewrites the matching hot-
+  and warm-tier `tool_call` events to
+  `{tool, memory_id, redacted: "forgotten", at}` and reports the count
+  (`_meta.redacted_tool_calls`). Rows are matched by `memory_id`, by `id`
+  (`update` rows), or, for rows written before 1.5.2, by content. Cold
+  archive bundles are not rewritten. See "Forgetting and the timeline" in
+  `book/src/mcp-surface.md`.
+
+### Added
+
+- Successful `remember`, `pin` and `update` calls report the id of the
+  memory they stored or changed as `_meta.id`, and their `tool_call` event
+  records it as `memory_id`.
+
 ### Changed
 
 - `forget`'s input schema declares only `id` (now `required`). `query` and
