@@ -42,7 +42,7 @@ from extract_baseline import (  # noqa: E402
     summarize,
 )
 
-# group -> max acceptable encrypted/plain p95 ratio.
+# group -> max acceptable encrypted/plain p50 ratio.
 #
 # Measured on a Linux CI-class VM with `--quick`: storage_put 5.1x,
 # storage_get 7.4x, wal_append 1.02x, wal_replay 12.4x. Ceilings sit
@@ -50,16 +50,22 @@ from extract_baseline import (  # noqa: E402
 # sub-microsecond operation while still catching an order-of-magnitude
 # regression. Tighten them once a full-sample baseline exists on the
 # release hardware.
+#
+# storage_get: the plain side is ~0.15-0.2 µs, so a lucky plain sample
+# moves the ratio by several x (8.8x, 10x and 13.0x on three runs of
+# one commit on GitHub runners, Nov 2026). The ceiling is 16x and the
+# metric is the median, which still catches a per-read key derivation
+# (that would be 50x+).
 CEILINGS: dict[str, float] = {
     "encrypted_storage_put": 8.0,
-    "encrypted_storage_get": 12.0,
+    "encrypted_storage_get": 16.0,
     # I/O-dominated: fdatasync swamps the AEAD, so this must stay ~1x.
     # A jump here means encryption started costing a syscall.
     "encrypted_wal_append": 1.5,
     "encrypted_wal_replay": 20.0,
 }
 
-METRIC = "p95_ns"
+METRIC = "p50_ns"
 
 
 def collect_from_criterion() -> dict[str, dict]:
@@ -118,7 +124,7 @@ def main() -> None:
             continue
         if plain <= 0:
             missing.append(group)
-            print(f"  ?  {group:28s} plain p95 was {plain}; skipped")
+            print(f"  ?  {group:28s} plain {METRIC} was {plain}; skipped")
             continue
         ratio = enc / plain
         ok = ratio <= ceiling

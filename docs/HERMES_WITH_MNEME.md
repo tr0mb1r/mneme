@@ -37,6 +37,8 @@ the changelog for detail.
 | The context budget was mostly `tool_call` noise | Auto-logged kinds competed with real events | `mneme://context` leaves auto-logged kinds out by default (`kinds` / `exclude_kinds`), and read-only calls are no longer logged (`[episodic] auto_log_tool_calls`) |
 | A retried `remember` stored a second copy | No duplicate check | Exact duplicates return the existing id |
 | "Consolidation runs but promotes nothing" | Correct: promotion needs events 28 days old, and `stats` couldn't say so | `stats` reports thresholds, the oldest hot event's age, eligible events and days to the first promotion, plus the server version (also at `GET /version`) |
+| The startup block listed the same events whatever the message was | Events were ranked by age and weight only, and the hook filtered them after the server had spent its budget on them | From 1.6 the server ranks events against the message, drops duplicates, archived and low-weight ones, and the hook shows what it gets; `--scope-map` narrows the read to the thread's scope plus `global` |
+| A decision recorded as an event could not be found by `recall` | `recall` searched memories only | `recall` with `layers: ["semantic", "episodic"]`; the skill says when to use it |
 | `keyword` search and `supersedes` went unused | Hermes loads MCP tools on demand, so the agent learns features from the skill text and the session-start block, not from tool schemas | The hook's footer and the `mneme` skill name both features |
 | A "secrets never go into mneme" rule was advice only | Nothing enforced it | Writes are scanned for credential shapes |
 | Scope changes didn't stick | The scope is per MCP session and resets on reconnect | `switch_scope` says so in its reply |

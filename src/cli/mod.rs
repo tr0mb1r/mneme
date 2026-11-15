@@ -87,6 +87,13 @@ pub enum Command {
         /// recent state at session start and after context compression).
         #[arg(long)]
         no_hook: bool,
+        /// hermes only: JSON file mapping thread ids to scopes. The
+        /// hook then loads each conversation's own scope plus `global`
+        /// instead of everything. Give the path as the hook sees it
+        /// (inside the container, e.g. `/opt/data/threads.json`); the
+        /// file need not exist yet. Needs a mneme 1.6 server.
+        #[arg(long, value_name = "FILE", conflicts_with = "no_hook")]
+        scope_map: Option<PathBuf>,
     },
     /// Start the MCP server (stdio). Right pick when the host
     /// (Claude Desktop, Cursor, etc.) spawns mneme directly as a
@@ -258,6 +265,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             token_env,
             hermes_home,
             no_hook,
+            scope_map,
         } => init::execute(
             agent,
             upgrade,
@@ -268,6 +276,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 token_env,
                 agent_home: hermes_home,
                 no_hook,
+                scope_map,
             },
         ),
         Command::Run => run::execute(),
