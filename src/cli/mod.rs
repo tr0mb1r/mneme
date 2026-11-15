@@ -5,26 +5,11 @@ use clap::{Parser, Subcommand};
 
 pub mod auth;
 pub mod backup;
-#[cfg(unix)]
 pub mod client;
-// Windows stub for `mneme client`. The wrapper is a Unix-socket
-// bridge (ADR-0012 D12) that depends on tokio::net::UnixStream plus
-// the Unix-only daemon::listener helpers. Named-pipe support is M4
-// per ADR-0012 D2 — until then the subcommand returns a clear error
-// instead of triggering a Windows compile break.
-#[cfg(not(unix))]
-pub mod client {
-    use crate::{MnemeError, Result};
-    pub fn execute() -> Result<()> {
-        Err(MnemeError::Mcp(
-            "mneme client requires Unix domain sockets; Windows named-pipe support is M4 per ADR-0012 D2 (see src/daemon/mod.rs)"
-                .into(),
-        ))
-    }
-}
 pub mod daemon;
 pub mod demo;
 pub mod encrypt;
+pub mod eval;
 pub mod export;
 pub mod init;
 pub mod inspect;
@@ -102,6 +87,13 @@ pub enum Command {
         /// recent state at session start and after context compression).
         #[arg(long)]
         no_hook: bool,
+        /// hermes only: JSON file mapping thread ids to scopes. The
+        /// hook then loads each conversation's own scope plus `global`
+        /// instead of everything. Give the path as the hook sees it
+        /// (inside the container, e.g. `/opt/data/threads.json`); the
+        /// file need not exist yet. Needs a mneme 1.6 server.
+        #[arg(long, value_name = "FILE", conflicts_with = "no_hook")]
+        scope_map: Option<PathBuf>,
     },
     /// Start the MCP server (stdio). Right pick when the host
     /// (Claude Desktop, Cursor, etc.) spawns mneme directly as a
@@ -167,12 +159,20 @@ pub enum Command {
         #[arg(long)]
         query: Option<String>,
     },
+    /// Measure recall and auto-context quality against a questions
+    /// file with known answers. Read-only: it calls `recall` and reads
+    /// `mneme://context`, and fails if the store changed during the
+    /// run. Writes `metrics-<tag>.json` and `summary-<tag>.md`.
+    Eval(eval::EvalArgs),
     /// Export memories for backup
     Export {
         #[arg(long)]
         scope: Option<String>,
         #[arg(long, default_value = "json")]
         format: String,
+        /// Also dump episodic events from the cold archive
+        #[arg(long)]
+        include_cold: bool,
     },
     /// Stop a running mneme instance
     Stop,
@@ -265,6 +265,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             token_env,
             hermes_home,
             no_hook,
+            scope_map,
         } => init::execute(
             agent,
             upgrade,
@@ -275,6 +276,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 token_env,
                 agent_home: hermes_home,
                 no_hook,
+                scope_map,
             },
         ),
         Command::Run => run::execute(),
@@ -283,7 +285,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Client => client::execute(),
         Command::Stats => stats::execute(),
         Command::Inspect { id, query } => inspect::execute(id, query),
-        Command::Export { scope, format } => export::execute(scope, format),
+        Command::Eval(args) => eval::execute(args),
+        Command::Export {
+            scope,
+            format,
+            include_cold,
+        } => export::execute(scope, format, include_cold),
         Command::Stop => stop::execute(),
         Command::Backup {
             output,

@@ -82,8 +82,9 @@
 
 use super::snapshot_scheduler;
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -99,9 +100,12 @@ use crate::index::hnsw::HnswIndex;
 use crate::index::snapshot;
 use crate::memory::activity::ActivityCounter;
 use crate::memory::keyword::{self, KeywordHit, KeywordIndex};
+use crate::memory::relations::{
+    self, Provenance, ProvenanceRecord, Relation, RelationTarget, RelationType,
+};
 use crate::storage::Storage;
 use crate::storage::wal::{self, WalOp, WalWriter};
-use crate::storage::{MEM_KEY_PREFIX, SUP_KEY_PREFIX};
+use crate::storage::{MEM_KEY_PREFIX, MTS_KEY_PREFIX, ST_KEY_PREFIX, SUP_KEY_PREFIX};
 use crate::{MnemeError, Result};
 
 /// How many extra results to over-fetch from HNSW on the *first*
@@ -205,6 +209,221 @@ pub struct RecallHit {
     pub superseded_by: Option<MemoryId>,
     /// Which half of hybrid recall found this memory.
     pub matched: MatchSource,
+    /// Relevance on one scale for every recall mode: cosine similarity
+    /// plus keyword evidence ([`KEYWORD_WEIGHT`] × coverage² and
+    /// [`PHRASE_WEIGHT`]). Equal to the similarity for a hit with no
+    /// literal match. Auto-context and mixed-layer ranking read this
+    /// rather than re-deriving it from `score`.
+    pub rank: f32,
+    /// When the content was last edited by `update`; the creation time
+    /// for a memory never edited.
+    pub updated_at: DateTime<Utc>,
+    /// Lifecycle status. Only ever [`MemoryStatus::Archived`] when the
+    /// caller asked for archived memories via
+    /// [`RecallFilters::include_archived`].
+    pub status: MemoryStatus,
+    /// A current, newer memory `refines` or `contradicts` this one, so
+    /// it was pushed down: its keyword evidence is not counted and
+    /// `rank` is lower by the demote margin
+    /// ([`SemanticStore::set_demote_margin`]). Still returned; a
+    /// demoted memory is out of date in part, not gone.
+    pub demoted: bool,
+    /// The relations this memory takes part in. Empty for most.
+    pub relations: HitRelations,
+    /// How the writer came to know this, if it said.
+    pub provenance: Option<Provenance>,
+    /// Where it came from, if the writer said.
+    pub source: Option<String>,
+}
+
+/// One end of a relation between two memories, as shown on a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub id: MemoryId,
+    pub reason: String,
+}
+
+/// Something a memory names as its evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Evidence {
+    pub target: RelationTarget,
+    pub reason: String,
+}
+
+/// The relations of one memory, both directions, with gone memories
+/// already filtered out. `superseded_by` stays on [`RecallHit`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HitRelations {
+    /// Memories that refine this one.
+    pub refined_by: Vec<Link>,
+    /// Memories that contradict this one.
+    pub contradicted_by: Vec<Link>,
+    /// Memories this one refines.
+    pub refines: Vec<Link>,
+    /// Memories this one contradicts.
+    pub contradicts: Vec<Link>,
+    /// Memories this one supersedes.
+    pub supersedes: Vec<Link>,
+    /// What this memory cites: memories, events, external references.
+    pub evidence: Vec<Evidence>,
+}
+
+impl HitRelations {
+    pub fn is_empty(&self) -> bool {
+        self.refined_by.is_empty()
+            && self.contradicted_by.is_empty()
+            && self.refines.is_empty()
+            && self.contradicts.is_empty()
+            && self.supersedes.is_empty()
+            && self.evidence.is_empty()
+    }
+
+    /// Ids of every memory linked in either direction, without
+    /// repeats, in a stable order.
+    pub fn linked_memories(&self) -> Vec<MemoryId> {
+        let mut out: Vec<MemoryId> = Vec::new();
+        let links = self
+            .refined_by
+            .iter()
+            .chain(&self.contradicted_by)
+            .chain(&self.refines)
+            .chain(&self.contradicts)
+            .chain(&self.supersedes)
+            .map(|l| l.id);
+        let cited = self.evidence.iter().filter_map(|e| match &e.target {
+            RelationTarget::Memory(id) => Some(*id),
+            _ => None,
+        });
+        for id in links.chain(cited) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+}
+
+/// Default for [`SemanticStore::set_demote_margin`]; the default of
+/// `[recall] demote_margin`. About the similarity gap between a right
+/// answer and a lookalike, so a refined memory drops just below its
+/// refiner rather than to the bottom of the list.
+pub const DEFAULT_DEMOTE_MARGIN: f32 = 0.10;
+
+/// Lifecycle status of a memory.
+///
+/// An archived memory is not current: `recall` leaves it out unless
+/// asked, auto-context never carries it, and `export` always does. It
+/// keeps its id, content and vector, so archiving is reversible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MemoryStatus {
+    #[default]
+    Active,
+    Archived,
+}
+
+impl MemoryStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "archived" => Some(Self::Archived),
+            _ => None,
+        }
+    }
+}
+
+/// Which timestamp [`RecallFilters::since`] / [`RecallFilters::until`]
+/// compare against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TimeField {
+    /// When the memory was first stored (the default).
+    #[default]
+    CreatedAt,
+    /// When its content was last edited.
+    UpdatedAt,
+}
+
+impl TimeField {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "created_at" => Some(Self::CreatedAt),
+            "updated_at" => Some(Self::UpdatedAt),
+            _ => None,
+        }
+    }
+}
+
+/// The parts of a memory kept beside its `mem:` row rather than in
+/// [`MemoryItem`]: see [`read_memory_meta`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryMeta {
+    /// Last content edit, or `created_at` if never edited.
+    pub updated_at: DateTime<Utc>,
+    pub status: MemoryStatus,
+    /// The stored supersession link, if any. Raw: the target is not
+    /// checked for existence (unlike [`SemanticStore::superseded_by`]),
+    /// so an export carries exactly what is on disk.
+    pub superseded_by: Option<MemoryId>,
+    /// The memory's provenance row, if it has one.
+    pub provenance: Option<ProvenanceRecord>,
+    /// The relations this memory carries, as stored (targets are not
+    /// checked for existence).
+    pub relations: Vec<Relation>,
+}
+
+/// Read a memory's side-table metadata straight from `storage`.
+///
+/// For paths that scan `mem:` rows without a [`SemanticStore`] (the
+/// `export` tool and CLI). Four point reads and one short range scan;
+/// absent rows resolve to the defaults (never edited, active, not
+/// superseded, no provenance, no relations).
+pub async fn read_memory_meta(storage: &dyn Storage, item: &MemoryItem) -> Result<MemoryMeta> {
+    let updated_at = read_updated_at(storage, item.id)
+        .await?
+        .unwrap_or(item.created_at);
+    let status = read_status(storage, item.id).await?;
+    let superseded_by = match storage.get(&sup_key(&item.id)).await? {
+        None => None,
+        Some(bytes) => <[u8; 16]>::try_from(bytes.as_slice())
+            .ok()
+            .map(|raw| MemoryId(ulid::Ulid::from_bytes(raw))),
+    };
+    Ok(MemoryMeta {
+        updated_at,
+        status,
+        superseded_by,
+        provenance: relations::get_provenance(storage, item.id).await?,
+        relations: relations::outgoing(storage, item.id).await?,
+    })
+}
+
+/// The `mts:` row for `id`, decoded. `None` when absent or malformed
+/// (a malformed row is logged and treated as never edited).
+async fn read_updated_at(storage: &dyn Storage, id: MemoryId) -> Result<Option<DateTime<Utc>>> {
+    let Some(bytes) = storage.get(&mts_key(&id)).await? else {
+        return Ok(None);
+    };
+    let decoded = <[u8; 8]>::try_from(bytes.as_slice())
+        .ok()
+        .and_then(|raw| DateTime::<Utc>::from_timestamp_millis(i64::from_be_bytes(raw)));
+    if decoded.is_none() {
+        tracing::warn!(memory_id = %id, "ignoring malformed updated_at row");
+    }
+    Ok(decoded)
+}
+
+/// Archived iff an `st:` row exists. The byte's value is reserved.
+async fn read_status(storage: &dyn Storage, id: MemoryId) -> Result<MemoryStatus> {
+    Ok(match storage.get(&st_key(&id)).await? {
+        Some(_) => MemoryStatus::Archived,
+        None => MemoryStatus::Active,
+    })
 }
 
 /// How [`SemanticStore::recall`] finds candidates.
@@ -236,6 +455,9 @@ pub enum MatchSource {
     Semantic,
     Keyword,
     Both,
+    /// Found by its relation to an external reference
+    /// ([`SemanticStore::recall_by_ref`]), not by a search.
+    Reference,
 }
 
 impl MatchSource {
@@ -244,6 +466,7 @@ impl MatchSource {
             Self::Semantic => "semantic",
             Self::Keyword => "keyword",
             Self::Both => "both",
+            Self::Reference => "ref",
         }
     }
 }
@@ -257,7 +480,12 @@ impl MatchSource {
 /// rather than silently returning a short list.
 #[derive(Debug, Clone, Default)]
 pub struct RecallFilters {
+    /// Single-scope filter. Unioned with [`Self::scopes`]; kept so the
+    /// common one-scope caller stays a one-liner.
     pub scope: Option<String>,
+    /// Scope set: a memory passes if its scope equals any entry (or
+    /// [`Self::scope`]). Both empty means "no scope constraint".
+    pub scopes: Vec<String>,
     pub kind: Option<MemoryKind>,
     /// Every tag listed here must be present on the memory (AND, not
     /// OR). Empty means "no tag constraint". Matching is exact and
@@ -280,6 +508,21 @@ pub struct RecallFilters {
     /// Vector, keyword, or both (default). Every other filter,
     /// `min_similarity` included, applies to hits from either search.
     pub mode: RecallMode,
+    /// Keep only memories whose [`Self::time_field`] timestamp is at or
+    /// after this instant.
+    pub since: Option<DateTime<Utc>>,
+    /// Keep only memories whose [`Self::time_field`] timestamp is
+    /// strictly before this instant: the window is half-open,
+    /// `[since, until)`, as for `recall_recent`.
+    pub until: Option<DateTime<Utc>>,
+    /// Which timestamp `since` / `until` compare against.
+    pub time_field: TimeField,
+    /// Also return archived memories ([`MemoryStatus::Archived`]). Off
+    /// by default: archiving is how an agent says "not current".
+    pub include_archived: bool,
+    /// Keep only memories recorded with this provenance. A memory with
+    /// no provenance never matches.
+    pub provenance: Option<Provenance>,
 }
 
 impl RecallFilters {
@@ -289,6 +532,30 @@ impl RecallFilters {
             scope: Some(scope.into()),
             ..Default::default()
         }
+    }
+
+    /// Filter by a set of scopes. An empty set is no constraint.
+    pub fn with_scopes(scopes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            scopes: scopes.into_iter().map(Into::into).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Whether `scope` passes the scope constraint.
+    fn scope_matches(&self, scope: &str) -> bool {
+        if self.scope.is_none() && self.scopes.is_empty() {
+            return true;
+        }
+        self.scope.as_deref() == Some(scope) || self.scopes.iter().any(|s| s == scope)
+    }
+
+    fn has_time_window(&self) -> bool {
+        self.since.is_some() || self.until.is_some()
+    }
+
+    fn in_time_window(&self, ts: DateTime<Utc>) -> bool {
+        self.since.is_none_or(|s| ts >= s) && self.until.is_none_or(|u| ts < u)
     }
 
     /// Apply every populated predicate to one candidate.
@@ -307,9 +574,12 @@ impl RecallFilters {
     /// Scope / kind / tag predicates — everything except the
     /// similarity floor, which keyword matches don't answer to.
     fn matches_metadata(&self, item: &MemoryItem) -> bool {
-        if let Some(want_scope) = &self.scope
-            && &item.scope != want_scope
-        {
+        if !self.scope_matches(&item.scope) {
+            return false;
+        }
+        // The `updated_at` window needs the `mts:` side row, so it is
+        // checked in `SemanticStore::admit` instead.
+        if self.time_field == TimeField::CreatedAt && !self.in_time_window(item.created_at) {
             return false;
         }
         if let Some(want_kind) = self.kind
@@ -398,7 +668,7 @@ pub enum RememberOutcome {
 
 /// Trim and collapse runs of internal whitespace, so a retry that
 /// differs only in spacing still counts as the same content.
-fn normalise_content(s: &str) -> String {
+pub(crate) fn normalise_content(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -412,11 +682,17 @@ pub struct UpdatePatch {
     pub kind: Option<MemoryKind>,
     pub tags: Option<Vec<String>>,
     pub scope: Option<String>,
+    /// Archive or re-activate. Never touches `updated_at`.
+    pub status: Option<MemoryStatus>,
 }
 
 impl UpdatePatch {
     pub fn is_empty(&self) -> bool {
-        self.content.is_none() && self.kind.is_none() && self.tags.is_none() && self.scope.is_none()
+        self.content.is_none()
+            && self.kind.is_none()
+            && self.tags.is_none()
+            && self.scope.is_none()
+            && self.status.is_none()
     }
 }
 
@@ -511,6 +787,28 @@ pub struct SemanticStore {
     /// between the scan and the swap-in); kept in step by every write
     /// after that. Memory-only by design: see [`super::keyword`].
     keyword: RwLock<Option<KeywordIndex>>,
+
+    /// Which memories have relations or a provenance row. `None` until
+    /// the first recall builds it, like the keyword index. It exists so
+    /// that recall pays nothing for these side tables on the (common)
+    /// memory that has neither: a set lookup instead of a storage read
+    /// per candidate. A superset is fine (a stale entry costs one read
+    /// that finds nothing); a missing entry is not, so every write to
+    /// the side tables goes through this store and updates it.
+    side: RwLock<Option<SideIndex>>,
+
+    /// `[recall] demote_margin`, as `f32` bits.
+    demote_margin: AtomicU32,
+}
+
+/// See [`SemanticStore::side`].
+#[derive(Default)]
+struct SideIndex {
+    /// Memories that carry at least one relation.
+    sources: HashSet<MemoryId>,
+    /// Memories at least one relation points at.
+    targets: HashSet<MemoryId>,
+    provenance: HashMap<MemoryId, Provenance>,
 }
 
 impl SemanticStore {
@@ -662,6 +960,8 @@ impl SemanticStore {
             scheduler_join,
             activity: ActivityCounter::new(),
             keyword: RwLock::new(None),
+            side: RwLock::new(None),
+            demote_margin: AtomicU32::new(DEFAULT_DEMOTE_MARGIN.to_bits()),
         }))
     }
 
@@ -932,6 +1232,11 @@ impl SemanticStore {
             if self.superseded_by(id).await?.is_some() {
                 continue;
             }
+            // Nor is an archived one: deduplicating a write against it
+            // would swallow a fact the agent can no longer recall.
+            if read_status(self.storage.as_ref(), id).await? == MemoryStatus::Archived {
+                continue;
+            }
             let existing: MemoryItem = postcard::from_bytes(&bytes)
                 .map_err(|e| MnemeError::Storage(format!("decode MemoryItem {id}: {e}")))?;
             out.push(NearDuplicate {
@@ -980,8 +1285,328 @@ impl SemanticStore {
             return Ok(false);
         }
         self.storage.put(&sup_key(&old), &new.0.to_bytes()).await?;
+        // The same fact as a relation, so it shows up beside the other
+        // types. `sup:` stays the authority for hiding `old`. An
+        // existing relation (written with a reason) is left alone.
+        let target = RelationTarget::Memory(old);
+        let already = relations::outgoing(self.storage.as_ref(), new)
+            .await?
+            .iter()
+            .any(|r| r.kind == RelationType::Supersedes && r.target == target);
+        if !already {
+            relations::put(
+                self.storage.as_ref(),
+                &Relation {
+                    from: new,
+                    kind: RelationType::Supersedes,
+                    target,
+                    reason: String::new(),
+                    created_at: Utc::now(),
+                },
+            )
+            .await?;
+        }
+        self.with_side_index(|side| {
+            side.sources.insert(new);
+            side.targets.insert(old);
+        });
         self.note_mutation();
         Ok(true)
+    }
+
+    // ---------- relations ----------
+
+    /// Record that memory `from` stands in relation `kind` to `target`,
+    /// replacing any earlier relation of the same type between the two
+    /// (so the reason can be corrected by writing it again).
+    ///
+    /// Returns `false`, writing nothing, if `from` is not stored, if a
+    /// memory `target` is not stored, or if the two are the same
+    /// memory. An event target is not checked here (this store does
+    /// not hold events) and a reference cannot be: callers validate.
+    /// Limits on `reason` and the reference are enforced
+    /// ([`relations::validate`]).
+    ///
+    /// `supersedes` also writes the `sup:` link, with all that implies
+    /// for recall. `refines` and `contradicts` demote the target while
+    /// `from` is current and the newer of the two; see
+    /// [`RecallHit::demoted`].
+    pub async fn relate(
+        &self,
+        from: MemoryId,
+        kind: RelationType,
+        target: RelationTarget,
+        reason: &str,
+    ) -> Result<bool> {
+        relations::validate(kind, &target, reason)
+            .map_err(|msg| MnemeError::Storage(format!("relation: {msg}")))?;
+        let _g = self.write_lock.lock().await;
+        if self.storage.get(&mem_key(&from)).await?.is_none() {
+            return Ok(false);
+        }
+        if let RelationTarget::Memory(to) = &target
+            && (*to == from || self.storage.get(&mem_key(to)).await?.is_none())
+        {
+            return Ok(false);
+        }
+        relations::put(
+            self.storage.as_ref(),
+            &Relation {
+                from,
+                kind,
+                target: target.clone(),
+                reason: reason.to_owned(),
+                created_at: Utc::now(),
+            },
+        )
+        .await?;
+        if let (RelationType::Supersedes, RelationTarget::Memory(old)) = (kind, &target) {
+            self.storage.put(&sup_key(old), &from.0.to_bytes()).await?;
+        }
+        self.with_side_index(|side| {
+            side.sources.insert(from);
+            if let RelationTarget::Memory(to) = &target {
+                side.targets.insert(*to);
+            }
+        });
+        self.note_mutation();
+        Ok(true)
+    }
+
+    /// The relations `id` carries, as stored.
+    pub async fn outgoing_relations(&self, id: MemoryId) -> Result<Vec<Relation>> {
+        relations::outgoing(self.storage.as_ref(), id).await
+    }
+
+    /// The relations of `id` in both directions, as shown on a recall
+    /// row. Relations whose other end is a memory that no longer exists
+    /// are left out.
+    pub async fn relations_of(&self, id: MemoryId) -> Result<HitRelations> {
+        let storage = self.storage.as_ref();
+        let mut out = HitRelations::default();
+        for r in relations::outgoing(storage, id).await? {
+            match (&r.target, r.kind) {
+                (RelationTarget::Memory(to), kind) => {
+                    if self.storage.get(&mem_key(to)).await?.is_none() {
+                        continue;
+                    }
+                    let link = Link {
+                        id: *to,
+                        reason: r.reason,
+                    };
+                    match kind {
+                        RelationType::Refines => out.refines.push(link),
+                        RelationType::Contradicts => out.contradicts.push(link),
+                        RelationType::Supersedes => out.supersedes.push(link),
+                        RelationType::EvidenceFor => out.evidence.push(Evidence {
+                            target: RelationTarget::Memory(link.id),
+                            reason: link.reason,
+                        }),
+                    }
+                }
+                (target, _) => out.evidence.push(Evidence {
+                    target: target.clone(),
+                    reason: r.reason,
+                }),
+            }
+        }
+        for r in relations::incoming(storage, &RelationTarget::Memory(id)).await? {
+            let link = Link {
+                id: r.from,
+                reason: r.reason,
+            };
+            match r.kind {
+                RelationType::Refines => out.refined_by.push(link),
+                RelationType::Contradicts => out.contradicted_by.push(link),
+                // `superseded_by` is reported from the `sup:` link;
+                // being cited as evidence is not shown on the cited row.
+                RelationType::Supersedes | RelationType::EvidenceFor => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether a current memory, edited more recently than
+    /// `updated_at`, refines or contradicts `id`.
+    ///
+    /// "Current" is not archived and not superseded: a refinement that
+    /// was itself retired no longer speaks for the present. "Newer"
+    /// keeps a memory that was revised *after* being refined from
+    /// staying demoted by a remark about its old text.
+    async fn is_demoted(&self, id: MemoryId, updated_at: DateTime<Utc>) -> Result<bool> {
+        let storage = self.storage.as_ref();
+        for r in relations::incoming(storage, &RelationTarget::Memory(id)).await? {
+            if !r.kind.demotes() {
+                continue;
+            }
+            let Some(source) = self.get(r.from).await? else {
+                continue;
+            };
+            if read_status(storage, r.from).await? == MemoryStatus::Archived
+                || self.superseded_by(r.from).await?.is_some()
+            {
+                continue;
+            }
+            let source_updated = read_updated_at(storage, r.from)
+                .await?
+                .unwrap_or(source.created_at);
+            if source_updated > updated_at {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Fill in the parts of each returned row that live in side tables
+    /// and are not needed for ranking: relations and the provenance
+    /// source. Storage is read only for rows the side index flags.
+    async fn decorate(&self, hits: &mut [RecallHit]) -> Result<()> {
+        for hit in hits.iter_mut() {
+            let id = hit.item.id;
+            let has_relations =
+                self.side_read(|side| side.sources.contains(&id) || side.targets.contains(&id));
+            if has_relations {
+                hit.relations = self.relations_of(id).await?;
+            }
+            if hit.provenance.is_some()
+                && let Some(record) = relations::get_provenance(self.storage.as_ref(), id).await?
+            {
+                hit.provenance = Some(record.provenance);
+                hit.source = record.source;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rank penalty for a demoted memory, on the cosine scale.
+    pub fn demote_margin(&self) -> f32 {
+        f32::from_bits(self.demote_margin.load(Ordering::Relaxed))
+    }
+
+    /// Set `[recall] demote_margin`. Negative or non-finite values are
+    /// treated as zero (no penalty; keyword evidence is still dropped).
+    pub fn set_demote_margin(&self, margin: f32) {
+        let margin = if margin.is_finite() {
+            margin.max(0.0)
+        } else {
+            0.0
+        };
+        self.demote_margin
+            .store(margin.to_bits(), Ordering::Relaxed);
+    }
+
+    // ---------- provenance ----------
+
+    /// Record how `id` came to be known. Returns `false` if no memory
+    /// with this id is stored. Replaces an earlier record.
+    pub async fn set_provenance(&self, id: MemoryId, record: ProvenanceRecord) -> Result<bool> {
+        if record
+            .source
+            .as_deref()
+            .is_some_and(|s| s.chars().count() > relations::MAX_SOURCE_CHARS)
+        {
+            return Err(MnemeError::Storage(format!(
+                "provenance source is longer than {} characters",
+                relations::MAX_SOURCE_CHARS
+            )));
+        }
+        let _g = self.write_lock.lock().await;
+        if self.storage.get(&mem_key(&id)).await?.is_none() {
+            return Ok(false);
+        }
+        relations::put_provenance(self.storage.as_ref(), id, &record).await?;
+        self.with_side_index(|side| {
+            side.provenance.insert(id, record.provenance);
+        });
+        self.note_mutation();
+        Ok(true)
+    }
+
+    /// The provenance recorded for `id`, if any.
+    pub async fn provenance(&self, id: MemoryId) -> Result<Option<ProvenanceRecord>> {
+        relations::get_provenance(self.storage.as_ref(), id).await
+    }
+
+    /// How many stored memories carry each provenance. Memories with
+    /// none are not counted here; subtract from the total for those.
+    pub async fn provenance_counts(&self) -> Result<Vec<(Provenance, usize)>> {
+        let rows = relations::scan_provenance(self.storage.as_ref()).await?;
+        let mut counts: Vec<(Provenance, usize)> =
+            Provenance::ALL.into_iter().map(|p| (p, 0)).collect();
+        for (id, record) in rows {
+            // A row can outlive its memory by a crash inside `forget`.
+            if self.storage.get(&mem_key(&id)).await?.is_none() {
+                continue;
+            }
+            if let Some(slot) = counts.iter_mut().find(|(p, _)| *p == record.provenance) {
+                slot.1 += 1;
+            }
+        }
+        Ok(counts)
+    }
+
+    // ---------- side index ----------
+
+    /// Build the side index from storage if it does not exist yet.
+    /// Same discipline as [`Self::ensure_keyword_index`]: the scan runs
+    /// under `write_lock`, so a write either precedes it or updates the
+    /// finished index.
+    async fn ensure_side_index(&self) -> Result<()> {
+        if self.side_built() {
+            return Ok(());
+        }
+        let _g = self.write_lock.lock().await;
+        if self.side_built() {
+            return Ok(());
+        }
+        let mut side = SideIndex::default();
+        for r in relations::scan_all(self.storage.as_ref()).await? {
+            side.sources.insert(r.from);
+            if let RelationTarget::Memory(to) = r.target {
+                side.targets.insert(to);
+            }
+        }
+        for (id, record) in relations::scan_provenance(self.storage.as_ref()).await? {
+            side.provenance.insert(id, record.provenance);
+        }
+        match self.side.write() {
+            Ok(mut guard) => *guard = Some(side),
+            Err(poisoned) => *poisoned.into_inner() = Some(side),
+        }
+        Ok(())
+    }
+
+    fn side_built(&self) -> bool {
+        self.side.read().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// Read from the side index. Before it is built (or if its lock is
+    /// poisoned) `f` sees an empty index; recall builds it first.
+    fn side_read<T>(&self, f: impl FnOnce(&SideIndex) -> T) -> T {
+        match self.side.read() {
+            Ok(guard) => match guard.as_ref() {
+                Some(side) => f(side),
+                None => f(&SideIndex::default()),
+            },
+            Err(_) => f(&SideIndex::default()),
+        }
+    }
+
+    /// Apply `f` to the side index if it has been built. Callers hold
+    /// `write_lock`. A poisoned lock drops the index so the next recall
+    /// rebuilds it from storage.
+    fn with_side_index(&self, f: impl FnOnce(&mut SideIndex)) {
+        match self.side.write() {
+            Ok(mut guard) => {
+                if let Some(side) = guard.as_mut() {
+                    f(side);
+                }
+            }
+            Err(poisoned) => {
+                tracing::warn!("side index lock poisoned; it will be rebuilt");
+                *poisoned.into_inner() = None;
+            }
+        }
     }
 
     /// The memory that superseded `id`, if any.
@@ -1049,13 +1674,21 @@ impl SemanticStore {
         // Embedded in every mode: keyword-only hits still report their
         // vector similarity, so the agent can compare rows.
         let qvec = self.embedder.embed(trimmed).await?;
+        self.ensure_side_index().await?;
 
-        let (semantic, semantic_stale) = match filters.mode {
+        let (mut semantic, semantic_stale) = match filters.mode {
             RecallMode::Keyword => (Vec::new(), Vec::new()),
             _ => self.semantic_candidates(&qvec, k, filters).await?,
         };
         if filters.mode == RecallMode::Semantic {
-            return Ok(append_stale(semantic, semantic_stale, k));
+            // No literal evidence was looked for, so `rank` stays the
+            // similarity `admit` set, less the margin for a demoted
+            // row. The list arrives nearest-first; re-sorting by rank
+            // only moves demoted rows (the sort is stable).
+            semantic.sort_by(|a, b| by_rank_then_recency(a.rank, a, b.rank, b));
+            let mut hits = append_stale(semantic, semantic_stale, k);
+            self.decorate(&mut hits).await?;
+            return Ok(hits);
         }
         let (lexical, lexical_stale) = self.keyword_candidates(trimmed, &qvec, k, filters).await?;
         let fused = fuse(trimmed, semantic, lexical, k, filters.mode);
@@ -1071,7 +1704,103 @@ impl SemanticStore {
                 .partial_cmp(&b.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        Ok(append_stale(fused, stale, k))
+        let mut hits = append_stale(fused, stale, k);
+        self.decorate(&mut hits).await?;
+        Ok(hits)
+    }
+
+    /// Memories that have a relation to the external reference
+    /// `reference` (`evidence_for` in practice), newest edit first, or
+    /// best match first when `query` is given.
+    ///
+    /// This is a lookup, not a search: the reference is matched byte
+    /// for byte through the reverse relation table. `filters` apply as
+    /// in [`recall`](Self::recall) (scope, kind, tags, time window,
+    /// archived, superseded, provenance), except `mode` and
+    /// `min_similarity`, which have nothing to act on without a query.
+    /// With a `query`, each row carries its real similarity to it and
+    /// `min_similarity` applies; without, `score` is `1.0` and `rank`
+    /// `0.0`, placeholders the `recall` tool reports as null.
+    pub async fn recall_by_ref(
+        &self,
+        reference: &str,
+        query: Option<&str>,
+        k: usize,
+        filters: &RecallFilters,
+    ) -> Result<Vec<RecallHit>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        self.ensure_side_index().await?;
+        let target = RelationTarget::Ref(reference.to_owned());
+        let mut ids: Vec<MemoryId> = Vec::new();
+        for relation in relations::incoming(self.storage.as_ref(), &target).await? {
+            if !ids.contains(&relation.from) {
+                ids.push(relation.from);
+            }
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = query.map(str::trim).filter(|q| !q.is_empty());
+        let distances: HashMap<MemoryId, f32> = match query {
+            None => HashMap::new(),
+            Some(q) => {
+                let qvec = self.embedder.embed(q).await?;
+                let wanted: HashSet<MemoryId> = ids.iter().copied().collect();
+                let guard = self
+                    .index
+                    .read()
+                    .map_err(|e| MnemeError::Index(format!("hnsw rwlock poisoned: {e}")))?;
+                guard
+                    .vectors_for(&wanted)
+                    .into_iter()
+                    .map(|(id, v)| (id, 1.0 - dot(&v, &qvec)))
+                    .collect()
+            }
+        };
+
+        let mut current = Vec::new();
+        let mut stale = Vec::new();
+        for id in ids {
+            let Some(item) = self.get(id).await? else {
+                continue;
+            };
+            let score = distances.get(&id).copied().unwrap_or(1.0);
+            let passes = if query.is_some() {
+                filters.matches(&item, score)
+            } else {
+                filters.matches_metadata(&item)
+            };
+            if !passes {
+                continue;
+            }
+            match self
+                .admit(item, score, MatchSource::Reference, filters)
+                .await?
+            {
+                Admitted::Current(mut hit) => {
+                    if query.is_none() {
+                        hit.rank = 0.0;
+                    }
+                    current.push(hit);
+                }
+                Admitted::Stale(mut hit) => {
+                    if query.is_none() {
+                        hit.rank = 0.0;
+                    }
+                    stale.push(hit);
+                }
+                Admitted::Rejected => {}
+            }
+        }
+        let order = |a: &RecallHit, b: &RecallHit| by_rank_then_recency(a.rank, a, b.rank, b);
+        current.sort_by(order);
+        stale.sort_by(order);
+        current.truncate(k);
+        let mut hits = append_stale(current, stale, k);
+        self.decorate(&mut hits).await?;
+        Ok(hits)
     }
 
     /// Vector candidates: the `k` nearest current memories passing
@@ -1125,20 +1854,13 @@ impl SemanticStore {
                 if !filters.matches(&item, *score) {
                     continue;
                 }
-                match self.superseded_by(item.id).await? {
-                    None => out.push(RecallHit {
-                        item,
-                        score: *score,
-                        superseded_by: None,
-                        matched: MatchSource::Semantic,
-                    }),
-                    Some(newer) if filters.include_superseded => stale.push(RecallHit {
-                        item,
-                        score: *score,
-                        superseded_by: Some(newer),
-                        matched: MatchSource::Semantic,
-                    }),
-                    Some(_) => continue,
+                match self
+                    .admit(item, *score, MatchSource::Semantic, filters)
+                    .await?
+                {
+                    Admitted::Current(hit) => out.push(hit),
+                    Admitted::Stale(hit) => stale.push(hit),
+                    Admitted::Rejected => continue,
                 }
                 if out.len() >= k {
                     break;
@@ -1233,26 +1955,160 @@ impl SemanticStore {
             if !filters.matches(&item, score) {
                 continue;
             }
-            match self.superseded_by(item.id).await? {
-                None => out.push((
-                    RecallHit {
-                        item,
-                        score,
-                        superseded_by: None,
-                        matched: MatchSource::Keyword,
-                    },
-                    kh,
-                )),
-                Some(newer) if filters.include_superseded => stale.push(RecallHit {
-                    item,
-                    score,
-                    superseded_by: Some(newer),
-                    matched: MatchSource::Keyword,
-                }),
-                Some(_) => {}
+            match self
+                .admit(item, score, MatchSource::Keyword, filters)
+                .await?
+            {
+                Admitted::Current(hit) => out.push((hit, kh)),
+                Admitted::Stale(mut hit) => {
+                    // Stale rows skip `fuse`, so their keyword evidence
+                    // is folded in here.
+                    if !hit.demoted {
+                        hit.rank += KEYWORD_WEIGHT * kh.coverage * kh.coverage;
+                    }
+                    stale.push(hit);
+                }
+                Admitted::Rejected => {}
             }
         }
         Ok((out, stale))
+    }
+
+    /// The side-table half of filtering, shared by both candidate
+    /// searches: status, the `updated_at` time window and supersession.
+    /// Runs after [`RecallFilters::matches`] so the extra point reads
+    /// are only paid for candidates that passed the cheap predicates.
+    ///
+    /// The returned hit's `rank` is its similarity; [`fuse`] adds
+    /// keyword evidence.
+    async fn admit(
+        &self,
+        item: MemoryItem,
+        score: f32,
+        matched: MatchSource,
+        filters: &RecallFilters,
+    ) -> Result<Admitted> {
+        let storage = self.storage.as_ref();
+        let status = read_status(storage, item.id).await?;
+        if status == MemoryStatus::Archived && !filters.include_archived {
+            return Ok(Admitted::Rejected);
+        }
+        let updated_at = read_updated_at(storage, item.id)
+            .await?
+            .unwrap_or(item.created_at);
+        if filters.time_field == TimeField::UpdatedAt
+            && filters.has_time_window()
+            && !filters.in_time_window(updated_at)
+        {
+            return Ok(Admitted::Rejected);
+        }
+        let superseded_by = self.superseded_by(item.id).await?;
+        if superseded_by.is_some() && !filters.include_superseded {
+            return Ok(Admitted::Rejected);
+        }
+        // Both answered from the side index: no storage read unless
+        // this memory really is the target of a relation.
+        let (provenance, is_target) = self.side_read(|side| {
+            (
+                side.provenance.get(&item.id).copied(),
+                side.targets.contains(&item.id),
+            )
+        });
+        if filters.provenance.is_some() && filters.provenance != provenance {
+            return Ok(Admitted::Rejected);
+        }
+        let demoted = is_target && self.is_demoted(item.id, updated_at).await?;
+        let mut rank = similarity_from_distance(score);
+        if demoted {
+            rank -= self.demote_margin();
+        }
+        let hit = RecallHit {
+            item,
+            score,
+            superseded_by,
+            matched,
+            rank,
+            updated_at,
+            status,
+            demoted,
+            relations: HitRelations::default(),
+            provenance,
+            source: None,
+        };
+        Ok(if hit.superseded_by.is_some() {
+            Admitted::Stale(hit)
+        } else {
+            Admitted::Current(hit)
+        })
+    }
+
+    /// When `id`'s content was last edited, or `None` if no memory with
+    /// this id is stored. A memory never edited reports its creation
+    /// time.
+    pub async fn updated_at(&self, id: MemoryId) -> Result<Option<DateTime<Utc>>> {
+        let Some(item) = self.get(id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            read_updated_at(self.storage.as_ref(), id)
+                .await?
+                .unwrap_or(item.created_at),
+        ))
+    }
+
+    /// Lifecycle status of `id`, or `None` if no memory with this id is
+    /// stored.
+    pub async fn status(&self, id: MemoryId) -> Result<Option<MemoryStatus>> {
+        if self.storage.get(&mem_key(&id)).await?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(read_status(self.storage.as_ref(), id).await?))
+    }
+
+    /// Side-table metadata for a stored memory: see [`read_memory_meta`].
+    pub async fn meta(&self, item: &MemoryItem) -> Result<MemoryMeta> {
+        read_memory_meta(self.storage.as_ref(), item).await
+    }
+
+    /// Archive or re-activate a memory. Returns `false` if no memory
+    /// with this id is stored. Idempotent; never changes `updated_at`.
+    pub async fn set_status(&self, id: MemoryId, status: MemoryStatus) -> Result<bool> {
+        let _g = self.write_lock.lock().await;
+        if self.storage.get(&mem_key(&id)).await?.is_none() {
+            return Ok(false);
+        }
+        self.write_status(id, status).await?;
+        self.note_mutation();
+        Ok(true)
+    }
+
+    /// Callers hold `write_lock`.
+    async fn write_status(&self, id: MemoryId, status: MemoryStatus) -> Result<()> {
+        match status {
+            MemoryStatus::Archived => self.storage.put(&st_key(&id), &[ST_ARCHIVED]).await,
+            MemoryStatus::Active => self.storage.delete(&st_key(&id)).await,
+        }
+    }
+
+    /// Record `at` as the last content edit of `id`. Callers hold
+    /// `write_lock`.
+    async fn write_updated_at(&self, id: MemoryId, at: DateTime<Utc>) -> Result<()> {
+        self.storage
+            .put(&mts_key(&id), &at.timestamp_millis().to_be_bytes())
+            .await
+    }
+
+    /// Set a memory's `updated_at` to an arbitrary instant. For tests
+    /// and seed tooling that need an edit history without waiting for
+    /// the clock; `update` is the production path.
+    #[doc(hidden)]
+    pub async fn backdate_updated_at(&self, id: MemoryId, at: DateTime<Utc>) -> Result<bool> {
+        let _g = self.write_lock.lock().await;
+        if self.storage.get(&mem_key(&id)).await?.is_none() {
+            return Ok(false);
+        }
+        self.write_updated_at(id, at).await?;
+        Ok(true)
     }
 
     /// Build the keyword index from storage if it doesn't exist yet.
@@ -1383,6 +2239,18 @@ impl SemanticStore {
         // left in place and resolve as "not superseded" once it's gone
         // (see `superseded_by`).
         self.storage.delete(&sup_key(&id)).await?;
+        // And its side rows, so a forgotten id leaves nothing behind.
+        self.storage.delete(&mts_key(&id)).await?;
+        self.storage.delete(&st_key(&id)).await?;
+        // Relations in both directions and the provenance row. A
+        // relation lapses with either end; see `memory::relations`.
+        relations::delete_all_for(self.storage.as_ref(), id).await?;
+        relations::delete_provenance(self.storage.as_ref(), id).await?;
+        self.with_side_index(|side| {
+            side.sources.remove(&id);
+            side.targets.remove(&id);
+            side.provenance.remove(&id);
+        });
         self.with_keyword_index(|idx| idx.remove(id));
         // Tombstone the vector unconditionally — even if the metadata
         // is gone, leaving an orphan vector wastes RAM and can return
@@ -1406,6 +2274,10 @@ impl SemanticStore {
     ///
     /// `created_at` is preserved across updates — it identifies when
     /// the memory was first stored, not when it was last touched.
+    /// `updated_at` (the `mts:` side row) moves only when the content
+    /// actually changes: re-tagging, re-scoping, archiving, or writing
+    /// back identical text leave it alone, so it stays a faithful
+    /// "this fact was last revised" signal for auto-context freshness.
     pub async fn update(&self, id: MemoryId, patch: UpdatePatch) -> Result<bool> {
         let key = mem_key(&id);
         let bytes = match self.storage.get(&key).await? {
@@ -1422,6 +2294,7 @@ impl SemanticStore {
         // Re-embed BEFORE acquiring write_lock so we don't block
         // concurrent remember/forget callers on a forward pass — same
         // pattern as `remember`.
+        let mut content_changed = false;
         let new_vector = match &patch.content {
             Some(new_content) => {
                 let trimmed = new_content.trim();
@@ -1436,6 +2309,7 @@ impl SemanticStore {
                         self.embedder.dim()
                     )));
                 }
+                content_changed = item.content != trimmed;
                 item.content = trimmed.to_owned();
                 Some(v)
             }
@@ -1457,9 +2331,21 @@ impl SemanticStore {
 
         let _g = self.write_lock.lock().await;
         self.storage.put(&key, &value).await?;
+        // Side rows are separate puts (the storage seam has no
+        // multi-key transaction). A crash between them leaves the new
+        // content with the old `updated_at`: stale by one edit, never
+        // wrong about the content itself.
+        if content_changed {
+            self.write_updated_at(id, Utc::now()).await?;
+        }
+        if let Some(status) = patch.status {
+            self.write_status(id, status).await?;
+        }
         if let Some(vec) = new_vector {
             self.wal.append(WalOp::VectorReplace { id, vec }).await?;
             self.with_keyword_index(|idx| idx.insert(id, &item.content));
+            self.note_mutation();
+        } else if patch.status.is_some() {
             self.note_mutation();
         }
         Ok(true)
@@ -1597,20 +2483,61 @@ fn fuse(
         if keyword::contains_phrase(&keyword::words(&hit.item.content), &query_words) {
             *ev += PHRASE_WEIGHT;
         }
+        // A memory that a newer one refines or contradicts matches the
+        // query's words as well as ever, usually better than its
+        // refiner: the stale wording is what the question was phrased
+        // after. That literal match is exactly what must not decide.
+        if hit.demoted {
+            *ev = 0.0;
+        }
     }
-    let rank = |(hit, ev): &(RecallHit, f32)| -> f32 {
-        let similarity = similarity_from_distance(hit.score);
+    // `RecallHit::rank` is similarity + evidence in every mode, so
+    // callers that mix layers compare like with like. Only the *sort*
+    // differs in keyword mode.
+    // `admit` set `rank` to the similarity, less the demote margin.
+    let base: Vec<f32> = merged.iter().map(|(hit, _)| hit.rank).collect();
+    for (hit, ev) in merged.iter_mut() {
+        hit.rank += *ev;
+    }
+    let mut keyed: Vec<((RecallHit, f32), f32)> = merged.into_iter().zip(base).collect();
+    let order = |((hit, ev), base): &((RecallHit, f32), f32)| -> f32 {
         match mode {
-            RecallMode::Keyword => ev * 10.0 + similarity,
-            _ => similarity + ev,
+            RecallMode::Keyword => ev * 10.0 + base,
+            _ => hit.rank,
         }
     };
-    merged.sort_by(|a, b| {
-        rank(b)
-            .partial_cmp(&rank(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    merged.into_iter().take(k).map(|(h, _)| h).collect()
+    keyed.sort_by(|a, b| by_rank_then_recency(order(a), &a.0.0, order(b), &b.0.0));
+    keyed.into_iter().take(k).map(|((h, _), _)| h).collect()
+}
+
+/// Sort keys closer than this are a tie. Two memories with the same
+/// vector and the same keyword evidence differ only by float noise,
+/// and that noise must not be what orders them.
+const RANK_TIE: f32 = 1e-4;
+
+/// Best key first; among equals, the most recently edited first, then
+/// the newest id.
+///
+/// The tie-break matters more than it looks. A fact and its corrected
+/// version are close in meaning and share most of their words, so they
+/// routinely tie, and before 1.6 the tie fell to whichever the search
+/// happened to return first: in keyword mode, the older memory, every
+/// time. Preferring the later edit puts the current version first even
+/// when nobody has linked the two.
+///
+/// Keys are compared in steps of [`RANK_TIE`] rather than with an
+/// "about equal" test, so the ordering stays transitive.
+fn by_rank_then_recency(
+    key_a: f32,
+    a: &RecallHit,
+    key_b: f32,
+    b: &RecallHit,
+) -> std::cmp::Ordering {
+    let step = |key: f32| (key / RANK_TIE).round() as i64;
+    step(key_b)
+        .cmp(&step(key_a))
+        .then_with(|| b.updated_at.cmp(&a.updated_at))
+        .then_with(|| b.item.id.cmp(&a.item.id))
 }
 
 /// Superseded hits rank after every current one and only fill leftover
@@ -1623,6 +2550,32 @@ fn append_stale(mut hits: Vec<RecallHit>, stale: Vec<RecallHit>, k: usize) -> Ve
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// What [`SemanticStore::admit`] decided about one candidate.
+enum Admitted {
+    Current(RecallHit),
+    /// Superseded, and the caller asked for superseded memories.
+    Stale(RecallHit),
+    Rejected,
+}
+
+/// Value of an `st:` row. Presence is what counts; the byte leaves
+/// room for further statuses.
+const ST_ARCHIVED: u8 = 1;
+
+fn mts_key(id: &MemoryId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(MTS_KEY_PREFIX.len() + 16);
+    k.extend_from_slice(MTS_KEY_PREFIX);
+    k.extend_from_slice(&id.0.to_bytes());
+    k
+}
+
+fn st_key(id: &MemoryId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(ST_KEY_PREFIX.len() + 16);
+    k.extend_from_slice(ST_KEY_PREFIX);
+    k.extend_from_slice(&id.0.to_bytes());
+    k
 }
 
 fn sup_key(id: &MemoryId) -> Vec<u8> {
@@ -3077,12 +4030,26 @@ mod tests {
             score: 0.2,
             superseded_by: None,
             matched: MatchSource::Semantic,
+            rank: 0.8,
+            updated_at: Utc::now(),
+            status: MemoryStatus::Active,
+            demoted: false,
+            relations: Default::default(),
+            provenance: None,
+            source: None,
         };
         let weak_keyword = RecallHit {
             item: item("the user called twice"),
             score: 0.7,
             superseded_by: None,
             matched: MatchSource::Keyword,
+            rank: 0.3,
+            updated_at: Utc::now(),
+            status: MemoryStatus::Active,
+            demoted: false,
+            relations: Default::default(),
+            provenance: None,
+            source: None,
         };
         let kh = KeywordHit {
             id: weak_keyword.item.id,
@@ -3098,5 +4065,1344 @@ mod tests {
             RecallMode::Hybrid,
         );
         assert_eq!(fused[0].item.id, semantic_id);
+    }
+
+    // ---------- side tables: updated_at (mts:) and status (st:) ----------
+
+    async fn raw_side_rows(storage: &dyn Storage, id: MemoryId) -> (bool, bool, bool) {
+        (
+            storage.get(&mts_key(&id)).await.unwrap().is_some(),
+            storage.get(&st_key(&id)).await.unwrap().is_some(),
+            storage.get(&sup_key(&id)).await.unwrap().is_some(),
+        )
+    }
+
+    fn store_on(root: &Path, storage: Arc<dyn Storage>) -> Arc<SemanticStore> {
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        SemanticStore::open_disabled(root, storage, embedder).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_new_memory_has_no_side_rows_and_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let s = store_on(tmp.path(), Arc::clone(&storage));
+        let id = s
+            .remember("alpha bravo", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            raw_side_rows(storage.as_ref(), id).await,
+            (false, false, false)
+        );
+        let item = s.get(id).await.unwrap().unwrap();
+        assert_eq!(s.updated_at(id).await.unwrap(), Some(item.created_at));
+        assert_eq!(s.status(id).await.unwrap(), Some(MemoryStatus::Active));
+        let hits = s
+            .recall("alpha bravo", 5, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(hits[0].updated_at, item.created_at);
+        assert_eq!(hits[0].status, MemoryStatus::Active);
+        // Unknown ids have no metadata at all.
+        let ghost = MemoryId::new();
+        assert_eq!(s.updated_at(ghost).await.unwrap(), None);
+        assert_eq!(s.status(ghost).await.unwrap(), None);
+        assert!(!s.set_status(ghost, MemoryStatus::Archived).await.unwrap());
+        assert_eq!(
+            raw_side_rows(storage.as_ref(), ghost).await,
+            (false, false, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn content_update_bumps_updated_at_and_keeps_created_at() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let id = s
+            .remember("balance is 5200", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let created = s.get(id).await.unwrap().unwrap().created_at;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let before = Utc::now();
+        s.update(
+            id,
+            UpdatePatch {
+                content: Some("balance is 4800".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let updated = s.updated_at(id).await.unwrap().unwrap();
+        assert_eq!(s.get(id).await.unwrap().unwrap().created_at, created);
+        assert!(updated > created);
+        // Stored at millisecond precision.
+        assert!(updated >= before - chrono::Duration::milliseconds(1));
+        assert!(updated <= Utc::now());
+        let hits = s
+            .recall("balance is 4800", 5, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(hits[0].updated_at, updated);
+    }
+
+    #[tokio::test]
+    async fn metadata_only_update_does_not_bump_updated_at() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let s = store_on(tmp.path(), Arc::clone(&storage));
+        let id = s
+            .remember("alpha bravo", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let created = s.get(id).await.unwrap().unwrap().created_at;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        for patch in [
+            UpdatePatch {
+                kind: Some(MemoryKind::Decision),
+                ..Default::default()
+            },
+            UpdatePatch {
+                tags: Some(vec!["t".into()]),
+                ..Default::default()
+            },
+            UpdatePatch {
+                scope: Some("work".into()),
+                ..Default::default()
+            },
+            UpdatePatch {
+                status: Some(MemoryStatus::Archived),
+                ..Default::default()
+            },
+            UpdatePatch {
+                status: Some(MemoryStatus::Active),
+                ..Default::default()
+            },
+            // Writing the same text back is not an edit either.
+            UpdatePatch {
+                content: Some("  alpha bravo ".into()),
+                ..Default::default()
+            },
+            UpdatePatch::default(),
+        ] {
+            assert!(s.update(id, patch).await.unwrap());
+            assert_eq!(s.updated_at(id).await.unwrap(), Some(created));
+        }
+        // Not even a row was written.
+        assert!(!raw_side_rows(storage.as_ref(), id).await.0);
+        // The patches themselves did land.
+        let item = s.get(id).await.unwrap().unwrap();
+        assert_eq!(item.kind, MemoryKind::Decision);
+        assert_eq!(item.scope, "work");
+    }
+
+    #[tokio::test]
+    async fn forget_removes_side_rows() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let s = store_on(tmp.path(), Arc::clone(&storage));
+        let id = s
+            .remember("alpha bravo", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let newer = s
+            .remember("alpha bravo two", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        s.update(
+            id,
+            UpdatePatch {
+                content: Some("alpha bravo charlie".into()),
+                status: Some(MemoryStatus::Archived),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        s.supersede(id, newer).await.unwrap();
+        assert_eq!(
+            raw_side_rows(storage.as_ref(), id).await,
+            (true, true, true)
+        );
+
+        assert!(s.forget(id).await.unwrap());
+        assert_eq!(
+            raw_side_rows(storage.as_ref(), id).await,
+            (false, false, false)
+        );
+        assert_eq!(s.updated_at(id).await.unwrap(), None);
+        assert_eq!(s.status(id).await.unwrap(), None);
+        // Nothing with this id is left under any memory prefix.
+        for prefix in [
+            MEM_KEY_PREFIX,
+            MTS_KEY_PREFIX,
+            ST_KEY_PREFIX,
+            SUP_KEY_PREFIX,
+        ] {
+            let rows = storage.scan_prefix(prefix).await.unwrap();
+            assert!(
+                rows.iter().all(|(k, _)| !k.ends_with(&id.0.to_bytes())),
+                "row left under {:?}",
+                std::str::from_utf8(prefix)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn archived_memories_are_hidden_unless_asked_for() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let live = s
+            .remember("deploy runbook v2", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let old = s
+            .remember("deploy runbook v1", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        assert!(s.set_status(old, MemoryStatus::Archived).await.unwrap());
+
+        for mode in [
+            RecallMode::Hybrid,
+            RecallMode::Semantic,
+            RecallMode::Keyword,
+        ] {
+            let default = RecallFilters {
+                mode,
+                ..Default::default()
+            };
+            let ids: Vec<MemoryId> = s
+                .recall("deploy runbook", 10, &default)
+                .await
+                .unwrap()
+                .iter()
+                .map(|h| h.item.id)
+                .collect();
+            assert_eq!(ids, vec![live], "{mode:?}");
+
+            let asked = RecallFilters {
+                mode,
+                include_archived: true,
+                ..Default::default()
+            };
+            let hits = s.recall("deploy runbook", 10, &asked).await.unwrap();
+            assert_eq!(hits.len(), 2, "{mode:?}");
+            let archived = hits.iter().find(|h| h.item.id == old).unwrap();
+            assert_eq!(archived.status, MemoryStatus::Archived);
+        }
+
+        // Archiving is reversible and idempotent.
+        assert!(s.set_status(old, MemoryStatus::Archived).await.unwrap());
+        assert!(s.set_status(old, MemoryStatus::Active).await.unwrap());
+        assert_eq!(
+            s.recall("deploy runbook", 10, &RecallFilters::default())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// A retried `remember` must not be deduplicated against a memory
+    /// the agent has archived: it could never recall the "existing" one.
+    #[tokio::test]
+    async fn dedupe_does_not_match_an_archived_twin() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let first = s
+            .remember("the port is 9090", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        s.set_status(first, MemoryStatus::Archived).await.unwrap();
+        let outcome = s
+            .remember_or_dedupe("the port is 9090", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        match outcome {
+            RememberOutcome::Stored { id, near } => {
+                assert_ne!(id, first);
+                assert!(near.is_none());
+            }
+            other => panic!("expected a new memory, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_set_filters_by_membership() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        for scope in ["a", "b", "c"] {
+            s.remember(
+                &format!("shared topic {scope}"),
+                MemoryKind::Fact,
+                vec![],
+                scope.into(),
+            )
+            .await
+            .unwrap();
+        }
+        let scopes_for = |filters: RecallFilters| {
+            let s = Arc::clone(&s);
+            async move {
+                let mut out: Vec<String> = s
+                    .recall("shared topic", 10, &filters)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|h| h.item.scope)
+                    .collect();
+                out.sort();
+                out
+            }
+        };
+        assert_eq!(
+            scopes_for(RecallFilters::with_scopes(["a", "b"])).await,
+            ["a", "b"]
+        );
+        // The single-scope field still works, and unions with the set.
+        assert_eq!(scopes_for(RecallFilters::with_scope("c")).await, ["c"]);
+        assert_eq!(
+            scopes_for(RecallFilters {
+                scope: Some("c".into()),
+                scopes: vec!["a".into()],
+                ..Default::default()
+            })
+            .await,
+            ["a", "c"]
+        );
+        assert_eq!(scopes_for(RecallFilters::default()).await, ["a", "b", "c"]);
+        assert!(
+            scopes_for(RecallFilters::with_scopes(["nope"]))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn since_and_until_filter_on_the_chosen_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let untouched = s
+            .remember("quarterly plan alpha", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let edited = s
+            .remember("quarterly plan beta", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let created = s.get(edited).await.unwrap().unwrap().created_at;
+        // As if it had been revised a week after it was written.
+        // `updated_at` is stored at millisecond precision.
+        let revised = DateTime::<Utc>::from_timestamp_millis(
+            (created + chrono::Duration::days(7)).timestamp_millis(),
+        )
+        .unwrap();
+        assert!(s.backdate_updated_at(edited, revised).await.unwrap());
+
+        let ids = |filters: RecallFilters| {
+            let s = Arc::clone(&s);
+            async move {
+                let mut out: Vec<MemoryId> = s
+                    .recall("quarterly plan", 10, &filters)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|h| h.item.id)
+                    .collect();
+                out.sort();
+                out
+            }
+        };
+        let mut both = vec![untouched, edited];
+        both.sort();
+        let cutoff = created + chrono::Duration::days(1);
+
+        // By creation time (the default) both are older than the cutoff.
+        assert!(
+            ids(RecallFilters {
+                since: Some(cutoff),
+                ..Default::default()
+            })
+            .await
+            .is_empty()
+        );
+        assert_eq!(
+            ids(RecallFilters {
+                until: Some(cutoff),
+                ..Default::default()
+            })
+            .await,
+            both
+        );
+        // By edit time only the revised one is newer.
+        for mode in [
+            RecallMode::Hybrid,
+            RecallMode::Semantic,
+            RecallMode::Keyword,
+        ] {
+            assert_eq!(
+                ids(RecallFilters {
+                    since: Some(cutoff),
+                    time_field: TimeField::UpdatedAt,
+                    mode,
+                    ..Default::default()
+                })
+                .await,
+                vec![edited],
+                "{mode:?}"
+            );
+            assert_eq!(
+                ids(RecallFilters {
+                    until: Some(cutoff),
+                    time_field: TimeField::UpdatedAt,
+                    mode,
+                    ..Default::default()
+                })
+                .await,
+                vec![untouched],
+                "{mode:?}"
+            );
+        }
+        // The window is half-open: `since` is included, `until` is not.
+        let window = |since, until| RecallFilters {
+            since: Some(since),
+            until: Some(until),
+            time_field: TimeField::UpdatedAt,
+            ..Default::default()
+        };
+        let ms = chrono::Duration::milliseconds(1);
+        assert_eq!(ids(window(revised, revised + ms)).await, vec![edited]);
+        assert!(ids(window(revised - ms, revised)).await.is_empty());
+    }
+
+    /// `rank` is similarity plus keyword evidence on every path.
+    #[tokio::test]
+    async fn rank_is_similarity_plus_evidence_in_every_mode() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        s.remember(
+            "the gateway listens on port 4002",
+            MemoryKind::Fact,
+            vec![],
+            "p".into(),
+        )
+        .await
+        .unwrap();
+        s.remember("lunch was a sandwich", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let recall = |mode| {
+            let s = Arc::clone(&s);
+            async move {
+                s.recall(
+                    "gateway port 4002",
+                    5,
+                    &RecallFilters {
+                        mode,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Semantic: no literal evidence is looked for.
+        for h in recall(RecallMode::Semantic).await {
+            assert!((h.rank - similarity_from_distance(h.score)).abs() < 1e-6);
+        }
+        // Hybrid: the literal match gains the full keyword weight; the
+        // other row gains nothing.
+        let hybrid = recall(RecallMode::Hybrid).await;
+        let gateway = hybrid
+            .iter()
+            .find(|h| h.item.content.contains("gateway"))
+            .unwrap();
+        let evidence = gateway.rank - similarity_from_distance(gateway.score);
+        assert!(
+            (evidence - KEYWORD_WEIGHT).abs() < 1e-4,
+            "evidence {evidence}"
+        );
+        for h in hybrid
+            .iter()
+            .filter(|h| !h.item.content.contains("gateway"))
+        {
+            assert!((h.rank - similarity_from_distance(h.score)).abs() < 1e-6);
+        }
+        // Keyword: sorted by evidence first, but `rank` is on the same
+        // scale as the other modes, not the internal sort key.
+        let keyword = recall(RecallMode::Keyword).await;
+        assert_eq!(keyword.len(), 1);
+        assert!((keyword[0].rank - gateway.rank).abs() < 1e-6);
+        assert!(keyword[0].rank < 2.0);
+    }
+
+    /// The side rows are ordinary KV rows: they come back after the
+    /// process restarts, on a plain store and on an encrypted one, and
+    /// on the encrypted one they are ciphertext on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn side_rows_survive_reopen_plain_and_encrypted() {
+        use crate::crypto::{Aead, Dek};
+        use crate::storage::EncryptedStorage;
+        use crate::storage::redb_impl::RedbStorage;
+
+        for encrypted in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let kv_root = tmp.path().join("episodic");
+            std::fs::create_dir_all(&kv_root).unwrap();
+            let dek = Dek::generate().unwrap();
+            let open = || -> (Arc<dyn Storage>, Arc<RedbStorage>) {
+                if encrypted {
+                    let raw =
+                        RedbStorage::open_encrypted(&kv_root, Arc::new(Aead::new(&dek))).unwrap();
+                    let wrapped: Arc<dyn Storage> = EncryptedStorage::new(Arc::clone(&raw), &dek);
+                    (wrapped, raw)
+                } else {
+                    let raw = RedbStorage::open(&kv_root).unwrap();
+                    (Arc::clone(&raw) as Arc<dyn Storage>, raw)
+                }
+            };
+
+            let revised = DateTime::<Utc>::from_timestamp_millis(1_800_000_123_456).unwrap();
+            let (edited, archived, plain) = {
+                let (storage, _raw) = open();
+                let s = store_on(tmp.path(), storage);
+                let edited = s
+                    .remember("edited memory", MemoryKind::Fact, vec![], "p".into())
+                    .await
+                    .unwrap();
+                let archived = s
+                    .remember("archived memory", MemoryKind::Fact, vec![], "p".into())
+                    .await
+                    .unwrap();
+                let plain = s
+                    .remember("plain memory", MemoryKind::Fact, vec![], "p".into())
+                    .await
+                    .unwrap();
+                s.update(
+                    edited,
+                    UpdatePatch {
+                        content: Some("edited memory, revised".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                // Pin the timestamp so the comparison below is exact.
+                s.backdate_updated_at(edited, revised).await.unwrap();
+                s.set_status(archived, MemoryStatus::Archived)
+                    .await
+                    .unwrap();
+                s.shutdown().await.unwrap();
+                (edited, archived, plain)
+            };
+
+            let (storage, raw) = open();
+            let s = store_on(tmp.path(), Arc::clone(&storage));
+            let label = if encrypted { "encrypted" } else { "plain" };
+            assert_eq!(
+                s.updated_at(edited).await.unwrap(),
+                Some(revised),
+                "{label}"
+            );
+            assert_eq!(
+                s.status(archived).await.unwrap(),
+                Some(MemoryStatus::Archived),
+                "{label}"
+            );
+            let plain_item = s.get(plain).await.unwrap().unwrap();
+            assert_eq!(
+                s.updated_at(plain).await.unwrap(),
+                Some(plain_item.created_at),
+                "{label}"
+            );
+            assert_eq!(
+                s.status(plain).await.unwrap(),
+                Some(MemoryStatus::Active),
+                "{label}"
+            );
+            // And recall honours them after the restart.
+            let hits = s
+                .recall("memory", 10, &RecallFilters::default())
+                .await
+                .unwrap();
+            assert!(hits.iter().all(|h| h.item.id != archived), "{label}");
+            let hit = hits.iter().find(|h| h.item.id == edited).unwrap();
+            assert_eq!(hit.updated_at, revised, "{label}");
+
+            // On disk: the documented encodings when plain, sealed
+            // envelopes when encrypted.
+            let mts = raw.get(&mts_key(&edited)).await.unwrap().unwrap();
+            let st = raw.get(&st_key(&archived)).await.unwrap().unwrap();
+            if encrypted {
+                assert_eq!(&mts[..4], b"MNE1", "mts row is not sealed");
+                assert_eq!(&st[..4], b"MNE1", "st row is not sealed");
+            } else {
+                assert_eq!(mts, revised.timestamp_millis().to_be_bytes());
+                assert_eq!(st, [ST_ARCHIVED]);
+            }
+            s.shutdown().await.unwrap();
+        }
+    }
+
+    // ---------- relations and provenance (1.6) ----------
+
+    /// Three memories the stub embedder cannot tell apart from the
+    /// query (same first byte, same length), so every difference in
+    /// rank below comes from relations, not from similarity.
+    const OLD: &str = "port for the gateway is 8080";
+    const NEW: &str = "port for the gateway is 9090";
+    const QUERY: &str = "port for the gateway is 7070";
+
+    async fn pair(s: &SemanticStore) -> (MemoryId, MemoryId) {
+        let old = s
+            .remember(OLD, MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let new = s
+            .remember(NEW, MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        (old, new)
+    }
+
+    async fn ranked(s: &SemanticStore, mode: RecallMode) -> Vec<RecallHit> {
+        s.recall(
+            QUERY,
+            10,
+            &RecallFilters {
+                mode,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn of(hits: &[RecallHit], id: MemoryId) -> &RecallHit {
+        hits.iter().find(|h| h.item.id == id).unwrap()
+    }
+
+    const MODES: [RecallMode; 3] = [
+        RecallMode::Hybrid,
+        RecallMode::Semantic,
+        RecallMode::Keyword,
+    ];
+
+    #[tokio::test]
+    async fn a_refined_memory_ranks_below_its_refiner_at_equal_cosine() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+
+        // Before: nothing separates them.
+        for mode in MODES {
+            let hits = ranked(&s, mode).await;
+            assert_eq!(of(&hits, old).score, of(&hits, new).score, "{mode:?}");
+            assert_eq!(of(&hits, old).rank, of(&hits, new).rank, "{mode:?}");
+            assert!(!of(&hits, old).demoted);
+            assert!(of(&hits, old).relations.is_empty());
+        }
+
+        assert!(
+            s.relate(
+                new,
+                RelationType::Refines,
+                RelationTarget::Memory(old),
+                "port moved in March"
+            )
+            .await
+            .unwrap()
+        );
+
+        for mode in MODES {
+            let hits = ranked(&s, mode).await;
+            let ids: Vec<MemoryId> = hits.iter().map(|h| h.item.id).collect();
+            assert_eq!(ids, vec![new, old], "{mode:?}");
+            let (o, n) = (of(&hits, old), of(&hits, new));
+            // Still returned, same similarity, lower rank.
+            assert_eq!(o.score, n.score, "{mode:?}");
+            assert!(o.demoted && !n.demoted, "{mode:?}");
+            assert!(n.rank - o.rank >= DEFAULT_DEMOTE_MARGIN - 1e-6, "{mode:?}");
+            // The demoted row keeps no keyword evidence: its rank is
+            // its similarity less the margin, exactly.
+            assert!(
+                (o.rank - (similarity_from_distance(o.score) - DEFAULT_DEMOTE_MARGIN)).abs() < 1e-6,
+                "{mode:?}: {}",
+                o.rank
+            );
+            // Both rows say how they are related.
+            assert_eq!(
+                o.relations.refined_by,
+                vec![Link {
+                    id: new,
+                    reason: "port moved in March".into()
+                }]
+            );
+            assert_eq!(n.relations.refines[0].id, old);
+        }
+    }
+
+    #[tokio::test]
+    async fn forgetting_the_refiner_restores_the_rank() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let s = store_on(tmp.path(), Arc::clone(&storage));
+        let (old, new) = pair(&s).await;
+        let before = of(&ranked(&s, RecallMode::Hybrid).await, old).rank;
+        s.relate(new, RelationType::Refines, RelationTarget::Memory(old), "")
+            .await
+            .unwrap();
+        assert!(of(&ranked(&s, RecallMode::Hybrid).await, old).demoted);
+
+        assert!(s.forget(new).await.unwrap());
+        for mode in MODES {
+            let hits = ranked(&s, mode).await;
+            assert_eq!(hits.len(), 1, "{mode:?}");
+            assert!(!hits[0].demoted, "{mode:?}");
+            assert!(hits[0].relations.is_empty(), "{mode:?}");
+        }
+        // Its keyword evidence counts again: the rank is back above the
+        // bare similarity, where a demoted row sits a margin below it.
+        let restored = &ranked(&s, RecallMode::Hybrid).await[0];
+        assert!(restored.rank > similarity_from_distance(restored.score));
+        assert!(before > 0.0);
+        // And the rows are gone, not merely ignored.
+        assert!(
+            storage
+                .scan_prefix(crate::storage::REL_KEY_PREFIX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .scan_prefix(crate::storage::RREL_KEY_PREFIX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn contradicts_demotes_like_refines() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        s.relate(
+            new,
+            RelationType::Contradicts,
+            RelationTarget::Memory(old),
+            "measured again",
+        )
+        .await
+        .unwrap();
+        for mode in MODES {
+            let hits = ranked(&s, mode).await;
+            assert_eq!(hits[0].item.id, new, "{mode:?}");
+            let o = of(&hits, old);
+            assert!(o.demoted, "{mode:?}");
+            assert_eq!(o.relations.contradicted_by[0].reason, "measured again");
+            assert_eq!(of(&hits, new).relations.contradicts[0].id, old);
+        }
+        s.forget(new).await.unwrap();
+        assert!(!ranked(&s, RecallMode::Hybrid).await[0].demoted);
+    }
+
+    #[tokio::test]
+    async fn only_a_current_newer_refiner_demotes() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        s.relate(new, RelationType::Refines, RelationTarget::Memory(old), "")
+            .await
+            .unwrap();
+        let demoted = |s: Arc<SemanticStore>| async move {
+            let hits = s
+                .recall(
+                    QUERY,
+                    10,
+                    &RecallFilters {
+                        include_archived: true,
+                        include_superseded: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            of(&hits, old).demoted
+        };
+        assert!(demoted(Arc::clone(&s)).await);
+
+        // An archived refiner no longer speaks for the present.
+        s.set_status(new, MemoryStatus::Archived).await.unwrap();
+        assert!(!demoted(Arc::clone(&s)).await);
+        s.set_status(new, MemoryStatus::Active).await.unwrap();
+        assert!(demoted(Arc::clone(&s)).await);
+
+        // Nor does a superseded one.
+        let newest = s
+            .remember(
+                "port for the gateway is 9191",
+                MemoryKind::Fact,
+                vec![],
+                "p".into(),
+            )
+            .await
+            .unwrap();
+        s.supersede(new, newest).await.unwrap();
+        assert!(!demoted(Arc::clone(&s)).await);
+        s.forget(newest).await.unwrap();
+        assert!(demoted(Arc::clone(&s)).await);
+
+        // And once the old memory is itself revised after the
+        // refinement, the remark about its old text lapses.
+        let later = Utc::now() + chrono::Duration::days(1);
+        s.backdate_updated_at(old, later).await.unwrap();
+        assert!(!demoted(Arc::clone(&s)).await);
+    }
+
+    #[tokio::test]
+    async fn the_demote_margin_is_configurable() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        s.relate(new, RelationType::Refines, RelationTarget::Memory(old), "")
+            .await
+            .unwrap();
+        s.set_demote_margin(0.25);
+        let hits = ranked(&s, RecallMode::Semantic).await;
+        assert!((of(&hits, new).rank - of(&hits, old).rank - 0.25).abs() < 1e-6);
+        // Garbage is "no penalty", never a boost.
+        s.set_demote_margin(-3.0);
+        assert_eq!(s.demote_margin(), 0.0);
+        s.set_demote_margin(f32::NAN);
+        assert_eq!(s.demote_margin(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_supersedes_relation_still_hides_the_old_memory() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        s.relate(
+            new,
+            RelationType::Supersedes,
+            RelationTarget::Memory(old),
+            "replaced outright",
+        )
+        .await
+        .unwrap();
+        for mode in MODES {
+            let ids: Vec<MemoryId> = ranked(&s, mode).await.iter().map(|h| h.item.id).collect();
+            assert_eq!(ids, vec![new], "{mode:?}");
+        }
+        assert_eq!(s.superseded_by(old).await.unwrap(), Some(new));
+        let all = s
+            .recall(
+                QUERY,
+                10,
+                &RecallFilters {
+                    include_superseded: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(of(&all, old).superseded_by, Some(new));
+        assert_eq!(
+            of(&all, new).relations.supersedes[0].reason,
+            "replaced outright"
+        );
+    }
+
+    /// The `supersedes` argument is sugar: it writes the `sup:` link
+    /// and the same fact as a relation, and never erases a reason.
+    #[tokio::test]
+    async fn supersede_also_records_a_relation() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        assert!(s.supersede(old, new).await.unwrap());
+        let out = s.outgoing_relations(new).await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, RelationType::Supersedes);
+        assert_eq!(out[0].target, RelationTarget::Memory(old));
+        assert_eq!(out[0].reason, "");
+
+        s.relate(
+            new,
+            RelationType::Supersedes,
+            RelationTarget::Memory(old),
+            "why",
+        )
+        .await
+        .unwrap();
+        s.supersede(old, new).await.unwrap();
+        assert_eq!(s.outgoing_relations(new).await.unwrap()[0].reason, "why");
+    }
+
+    #[tokio::test]
+    async fn relate_rejects_missing_ends_and_self() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        let ghost = MemoryId::new();
+        let refines = RelationType::Refines;
+        assert!(
+            !s.relate(ghost, refines, RelationTarget::Memory(old), "")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !s.relate(new, refines, RelationTarget::Memory(ghost), "")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !s.relate(new, refines, RelationTarget::Memory(new), "")
+                .await
+                .unwrap()
+        );
+        assert!(s.outgoing_relations(new).await.unwrap().is_empty());
+        // Limits are errors, not silent truncation.
+        assert!(
+            s.relate(new, refines, RelationTarget::Memory(old), &"r".repeat(301))
+                .await
+                .is_err()
+        );
+        assert!(
+            s.relate(new, refines, RelationTarget::Ref("x:y".into()), "")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_for_a_ref_is_found_by_recall_by_ref() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let cited = s
+            .remember(
+                "pricing tiers were cut to three",
+                MemoryKind::Decision,
+                vec![],
+                "work".into(),
+            )
+            .await
+            .unwrap();
+        let also = s
+            .remember(
+                "enterprise tier keeps annual billing",
+                MemoryKind::Fact,
+                vec![],
+                "work".into(),
+            )
+            .await
+            .unwrap();
+        let other = s
+            .remember(
+                "unrelated note about lunch",
+                MemoryKind::Fact,
+                vec![],
+                "work".into(),
+            )
+            .await
+            .unwrap();
+        let reference = "research:pricing-study";
+        for id in [cited, also] {
+            s.relate(
+                id,
+                RelationType::EvidenceFor,
+                RelationTarget::Ref(reference.into()),
+                "section 4",
+            )
+            .await
+            .unwrap();
+        }
+        s.relate(
+            other,
+            RelationType::EvidenceFor,
+            RelationTarget::Ref("research:pricing-study-2".into()),
+            "",
+        )
+        .await
+        .unwrap();
+
+        let hits = s
+            .recall_by_ref(reference, None, 10, &RecallFilters::default())
+            .await
+            .unwrap();
+        let mut ids: Vec<MemoryId> = hits.iter().map(|h| h.item.id).collect();
+        ids.sort();
+        let mut want = vec![cited, also];
+        want.sort();
+        assert_eq!(ids, want);
+        for h in &hits {
+            assert_eq!(h.matched, MatchSource::Reference);
+            assert_eq!(
+                h.relations.evidence,
+                vec![Evidence {
+                    target: RelationTarget::Ref(reference.into()),
+                    reason: "section 4".into()
+                }]
+            );
+        }
+        // Exact match only.
+        assert!(
+            s.recall_by_ref("research:pricing", None, 10, &RecallFilters::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Filters still apply, and so does the limit.
+        let decisions = RecallFilters {
+            kind: Some(MemoryKind::Decision),
+            ..Default::default()
+        };
+        let hits = s
+            .recall_by_ref(reference, None, 10, &decisions)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.item.id).collect::<Vec<_>>(),
+            vec![cited]
+        );
+        assert_eq!(
+            s.recall_by_ref(reference, None, 1, &RecallFilters::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // With a query the rows carry a real similarity to it.
+        let hits = s
+            .recall_by_ref(
+                reference,
+                Some("pricing tiers were cut to three"),
+                10,
+                &RecallFilters::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits[0].item.id, cited);
+        assert!(hits[0].score < 0.001);
+        // Archived memories are hidden here as everywhere.
+        s.set_status(cited, MemoryStatus::Archived).await.unwrap();
+        let hits = s
+            .recall_by_ref(reference, None, 10, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.item.id).collect::<Vec<_>>(),
+            vec![also]
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_is_stored_filtered_and_counted() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let stated = s
+            .remember("shared topic one", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let inferred = s
+            .remember("shared topic two", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let plain = s
+            .remember("shared topic six", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        assert!(
+            s.set_provenance(
+                stated,
+                ProvenanceRecord {
+                    provenance: Provenance::UserStated,
+                    source: Some("telegram:chat-12".into())
+                }
+            )
+            .await
+            .unwrap()
+        );
+        s.set_provenance(
+            inferred,
+            ProvenanceRecord {
+                provenance: Provenance::Inferred,
+                source: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !s.set_provenance(
+                MemoryId::new(),
+                ProvenanceRecord {
+                    provenance: Provenance::Observed,
+                    source: None
+                }
+            )
+            .await
+            .unwrap()
+        );
+
+        let all = s
+            .recall("shared topic", 10, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(of(&all, stated).provenance, Some(Provenance::UserStated));
+        assert_eq!(of(&all, stated).source.as_deref(), Some("telegram:chat-12"));
+        assert_eq!(of(&all, inferred).provenance, Some(Provenance::Inferred));
+        assert_eq!(of(&all, inferred).source, None);
+        assert_eq!(of(&all, plain).provenance, None);
+
+        for mode in MODES {
+            let hits = s
+                .recall(
+                    "shared topic",
+                    10,
+                    &RecallFilters {
+                        provenance: Some(Provenance::Inferred),
+                        mode,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                hits.iter().map(|h| h.item.id).collect::<Vec<_>>(),
+                vec![inferred],
+                "{mode:?}"
+            );
+        }
+
+        let counts = s.provenance_counts().await.unwrap();
+        let count = |p| counts.iter().find(|(q, _)| *q == p).unwrap().1;
+        assert_eq!(count(Provenance::UserStated), 1);
+        assert_eq!(count(Provenance::Inferred), 1);
+        assert_eq!(count(Provenance::Observed), 0);
+        assert_eq!(count(Provenance::Imported), 0);
+
+        // `forget` takes the row with the memory.
+        s.forget(stated).await.unwrap();
+        assert_eq!(s.provenance(stated).await.unwrap(), None);
+        let counts = s.provenance_counts().await.unwrap();
+        assert_eq!(counts.iter().map(|(_, n)| n).sum::<usize>(), 1);
+        // Over-long sources are refused.
+        assert!(
+            s.set_provenance(
+                plain,
+                ProvenanceRecord {
+                    provenance: Provenance::Imported,
+                    source: Some("s".repeat(201))
+                }
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    /// Relations and provenance are ordinary KV rows: after a restart
+    /// the side index is rebuilt from them and recall behaves the same,
+    /// on a plain store and on an encrypted one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relations_and_provenance_survive_reopen_plain_and_encrypted() {
+        use crate::crypto::{Aead, Dek};
+        use crate::storage::EncryptedStorage;
+        use crate::storage::redb_impl::RedbStorage;
+
+        for encrypted in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let kv_root = tmp.path().join("episodic");
+            std::fs::create_dir_all(&kv_root).unwrap();
+            let dek = Dek::generate().unwrap();
+            let open = || -> Arc<dyn Storage> {
+                if encrypted {
+                    let raw =
+                        RedbStorage::open_encrypted(&kv_root, Arc::new(Aead::new(&dek))).unwrap();
+                    EncryptedStorage::new(raw, &dek)
+                } else {
+                    RedbStorage::open(&kv_root).unwrap()
+                }
+            };
+            let (old, new) = {
+                let s = store_on(tmp.path(), open());
+                let (old, new) = pair(&s).await;
+                s.relate(
+                    new,
+                    RelationType::Refines,
+                    RelationTarget::Memory(old),
+                    "moved",
+                )
+                .await
+                .unwrap();
+                s.relate(
+                    new,
+                    RelationType::EvidenceFor,
+                    RelationTarget::Ref("path:/etc/gateway.toml".into()),
+                    "",
+                )
+                .await
+                .unwrap();
+                s.set_provenance(
+                    new,
+                    ProvenanceRecord {
+                        provenance: Provenance::Observed,
+                        source: Some("tool:cat".into()),
+                    },
+                )
+                .await
+                .unwrap();
+                s.shutdown().await.unwrap();
+                (old, new)
+            };
+
+            let s = store_on(tmp.path(), open());
+            let label = if encrypted { "encrypted" } else { "plain" };
+            let hits = ranked(&s, RecallMode::Hybrid).await;
+            assert_eq!(hits[0].item.id, new, "{label}");
+            assert!(of(&hits, old).demoted, "{label}");
+            assert_eq!(of(&hits, old).relations.refined_by[0].reason, "moved");
+            assert_eq!(of(&hits, new).provenance, Some(Provenance::Observed));
+            assert_eq!(of(&hits, new).source.as_deref(), Some("tool:cat"));
+            assert_eq!(of(&hits, new).relations.evidence.len(), 1, "{label}");
+            assert_eq!(
+                s.recall_by_ref("path:/etc/gateway.toml", None, 5, &RecallFilters::default())
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "{label}"
+            );
+            s.shutdown().await.unwrap();
+        }
+    }
+
+    /// A store with no relations pays nothing for them: the rows of an
+    /// ordinary recall are exactly what they were before 1.6.
+    #[tokio::test]
+    async fn rows_without_relations_are_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        for mode in MODES {
+            for h in ranked(&s, mode).await {
+                assert!(!h.demoted);
+                assert!(h.relations.is_empty());
+                assert_eq!(h.provenance, None);
+                assert_eq!(h.source, None);
+                assert!(h.item.id == old || h.item.id == new);
+            }
+        }
+    }
+
+    /// Two memories the query cannot tell apart, with nothing linking
+    /// them: the one edited last comes first, in every mode. Before
+    /// 1.6 keyword mode put the older one first, every time.
+    #[tokio::test]
+    async fn ties_go_to_the_most_recently_edited_memory() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        // Several rounds, so an order that only happens to hold for one
+        // pair of random ids would show.
+        for round in 0..4 {
+            let old = s
+                .remember(
+                    &format!("port {round} for the gateway is 8080"),
+                    MemoryKind::Fact,
+                    vec![],
+                    "p".into(),
+                )
+                .await
+                .unwrap();
+            let new = s
+                .remember(
+                    &format!("port {round} for the gateway is 9090"),
+                    MemoryKind::Fact,
+                    vec![],
+                    "p".into(),
+                )
+                .await
+                .unwrap();
+            let query = format!("port {round} for the gateway is 7070");
+            let order = |s: Arc<SemanticStore>, mode| {
+                let query = query.clone();
+                async move {
+                    s.recall(
+                        &query,
+                        2,
+                        &RecallFilters {
+                            mode,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|h| h.item.id == old || h.item.id == new)
+                    .map(|h| h.item.id)
+                    .collect::<Vec<_>>()
+                }
+            };
+            for mode in [RecallMode::Hybrid, RecallMode::Keyword] {
+                assert_eq!(
+                    order(Arc::clone(&s), mode).await,
+                    vec![new, old],
+                    "round {round} {mode:?}"
+                );
+            }
+            // Revise the older one (in place, same text length) and it
+            // becomes the current one.
+            s.backdate_updated_at(old, Utc::now() + chrono::Duration::days(1))
+                .await
+                .unwrap();
+            for mode in [RecallMode::Hybrid, RecallMode::Keyword] {
+                assert_eq!(
+                    order(Arc::clone(&s), mode).await,
+                    vec![old, new],
+                    "round {round} {mode:?} after the edit"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rank_ties_are_stepped_not_fuzzy() {
+        let item = |content: &str| MemoryItem {
+            id: MemoryId::new(),
+            content: content.into(),
+            kind: MemoryKind::Fact,
+            tags: vec![],
+            scope: "p".into(),
+            created_at: Utc::now(),
+        };
+        let hit = |age_days: i64| RecallHit {
+            item: item("x"),
+            score: 0.5,
+            superseded_by: None,
+            matched: MatchSource::Semantic,
+            rank: 0.5,
+            updated_at: Utc::now() - chrono::Duration::days(age_days),
+            status: MemoryStatus::Active,
+            demoted: false,
+            relations: Default::default(),
+            provenance: None,
+            source: None,
+        };
+        let (older, newer) = (hit(30), hit(1));
+        use std::cmp::Ordering::{Greater, Less};
+        // Float noise apart: the newer edit wins either way round.
+        assert_eq!(
+            by_rank_then_recency(0.500_001, &older, 0.5, &newer),
+            Greater
+        );
+        assert_eq!(by_rank_then_recency(0.5, &newer, 0.500_001, &older), Less);
+        // A real difference in rank still decides.
+        assert_eq!(by_rank_then_recency(0.51, &older, 0.5, &newer), Less);
+        assert_eq!(by_rank_then_recency(0.5, &newer, 0.51, &older), Greater);
     }
 }

@@ -1,0 +1,56 @@
+# Evaluation questions for the synthetic corpus (tests/common/corpus.rs).
+# `gold`, `gold_l3` and `stale` hold symbolic keys, not ids: ids are assigned when
+# the corpus is seeded. Resolve them with
+#   cargo run --example seed_storage -- corpus --questions <this file> <out.jsonl>
+# Keys: fact:<scope>:<n>  pair:<n>:current|stale  event:<n>  warm:<n>
+# exact: a file name that appears in one memory only
+{"id": "q01", "question": "which environment variable does global_handler_41.rs read?", "type": "exact", "scope": "global", "gold": ["fact:global:41"]}
+{"id": "q02", "question": "which environment variable does global_handler_46.rs read?", "type": "exact", "scope": "global", "gold": ["fact:global:46"]}
+{"id": "q03", "question": "which environment variable does trading_handler_41.rs read?", "type": "exact", "scope": "trading", "gold": ["fact:trading:41"]}
+{"id": "q04", "question": "which environment variable does trading_handler_46.rs read?", "type": "exact", "scope": "trading", "gold": ["fact:trading:46"]}
+{"id": "q05", "question": "which environment variable does ops_handler_41.rs read?", "type": "exact", "scope": "ops", "gold": ["fact:ops:41"]}
+{"id": "q06", "question": "which environment variable does ops_handler_46.rs read?", "type": "exact", "scope": "ops", "gold": ["fact:ops:46"]}
+{"id": "q07", "question": "which environment variable does research_handler_41.rs read?", "type": "exact", "scope": "research", "gold": ["fact:research:41"]}
+{"id": "q08", "question": "which environment variable does research_handler_46.rs read?", "type": "exact", "scope": "research", "gold": ["fact:research:46"]}
+{"id": "q09", "question": "which environment variable does hermes_handler_41.rs read?", "type": "exact", "scope": "hermes", "gold": ["fact:hermes:41"]}
+{"id": "q10", "question": "which environment variable does hermes_handler_46.rs read?", "type": "exact", "scope": "hermes", "gold": ["fact:hermes:46"]}
+{"id": "q11", "question": "which environment variable does personal_handler_41.rs read?", "type": "exact", "scope": "personal", "gold": ["fact:personal:41"]}
+{"id": "q12", "question": "which environment variable does personal_handler_46.rs read?", "type": "exact", "scope": "personal", "gold": ["fact:personal:46"]}
+# fact: one setting of one component in one scope
+{"id": "q13", "question": "what is the ledger batch size in global?", "type": "fact", "scope": "global", "gold": ["fact:global:12"]}
+{"id": "q14", "question": "what is the planner timeout in seconds in global?", "type": "fact", "scope": "global", "gold": ["fact:global:27"]}
+{"id": "q15", "question": "what is the indexer batch size in trading?", "type": "fact", "scope": "trading", "gold": ["fact:trading:13"]}
+{"id": "q16", "question": "what is the cache timeout in seconds in trading?", "type": "fact", "scope": "trading", "gold": ["fact:trading:26"]}
+{"id": "q17", "question": "what is the notifier batch size in ops?", "type": "fact", "scope": "ops", "gold": ["fact:ops:14"]}
+{"id": "q18", "question": "what is the importer timeout in seconds in ops?", "type": "fact", "scope": "ops", "gold": ["fact:ops:25"]}
+{"id": "q19", "question": "what is the importer batch size in research?", "type": "fact", "scope": "research", "gold": ["fact:research:15"]}
+{"id": "q20", "question": "what is the notifier timeout in seconds in research?", "type": "fact", "scope": "research", "gold": ["fact:research:24"]}
+{"id": "q21", "question": "what is the cache batch size in hermes?", "type": "fact", "scope": "hermes", "gold": ["fact:hermes:16"]}
+{"id": "q22", "question": "what is the indexer timeout in seconds in hermes?", "type": "fact", "scope": "hermes", "gold": ["fact:hermes:23"]}
+{"id": "q23", "question": "what is the planner batch size in personal?", "type": "fact", "scope": "personal", "gold": ["fact:personal:17"]}
+{"id": "q24", "question": "what is the ledger timeout in seconds in personal?", "type": "fact", "scope": "personal", "gold": ["fact:personal:22"]}
+# latest-state: two memories about one account; the current one must win
+{"id": "q25", "question": "what is the current balance of account-K11?", "type": "latest-state", "scope": "trading", "gold": ["pair:0:current"], "stale": ["pair:0:stale"]}
+{"id": "q26", "question": "what is the current balance of account-K14?", "type": "latest-state", "scope": "ops", "gold": ["pair:1:current"], "stale": ["pair:1:stale"]}
+{"id": "q27", "question": "what is the current balance of account-K17?", "type": "latest-state", "scope": "trading", "gold": ["pair:2:current"], "stale": ["pair:2:stale"]}
+{"id": "q28", "question": "what is the current balance of account-K20?", "type": "latest-state", "scope": "ops", "gold": ["pair:3:current"], "stale": ["pair:3:stale"]}
+{"id": "q29", "question": "what is the current balance of account-K23?", "type": "latest-state", "scope": "trading", "gold": ["pair:4:current"], "stale": ["pair:4:stale"]}
+{"id": "q30", "question": "what is the current balance of account-K26?", "type": "latest-state", "scope": "ops", "gold": ["pair:5:current"], "stale": ["pair:5:stale"]}
+{"id": "q31", "question": "what is the current balance of account-K29?", "type": "latest-state", "scope": "trading", "gold": ["pair:6:current"], "stale": ["pair:6:stale"]}
+{"id": "q32", "question": "what is the current balance of account-K32?", "type": "latest-state", "scope": "ops", "gold": ["pair:7:current"], "stale": ["pair:7:stale"]}
+{"id": "q33", "question": "what is the current balance of account-K35?", "type": "latest-state", "scope": "trading", "gold": ["pair:8:current"], "stale": ["pair:8:stale"]}
+{"id": "q34", "question": "what is the current balance of account-K38?", "type": "latest-state", "scope": "ops", "gold": ["pair:9:current"], "stale": ["pair:9:stale"]}
+# l3-only: the answer is an event on the timeline, in no memory
+{"id": "q35", "question": "what was the outcome of study kestrel-17?", "type": "l3-only", "scope": "trading", "gold_l3": ["event:0"]}
+{"id": "q36", "question": "what was the outcome of study kestrel-19?", "type": "l3-only", "scope": "research", "gold_l3": ["event:2"]}
+{"id": "q37", "question": "what was the outcome of study kestrel-21?", "type": "l3-only", "scope": "personal", "gold_l3": ["event:4"]}
+{"id": "q38", "question": "what was the outcome of study kestrel-23?", "type": "l3-only", "scope": "ops", "gold_l3": ["event:6"]}
+{"id": "q39", "question": "what was the outcome of study kestrel-25?", "type": "l3-only", "scope": "hermes", "gold_l3": ["event:8"]}
+{"id": "q40", "question": "what was the outcome of study kestrel-27?", "type": "l3-only", "scope": "trading", "gold_l3": ["event:10"]}
+{"id": "q41", "question": "what was the outcome of study kestrel-29?", "type": "l3-only", "scope": "research", "gold_l3": ["event:12"]}
+{"id": "q42", "question": "what was the outcome of study kestrel-31?", "type": "l3-only", "scope": "personal", "gold_l3": ["event:14"]}
+{"id": "q43", "question": "what was the outcome of study kestrel-33?", "type": "l3-only", "scope": "ops", "gold_l3": ["event:16"]}
+{"id": "q44", "question": "what was the outcome of study kestrel-35?", "type": "l3-only", "scope": "hermes", "gold_l3": ["event:18"]}
+# l3-warm: the same, for events consolidation moved to the warm tier
+{"id": "q45", "question": "what was checked in warmnote-10?", "type": "l3-warm", "scope": "hermes", "gold_l3": ["warm:10"]}
+{"id": "q46", "question": "what was checked in warmnote-40?", "type": "l3-warm", "scope": "hermes", "gold_l3": ["warm:40"]}

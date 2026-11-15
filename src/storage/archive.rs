@@ -188,6 +188,49 @@ impl ColdArchive {
         Ok(self.read_bundle(&path)?.events)
     }
 
+    /// Events whose `created_at` falls in the half-open window
+    /// `[since, until)`, newest first, at most `limit`. Either bound may
+    /// be `None`.
+    ///
+    /// Only the quarterly bundles that overlap the window are opened,
+    /// newest quarter first, and reading stops once `limit` rows that
+    /// pass `keep` are in hand, so a bounded query never decompresses
+    /// the whole archive. With no bounds every bundle is a candidate.
+    pub fn read_window(
+        &self,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        limit: usize,
+        keep: impl Fn(&EpisodicEvent) -> bool,
+    ) -> Result<Vec<EpisodicEvent>> {
+        let mut out = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+        let first = since.map(Quarter::containing);
+        // `until` is exclusive: a window ending exactly on a quarter
+        // boundary does not reach into the quarter that starts there.
+        let last = until.map(|u| Quarter::containing(u - chrono::Duration::nanoseconds(1)));
+        let mut quarters = self.list_quarters()?;
+        quarters.retain(|q| first.is_none_or(|f| *q >= f) && last.is_none_or(|l| *q <= l));
+        for q in quarters.into_iter().rev() {
+            // Bundles are sorted by `created_at` ascending.
+            for event in self.read_quarter(q)?.into_iter().rev() {
+                if since.is_some_and(|s| event.created_at < s)
+                    || until.is_some_and(|u| event.created_at >= u)
+                    || !keep(&event)
+                {
+                    continue;
+                }
+                out.push(event);
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Lookup a single event by id. Linear scan over the bundle that
     /// would contain `created_at`; if you don't know the timestamp,
     /// use [`find_anywhere`](Self::find_anywhere) instead (which
@@ -354,6 +397,78 @@ mod tests {
             last_accessed: ts,
             created_at: ts,
         }
+    }
+
+    #[test]
+    fn read_window_opens_only_overlapping_quarters_newest_first() {
+        let tmp = TempDir::new().unwrap();
+        let archive = ColdArchive::new(tmp.path());
+        let events = vec![
+            event_at(2025, 2, 10, "q1"),
+            event_at(2025, 5, 10, "q2-may"),
+            event_at(2025, 6, 20, "q2-june"),
+            event_at(2025, 8, 1, "q3"),
+            event_at(2025, 11, 5, "q4"),
+        ];
+        archive.append(&events).unwrap();
+        let kinds = |rows: Vec<EpisodicEvent>| -> Vec<String> {
+            rows.into_iter().map(|e| e.kind).collect()
+        };
+        let at = |m: u32, d: u32| Utc.with_ymd_and_hms(2025, m, d, 0, 0, 0).unwrap();
+        let any = |_: &EpisodicEvent| true;
+
+        // No bounds: everything, newest first.
+        assert_eq!(
+            kinds(archive.read_window(None, None, 100, any).unwrap()),
+            vec!["q4", "q3", "q2-june", "q2-may", "q1"]
+        );
+        // A window inside Q2.
+        assert_eq!(
+            kinds(
+                archive
+                    .read_window(Some(at(5, 1)), Some(at(6, 1)), 100, any)
+                    .unwrap()
+            ),
+            vec!["q2-may"]
+        );
+        // Spanning two quarters; `since` inclusive, `until` exclusive.
+        assert_eq!(
+            kinds(
+                archive
+                    .read_window(Some(at(6, 1)), Some(at(9, 1)), 100, any)
+                    .unwrap()
+            ),
+            vec!["q3", "q2-june"]
+        );
+        // `until` on a quarter boundary does not reach into that quarter.
+        assert_eq!(
+            kinds(archive.read_window(None, Some(at(4, 1)), 100, any).unwrap()),
+            vec!["q1"]
+        );
+        // The cap keeps the newest rows.
+        assert_eq!(
+            kinds(archive.read_window(None, None, 2, any).unwrap()),
+            vec!["q4", "q3"]
+        );
+        assert!(archive.read_window(None, None, 0, any).unwrap().is_empty());
+        // The row filter is applied before the cap.
+        assert_eq!(
+            kinds(
+                archive
+                    .read_window(None, None, 1, |e| e.kind.starts_with("q2"))
+                    .unwrap()
+            ),
+            vec!["q2-june"]
+        );
+        // A window before everything, and an archive with no directory.
+        assert!(
+            archive
+                .read_window(None, Some(at(1, 1)), 100, any)
+                .unwrap()
+                .is_empty()
+        );
+        let empty = ColdArchive::new(TempDir::new().unwrap().path());
+        assert!(empty.read_window(None, None, 100, any).unwrap().is_empty());
     }
 
     #[test]

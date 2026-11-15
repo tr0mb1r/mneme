@@ -47,8 +47,6 @@
 //! exact command in `$HERMES_HOME/shell-hooks-allowlist.json`, Hermes'
 //! documented manual-approval file. Running `mneme init hermes` is the
 //! approval; `--no-hook` opts out, `hermes hooks revoke` withdraws it.
-//! Skipped on Windows in local mode, where Hermes runs `mneme run`
-//! itself and a second instance can't share the store.
 //!
 //! Uninstall removes the entry, the skill, the marker block, the hook,
 //! its state, and its approval. Everything else in those files is
@@ -100,7 +98,7 @@ events.";
 const SKILL_MD: &str = r#"---
 name: mneme
 description: Persistent long-term memory across sessions via the mneme MCP server. Use at the start of every conversation, whenever the user refers to earlier work, and whenever a decision, preference, or rule is worth keeping.
-version: 1.1.0
+version: 1.2.0
 metadata:
   hermes:
     tags: [memory, mcp]
@@ -145,6 +143,13 @@ tools appear as `mcp_mneme_<tool>`; its resources are read with
    best coverage first), not exact phrases. Filter with `tags` or `scope`
    when you know them. For a broad question use `tags`, not
    `min_similarity`: that floor drops weak matches.
+   - **"What did we conclude about X?"** Pass
+     `layers: ["semantic", "episodic"]`. Decisions, lessons and summaries
+     written with `record_event` are only found this way; the default
+     searches memories alone.
+   - **Time questions** ("what changed last week?"): `since` / `until` on
+     `mcp_mneme_recall` (RFC3339; work the dates out yourself). For a plain
+     timeline with no query, `mcp_mneme_recall_recent`.
 3. **Remember** durable facts with `mcp_mneme_remember`: decisions and their
    reasons, preferences the user states, project conventions, conclusions
    from investigation. One fact per memory, under ~500 characters.
@@ -156,6 +161,9 @@ tools appear as `mcp_mneme_<tool>`; its resources are read with
    existing one, decide: it replaces it → `mcp_mneme_update` the new id with
    `supersedes: "<old id>"`; it only restates it → `mcp_mneme_forget` the new
    id; both are true → ignore the note.
+   **When a fact is no longer current and nothing replaces it**, archive it:
+   `mcp_mneme_update` with `status: "archived"`. It leaves recall and
+   context but stays readable; don't `forget` it and log an event instead.
 4. **Pin** rules that must apply every session ("always answer in British
    English") with `mcp_mneme_pin` instead of `remember`. To replace a rule,
    `mcp_mneme_unpin` the old one and pin the new.
@@ -195,7 +203,7 @@ check `hermes mcp list` and run `/reload-mcp`.
 /// Where `mneme init hermes` connects Hermes to mneme.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Transport {
-    /// Spawn `mneme client` (or `mneme run` on Windows).
+    /// Spawn `mneme client`.
     Local,
     /// Connect to a Streamable HTTP endpoint.
     Remote { url: String, token_env: String },
@@ -209,6 +217,8 @@ struct Paths {
     hook: PathBuf,
     hook_state: PathBuf,
     allowlist: PathBuf,
+    /// `--scope-map`, passed through to the hook's command line.
+    scope_map: Option<PathBuf>,
 }
 
 impl Paths {
@@ -221,6 +231,7 @@ impl Paths {
             hook: hermes_home.join("agent-hooks").join(HOOK_FILE),
             hook_state: hermes_home.join("mneme-hook-state"),
             allowlist: hermes_home.join("shell-hooks-allowlist.json"),
+            scope_map: None,
         }
     }
 }
@@ -242,6 +253,9 @@ fn hook_command(paths: &Paths, t: &Transport) -> String {
             ]);
         }
     }
+    if let Some(map) = &paths.scope_map {
+        parts.extend(["--scope-map".into(), map.display().to_string()]);
+    }
     parts
         .iter()
         .map(|p| shell_quote(p))
@@ -261,8 +275,8 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Whether to install the hook for this transport.
-fn wants_hook(opts: &InstallOptions, t: &Transport) -> bool {
-    !opts.no_hook && (cfg!(unix) || matches!(t, Transport::Remote { .. }))
+fn wants_hook(opts: &InstallOptions) -> bool {
+    !opts.no_hook
 }
 
 fn hook_item(command: &str) -> Vec<String> {
@@ -291,16 +305,17 @@ pub fn run(mode: InstallMode, home_dir: &Path, opts: &InstallOptions) -> Result<
 /// [`run`] with Hermes' home already resolved. Tests call this so a
 /// developer's own `$HERMES_HOME` can never be touched.
 fn run_at(mode: InstallMode, hermes_home: &Path, opts: &InstallOptions) -> Result<(), AgentError> {
-    let paths = Paths::new(hermes_home);
+    let mut paths = Paths::new(hermes_home);
+    paths.scope_map = opts.scope_map.clone();
     match mode {
         InstallMode::Install | InstallMode::Upgrade => {
             let t = transport(opts)?;
-            install(&paths, &t, wants_hook(opts, &t))
+            install(&paths, &t, wants_hook(opts))
         }
         InstallMode::Uninstall => uninstall(&paths),
         InstallMode::Show => {
             let t = transport(opts)?;
-            print_plan(&paths, &t, wants_hook(opts, &t));
+            print_plan(&paths, &t, wants_hook(opts));
             Ok(())
         }
     }
@@ -365,12 +380,9 @@ fn validate_env_name(name: &str) -> Result<(), AgentError> {
 fn entry_body(t: &Transport) -> Vec<String> {
     match t {
         Transport::Local => {
-            // `mneme client` needs Unix sockets; on Windows the host
-            // spawns its own `mneme run` instead.
-            let sub = if cfg!(unix) { "client" } else { "run" };
             vec![
                 "command: \"mneme\"".into(),
-                format!("args: [\"{sub}\"]"),
+                "args: [\"client\"]".into(),
                 format!("connect_timeout: {CONNECT_TIMEOUT_SECS}"),
             ]
         }
@@ -532,7 +544,6 @@ fn write_allowlist(path: &Path, data: &serde_json::Value) -> Result<(), AgentErr
     let text = serde_json::to_string_pretty(data)
         .map_err(|e| AgentError::Generic(format!("serialise allowlist: {e}")))?;
     assets::write_text(path, &(text + "\n"))?;
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -788,8 +799,7 @@ mod tests {
         let cfg = read(&tmp.path().join("config.yaml"));
         assert!(cfg.starts_with("mcp_servers:\n"), "{cfg}");
         assert!(cfg.contains("  mneme:\n    command: \"mneme\"\n"), "{cfg}");
-        let sub = if cfg!(unix) { "client" } else { "run" };
-        assert!(cfg.contains(&format!("    args: [\"{sub}\"]\n")), "{cfg}");
+        assert!(cfg.contains("    args: [\"client\"]\n"), "{cfg}");
         assert!(cfg.contains("connect_timeout: 120"));
         let skill = read(&tmp.path().join("skills/mneme/SKILL.md"));
         assert!(skill.starts_with("---\nname: mneme\n"));
@@ -800,7 +810,7 @@ mod tests {
     /// the tools: pin the version and the behaviours it teaches.
     #[test]
     fn skill_teaches_the_current_tool_behaviour() {
-        assert!(SKILL_MD.contains("\nversion: 1.1.0\n"));
+        assert!(SKILL_MD.contains("\nversion: 1.2.0\n"));
         for needle in [
             "What goes where",
             "`scope` explicitly on every write",
@@ -810,6 +820,9 @@ mod tests {
             "not exact phrases",
             "`tags`, not\n   `min_similarity`",
             "secret_detected",
+            "`layers: [\"semantic\", \"episodic\"]`",
+            "`since` / `until` on\n     `mcp_mneme_recall`",
+            "`status: \"archived\"`",
         ] {
             assert!(SKILL_MD.contains(needle), "skill lost `{needle}`");
         }
@@ -1048,15 +1061,14 @@ mcp_servers:
         .unwrap();
         let script = tmp.path().join("agent-hooks").join("mneme-context.py");
         assert_eq!(read(&script), assets::HERMES_CONTEXT_HOOK);
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&script).unwrap().permissions().mode();
             assert!(mode & 0o111 != 0, "hook must be executable");
         }
         let cfg = read(&tmp.path().join("config.yaml"));
-        // Built with the same quoting as the installer: a Windows path has
-        // backslashes, so it gets shell-quoted and then YAML-escaped.
+        // Built with the same quoting as the installer: shell-quoted,
+        // then YAML-escaped.
         let command = format!(
             "{} --url http://mneme:7878/mcp --token-env MNEME_HTTP_TOKEN",
             shell_quote(&script.display().to_string())
@@ -1079,21 +1091,48 @@ mcp_servers:
     }
 
     #[test]
+    fn scope_map_is_passed_to_the_hook_and_approved_with_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut opts = remote("http://mneme:7878/mcp");
+        opts.scope_map = Some(PathBuf::from("/opt/data/autonomy/threads.json"));
+        run_at(InstallMode::Install, tmp.path(), &opts).unwrap();
+        let script = tmp.path().join("agent-hooks").join("mneme-context.py");
+        let command = format!(
+            "{} --url http://mneme:7878/mcp --token-env MNEME_HTTP_TOKEN \
+             --scope-map /opt/data/autonomy/threads.json",
+            shell_quote(&script.display().to_string())
+        );
+        let cfg = read(&tmp.path().join("config.yaml"));
+        assert!(cfg.contains(&yaml_config::quote(&command)), "{cfg}");
+        assert_eq!(allowlist(tmp.path())["approvals"][0]["command"], command);
+
+        // Upgrading without the flag drops it again, approval included.
+        run_at(
+            InstallMode::Upgrade,
+            tmp.path(),
+            &remote("http://mneme:7878/mcp"),
+        )
+        .unwrap();
+        assert!(!read(&tmp.path().join("config.yaml")).contains("--scope-map"));
+        let approvals = allowlist(tmp.path());
+        assert_eq!(approvals["approvals"].as_array().unwrap().len(), 1);
+        assert!(
+            !approvals["approvals"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("--scope-map")
+        );
+    }
+
+    #[test]
     fn local_hook_spawns_mneme_client() {
         let tmp = TempDir::new().unwrap();
         run_at(InstallMode::Install, tmp.path(), &local()).unwrap();
         let cfg = read(&tmp.path().join("config.yaml"));
-        if cfg!(unix) {
-            assert!(
-                cfg.contains("mneme-context.py --command mneme --arg client\""),
-                "{cfg}"
-            );
-        } else {
-            assert!(
-                !cfg.contains("mneme-context.py"),
-                "no local hook on Windows"
-            );
-        }
+        assert!(
+            cfg.contains("mneme-context.py --command mneme --arg client\""),
+            "{cfg}"
+        );
     }
 
     #[test]

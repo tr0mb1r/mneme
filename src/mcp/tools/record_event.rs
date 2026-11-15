@@ -38,7 +38,10 @@ use super::secret_guard::{self, Guard};
 use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::config::SecretsMode;
+use crate::ids::MemoryId;
 use crate::memory::episodic::{DEFAULT_RETRIEVAL_WEIGHT, EpisodicStore};
+use crate::memory::relations::{RelationTarget, RelationType};
+use crate::memory::semantic::{MemoryKind, RememberOutcome, SemanticStore};
 use crate::memory::working::ActiveSession;
 use crate::scope::ScopeState;
 
@@ -74,7 +77,13 @@ happened>\"}`; put all text under `payload` (there is no top-level \
 `text` or `content` argument). An absent, null, empty, blank or \
 bare boolean/number payload is rejected. mneme stores the payload verbatim. `scope` \
 defaults to the active scope; `retrieval_weight` defaults to 1.0 \
-(range [0.0, 1.0]).";
+(range [0.0, 1.0]).
+
+`promote: {\"type\": \"decision\", \"tags\": [...]}` also stores the \
+event's text as a long-term memory (as `remember` would) with an \
+`evidence_for` link back to the event, in one call. Use it for an event \
+whose outcome should stay findable by meaning after the timeline moves \
+on. The payload needs a `content` or `text` string.";
 
 /// Text-bearing payload fields: an object holding only these, all
 /// blank, carries nothing worth storing.
@@ -118,6 +127,18 @@ pub struct RecordEvent {
     max_chars: usize,
     /// `[guardrails] secrets`.
     secrets: SecretsMode,
+    /// L4, for `promote`. `None` in fixtures built without it; asking
+    /// to promote is then an error.
+    semantic: Option<Arc<SemanticStore>>,
+}
+
+/// The reason recorded on the `evidence_for` link `promote` writes.
+const PROMOTE_REASON: &str = "promoted from this event";
+
+/// A parsed `promote` argument.
+struct Promote {
+    kind: MemoryKind,
+    tags: Vec<String>,
 }
 
 impl RecordEvent {
@@ -128,7 +149,57 @@ impl RecordEvent {
             active_session: None,
             max_chars: DEFAULT_MAX_CHARS,
             secrets: SecretsMode::default(),
+            semantic: None,
         }
+    }
+
+    /// Attach the semantic store so `promote` can write the memory.
+    pub fn with_semantic(mut self, semantic: Arc<SemanticStore>) -> Self {
+        self.semantic = Some(semantic);
+        self
+    }
+
+    /// Parse `promote`. The event's own tags are the default, so a
+    /// promoted memory is found under the same tags as its event.
+    fn parse_promote(
+        arg: Option<&Value>,
+        event_tags: &[String],
+    ) -> Result<Option<Promote>, ToolError> {
+        let obj = match arg {
+            None | Some(Value::Null) => return Ok(None),
+            Some(Value::Object(obj)) => obj,
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`promote` must be an object: {\"type\": \"decision\", \"tags\": [...]}".into(),
+                ));
+            }
+        };
+        if let Some(stray) = obj
+            .keys()
+            .find(|k| !["type", "kind", "tags"].contains(&k.as_str()))
+        {
+            return Err(ToolError::InvalidArguments(format!(
+                "`promote`: unexpected key `{stray}`; use type, tags"
+            )));
+        }
+        let kind = match obj.get("type").or_else(|| obj.get("kind")) {
+            None | Some(Value::Null) => MemoryKind::Fact,
+            Some(Value::String(s)) => MemoryKind::parse(s).ok_or_else(|| {
+                ToolError::InvalidArguments(format!(
+                    "`promote.type` must be one of fact|decision|preference|conversation, got `{s}`"
+                ))
+            })?,
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`promote.type` must be a string".into(),
+                ));
+            }
+        };
+        let tags = match obj.get("tags") {
+            None | Some(Value::Null) => event_tags.to_vec(),
+            some => super::parse_tags_arg(some)?,
+        };
+        Ok(Some(Promote { kind, tags }))
     }
 
     /// Builder hook — production wires the active session here so
@@ -196,6 +267,22 @@ impl Tool for RecordEvent {
                         "minimum": 0.0,
                         "maximum": 1.0,
                         "description": "Per-event ranking weight. Defaults to 1.0; lower for chatty/low-signal events to push them behind their peers.",
+                    },
+                    "promote": {
+                        "type": "object",
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": ["fact", "decision", "preference", "conversation"],
+                                "description": "Kind of the memory. Defaults to fact."
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Tags of the memory. Defaults to the event's tags."
+                            }
+                        },
+                        "description": "Also store the event's text (payload `content`, or `text`) as a long-term memory with an `evidence_for` link to this event. The reply carries the memory id in `_meta.promoted_memory_id`.",
                     },
                 },
                 "required": ["kind", "payload"],
@@ -291,6 +378,32 @@ impl Tool for RecordEvent {
             )));
         }
 
+        // ---------- promote (validated before anything is written) ----------
+        let promote = Self::parse_promote(args.get("promote"), &tags)?;
+        let promote = match promote {
+            None => None,
+            Some(p) => {
+                let semantic = self.semantic.as_ref().ok_or_else(|| {
+                    ToolError::Internal("`promote`: no semantic store attached".into())
+                })?;
+                let text = TEXT_FIELDS
+                    .iter()
+                    .find_map(|f| payload_value.get(*f).and_then(Value::as_str))
+                    .or(payload_value.as_str())
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| {
+                        ToolError::InvalidArguments(
+                            "`promote` needs the event's text: put it under \
+                             payload.content"
+                                .into(),
+                        )
+                    })?
+                    .to_owned();
+                Some((p, Arc::clone(semantic), text))
+            }
+        };
+
         // ---------- write to L3 ----------
         let id = self
             .episodic
@@ -329,9 +442,45 @@ impl Tool for RecordEvent {
             );
         }
 
-        let mut result = ToolResult::text(format!("recorded event {id}"));
-        if let Some(meta) = size_tier::success_meta(tier, payload_len, self.max_chars) {
-            result = result.with_meta(meta);
+        // ---------- promote: the L4 twin and its link ----------
+        // After the event exists, so the link has something to point
+        // at. A retry stores nothing twice: identical content in the
+        // same scope resolves to the existing memory, and the link is
+        // then written from that one to this event as well.
+        let mut promoted: Option<MemoryId> = None;
+        if let Some((p, semantic, text)) = promote {
+            let memory_id = match semantic
+                .remember_or_dedupe(&text, p.kind, p.tags, scope.clone())
+                .await
+                .map_err(|e| ToolError::Internal(format!("promote: {e}")))?
+            {
+                RememberOutcome::Stored { id, .. } | RememberOutcome::Existing(id) => id,
+            };
+            semantic
+                .relate(
+                    memory_id,
+                    RelationType::EvidenceFor,
+                    RelationTarget::Event(id),
+                    PROMOTE_REASON,
+                )
+                .await
+                .map_err(|e| ToolError::Internal(format!("promote link: {e}")))?;
+            promoted = Some(memory_id);
+        }
+
+        let text = match promoted {
+            Some(memory_id) => format!("recorded event {id}; promoted to memory {memory_id}"),
+            None => format!("recorded event {id}"),
+        };
+        let mut meta = size_tier::success_meta(tier, payload_len, self.max_chars)
+            .and_then(|m| m.as_object().cloned())
+            .unwrap_or_default();
+        if let Some(memory_id) = promoted {
+            meta.insert("promoted_memory_id".into(), json!(memory_id.to_string()));
+        }
+        let mut result = ToolResult::text(text);
+        if !meta.is_empty() {
+            result = result.with_meta(Value::Object(meta));
         }
         Ok(secret_guard::attach(result, secret_advisory, id))
     }

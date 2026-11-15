@@ -10,15 +10,12 @@ they're outstanding, which is more useful than a version number.
 
 ## Platform gaps
 
-**Windows runs `mneme run` and `mneme serve` only.** `mneme daemon` and `mneme client`
-depend on Unix domain sockets; Windows named-pipe support (ADR-0012
-D2/D9) isn't implemented, so the daemon-mode default doesn't apply
-there. `mneme stop` also returns `not yet implemented` on Windows — use
-Task Manager or `Stop-Process`. Every other subcommand works. The
-release pipeline builds a Windows binary, but 1.5.0 shipped without one
-(the Windows build hung); use `cargo install mneme-mcp` there. Configure your MCP host with
-`args: ["run"]` rather than `["client"]`, or run `mneme serve` and
-point HTTP-capable hosts at it to share one server.
+**Linux and macOS only.** Windows support was dropped after 1.5: there
+is no Windows binary, CI no longer builds or tests on Windows, the
+Windows-specific code has been removed, and a Windows build stops with
+a compile error. A Windows host can run
+mneme inside WSL2 (it is Linux there), or reach a `mneme serve` running
+elsewhere over Streamable HTTP.
 
 **Streamable HTTP has no server-to-client stream.** `mneme serve` (and
 the daemon with `[http] enabled`) answer every request with plain JSON
@@ -57,17 +54,24 @@ writes them into new configs.
 | `[mcp] sse_port` | Superseded by `[http] bind`. |
 | `[telemetry]` (whole section) | No telemetry subsystem exists. mneme makes no network calls on any code path. |
 | `[consolidation] schedule` | Only `"idle"` is implemented. Any other value logs a warning and falls back to it. Future modes (`every_<n>m`, cron, `on_demand`) aren't built. |
+| `[recall] stemming` | Declared in 1.6; `"en"` is accepted and does nothing yet. See below. |
 
 ## Tool surface
 
-**`forget` can't do bulk deletes.** The JSON Schema advertises `query`
-and `scope` parameters; the runtime rejects both with "not yet
-supported". Pass `id`. Cold-archive entries are out of reach by design —
-`forget` covers L4, L0, and L3 hot+warm only.
+**`forget` can't do bulk deletes.** It takes `id` only. (Up to 1.5.1 the
+schema also advertised `query` and `scope`, which the runtime always
+rejected; they are gone from the schema, and passing one returns
+`INVALID_PARAMS` with a pointer to "find the ids, forget each one".)
+Cold-archive entries are out of reach by design — `forget` covers L4,
+L0, and L3 hot+warm only. Since 1.6 the kinds in
+`[consolidation] cold_exempt_kinds` never reach the cold archive, so
+they stay forgettable.
 
-**`remember`'s `pinned` flag is ignored.** Recognised by the schema,
-logged when set, not wired to the procedural layer. Call `pin`
-separately if you want a rule in L0.
+**`remember` does not pin.** `pinned: true` is rejected with
+`INVALID_PARAMS` and a pointer to `pin` (up to 1.5.1 it was logged and
+ignored, so the caller believed a rule had been pinned). The argument is
+still declared, marked deprecated, so `pinned: false` from an older
+client keeps working. Call `pin` if you want a rule in L0.
 
 **No structured tool output.** MCP 2025-06-18 supports `outputSchema` +
 `structuredContent`; mneme returns JSON inside a text block, so agents
@@ -89,27 +93,48 @@ is hybrid (vector + BM25, see
 [MCP surface](./mcp-surface.md#hybrid-recall)), but the keyword half
 matches whole tokens: `backtest` doesn't match `backtesting`, and a
 fragment of an identifier only matches at `_ . - / :` boundaries
-(`gateway` finds `IBKR_GATEWAY_PORT`; `gatew` doesn't). The keyword index
-is rebuilt in memory on the first recall after each start, one pass over
-the stored memories.
+(`gateway` finds `IBKR_GATEWAY_PORT`; `gatew` doesn't). The same holds
+for the event index `recall(layers=[…, "episodic"])` uses. Both indexes
+are rebuilt in memory on the first recall after each start, one pass
+over the stored rows. `[recall] stemming = "en"` is reserved for this
+and not implemented.
+
+**The cold archive is not searched.** `recall` covers hot and warm
+events. Cold events can be read by time (`recall_recent` /
+`export` with `include_cold`), not found by content.
+
+**Events are found by their words only.** L3 has no embeddings
+(ADR-0007), so `recall` over events is lexical: a paraphrase that shares
+no word with the event misses it. A short memory per conclusion is still
+what makes it findable by meaning.
+
+**`recall` defaults to memories only.** Searching events is opt-in
+(`layers`), until the quality checks show mixed results never push a
+better memory out.
 
 **L4 has no automatic lifecycle.** L3 has a full hot → warm → cold
 pipeline with a scheduler; L4 grows monotonically unless the agent
 curates it. What exists: `supersedes` on `remember` / `update` (retires
-an outdated memory from recall without deleting it), a similarity
-advisory on every `remember` that names the closest current memory
-(≥ 0.80), and an orphan-vector sweep in the consolidation pass. What
-doesn't exist:
+an outdated memory from recall without deleting it),
+`update(status: "archived")` (1.6: takes a memory out of recall and
+auto-context, reversibly), `updated_at` (1.6: auto-context decays a
+memory from its last edit), a similarity advisory on every `remember`
+that names the closest current memory (≥ 0.80), and an orphan-vector
+sweep in the consolidation pass. What doesn't exist:
 
-- **No `last_accessed` on semantic or procedural items.** `MemoryItem`
-  has no touch-on-read field, so L4 carries no recency signal at all and
-  nothing can decay. Adding it is an on-disk schema change (postcard is
-  not self-describing), so it needs a migration.
-- **No automatic compaction.** Nothing merges or retires near-duplicate
-  facts on its own; the advisory reports them and `supersedes` is the
-  agent's tool for retiring them.
-- **`EpisodicStore::touch` is never called from the tool surface**, so
-  L3's `last_accessed` ordering is effectively creation order.
+- **No `last_accessed` on semantic or procedural items.** Nothing
+  records that a memory was read, so there is no "unused for a year"
+  signal. `recall` ranking is not decayed at all.
+- **No automatic compaction or archiving.** Nothing merges, retires or
+  archives memories on its own; the advisory reports near-duplicates and
+  `supersedes` / `status` are the agent's tools.
+- **Relations are stated, never inferred.** `relations` on `remember` /
+  `update` (1.6) record that one memory refines, contradicts or
+  supersedes another, or what it cites as evidence. The server does not detect contradictions or
+  propose links beyond the similarity advisory.
+- **Only `recall` refreshes an event's `last_accessed`** (1.6, hot
+  events, at most daily). Reading an event through `recall_recent` or
+  auto-context does not.
 
 **No graph fields on events.** ADR-0011's structured cross-references
 aren't on `EpisodicEvent`; relations travel inside the free-form JSON
@@ -128,8 +153,9 @@ noted where it belongs.
 ## Schema polish
 
 Per `src/lib.rs`'s schema overview: `last_accessed` on semantic and
-procedural, and `kind` on procedural, are both absent. Neither breaks
-the current schema to add later, but both need a migration.
+procedural, and `kind` on procedural, are both absent. `updated_at` and
+`status` were added in 1.6 as side tables rather than struct fields, so
+`schema_version` is still 1; the same route is open for these.
 
 ## Not planned
 

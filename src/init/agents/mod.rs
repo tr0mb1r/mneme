@@ -100,6 +100,10 @@ pub struct InstallOptions {
     /// Skip lifecycle hooks the installer would otherwise add (Hermes:
     /// the context-reload hook).
     pub no_hook: bool,
+    /// Hermes: JSON file mapping thread ids to scopes, as the path the
+    /// hook will see it at. The hook then reads
+    /// `mneme://context?scope=<thread scope>,global`.
+    pub scope_map: Option<PathBuf>,
 }
 
 /// What `mneme init <agent>` should do — install (the default),

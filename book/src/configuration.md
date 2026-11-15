@@ -37,17 +37,55 @@ hnsw_snapshot_inserts   = 1000
 hnsw_snapshot_minutes   = 60
 
 [episodic]
-auto_log_tool_calls = "writes"   # or "all" / "off"
+auto_log_tool_calls  = "writes"  # or "all" / "off"
+log_tool_call_values = "full"    # or "ids" / "off"
+index_kinds          = ["decision", "milestone", "lesson", "summary", "resolution",
+                        "problem", "pivot", "observation", "archived"]
+touch_on_recall      = true
+
+[working]
+record_tool_turns = "writes"     # or "all" / "off"
+
+[auto_context]
+semantic_half_life_days = 90.0
+semantic_recency_floor  = 0.75
+episodic_max_share      = 0.35
+semantic_min_share      = 0.3
+semantic_min_items      = 5
+working_max_share       = 0.05
+episodic_query_mix      = 0.3
+event_clip_chars        = 400
+min_event_weight        = 0.3
+max_events_per_kind     = 6
+pin_scopes              = ["global"]
+include_demoted         = false
+
+[recall]
+demote_margin = 0.1
 
 [consolidation]
 hot_to_warm_days  = 28
 warm_to_cold_days = 180
 schedule          = "idle"
+cold_exempt_kinds = ["archived", "summary", "milestone", "lesson", "decision"]
 
 [budgets]
 default_recall_limit       = 10
 auto_context_token_budget  = 4000
 max_remember_chars         = 10000
+
+[auto_context]
+semantic_half_life_days = 90     # 0 = no decay for memories
+semantic_recency_floor  = 0.75
+episodic_max_share      = 0.35
+semantic_min_share      = 0.30
+semantic_min_items      = 5
+working_max_share       = 0.05
+episodic_query_mix      = 0.3
+event_clip_chars        = 400    # 0 = do not clip
+min_event_weight        = 0.3
+max_events_per_kind     = 6      # 0 = no cap
+pin_scopes              = ["global"]
 
 [guardrails]
 secrets = "reject"              # or "warn" / "off"
@@ -354,7 +392,18 @@ the wall-clock trigger.
 
 The same scheduler also fires when `turns_since_last_checkpoint >=
 interval_turns`, evaluated whenever the server pokes after a
-successful `tools/call`. Whichever trigger fires first wins.
+successful `tools/call` that added a turn. Whichever trigger fires
+first wins.
+
+What counts as a turn: a `user_message` / `assistant_message` recorded
+with `record_event`, and each successful call to a tool that changes
+something (`remember`, `update`, `forget`, `pin`, `unpin`,
+`record_event`, `switch_scope`). Read-only tools (`recall`,
+`recall_recent`, `summarize_session`, `stats`, `list_scopes`, `export`)
+add none since 1.5.2; before that every successful call did, so a
+session that only looked things up filled the working window with tool
+names and checkpointed for nothing. The rule is the tool's own
+`readOnlyHint`, the same one `auto_log_tool_calls = "writes"` uses.
 
 The two are designed together: pure wall-clock under-flushes a
 busy session (5 turns of dense back-and-forth in 10 s would sit
@@ -422,6 +471,103 @@ payload carries the value-bearing argument of write tools
 (`remember.content`, for instance), so it is also the place a credential
 would be copied to if `[guardrails] secrets` let one through.
 
+### `log_tool_call_values`
+
+| | |
+|---|---|
+| **Type** | string |
+| **Default** | `"full"` |
+| **Valid** | `"full"`, `"ids"`, `"off"` |
+| **Affects** | how much of a call's arguments a `tool_call` event keeps |
+| **Since** | 1.6.0 |
+
+`auto_log_tool_calls` decides *which* calls are mirrored; this decides
+*what* a mirrored event holds.
+
+- `"full"`: the value-bearing arguments as passed: `content` for
+  `remember` / `pin` / `update`, the query for `recall`, and so on. The
+  timeline can answer "what exactly was written, and when". `forget`
+  redacts the events that mirrored a forgotten memory (see
+  [Forgetting and the timeline](./mcp-surface.md#forgetting-and-the-timeline)).
+- `"ids"`: the tool name, the ids (`id`, `memory_id`) and the scope
+  (`scope`, `new_scope`). A write's `content` is replaced by
+  `content_len` (characters) and `content_sha256` (the first 8 hex digits
+  of its SHA-256), enough to see that the same text was written twice
+  without storing it. Queries, kinds and limits are dropped. A write the
+  secret guard flagged gets neither field.
+- `"off"`: `{"tool": "<name>"}` and nothing else.
+
+```json
+{"tool": "remember", "scope": "work", "memory_id": "01M7…", "content_sha256": "9f2c41aa", "content_len": 58}
+```
+
+Pick `"ids"` when the timeline should show activity but must never be a
+second copy of the memories. `forget` works the same in every mode: in
+`"ids"` the rows are found by id and lose the hash and length too; in
+`"off"` they hold nothing to redact. The setting applies to events
+written from then on; it does not rewrite existing rows.
+
+### `index_kinds`
+
+| | |
+|---|---|
+| **Type** | array of strings |
+| **Default** | `["decision", "milestone", "lesson", "summary", "resolution", "problem", "pivot", "observation", "archived"]` |
+| **Affects** | which event kinds `recall(layers=[…, "episodic"])` and query-conditioned auto-context can find |
+| **Since** | 1.6.0 |
+
+Events of these kinds are keyword-indexed (in memory, hot and warm
+tiers). The text indexed is `payload.content`, else `payload.text`, plus
+the tags. `tool_call` and the message kinds are left out by default:
+they are many, and they repeat text that is already stored elsewhere.
+Changing the list takes effect on restart, when the index is rebuilt.
+
+### `touch_on_recall`
+
+| | |
+|---|---|
+| **Type** | boolean |
+| **Default** | `true` |
+| **Affects** | whether `recall` refreshes `last_accessed` on the events it returns |
+| **Since** | 1.6.0 |
+
+Consolidation moves an event to warm once its `last_accessed` is
+`hot_to_warm_days` old. With this on, a hot event returned by `recall`
+has its `last_accessed` set to now, so events that keep being used stay
+hot. The write happens after the response is sent and at most once per
+24 hours per event; warm events are never rewritten. Set it to `false`
+for runs that must not write on reads (evaluations, CI): `recall` then
+changes nothing.
+
+---
+
+## `[working]` — the L1 working session
+
+### `record_tool_turns`
+
+| | |
+|---|---|
+| **Type** | string |
+| **Default** | `"writes"` |
+| **Valid** | `"writes"`, `"all"`, `"off"` |
+| **Affects** | which successful tool calls add a turn to the working session |
+| **Since** | 1.6.0 (the `"writes"` behaviour since 1.5.2) |
+
+A tool turn is `role = "tool"` with the tool's name as content. It shows
+up in the `working` section of `mneme://context`, counts towards
+`turns_total`, and counts towards `[checkpoints] session_interval_turns`.
+
+- `"writes"`: only tools that are not `readOnlyHint` (`remember`,
+  `update`, `forget`, `pin`, `unpin`, `record_event`, `switch_scope`).
+  Looking something up is not conversation.
+- `"all"`: every successful call, as up to 1.5.1.
+- `"off"`: none. The only turns are the messages an agent records with
+  `record_event` (`user_message` / `assistant_message`).
+
+Each MCP session has its own working session: one per stdio process, one
+per daemon connection, one per HTTP `Mcp-Session-Id`. See
+[L1 is session-local](./mcp-surface.md#l1-is-session-local).
+
 ---
 
 ## `[consolidation]` — L3 hot/warm/cold tiering
@@ -457,7 +603,25 @@ Warm events older than this get archived to
 `<root>/cold/<YYYY-Qn>.zst` (zstd-compressed JSON bundles) and
 deleted from the warm tier. Cold lookups are still possible via
 `storage::archive::ColdArchive::find_anywhere(id)` but are off the
-hot path — they're for forensics, not auto-context.
+hot path — they're for forensics, not auto-context. `recall_recent` and
+`export` read them with `include_cold: true`; `recall` does not search
+them.
+
+### `cold_exempt_kinds`
+
+| | |
+|---|---|
+| **Type** | array of strings |
+| **Default** | `["archived", "summary", "milestone", "lesson", "decision"]` |
+| **Affects** | which event kinds stay in the warm tier for good |
+| **Since** | 1.6.0 |
+
+Events of these kinds are never archived to cold, however old. They stay
+in redb, so `recall` keeps finding them and `forget` can still delete
+them (cold bundles are never rewritten). The cost is that redb keeps
+growing with them; these are the low-volume kinds. `[]` restores the
+pre-1.6 behaviour, where every kind is archived at `warm_to_cold_days`.
+Events already in the cold archive are not brought back.
 
 ### `schedule`
 
@@ -505,9 +669,12 @@ one. `recall` callers can override per-call up to a hard cap of
 | **Affects** | `mneme://context` total payload size |
 
 Total token budget for the auto-context resource. The orchestrator
-greedy-packs the four memory layers (procedural / working / episodic
-/ semantic) up to this ceiling, with per-layer minimums protecting
-each layer from being starved.
+packs the four memory layers (procedural / working / episodic /
+semantic) up to this ceiling. How the budget is divided between them is
+set in [`[auto_context]`](#auto_context--how-mnemecontext-is-scored-and-packed).
+
+Pinned items are never trimmed. If they alone are larger than this
+budget, the context exceeds it and holds nothing else.
 
 The default 4000 is calibrated for a ~32K-token model context window
 where you want to spend ~12% on agent memory. Bump for larger
@@ -546,6 +713,109 @@ Raise this only when you have a specific need (research notes, long
 runbooks). The advisory + warning meta will still surface above
 500/2,000 chars; tightening the ceiling moves only the rejection
 threshold.
+
+---
+
+## `[auto_context]` — how `mneme://context` is scored and packed
+
+All keys are optional; a config file without the section gets the
+defaults below. Scoring and packing are described in
+[MCP surface §Scoring](./mcp-surface.md#scoring-auto-context).
+
+### Layer shares
+
+Fractions of `[budgets] auto_context_token_budget`. Values outside
+`0.0`–`1.0` are clamped.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `episodic_max_share` | `0.35` | Most of the budget episodic events may take. |
+| `working_max_share` | `0.05` | Most of the budget working-session turns may take. |
+| `semantic_min_share` | `0.30` | Reserved for semantic rows before the other layers are packed. |
+| `semantic_min_items` | `5` | The reserve is this many rows instead, when they are fewer tokens than `semantic_min_share`. |
+
+Pinned items have no share: they are always kept. Semantic rows have no
+ceiling: they take whatever events and turns leave. The shares need not
+add up to 1.
+
+To give events more room, raise `episodic_max_share`; at `1.0` they are
+limited only by the semantic reserve and the pins, which is close to how
+the budget was split before 1.6.
+
+### Freshness of memories
+
+| Key | Default | Meaning |
+|---|---|---|
+| `semantic_half_life_days` | `90` | Half-life of a memory's freshness, measured from its last content edit (`updated_at`). `0` turns decay off. |
+| `semantic_recency_floor` | `0.75` | Lowest value the freshness factor can take. |
+
+A memory's auto-context score is `rank × 0.7 × max(floor, 2^(−age/half_life))`.
+With the defaults a memory never loses more than a quarter of its score to
+age. These keys affect `mneme://context` only; `recall` does not decay.
+
+### Event selection
+
+| Key | Default | Meaning |
+|---|---|---|
+| `episodic_query_mix` | `0.3` | β. With a `?q=` seed an event scores `recency × (β + (1−β)·lex)`, where `lex` is how much of the query it contains. `1.0` ignores the query; `0.0` removes events that share nothing with it from contention. |
+| `event_clip_chars` | `400` | Payloads longer than this are clipped and the row is marked `truncated`. `0` turns clipping off. |
+| `min_event_weight` | `0.3` | Events with `retrieval_weight` at or below this are left out. |
+| `max_events_per_kind` | `6` | At most this many events of one kind. `0` means no cap. |
+
+Events of kind `archived` are always left out unless the read names them
+with `?kinds=archived`.
+
+### `pin_scopes`
+
+| | |
+|---|---|
+| **Type** | array of strings |
+| **Default** | `["global"]` |
+| **Affects** | Which pins a scoped `mneme://context` read returns |
+
+A read of `mneme://context?scope=a,b` returns the pins stored under `a`
+and `b`, plus the pins stored under every scope listed here. A read with
+no `scope` returns every pin and ignores this key.
+
+Before 1.6 a scoped read returned only the pins of that scope, so naming
+a scope dropped the global rules. Set `pin_scopes = []` to restore that.
+
+### `include_demoted`
+
+| | |
+|---|---|
+| **Type** | boolean |
+| **Default** | `false` |
+| **Affects** | Whether demoted memories appear in `mneme://context` |
+
+A memory that a current, newer memory `refines` or `contradicts` is
+demoted (see [MCP surface §Relations](./mcp-surface.md#demotion)).
+`recall` returns it lower down; auto-context leaves it out. Set this to
+`true` to keep such memories in the context block, ranked below the
+memory that refines them.
+
+---
+
+## `[recall]` — ranking knobs
+
+### `demote_margin`
+
+| | |
+|---|---|
+| **Type** | number |
+| **Default** | `0.10` |
+| **Affects** | How far a refined or contradicted memory drops in `recall` |
+
+Subtracted from the `rank` of a demoted memory, on the cosine-similarity
+scale; its keyword evidence is dropped as well. The default is about the
+gap between a right answer and a lookalike, so the older memory lands
+just below the one that refines it rather than at the bottom of the
+list. `0` keeps the rank and only drops the keyword evidence. Negative
+values are treated as `0`.
+
+### `stemming`
+
+Reserved. Has no effect yet.
 
 ---
 

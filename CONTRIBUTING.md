@@ -25,6 +25,36 @@ Thanks for your interest. This document is short on purpose.
   home (`mem:` prefix in redb + HNSW). Don't blur layers.
 - **Stay in Mneme's lane.** No code embedding, no knowledge graph, no
   SaaS. The README's "What it isn't" section is the source of truth.
+- **Recall and auto-context changes are checked structurally.**
+  `tests/quality_structural.rs` runs on every PR against a synthetic
+  corpus (`tests/common/corpus.rs`; no model, stub embedder): scoped reads
+  keep global pins, layers stay within their budget shares, warm events
+  are reachable, `forget` leaves no text behind, working memory is per
+  session, canonical calls raise no argument errors, reads add no turns,
+  context is deterministic. If you change ranking, packing or the tool
+  surface, extend the corpus or the checks in the same PR. A test marked
+  `#[ignore = "needs ..."]` there is the acceptance test for work in
+  progress; un-ignore it when that work lands. To look at the corpus:
+  `MNEME_DATA_DIR=/tmp/c cargo run --example seed_storage -- corpus`,
+  then `MNEME_EMBEDDER=stub MNEME_DATA_DIR=/tmp/c mneme run`.
+- **Ranking quality is measured nightly with `mneme eval`.**
+  `.github/workflows/quality-nightly.yml` seeds the same corpus and
+  scores the questions in `tests/fixtures/eval/questions.jsonl`
+  (symbolic keys; the seeder resolves them to ids). To run it locally:
+
+  ```bash
+  export MNEME_DATA_DIR=/tmp/c MNEME_EMBEDDER=stub
+  cargo run --example seed_storage -- corpus \
+    --questions tests/fixtures/eval/questions.jsonl /tmp/questions.jsonl
+  cargo run -- eval /tmp/questions.jsonl --gate-mode keyword --tag local
+  ```
+
+  The thresholds live in the workflow, next to the values they were
+  calibrated from. If your change moves a number, say so in the PR; if
+  it moves one past a threshold, change the threshold in the same PR
+  and explain why. New kinds of question go in the fixture, with a new
+  `type`. For numbers with a real model, run `mneme eval` against your
+  own store and questions (the CLI reference in the book has the details).
 
 ## Style
 
@@ -38,20 +68,27 @@ Thanks for your interest. This document is short on purpose.
   before review.
 - Changes that touch hot-path code (`src/memory/`, `src/index/`,
   `src/storage/`, `src/orchestrator/`, `src/mcp/`) trip the
-  `.github/workflows/perf.yml` regression gate. Any p95 latency that
-  slips > 10 % vs `benches/baselines/v0_2_6.json` blocks merge per
-  release-planning v2.1 §6.2. Run locally with:
+  `.github/workflows/perf.yml` regression gate. It benchmarks the base
+  commit and your change on the same runner, in three interleaved
+  rounds (base, head, base, head, …), takes each side's best median
+  (p50) per bench, and blocks merge if one slows by more than 15 %. Run
+  the same comparison locally (it builds the base in a temporary git
+  worktree, so your working tree is left alone, uncommitted changes
+  included):
 
   ```sh
-  cargo bench --bench remember --bench recall \
-              --bench cold_start --bench auto_context -- --quick
-  python3 benches/baselines/extract_baseline.py /tmp/this.json --corpus 1000
-  python3 benches/baselines/compare.py benches/baselines/v0_2_6.json /tmp/this.json
+  benches/baselines/ab_gate.sh main /tmp/perf
+  python3 benches/baselines/compare.py /tmp/perf/base.json /tmp/perf/head.json \
+          --metric p50_ns --tolerance-pct 15
   ```
 
+  A single base run followed by a single head run is not a usable
+  comparison: `remember` does one fdatasync per call, and two passes of
+  identical code a few minutes apart have differed by over 20 %.
+
   If the regression is justified (e.g. v1.1 daemon-mode network hop),
-  update the baseline JSON in the same commit and explain the trade
-  in the description.
+  explain the trade in the PR description; an admin merges it through
+  the ruleset bypass.
 
 ## Commits
 

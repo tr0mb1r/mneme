@@ -395,7 +395,6 @@ mod tests {
         for (filename, _) in CLAUDE_CODE_HOOKS {
             let p = paths.hooks_dir.join(filename);
             assert!(p.exists(), "hook {filename} missing");
-            #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;

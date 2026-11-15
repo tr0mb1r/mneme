@@ -231,7 +231,6 @@ async fn call(
     v
 }
 
-#[cfg(unix)]
 async fn sigterm_and_wait(mut child: Child) {
     let pid = child.id().expect("pid") as i32;
     // SAFETY: signalling the child we spawned.
@@ -330,12 +329,7 @@ async fn serve_round_trips_memory_across_sessions() {
     .await;
     assert_eq!(r.status, 204);
 
-    #[cfg(unix)]
     sigterm_and_wait(child).await;
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill().await;
-    }
 }
 
 #[tokio::test]
@@ -356,7 +350,6 @@ async fn serve_defaults_to_the_daemon_token_file() {
 
 /// Bare-metal shape: one daemon serving Claude Code over the Unix
 /// socket and Hermes (or anything else) over HTTP, same store.
-#[cfg(unix)]
 #[tokio::test]
 async fn daemon_with_http_enabled_serves_both_transports() {
     let tmp = TempDir::new().unwrap();
@@ -419,4 +412,154 @@ async fn daemon_with_http_enabled_serves_both_transports() {
     drop(reader);
 
     sigterm_and_wait(child).await;
+}
+
+/// `stats` as parsed JSON, for one session.
+async fn stats(addr: SocketAddr, sid: &str, id: i64) -> Value {
+    let r = call(
+        addr,
+        TOKEN,
+        sid,
+        id,
+        "tools/call",
+        json!({"name": "stats", "arguments": {}}),
+    )
+    .await;
+    serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+/// `mneme://context` as parsed JSON, for one session.
+async fn context(addr: SocketAddr, sid: &str, id: i64) -> Value {
+    let r = call(
+        addr,
+        TOKEN,
+        sid,
+        id,
+        "resources/read",
+        json!({"uri": "mneme://context"}),
+    )
+    .await;
+    serde_json::from_str(r["result"]["contents"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+/// L1 is the conversation in progress and belongs to one client. Up to
+/// 1.5.x every HTTP session shared the process's single working session,
+/// so agent A's turns were served to agent B in `mneme://context`.
+#[tokio::test]
+async fn working_turns_are_isolated_between_http_sessions() {
+    let tmp = TempDir::new().unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let bind = addr.to_string();
+    let mut child = spawn(
+        &["serve", "--bind", &bind],
+        tmp.path(),
+        &[("MNEME_HTTP_TOKEN", TOKEN)],
+    );
+    wait_for_health(addr, &mut child).await;
+
+    let a = open_session(addr, TOKEN).await;
+    let b = open_session(addr, TOKEN).await;
+
+    // A talks; B only reads.
+    let said = "which tulip varieties did we order for the north bed";
+    let r = call(
+        addr,
+        TOKEN,
+        &a,
+        2,
+        "tools/call",
+        json!({"name": "record_event", "arguments": {
+            "kind": "user_message", "payload": {"content": said}
+        }}),
+    )
+    .await;
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let r = call(
+        addr,
+        TOKEN,
+        &a,
+        3,
+        "tools/call",
+        json!({"name": "remember", "arguments": {"content": "the north bed gets Queen of Night"}}),
+    )
+    .await;
+    assert_eq!(r["result"]["isError"], false, "{r}");
+
+    let stats_a = stats(addr, &a, 4).await;
+    let stats_b = stats(addr, &b, 4).await;
+    let (sid_a, sid_b) = (
+        stats_a["working"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+        stats_b["working"]["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    );
+    assert_ne!(
+        sid_a, sid_b,
+        "each HTTP session has its own working session"
+    );
+    assert!(
+        stats_a["working"]["turns_total"].as_u64().unwrap() >= 2,
+        "{stats_a}"
+    );
+    assert_eq!(
+        stats_b["working"]["turns_total"], 0,
+        "A's turns leaked into B: {stats_b}"
+    );
+
+    let ctx_a = context(addr, &a, 5).await;
+    let ctx_b = context(addr, &b, 5).await;
+    assert!(ctx_a["working"].to_string().contains(said), "{ctx_a}");
+    assert_eq!(
+        ctx_b["working"],
+        json!([]),
+        "A's turns leaked into B's context"
+    );
+    assert!(!ctx_b["working"].to_string().contains("tulip"));
+
+    // Closing A flushes its turns before the 204 and writes nothing for
+    // B, which has none.
+    let sessions = tmp.path().join("sessions");
+    let snapshot = |sid: &str| sessions.join(format!("{sid}.snapshot"));
+    let bearer = auth(TOKEN);
+    let r = http(
+        addr,
+        "DELETE",
+        "/mcp",
+        &[("Authorization", &bearer), ("Mcp-Session-Id", &a)],
+        None,
+    )
+    .await;
+    assert_eq!(r.status, 204);
+    assert!(
+        snapshot(&sid_a).exists(),
+        "DELETE must flush A's working session"
+    );
+    assert!(
+        !snapshot(&sid_b).exists(),
+        "a session without turns writes no snapshot"
+    );
+
+    // B writes, then the server stops with B still open: the listener
+    // closes it and its turn reaches disk.
+    let r = call(
+        addr,
+        TOKEN,
+        &b,
+        6,
+        "tools/call",
+        json!({"name": "pin", "arguments": {"content": "water the north bed on Mondays"}}),
+    )
+    .await;
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    assert_eq!(stats(addr, &b, 7).await["working"]["turns_total"], 1);
+
+    sigterm_and_wait(child).await;
+    assert!(
+        snapshot(&sid_b).exists(),
+        "shutdown must flush open sessions"
+    );
 }

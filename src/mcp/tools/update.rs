@@ -14,20 +14,28 @@ use ulid::Ulid;
 
 use super::secret_guard::{self, Guard};
 use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
-use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult, links};
 use crate::config::SecretsMode;
 use crate::ids::MemoryId;
-use crate::memory::semantic::{MemoryKind, SemanticStore, UpdatePatch};
+use crate::memory::episodic::EpisodicStore;
+use crate::memory::semantic::{MemoryStatus, SemanticStore, UpdatePatch};
 
 const DESCRIPTION: &str = "Edit an existing memory in place. Provide \
-`id` and any subset of `content`, `type`, `tags`, `scope` — only \
-supplied fields change. Use this when the user revises a fact, narrows \
+`id` and any subset of `content`, `kind`, `tags`, `scope`, `status` — \
+only supplied fields change. Use this when the user revises a fact, narrows \
 a preference, or re-classifies a memory; do NOT use this for \
 unrelated information (call `remember` for new memories instead). \
 Re-embedding happens automatically when `content` changes. Pass \
 `supersedes` to mark older memories as replaced by this one (for \
 example after `remember` reported a close existing memory): they stay \
-readable by id but drop out of `recall` and auto-context.";
+readable by id but drop out of `recall` and auto-context. Pass \
+`status: archived` for a memory that is no longer current but worth \
+keeping: it leaves auto-context and default `recall`, and comes back \
+with `recall(include_archived: true)`, `export`, or `status: active`. \
+Pass `relations` to say this memory `refines` or `contradicts` an older \
+one (which then ranks below it in `recall`, still findable) or what it is \
+`evidence_for`; relations are added, never removed, by an update. \
+`provenance` and `source` record how the fact is known.";
 
 pub struct Update {
     store: Arc<SemanticStore>,
@@ -38,6 +46,8 @@ pub struct Update {
     max_chars: usize,
     /// `[guardrails] secrets`.
     secrets: SecretsMode,
+    /// For checking that an `evidence_for` id names a stored event.
+    episodic: Option<Arc<EpisodicStore>>,
 }
 
 impl Update {
@@ -46,7 +56,14 @@ impl Update {
             store,
             max_chars: DEFAULT_MAX_CHARS,
             secrets: SecretsMode::default(),
+            episodic: None,
         }
+    }
+
+    /// Attach the episodic store so `relations` can cite an event.
+    pub fn with_episodic(mut self, episodic: Arc<EpisodicStore>) -> Self {
+        self.episodic = Some(episodic);
+        self
     }
 
     /// Override the over-limit ceiling. Mirrors `Remember::with_max_chars`.
@@ -76,10 +93,15 @@ impl Tool for Update {
                 "properties": {
                     "id": { "type": "string", "description": "Memory ULID." },
                     "content": { "type": "string", "description": "Replacement text. Triggers re-embedding." },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["fact", "decision", "preference", "conversation"],
+                        "description": "Replacement memory kind."
+                    },
                     "type": {
                         "type": "string",
                         "enum": ["fact", "decision", "preference", "conversation"],
-                        "description": "Replacement memory type."
+                        "description": "Alias of `kind` (the older name). Pass one or the other."
                     },
                     "tags": {
                         "type": "array",
@@ -87,13 +109,21 @@ impl Tool for Update {
                         "description": "Replacement tag list. Pass [] to clear."
                     },
                     "scope": { "type": "string", "description": "Replacement scope." },
+                    "status": {
+                        "type": "string",
+                        "enum": ["active", "archived"],
+                        "description": "`archived` hides the memory from auto-context and default recall without deleting it; `active` restores it."
+                    },
                     "supersedes": {
                         "oneOf": [
                             { "type": "string" },
                             { "type": "array", "items": { "type": "string" } }
                         ],
                         "description": "Id (or ids) of older memories this one replaces."
-                    }
+                    },
+                    "relations": links::relations_schema(),
+                    "provenance": links::provenance_schema().0,
+                    "source": links::provenance_schema().1
                 },
                 "required": ["id"]
             }),
@@ -160,19 +190,8 @@ impl Tool for Update {
             None => None,
         };
 
-        let kind = match args.get("type") {
-            None => None,
-            Some(Value::String(s)) => Some(MemoryKind::parse(s).ok_or_else(|| {
-                ToolError::InvalidArguments(format!(
-                    "`type` must be one of fact|decision|preference|conversation, got `{s}`"
-                ))
-            })?),
-            Some(_) => {
-                return Err(ToolError::InvalidArguments(
-                    "`type` must be a string".into(),
-                ));
-            }
-        };
+        // `kind`, or its alias `type`; both set and different is an error.
+        let kind = super::parse_kind_arg(&args)?;
 
         let tags = match args.get("tags") {
             None => None,
@@ -202,6 +221,18 @@ impl Tool for Update {
             }
         };
 
+        let status = match args.get("status") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(MemoryStatus::parse(s).ok_or_else(|| {
+                ToolError::InvalidArguments("`status` must be \"active\" or \"archived\"".into())
+            })?),
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`status` must be a string".into(),
+                ));
+            }
+        };
+
         let supersedes = super::parse_supersedes(args.get("supersedes"))?;
         if supersedes.contains(&memory_id) {
             return Err(ToolError::InvalidArguments(
@@ -222,11 +253,21 @@ impl Tool for Update {
             }
         }
 
+        let relations = links::parse_relations(
+            args.get("relations"),
+            &self.store,
+            self.episodic.as_deref(),
+            Some(memory_id),
+        )
+        .await?;
+        let provenance = links::parse_provenance(&args)?;
+
         let patch = UpdatePatch {
             content,
             kind,
             tags,
             scope,
+            status,
         };
 
         let existed = self
@@ -251,16 +292,24 @@ impl Tool for Update {
                     .await
                     .map_err(|e| ToolError::Internal(format!("supersede {old} failed: {e}")))?;
             }
+            links::apply(&self.store, memory_id, &relations, provenance.as_ref()).await?;
         }
 
         let mut text = if existed {
-            format!("updated memory {memory_id}")
+            match status {
+                Some(MemoryStatus::Archived) => format!("updated memory {memory_id} (archived)"),
+                Some(MemoryStatus::Active) => format!("updated memory {memory_id} (active)"),
+                None => format!("updated memory {memory_id}"),
+            }
         } else {
             format!("no such memory {memory_id}")
         };
         if existed && !supersedes.is_empty() {
             let ids: Vec<String> = supersedes.iter().map(ToString::to_string).collect();
             text.push_str(&format!(" (supersedes {})", ids.join(", ")));
+        }
+        if existed && !relations.is_empty() {
+            text.push_str(&format!(" ({})", links::summary(&relations)));
         }
         let mut result = ToolResult::text(text);
         // Only attach an advisory/warning if the update actually
@@ -278,7 +327,7 @@ impl Tool for Update {
         // arguments. The "forget <id>" note only makes sense when
         // something was stored.
         Ok(if existed {
-            secret_guard::attach(result, secret_advisory, memory_id)
+            secret_guard::attach(result.with_id(memory_id), secret_advisory, memory_id)
         } else {
             secret_guard::attach_meta(result, secret_advisory)
         })
@@ -493,7 +542,8 @@ mod tests {
             .invoke(json!({ "id": id.to_string(), "tags": ["x"] }))
             .await
             .unwrap();
-        assert!(res.meta.is_none());
+        // Just the id of the memory that changed.
+        assert_eq!(res.meta, Some(json!({ "id": id.to_string() })));
     }
 
     #[tokio::test]
@@ -694,5 +744,69 @@ mod tests {
             .await
             .unwrap();
         assert!(!res.is_error);
+    }
+
+    // ---------- status (1.6) ----------
+
+    async fn recall_ids(s: &SemanticStore, filters: &RecallFilters) -> Vec<MemoryId> {
+        s.recall("fresh kilo lima", 5, filters)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|h| h.item.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn status_archived_hides_from_recall_and_active_restores() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let id = s
+            .remember("fresh kilo lima", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let u = Update::new(Arc::clone(&s));
+
+        let res = u
+            .invoke(json!({ "id": id.to_string(), "status": "archived" }))
+            .await
+            .unwrap();
+        let text = match &res.content[0] {
+            crate::mcp::tools::ContentBlock::Text(t) => t.clone(),
+        };
+        assert!(text.contains("archived"), "{text}");
+        assert!(recall_ids(&s, &RecallFilters::default()).await.is_empty());
+        let with_archived = RecallFilters {
+            include_archived: true,
+            ..Default::default()
+        };
+        assert_eq!(recall_ids(&s, &with_archived).await, vec![id]);
+        // Still readable by id, content intact, and not an "edit".
+        assert_eq!(s.get(id).await.unwrap().unwrap().content, "fresh kilo lima");
+        let item = s.get(id).await.unwrap().unwrap();
+        assert_eq!(s.updated_at(id).await.unwrap(), Some(item.created_at));
+
+        u.invoke(json!({ "id": id.to_string(), "status": "active" }))
+            .await
+            .unwrap();
+        assert_eq!(recall_ids(&s, &RecallFilters::default()).await, vec![id]);
+    }
+
+    #[tokio::test]
+    async fn status_must_be_a_known_value() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let id = s
+            .remember("x", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let u = Update::new(s);
+        for bad in [json!("deleted"), json!(1), json!(["archived"])] {
+            let err = u
+                .invoke(json!({ "id": id.to_string(), "status": bad }))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::InvalidArguments(_)));
+        }
     }
 }

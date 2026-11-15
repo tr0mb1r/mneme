@@ -8,9 +8,10 @@ use serde_json::{Value, json};
 
 use super::secret_guard::{self, Guard};
 use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
-use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult, links};
 use crate::config::SecretsMode;
 use crate::ids::MemoryId;
+use crate::memory::episodic::EpisodicStore;
 use crate::memory::semantic::{
     MemoryKind, NEAR_DUPLICATE_SIMILARITY, NearDuplicate, RememberOutcome, SemanticStore,
 };
@@ -39,6 +40,15 @@ balance, a changed decision, a corrected detail), pass its id in \
 When a close existing memory is found, the reply says so (and gives its \
 id) so you can decide.\n\
 \n\
+RELATING FACTS: when this memory narrows, corrects part of, or disputes \
+an older one without replacing it, pass `relations: [{type: \"refines\" \
+| \"contradicts\", id, reason}]`. The older memory stays in `recall`, \
+ranked below this one. `{type: \"evidence_for\", id | ref, reason}` \
+records what this memory is based on: a memory, an event, or an external \
+reference such as `research:pricing-study`. `provenance` says how you \
+know it (`user_stated`, `observed`, `inferred`, `imported`) and `source` \
+where from.\n\
+\n\
 RETRIES: storing content identical to an existing current memory in the \
 same scope (ignoring leading/trailing and repeated whitespace) writes \
 nothing; the reply says `already stored as <id>` with `deduplicated: true`, \
@@ -66,6 +76,9 @@ pub struct Remember {
     max_chars: usize,
     /// `[guardrails] secrets`.
     secrets: SecretsMode,
+    /// For checking that an `evidence_for` id names a stored event.
+    /// Without it only memories and references can be cited.
+    episodic: Option<Arc<EpisodicStore>>,
 }
 
 impl Remember {
@@ -75,7 +88,14 @@ impl Remember {
             scope_state,
             max_chars: DEFAULT_MAX_CHARS,
             secrets: SecretsMode::default(),
+            episodic: None,
         }
+    }
+
+    /// Attach the episodic store so `relations` can cite an event.
+    pub fn with_episodic(mut self, episodic: Arc<EpisodicStore>) -> Self {
+        self.episodic = Some(episodic);
+        self
     }
 
     /// Override the over-limit ceiling. The 500/2,000-character
@@ -105,10 +125,15 @@ impl Tool for Remember {
                 "type": "object",
                 "properties": {
                     "content": { "type": "string", "description": "The information to remember." },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["fact", "decision", "preference", "conversation"],
+                        "description": "Memory kind. Defaults to fact."
+                    },
                     "type": {
                         "type": "string",
                         "enum": ["fact", "decision", "preference", "conversation"],
-                        "description": "Memory type. Defaults to fact."
+                        "description": "Alias of `kind` (the older name). Pass one or the other."
                     },
                     "tags": {
                         "type": "array",
@@ -116,7 +141,7 @@ impl Tool for Remember {
                         "description": "Optional tags for retrieval."
                     },
                     "scope": { "type": "string", "description": "Optional scope override. Defaults to the session's current scope (set by `switch_scope`)." },
-                    "pinned": { "type": "boolean", "description": "Promote to procedural memory." },
+                    "pinned": { "type": "boolean", "description": "Deprecated and not supported: `true` is rejected. Call `pin` to add an always-on rule." },
                     "supersedes": {
                         "oneOf": [
                             { "type": "string" },
@@ -124,7 +149,10 @@ impl Tool for Remember {
                         ],
                         "description": "Id (or ids) of memories this one replaces. They stay \
             readable by id but drop out of recall and auto-context."
-                    }
+                    },
+                    "relations": links::relations_schema(),
+                    "provenance": links::provenance_schema().0,
+                    "source": links::provenance_schema().1
                 },
                 "required": ["content"]
             }),
@@ -163,14 +191,9 @@ impl Tool for Remember {
             g => g.into_advisory(),
         };
 
-        let kind = match args.get("type").and_then(Value::as_str) {
-            None => MemoryKind::Fact,
-            Some(s) => MemoryKind::parse(s).ok_or_else(|| {
-                ToolError::InvalidArguments(format!(
-                    "`type` must be one of fact|decision|preference|conversation, got `{s}`"
-                ))
-            })?,
-        };
+        // `kind`, or its alias `type`; both set and different is an error.
+        let passed_kind = super::parse_kind_arg(&args)?;
+        let kind = passed_kind.unwrap_or(MemoryKind::Fact);
 
         let tags = super::parse_tags_arg(args.get("tags"))?;
 
@@ -180,14 +203,24 @@ impl Tool for Remember {
             .map(|s| s.to_owned())
             .unwrap_or_else(|| self.scope_state.current());
 
-        // `pinned` is recognised by the schema but not wired to the
-        // procedural layer. Warn loudly rather than silently dropping it,
-        // so a caller who set it learns the flag does nothing. Tracked in
-        // book/src/roadmap.md; call `pin` for an L0 rule.
-        if args.get("pinned").and_then(Value::as_bool) == Some(true) {
-            tracing::warn!(
-                "remember: `pinned=true` ignored — call the `pin` tool to add an L0 rule"
-            );
+        // `pinned` was never wired to the procedural layer: `true` used
+        // to be logged and dropped, so the caller believed a rule was
+        // pinned when it was not. Refuse it and say what to call.
+        // `false` (and `null`) ask for nothing and stay accepted.
+        match args.get("pinned") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+            Some(Value::Bool(true)) => {
+                return Err(ToolError::InvalidArguments(
+                    "`pinned` is not supported on `remember`; call `pin` to add an \
+                     always-on rule (L0), or drop `pinned` to store a normal memory"
+                        .into(),
+                ));
+            }
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`pinned` must be a boolean".into(),
+                ));
+            }
         }
 
         // Validate `supersedes` before writing anything, so a typo'd id
@@ -208,13 +241,24 @@ impl Tool for Remember {
             }
         }
 
+        // Relations and provenance are validated up front for the same
+        // reason. Both are absent on an ordinary `remember`, which then
+        // does no extra work here.
+        let relations = links::parse_relations(
+            args.get("relations"),
+            &self.store,
+            self.episodic.as_deref(),
+            None,
+        )
+        .await?;
+        let provenance = links::parse_provenance(&args)?;
+
         // With `supersedes` the new memory is meant to sit next to a close
         // neighbour until the link is written, so dedup is skipped there.
         let (id, duplicate) = if supersedes.is_empty() {
             // Only needed to tell the caller their `type`/`tags` were not
             // applied; cloned up front because the store takes ownership.
             let passed_tags = tags.clone();
-            let passed_kind = args.get("type").is_some().then_some(kind);
             match self
                 .store
                 .remember_or_dedupe(content, kind, tags, scope)
@@ -227,6 +271,9 @@ impl Tool for Remember {
                         memory_id = %id,
                         "remember: identical content already stored, nothing written"
                     );
+                    // A retry carries the same links; writing them
+                    // again is idempotent.
+                    links::apply(&self.store, id, &relations, provenance.as_ref()).await?;
                     let kept = self
                         .differs_from_stored(id, passed_kind, &passed_tags)
                         .await;
@@ -263,10 +310,15 @@ impl Tool for Remember {
                 .map_err(|e| ToolError::Internal(format!("supersede {old} failed: {e}")))?;
         }
 
+        links::apply(&self.store, id, &relations, provenance.as_ref()).await?;
+
         let mut text = format!("stored memory {id}");
         if !supersedes.is_empty() {
             let ids: Vec<String> = supersedes.iter().map(ToString::to_string).collect();
             text.push_str(&format!(" (supersedes {})", ids.join(", ")));
+        }
+        if !relations.is_empty() {
+            text.push_str(&format!(" ({})", links::summary(&relations)));
         }
 
         // Merge the size advisory (if any) and the similarity advisory
@@ -275,9 +327,16 @@ impl Tool for Remember {
         let mut meta = size_tier::success_meta(tier, len, self.max_chars)
             .and_then(|m| m.as_object().cloned())
             .unwrap_or_default();
-        // A neighbour the caller just superseded is the expected
-        // outcome, not something to warn about.
-        if let Some(near) = duplicate.filter(|d| !supersedes.contains(&d.id)) {
+        // A neighbour the caller just superseded, or just related this
+        // memory to, is the expected outcome, not something to warn
+        // about.
+        let already_linked = |near: &NearDuplicate| {
+            supersedes.contains(&near.id)
+                || relations
+                    .iter()
+                    .any(|r| r.target == crate::memory::relations::RelationTarget::Memory(near.id))
+        };
+        if let Some(near) = duplicate.filter(|d| !already_linked(d)) {
             let (key, advisory, note) = similarity_advisory(&near);
             tracing::info!(
                 memory_id = %id,
@@ -303,12 +362,22 @@ impl Tool for Remember {
                 ),
             );
         }
+        if !relations.is_empty() {
+            meta.insert("relations".into(), links::parsed_json(&relations));
+        }
+        if let Some(record) = &provenance {
+            meta.insert("provenance".into(), json!(record.provenance.as_str()));
+        }
 
         let mut result = ToolResult::text(text);
         if !meta.is_empty() {
             result = result.with_meta(Value::Object(meta));
         }
-        Ok(secret_guard::attach(result, secret_advisory, id))
+        Ok(secret_guard::attach(
+            result.with_id(id),
+            secret_advisory,
+            id,
+        ))
     }
 }
 
@@ -362,16 +431,20 @@ fn similarity_advisory(near: &NearDuplicate) -> (&'static str, Value, String) {
         "The new memory is {relation} memory {} (similarity {:.2}). Both are stored. \
          If the new one is an updated version (new value, changed decision), \
          retire the old one: call `update` on the new id with `supersedes: \"{}\"` \
-         (or pass `supersedes` to `remember` up front next time). If it only \
+         (or pass `supersedes` to `remember` up front next time). If it narrows \
+         or corrects part of the old one and both should stay findable, call \
+         `update` on the new id with `relations: [{{\"type\": \"refines\", \"id\": \"{}\"}}]`: \
+         the old one then ranks below it. If it only \
          restates the old one, `forget` the new id. If both are true and \
          distinct, ignore this.",
-        near.id, near.similarity, near.id
+        near.id, near.similarity, near.id, near.id
     );
     let note = format!(
         "note: {relation} memory {} (similarity {:.2}): \"{quoted}\". If this \
          replaces it, call `update` on the new id with `supersedes: \"{}\"`; if it \
+         refines it, with `relations: [{{\"type\": \"refines\", \"id\": \"{}\"}}]`; if it \
          only restates it, `forget` the new id.",
-        near.id, near.similarity, near.id
+        near.id, near.similarity, near.id, near.id
     );
     (
         key,
@@ -381,6 +454,8 @@ fn similarity_advisory(near: &NearDuplicate) -> (&'static str, Value, String) {
             "existing_scope": near.scope,
             "similarity": near.similarity,
             "message": message,
+            // What to pass if the new memory refines the existing one.
+            "suggested_relation": { "type": "refines", "id": near.id.to_string() },
         }),
         note,
     )
@@ -445,7 +520,16 @@ mod tests {
             .invoke(json!({ "content": "CI runs on ubuntu-latest only" }))
             .await
             .unwrap();
-        assert!(first.meta.is_none(), "first write should carry no advisory");
+        assert_eq!(
+            first
+                .meta
+                .as_ref()
+                .and_then(Value::as_object)
+                .map(|m| m.len()),
+            Some(1),
+            "first write should carry its id and no advisory: {:?}",
+            first.meta
+        );
 
         let second = r
             .invoke(json!({ "content": "CI runs on ubuntu-latest only." }))
@@ -603,7 +687,13 @@ mod tests {
         let r = Remember::new(store(&tmp), make_scope());
         let res = r.invoke(json!({ "content": "short fact" })).await.unwrap();
         assert!(!res.is_error);
-        assert!(res.meta.is_none(), "small content must not carry size meta");
+        let meta = res.meta.expect("a stored memory reports its id");
+        assert!(meta["id"].is_string());
+        assert_eq!(
+            meta.as_object().map(|m| m.len()),
+            Some(1),
+            "small content must not carry size meta: {meta}"
+        );
     }
 
     /// Content in [500, 2_000): stored with `length_advisory` meta.
@@ -1138,5 +1228,104 @@ mod tests {
             .unwrap_or(false);
         assert!(!has_adv, "off mode must not scan: {:?}", res.meta);
         assert_eq!(s.len(), 1);
+    }
+
+    fn fresh_with_store() -> (Remember, Arc<SemanticStore>, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        (Remember::new(Arc::clone(&store), make_scope()), store, tmp)
+    }
+
+    #[tokio::test]
+    async fn kind_is_accepted_and_type_stays_an_alias() {
+        let (r, store, _tmp) = fresh_with_store();
+        for (key, content) in [
+            ("kind", "we ship on Fridays"),
+            ("type", "we rest on Sundays"),
+        ] {
+            let res = r
+                .invoke(json!({ "content": content, key: "decision" }))
+                .await
+                .unwrap();
+            assert!(!res.is_error);
+        }
+        // The same value under both names is not a conflict.
+        r.invoke(json!({ "content": "both names", "kind": "decision", "type": "decision" }))
+            .await
+            .unwrap();
+        let hits = store
+            .recall(
+                "ship",
+                10,
+                &crate::memory::semantic::RecallFilters::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().all(|h| h.item.kind == MemoryKind::Decision));
+    }
+
+    #[tokio::test]
+    async fn kind_and_type_with_different_values_is_rejected() {
+        let (r, store, _tmp) = fresh_with_store();
+        let err = r
+            .invoke(json!({ "content": "x", "kind": "decision", "type": "fact" }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidArguments(m) => {
+                assert!(m.contains("pass either kind or type"), "{m}")
+            }
+            other => panic!("expected InvalidArguments, got {other:?}"),
+        }
+        let hits = store
+            .recall("x", 10, &crate::memory::semantic::RecallFilters::default())
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "a rejected call must store nothing");
+    }
+
+    #[tokio::test]
+    async fn bad_kind_value_names_the_key_the_caller_used() {
+        let (r, _store, _tmp) = fresh_with_store();
+        for key in ["kind", "type"] {
+            let err = r
+                .invoke(json!({ "content": "x", key: "weird" }))
+                .await
+                .unwrap_err();
+            let ToolError::InvalidArguments(m) = err else {
+                panic!("expected InvalidArguments");
+            };
+            assert!(m.starts_with(&format!("`{key}` must be one of")), "{m}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_true_is_rejected_with_a_pointer_to_pin() {
+        let (r, store, _tmp) = fresh_with_store();
+        let err = r
+            .invoke(json!({ "content": "always run fmt", "pinned": true }))
+            .await
+            .unwrap_err();
+        let ToolError::InvalidArguments(m) = err else {
+            panic!("expected InvalidArguments");
+        };
+        assert!(m.contains("call `pin`"), "{m}");
+        let hits = store
+            .recall(
+                "fmt",
+                10,
+                &crate::memory::semantic::RecallFilters::default(),
+            )
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "a rejected call must store nothing");
+
+        // `false` asks for nothing and keeps working.
+        let res = r
+            .invoke(json!({ "content": "always run fmt", "pinned": false }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
     }
 }

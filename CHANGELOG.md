@@ -12,6 +12,311 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+### Added
+
+- **Typed relations between memories.** `remember` and `update` take
+  `relations: [{type, id | ref, reason}]`. `refines` and `contradicts`
+  say a memory narrows, corrects or disputes an older one without
+  replacing it; `evidence_for` says what a memory is based on, which can
+  be a memory, an event, or an external reference string such as
+  `research:pricing-study` (opaque, at most 128 bytes); `supersedes` is
+  the existing hide-the-old-one link as a relation. `reason` is up to 300
+  characters. Bad input (unknown type, missing or unknown target, a
+  memory related to itself, a value over its limit) is `INVALID_PARAMS`
+  and nothing is written. Stored in side tables, so there is no schema
+  change and nothing to migrate.
+- **A refined or contradicted memory is demoted in `recall`, not
+  hidden.** While the newer memory is stored, current and more recently
+  edited, the older one loses its keyword evidence and `[recall]
+  demote_margin` (0.10) of rank in every mode, and its row carries
+  `demoted: true`. Forgetting or archiving the newer memory, or revising
+  the older one afterwards, undoes it. `mneme://context` leaves demoted
+  memories out unless `[auto_context] include_demoted = true`. Both
+  config keys existed since 1.6 without effect.
+- **`relations` on rows.** `recall` and `mneme://context` rows carry a
+  `relations` object (`superseded_by`, `refined_by`, `contradicted_by`,
+  `refines`, `contradicts`, `supersedes`, `evidence`) when the memory has
+  any; rows without relations are unchanged.
+- **`recall(ref: …)`** returns the memories that cite an external
+  reference. `query` is optional with it.
+- **`recall(expand: 1)`** adds `linked` to rows with relations: the id
+  and first 120 characters of each linked memory or event.
+- **Provenance.** `remember` and `update` take `provenance`
+  (`user_stated`, `observed`, `inferred`, `imported`) and `source` (free
+  text, at most 200 characters). Rows carry them, `recall(provenance: …)`
+  filters on them, and `stats` reports `memories.by_provenance`. Ranking
+  is not affected.
+- **`record_event(promote: {type, tags})`** also stores the event's text
+  as a long-term memory, with an `evidence_for` link from the memory to
+  the event. The memory id is returned as `_meta.promoted_memory_id`.
+- When `remember` reports a close existing memory, the note and the
+  advisory (`suggested_relation`) also show how to mark the new memory as
+  refining it.
+- `export` (the MCP tool and `mneme export`) emits each memory's
+  `provenance`, `source` and `relations`.
+- **`recall` can search recorded events.** `layers: ["semantic",
+  "episodic"]` adds keyword search over the L3 events whose kind is in
+  `[episodic] index_kinds` (decisions, milestones, lessons, summaries
+  and the like; not `tool_call`). Until now an event could be listed by
+  time but not found by what it said, so anything recorded with
+  `record_event` and never copied into a memory was invisible to
+  `recall`. Rows from both layers carry `layer` and `rank` and are
+  ordered by `rank`; an event that contains every query word ranks like
+  a memory at similarity 0.65. Events of kind `archived` or with
+  `retrieval_weight` ≤ 0.3 are demoted, not hidden. In `mode: "keyword"`
+  the layers are merged on keyword evidence measured the same way for
+  both, so an event that contains the query's distinctive words comes
+  before memories that share one common token with it. The default is
+  still `["semantic"]`, with the same rows in the same order as before.
+- **`recall` takes `since` / `until`** (RFC3339 or ULID, with
+  `time_field`), applied after the search with the search widened until
+  the window is filled. In 1.5.2 these were unknown arguments that
+  pointed at `recall_recent`. `scope` accepts several scopes separated by
+  commas. `include_archived` is accepted.
+- **`include_cold`** on `recall_recent` and `export`, and `mneme export
+  --include-cold`: read the cold archive too. Opt-in because it
+  decompresses quarterly bundles; `recall_recent` opens only the quarters
+  that overlap the window and reads at most 1000 cold rows. Rows are
+  tagged `"tier": "cold"`.
+- **`[consolidation] cold_exempt_kinds`** is honoured: events of those
+  kinds (`archived`, `summary`, `milestone`, `lesson`, `decision` by
+  default) stay in the warm tier instead of being archived, so they stay
+  searchable and forgettable. `[]` restores the old behaviour.
+- **`[episodic] touch_on_recall`** is honoured: hot events returned by
+  `recall` get their `last_accessed` refreshed, after the response and at
+  most once per 24 hours each, so events still in use are not moved to
+  warm on age alone. Nothing called `touch` before, so promotion was pure
+  age.
+
+- **Hermes hook: one scope per conversation.** `mneme init hermes
+  --scope-map <file>` (or `MNEME_SCOPE_MAP`) gives the context hook a
+  JSON map from thread ids to scopes; it then reads
+  `mneme://context?q=…&scope=<thread scope>,global`. Without a map, or
+  for a thread the map does not list, the read is unscoped as before.
+  `--scope-key` and `--shared-scope` on the hook adjust the lookup.
+
+### Changed
+
+- **`recall` breaks rank ties by the latest edit.** Two memories with
+  the same rank (within 0.0001) are now ordered newest `updated_at`
+  first, in `hybrid`, `semantic` and `keyword` mode. The order of tied
+  rows used to be whatever the search returned, which in keyword mode
+  put the older of two equally matching memories first every time: a
+  fact and its corrected version share nearly all their words. Rows with
+  different ranks are ordered as before.
+- **The Hermes hook no longer filters events itself.** Its skip list
+  (auto-logged kinds, `archived`), weight floor (0.3) and 200-character
+  clip are removed: the server applies all three before the token
+  budget is spent, and the hook shows what it is given, at most 15
+  events, marking payloads the server clipped. A 1.6 hook against a
+  pre-1.6 server shows that server's unfiltered events, so upgrade the
+  server first. Re-run `mneme init hermes --upgrade` to install it.
+- The Hermes `mneme` skill is 1.2.0: `layers: ["semantic", "episodic"]`
+  for "what did we conclude", `since` / `until` on `recall` for time
+  questions, and `update(status: "archived")` to retire a fact.
+- The consolidation scheduler runs its passes through the server's
+  shared episodic store rather than a private one, so the keyword index
+  sees events leave for cold. Search results are also checked against
+  storage, and an index entry whose row is gone is dropped.
+- `[recall] stemming = "en"` is accepted by the config but not yet
+  implemented; keyword search still matches exact tokens.
+
+### Security
+
+- Dependencies refreshed for RustSec advisories reported against the
+  1.5.0 lockfile: `zstd` / `zstd-safe` / `zstd-sys`, `rustls`,
+  `rustls-webpki`, `webpki-roots`, `quinn-proto`, `quinn-udp` (lockfile
+  update), and `zip` via `candle-core` 0.10 → 0.11 (the `zip` fixes are
+  only in 9.x, which candle 0.11 uses). `cargo deny check` is clean.
+
+### Removed
+
+- **Windows support.** mneme now supports Linux and macOS only. CI no
+  longer builds or tests on Windows, and releases ship no Windows binary.
+  On a Windows machine, run mneme inside WSL2. The Windows-only code
+  is gone from the tree: the `cfg(windows)` / `cfg(not(unix))` arms
+  (the `mneme client` and daemon-transport stubs, the detached-spawn
+  flags, the `mneme stop` and lockfile fallbacks, the no-op permission
+  helpers), the `keyring` `windows-native` backend, and the Hermes
+  installer's `mneme run` fallback. A build for a non-Unix target now
+  fails with `mneme supports Linux and macOS only`.
+
+### Fixed
+
+- **`mneme client` survives a daemon that is killed and restarted.** After
+  losing its daemon the client could connect to the old daemon's listener
+  in the instant before it closed, get a connection reset while replaying
+  `initialize`, and exit, so the MCP host lost its server. A disconnect
+  before the daemon has answered `initialize` is now retried like "nothing
+  listening yet". The client also no longer dies when the agent writes a
+  request before the disconnect was noticed, and it reports an auth
+  rejection on reconnect as such.
+
+- **Warm-tier events are readable again.** Consolidation moves an
+  episodic event from `epi:` to `wepi:` after `hot_to_warm_days` (28),
+  and no read path looked there, so the event was gone from
+  `recall_recent` and from `export` until it reached the cold archive.
+  In one store a `recall_recent(since, until)` window over seven weeks
+  returned 7 hot rows with 344 warm rows present.
+  - `recall_recent` reads the warm tier when `since` is older than
+    `hot_to_warm_days`, when only `until` is set, or when the new
+    `include_warm: true` is passed. `include_warm: false` keeps a call
+    hot only. A call with no time bound is unchanged (hot only).
+    Ordering and the `limit` caps are unchanged; the limit applies to
+    the merged result.
+  - `export` (the MCP tool and `mneme export`) includes warm rows by
+    default. A backup taken with it was silently missing every event
+    older than 28 days. The tool takes `include_warm: false` for the old
+    hot-only output; the CLI has no opt-out.
+  - Rows from both carry `"tier": "hot"` or `"tier": "warm"`.
+  - The cold archive is still not read by any tool; `mneme backup`
+    copies it.
+- **`forget` removes an event from both tiers.** A crash between the two
+  writes of a hot-to-warm move leaves the row under both prefixes until
+  the next consolidation pass. `forget` stopped at the hot copy, which
+  did not matter while the warm tier was unreadable; with warm reads the
+  leftover copy would have come back. Readers return such a row once.
+
+- `remember`, `update` and `recall` accept `kind` as the name of the
+  memory-kind argument, with `type` kept as an alias. Replies have always
+  called the field `kind`, so agents passed it back and the call failed
+  with "unexpected argument(s) `kind`". Passing both with different values
+  is `INVALID_PARAMS` ("pass either kind or type"). The mirrored
+  `tool_call` event records the value as `kind` whichever name was used.
+- `recall` with `since` / `until` now says to use `recall_recent` for a
+  time window, instead of only listing the accepted arguments.
+- `remember` with `pinned: true` is rejected with a pointer to `pin`. The
+  flag was never wired to the procedural layer: it was logged and dropped,
+  so the caller believed a rule had been pinned. `pinned: false` is still
+  accepted.
+
+- `forget` no longer leaves the memory's text on the timeline. `remember`,
+  `pin` and `update` mirror their `content` into `tool_call` events, and
+  `forget` deleted only the memory. It now also rewrites the matching hot-
+  and warm-tier `tool_call` events to
+  `{tool, memory_id, redacted: "forgotten", at}` and reports the count
+  (`_meta.redacted_tool_calls`). Rows are matched by `memory_id`, by `id`
+  (`update` rows), or, for rows written before 1.5.2, by content. Cold
+  archive bundles are not rewritten. See "Forgetting and the timeline" in
+  `book/src/mcp-surface.md`.
+
+- Read-only tool calls no longer push an L1 working turn. Every successful
+  `tools/call` used to add a `tool` turn, so `recall`, `recall_recent`,
+  `stats`, `list_scopes` and `export` inflated `turns_total`, filled the
+  working-memory window with tool names and triggered empty checkpoints (a
+  read-only evaluation run added 665 turns). Only tools that are not
+  `readOnlyHint` push a turn now, the rule `auto_log_tool_calls = "writes"`
+  already uses for the timeline. Not configurable yet.
+
+- **L1 working memory is per session on the daemon and over HTTP.** Every
+  daemon connection and every HTTP `Mcp-Session-Id` now has its own
+  working session and checkpoint scheduler. They used to share the
+  process's single session, so one agent's turns appeared in every other
+  agent's `mneme://context` and `turns_total` mixed all clients, although
+  the docs said "L1 working turns are session-local". A client's session
+  is flushed and its scheduler stopped when the connection closes, on
+  `DELETE /mcp` (before the 204), when an idle HTTP session is evicted and
+  at shutdown. A session that recorded no turn writes no snapshot. stdio
+  (`mneme run`) is unchanged.
+
+### Added
+
+- **`mneme eval`**: measure recall and auto-context quality against a
+  questions file with known answers. Runs `recall` over mode × scope ×
+  layers and replays `mneme://context` per question; reports hit@1,
+  hit@5, MRR, stale-over-current, off-scope@5, context gold, layer shares
+  and p50/p95 latency to `metrics-<tag>.json` and `summary-<tag>.md`.
+  Read-only, and fails if the store changed during the run. Optional
+  thresholds make it a gate; a nightly workflow runs it on a synthetic
+  corpus.
+
+- **Auto-context ranks events against the query.** With `?q=`, the
+  `episodic` section of `mneme://context` is no longer the same 64 most
+  recent events for every prompt. Candidates are the recent window plus
+  the episodic index's matches for the query, scored
+  `weight × 0.8 × recency × (β + (1−β)·lexical coverage)` with
+  `[auto_context] episodic_query_mix` (β, default 0.3). Without `?q=`
+  the ranking is recency, as before.
+- **Auto-context event selection.** Exact duplicates (same kind and
+  payload, ignoring case and whitespace) and near-duplicates (token
+  Jaccard ≥ 0.6) are dropped, at most `max_events_per_kind` (6) events of
+  one kind are kept, and payloads are clipped to `event_clip_chars` (400)
+  with `"truncated": true` on the row. A clipped event is charged at its
+  clipped size. Events of kind `archived` and events with
+  `retrieval_weight` at or below `min_event_weight` (0.3) are left out;
+  `?kinds=archived` opts back in.
+- **`mneme://context?scope=a,b`.** `scope` takes a comma-separated set.
+  L3 and L4 are filtered to the set; L0 returns the pins of those scopes
+  plus `[auto_context] pin_scopes`.
+- `mneme://context` reports `layer_tokens` (tokens spent per layer), and
+  its `request` echo gains `scopes`, `pin_scopes` and `shares`. Semantic
+  rows gain `updated_at` and `rank`; episodic rows gain `truncated`.
+- **`updated_at` on memories.** `update` records when a memory's content
+  last changed. Changing only `kind`, `tags`, `scope` or `status`, or
+  writing the same text back, does not move it. A memory never edited
+  reports its `created_at`. `recall` rows and `export` carry it.
+- **Archiving a memory: `update(id, status: "archived")`.** An archived
+  memory keeps its id, content and vector but is left out of `recall`
+  and never appears in auto-context. `status: "active"` restores it.
+  `recall` rows and `export` carry `status`; `export` always includes
+  archived memories.
+- `recall` rows carry `rank`: similarity plus keyword evidence, on the
+  same scale in `hybrid`, `semantic` and `keyword` mode.
+- `export` (the MCP tool and `mneme export`) emits `superseded_by` on a
+  memory that has a supersession link. The links were never exported, so
+  a dump could not tell a current fact from a replaced one.
+- Successful `remember`, `pin` and `update` calls report the id of the
+  memory they stored or changed as `_meta.id`, and their `tool_call` event
+  records it as `memory_id`.
+
+- `[working] record_tool_turns` (`"writes"` default, `"all"`, `"off"`):
+  which successful tool calls add an L1 working turn. `"writes"` is the
+  1.5.2 behaviour, now configurable; `"all"` restores a turn per call.
+- `[episodic] log_tool_call_values` (`"full"` default, `"ids"`, `"off"`):
+  how much of a call's arguments a `tool_call` event keeps. `"ids"` keeps
+  the tool name, ids and scope and replaces `content` with its length and
+  an 8-hex-digit SHA-256 prefix; `"off"` keeps the tool name only.
+  `forget` redaction works in every mode.
+- `mneme init` writes the 1.6 sections into the starter `config.toml`,
+  with comments: `[working]`, `[auto_context]`, and the new `[episodic]`
+  and `[consolidation]` keys.
+
+### Changed
+
+- **A scoped `mneme://context` read now also returns global pins.**
+  `?scope=myproject` used to return only the pins stored under
+  `myproject`, so naming a scope silently dropped every rule pinned under
+  `global`. A scoped read now returns the pins of the requested scopes
+  plus those of `[auto_context] pin_scopes` (default `["global"]`). Set
+  `pin_scopes = []` for the old behaviour. A read with no `scope` is
+  unchanged and returns every pin.
+- **Auto-context budget is split by layer shares, not a flat reserve.**
+  Each layer used to be guaranteed 1/16 of the budget and the rest went
+  by score, which events always won: in one store they took 77% of the
+  context and left room for two memories. Now, from `[auto_context]`:
+  pinned items are never trimmed; events take at most
+  `episodic_max_share` (0.35); working turns at most `working_max_share`
+  (0.05); and semantic rows have `semantic_min_share` (0.30) of the
+  budget, or `semantic_min_items` (5) rows if that is fewer tokens,
+  reserved before the other layers are packed, with no ceiling. A context
+  read with no `?q=` uses less of the budget than before, because events
+  stop at their share.
+- **Pinned items can exceed the auto-context budget.** They are never
+  trimmed. If the pins alone are larger than
+  `auto_context_token_budget`, `total_tokens` exceeds `max_tokens` and
+  the other layers are empty. The server logs a warning when pins use
+  more than 30% of the budget.
+- **Auto-context freshness for memories is measured from the last
+  edit**, with a 90-day half-life and a floor of 0.75
+  (`semantic_half_life_days`, `semantic_recency_floor`; `0` days turns
+  decay off). It was a 14-day half-life from `created_at`, under which a
+  six-week-old memory kept 13% of its score. `recall` ranking is not
+  decayed and is unchanged.
+- `forget`'s input schema declares only `id` (now `required`). `query` and
+  `scope` were advertised as reserved while every call that used them
+  failed; passing one is still `INVALID_PARAMS`, now with a hint to find
+  the ids and forget them one at a time.
+
 ## [1.5.0](https://github.com/tr0mb1r/mneme/compare/v1.4.1...v1.5.0) - 2026-10-12
 
 > Hardening from running mneme as the long-term memory of Hermes Agent
@@ -942,9 +1247,4 @@ formula, public release pipeline).
 ### Documentation
 
 - Issue and PR templates added under `.github/`.
-- `CONTRIBUTING.md` durability-path policy made concrete:
-  `scripts/manual_test.sh --stub` is the floor for any change
-  touching WAL / redb / HNSW / backup-restore.
-
-[0.2.1]: https://github.com/tr0mb1r/mneme/releases/tag/v0.2.1
-[0.2.0]: https://github.com/tr0mb1r/mneme/releases/tag/v0.2.0
+- `CONTRIBUT

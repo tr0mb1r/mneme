@@ -192,8 +192,9 @@ impl CheckpointScheduler {
     }
 
     /// Wake the scheduler immediately if it's currently sleeping.
-    /// Used by the MCP server after each successful `tools/call` so
-    /// the turn-count threshold is checked promptly rather than at
+    /// Used by the MCP server after each successful `tools/call` that
+    /// pushed a turn (read-only tools push none) so the turn-count
+    /// threshold is checked promptly rather than at
     /// the next wall-clock tick.
     pub fn poke(&self) {
         self.state.notify.notify_one();
@@ -204,9 +205,42 @@ impl CheckpointScheduler {
     /// checkpoint if there are any unflushed turns. Idempotent; a
     /// second call after shutdown returns immediately.
     pub async fn shutdown(&self) -> Result<()> {
+        self.stop_task().await;
+
+        // Final flush — `ActiveSession::shutdown` marks
+        // `clean_shutdown = true` and writes one last snapshot. The
+        // background loop may have already done a flush on the
+        // shutdown wake; the snapshot is idempotent so a duplicate
+        // flush is safe.
+        self.state.active.shutdown()
+    }
+
+    /// Stop the scheduler and flush, but only if the session was used.
+    ///
+    /// This is how a per-connection working session ends (an HTTP
+    /// session that is deleted or evicted, a daemon connection that
+    /// closes). The background task is always stopped. The final
+    /// snapshot, with its clean-shutdown mark, is written only when the
+    /// session recorded at least one turn: a client that connected,
+    /// listed the tools and left has nothing worth a file, and a busy
+    /// HTTP endpoint would otherwise leave one empty snapshot per probe.
+    /// Returns whether a snapshot was written. Idempotent.
+    ///
+    /// [`shutdown`](Self::shutdown) keeps its always-flush behaviour for
+    /// the process-lifetime session of `mneme run`.
+    pub async fn shutdown_if_used(&self) -> Result<bool> {
+        self.stop_task().await;
+        if self.state.active.turns_total() == 0 {
+            return Ok(false);
+        }
+        self.state.active.shutdown()?;
+        Ok(true)
+    }
+
+    /// Set the shutdown flag, wake the loop and wait for it to exit.
+    async fn stop_task(&self) {
         self.state.shutdown.store(true, Ordering::SeqCst);
         self.state.notify.notify_one();
-
         let join = match self.join.lock() {
             Ok(mut g) => g.take(),
             Err(e) => {
@@ -220,13 +254,6 @@ impl CheckpointScheduler {
         {
             tracing::warn!(error = %e, "checkpoint scheduler task panicked during shutdown");
         }
-
-        // Final flush — `ActiveSession::shutdown` marks
-        // `clean_shutdown = true` and writes one last snapshot. The
-        // background loop may have already done a flush on the
-        // shutdown wake; the snapshot is idempotent so a duplicate
-        // flush is safe.
-        self.state.active.shutdown()
     }
 
     /// Run one checkpoint pass synchronously, ignoring the scheduler
@@ -235,6 +262,62 @@ impl CheckpointScheduler {
     #[doc(hidden)]
     pub fn force_run(&self) -> Result<()> {
         do_one_pass(&self.state)
+    }
+}
+
+impl Drop for CheckpointScheduler {
+    /// Safety net for a scheduler that is dropped without `shutdown`:
+    /// tell the background task to exit, so a per-connection scheduler
+    /// can never outlive its connection as a task that wakes every
+    /// `interval_secs` for the rest of the process. No flush happens
+    /// here (it needs `await`); every owner calls
+    /// [`shutdown`](CheckpointScheduler::shutdown) or
+    /// [`shutdown_if_used`](CheckpointScheduler::shutdown_if_used) first.
+    fn drop(&mut self) {
+        self.state.shutdown.store(true, Ordering::SeqCst);
+        self.state.notify.notify_one();
+    }
+}
+
+/// Opens one working session, with its own checkpoint scheduler, per
+/// MCP session.
+///
+/// L1 is the conversation in progress, so it belongs to one client. The
+/// stdio server has exactly one client and uses the process-lifetime
+/// session `cli::run` opens at boot. The daemon and the HTTP listener
+/// serve many, and call [`open`](Self::open) once per accepted
+/// connection / per `Mcp-Session-Id`; before 1.6 they all shared the
+/// boot session, so one agent's turns showed up in every other agent's
+/// `mneme://context`.
+#[derive(Clone)]
+pub struct WorkingSessionFactory {
+    sessions_dir: std::path::PathBuf,
+    aead: Option<Arc<crate::crypto::Aead>>,
+    config: CheckpointSchedulerConfig,
+}
+
+impl WorkingSessionFactory {
+    pub fn new(
+        sessions_dir: std::path::PathBuf,
+        aead: Option<Arc<crate::crypto::Aead>>,
+        config: CheckpointSchedulerConfig,
+    ) -> Self {
+        Self {
+            sessions_dir,
+            aead,
+            config,
+        }
+    }
+
+    /// A fresh session (new id, no turns) and its scheduler. Must be
+    /// called inside a tokio runtime. Nothing is written to disk until
+    /// the session has turns to checkpoint. End it with
+    /// [`CheckpointScheduler::shutdown_if_used`].
+    pub fn open(&self) -> Result<(Arc<ActiveSession>, Arc<CheckpointScheduler>)> {
+        let session =
+            ActiveSession::open_with_crypto(self.sessions_dir.clone(), self.aead.clone())?;
+        let scheduler = CheckpointScheduler::start(Arc::clone(&session), self.config);
+        Ok((session, scheduler))
     }
 }
 
@@ -432,5 +515,46 @@ mod tests {
         // After shutdown the count is 1 (the final clean-shutdown
         // flush always runs, even on an empty session).
         assert_eq!(sched.metrics().checkpoints_total, 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_if_used_writes_nothing_for_an_unused_session() {
+        let tmp = TempDir::new().unwrap();
+        let factory = WorkingSessionFactory::new(
+            tmp.path().join("sessions"),
+            None,
+            CheckpointSchedulerConfig::production(),
+        );
+        let (unused, unused_sched) = factory.open().unwrap();
+        let (used, used_sched) = factory.open().unwrap();
+        assert_ne!(unused.id(), used.id());
+        used.push_turn("user", "hello");
+        assert_eq!(unused.turns_total(), 0, "sessions do not share turns");
+
+        assert!(!unused_sched.shutdown_if_used().await.unwrap());
+        assert!(!unused.snapshot_path().exists());
+        assert!(used_sched.shutdown_if_used().await.unwrap());
+        let restored =
+            crate::memory::working::Session::load(&tmp.path().join("sessions"), used.id()).unwrap();
+        assert!(restored.clean_shutdown);
+        assert_eq!(restored.turns.len(), 1);
+        // Idempotent.
+        assert!(used_sched.shutdown_if_used().await.unwrap());
+        assert!(!unused_sched.shutdown_if_used().await.unwrap());
+    }
+
+    /// A scheduler dropped without `shutdown` must not leave its task
+    /// running.
+    #[tokio::test]
+    async fn dropping_the_scheduler_stops_its_task() {
+        let tmp = TempDir::new().unwrap();
+        let active = ActiveSession::open(tmp.path().to_path_buf()).unwrap();
+        let sched = CheckpointScheduler::start(Arc::clone(&active), fast_config_secs(3600));
+        let handle = sched.join.lock().unwrap().take().unwrap();
+        drop(sched);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("task exits once the scheduler is dropped")
+            .unwrap();
     }
 }

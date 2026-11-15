@@ -35,7 +35,9 @@ use crate::memory::working::ActiveSession;
 use crate::scope::ScopeState;
 use crate::storage::Storage;
 
-pub use super::dispatch::{soft_error_message, tool_call_failed_payload, tool_call_payload};
+pub use super::dispatch::{
+    DispatchPolicy, soft_error_message, tool_call_failed_payload, tool_call_payload,
+};
 
 // Tools consume the SemanticStore directly (Phase 3); the `Storage`
 // handle on `Server` is now mostly informational, kept for future
@@ -95,9 +97,15 @@ pub struct McpSession {
     /// default scope. Mirrors `[scopes] derive_from_roots`; off unless
     /// the user opted in, because it changes where writes land.
     derive_scope_from_roots: bool,
-    /// Which successful `tools/call`s are mirrored as `tool_call`
-    /// events. `[episodic] auto_log_tool_calls`; defaults to `writes`.
-    auto_log: AutoLogToolCalls,
+    /// What a successful `tools/call` leaves behind: the L3 mirror
+    /// (`[episodic] auto_log_tool_calls`, `log_tool_call_values`) and
+    /// the L1 turn (`[working] record_tool_turns`).
+    policy: DispatchPolicy,
+    /// `true` when `session` / `checkpoint_scheduler` were opened for
+    /// this MCP session alone (daemon connection, HTTP session) and so
+    /// end with it; `false` for the process-lifetime pair `mneme run`
+    /// shares with its single stdio client and shuts down itself.
+    owns_working_session: bool,
     initialized: AtomicBool,
 }
 
@@ -116,7 +124,8 @@ impl McpSession {
             episodic: None,
             scope_state: None,
             derive_scope_from_roots: false,
-            auto_log: AutoLogToolCalls::default(),
+            policy: DispatchPolicy::default(),
+            owns_working_session: false,
             initialized: AtomicBool::new(false),
         }
     }
@@ -133,8 +142,47 @@ impl McpSession {
     /// `tool_call` events. `cli::run` passes
     /// `[episodic] auto_log_tool_calls`.
     pub fn with_auto_log_tool_calls(mut self, mode: AutoLogToolCalls) -> Self {
-        self.auto_log = mode;
+        self.policy.auto_log = mode;
         self
+    }
+
+    /// All three dispatch settings at once; `cli::run` builds the value
+    /// from the loaded config.
+    pub fn with_dispatch_policy(mut self, policy: DispatchPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Mark the working session passed to [`with_session`](Self::with_session)
+    /// as belonging to this MCP session only, so [`close`](Self::close)
+    /// ends it.
+    pub fn with_owned_working_session(mut self, owned: bool) -> Self {
+        self.owns_working_session = owned;
+        self
+    }
+
+    /// End this MCP session: stop its checkpoint scheduler and, if the
+    /// working session recorded any turn, write the final snapshot.
+    /// A no-op unless the session owns its working session. Idempotent.
+    ///
+    /// The HTTP transport calls this when a session is deleted, expires
+    /// or the listener stops; without it a per-session scheduler would
+    /// keep ticking and the last turns before the client left would
+    /// never reach disk.
+    pub async fn close(&self) {
+        if !self.owns_working_session {
+            return;
+        }
+        if let Some(scheduler) = &self.checkpoint_scheduler
+            && let Err(e) = scheduler.shutdown_if_used().await
+        {
+            tracing::warn!(error = %e, "closing working session: final checkpoint failed");
+        }
+    }
+
+    /// The working session's id, when one is attached.
+    pub fn working_session_id(&self) -> Option<crate::ids::SessionId> {
+        self.session.as_ref().map(|s| s.id())
     }
 
     /// Builder hook: attach the production runtime wiring so each
@@ -302,7 +350,7 @@ impl McpSession {
             self.checkpoint_scheduler.as_deref(),
             self.episodic.as_deref(),
             self.scope_state.as_deref(),
-            self.auto_log,
+            self.policy,
             id,
             params,
         )
@@ -392,6 +440,12 @@ where
     /// See [`McpSession::with_auto_log_tool_calls`].
     pub fn with_auto_log_tool_calls(mut self, mode: AutoLogToolCalls) -> Self {
         self.session = self.session.with_auto_log_tool_calls(mode);
+        self
+    }
+
+    /// See [`McpSession::with_dispatch_policy`].
+    pub fn with_dispatch_policy(mut self, policy: DispatchPolicy) -> Self {
+        self.session = self.session.with_dispatch_policy(policy);
         self
     }
 
@@ -999,7 +1053,7 @@ mod tests {
     fn session_defaults_to_writes_mode() {
         let (tools, resources, storage, _tmp) = bare_registries();
         let session = McpSession::new(tools, resources, storage);
-        assert_eq!(session.auto_log, AutoLogToolCalls::Writes);
+        assert_eq!(session.policy.auto_log, AutoLogToolCalls::Writes);
     }
 
     /// Closes the L3 producer gap. Until v0.2.3 the episodic hot
@@ -1436,15 +1490,19 @@ mod tests {
         // someone adds a tool and forgets to add an entry to the
         // match in `tool_call_payload`.
 
-        // remember: content + type + scope (tags excluded)
+        // remember: content + kind + scope (tags excluded). The `type`
+        // alias is recorded as `kind` too.
         let p = tool_call_payload(
             "remember",
             &json!({"content": "x", "type": "fact", "scope": "work", "tags": ["a"]}),
         );
         assert_eq!(p["tool"], "remember");
         assert_eq!(p["content"], "x");
-        assert_eq!(p["type"], "fact");
+        assert_eq!(p["kind"], "fact");
+        assert!(p.get("type").is_none());
         assert_eq!(p["scope"], "work");
+        let p = tool_call_payload("update", &json!({"id": "x", "kind": "decision"}));
+        assert_eq!(p["kind"], "decision");
         assert!(p.get("tags").is_none());
 
         // recall: query + limit (`k` is not a recall argument)

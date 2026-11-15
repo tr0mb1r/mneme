@@ -1,0 +1,106 @@
+name: quality-nightly
+
+# Recall and auto-context quality gate (plan W7).
+#
+# Seeds the synthetic corpus (tests/common/corpus.rs: 300 facts in 6
+# scopes, 10 stale/current pairs, 20 curated events, 60 warm events,
+# 6 pins) into a fresh data directory and runs `mneme eval` on it with
+# the questions in tests/fixtures/eval/questions.jsonl.
+#
+# Model-free: the stub embedder, no download, no network. Stub vectors
+# carry no meaning, so the gate reads keyword mode (`--gate-mode
+# keyword`); hybrid and semantic rows are still in the report but say
+# nothing here. A run with a real model is a manual `mneme eval` for
+# now (see book/src/cli.md).
+#
+# Nightly rather than per PR because it measures ranking, which moves
+# with tuning; the model-free structural invariants run on every PR in
+# tests/quality_structural.rs. Linux only.
+
+on:
+  schedule:
+    # 03:17 UTC, off the hour to stay clear of the scheduler rush.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MNEME_EMBEDDER: stub
+  MNEME_LOG: 'off'
+
+jobs:
+  quality:
+    name: quality gate (synthetic corpus, stub embedder)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build mneme and the corpus seeder
+        run: cargo build --release --bin mneme --example seed_storage
+
+      - name: Seed the corpus
+        run: |
+          mkdir -p quality
+          MNEME_DATA_DIR="$RUNNER_TEMP/corpus" ./target/release/examples/seed_storage \
+            corpus --questions tests/fixtures/eval/questions.jsonl quality/questions.jsonl
+
+      # Thresholds. Measured on the fixture when this gate was last
+      # calibrated (identical over six fresh seedings), keyword mode,
+      # unscoped:
+      #
+      #   L4 hit@5                      34/34 = 1.000   gate >= 0.95
+      #   all hit@5 (semantic+episodic) 46/46 = 1.000   gate >= 0.95
+      #                                 (44/46 passes, 43/46 fails)
+      #   context gold                  41/46 = 0.891   gate >= 0.85
+      #                                 (40/46 passes, 39/46 fails)
+      #   stale over current, context   0/10            gate <= 0
+      #   stale over current, recall    0/10            gate <= 0
+      #
+      # The recall figure was 10/10 until recall broke rank ties by
+      # `updated_at`: the two memories of a latest-state pair score the
+      # same on keywords, and the tie used to go to the older one.
+      #
+      # One known gap the numbers show, not gated:
+      #
+      # - With both layers, none of the ten hot L3-only questions has its
+      #   event in the top five: memories that share one token with the
+      #   question outrank the event that shares three. That is why
+      #   all hit@5 is 0.783 and not higher; raise its gate when it moves.
+      #
+      # Raise a threshold when the measured value rises; never lower one
+      # to make a red run green without saying why in the commit.
+      - name: mneme eval
+        run: |
+          ./target/release/mneme eval quality/questions.jsonl \
+            --data-dir "$RUNNER_TEMP/corpus" \
+            --out-dir quality \
+            --tag nightly \
+            --gate-mode keyword \
+            --min-l4-hit5 0.95 \
+            --min-all-hit5 0.95 \
+            --min-context-gold 0.85 \
+            --max-stale-over-current 0 \
+            --max-context-stale-over-current 0
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f quality/summary-nightly.md ]; then
+            cat quality/summary-nightly.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: quality-nightly
+          path: |
+            quality/metrics-nightly.json
+            quality/summary-nightly.md
+          if-no-files-found: warn

@@ -29,6 +29,9 @@ use crate::storage::archive::ColdArchive;
 
 pub mod export;
 pub mod forget;
+pub(crate) mod links;
+#[cfg(test)]
+mod links_surface_tests;
 pub mod list_scopes;
 pub mod pin;
 pub mod recall;
@@ -185,6 +188,23 @@ impl ToolResult {
         self
     }
 
+    /// Record the id of the memory a write stored or changed as
+    /// `_meta.id`, next to whatever advisories are already there.
+    ///
+    /// Clients get the id without parsing the reply text, and the
+    /// dispatcher copies it into the mirrored `tool_call` event as
+    /// `memory_id`, which is what lets `forget` find and redact that
+    /// event later.
+    pub fn with_id(mut self, id: impl std::fmt::Display) -> Self {
+        let mut meta = match self.meta.take() {
+            Some(Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        meta.insert("id".into(), Value::String(id.to_string()));
+        self.meta = Some(Value::Object(meta));
+        self
+    }
+
     pub fn with_error(mut self) -> Self {
         self.is_error = true;
         self
@@ -211,6 +231,14 @@ pub trait Tool: Send + Sync {
     /// when a caller passes a key the input schema does not declare.
     /// Use it to say where a commonly guessed parameter belongs.
     fn unknown_args_hint(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Like [`unknown_args_hint`](Self::unknown_args_hint), but for one
+    /// specific undeclared key: appended only when the caller passed
+    /// `arg`. Use it for a parameter agents are known to guess on this
+    /// tool but that lives on another one (`since` on `recall`).
+    fn unknown_arg_hint(&self, _arg: &str) -> Option<&'static str> {
         None
     }
 }
@@ -319,10 +347,13 @@ impl ToolRegistry {
         // L4 — semantic memory.
         r.register(Arc::new(
             remember::Remember::new(Arc::clone(&semantic), Arc::clone(&scope_state))
+                .with_episodic(Arc::clone(&episodic))
                 .with_max_chars(max_remember_chars)
                 .with_secret_guard(secrets),
         ));
-        r.register(Arc::new(recall::Recall::new(Arc::clone(&semantic))));
+        r.register(Arc::new(
+            recall::Recall::new(Arc::clone(&semantic)).with_episodic(Arc::clone(&episodic)),
+        ));
         r.register(Arc::new(forget::Forget::new(
             Arc::clone(&semantic),
             Arc::clone(&procedural),
@@ -330,6 +361,7 @@ impl ToolRegistry {
         )));
         r.register(Arc::new(
             update::Update::new(Arc::clone(&semantic))
+                .with_episodic(Arc::clone(&episodic))
                 .with_max_chars(max_remember_chars)
                 .with_secret_guard(secrets),
         ));
@@ -340,9 +372,9 @@ impl ToolRegistry {
         ));
         r.register(Arc::new(unpin::Unpin::new(Arc::clone(&procedural))));
         // L3 — episodic memory.
-        r.register(Arc::new(recall_recent::RecallRecent::new(Arc::clone(
-            &episodic,
-        ))));
+        r.register(Arc::new(
+            recall_recent::RecallRecent::new(Arc::clone(&episodic)).with_cold(cold.clone()),
+        ));
         r.register(Arc::new(summarize_session::SummarizeSession::new(
             Arc::clone(&episodic),
         )));
@@ -352,6 +384,7 @@ impl ToolRegistry {
         // captures conversation content rather than just tool names.
         let mut record_event_tool =
             record_event::RecordEvent::new(Arc::clone(&episodic), Arc::clone(&scope_state))
+                .with_semantic(Arc::clone(&semantic))
                 .with_max_chars(max_remember_chars)
                 .with_secret_guard(secrets);
         if let Some(ref session) = active_session {
@@ -367,7 +400,7 @@ impl ToolRegistry {
             Arc::clone(&semantic),
             Arc::clone(&procedural),
             Arc::clone(&episodic),
-            cold,
+            cold.clone(),
             schema_version,
         );
         if let Some(sched) = consolidation {
@@ -384,7 +417,9 @@ impl ToolRegistry {
             Arc::clone(&episodic),
             Arc::clone(&storage),
         )));
-        r.register(Arc::new(export::Export::new(procedural, episodic, storage)));
+        r.register(Arc::new(
+            export::Export::new(procedural, episodic, storage).with_cold(cold),
+        ));
         r
     }
 
@@ -410,8 +445,25 @@ impl ToolRegistry {
             Some(RegisteredTool {
                 allowed_args: Some(allowed),
                 hint,
+                tool,
                 ..
-            }) => reject_unknown_args(args, allowed, *hint),
+            }) => reject_unknown_args(args, allowed, *hint).map_err(|e| {
+                // Error path only: a clean call never reaches this.
+                let ToolError::InvalidArguments(mut msg) = e else {
+                    return e;
+                };
+                let mut seen: Vec<&'static str> = Vec::new();
+                for key in unknown_keys(args, allowed) {
+                    if let Some(h) = tool.unknown_arg_hint(key)
+                        && !seen.contains(&h)
+                    {
+                        seen.push(h);
+                        msg.push_str(". ");
+                        msg.push_str(h);
+                    }
+                }
+                ToolError::InvalidArguments(msg)
+            }),
             _ => Ok(()),
         }
     }
@@ -482,6 +534,66 @@ pub(crate) fn parse_tags_arg(arg: Option<&Value>) -> Result<Vec<String>, ToolErr
     }
 }
 
+/// The memory-kind argument shared by `remember`, `update` and `recall`:
+/// `kind`, or its older alias `type`.
+///
+/// Every reply names the field `kind`, so agents pass `kind` back; the
+/// input used to accept only `type` and such calls failed. Both are
+/// accepted now. Returns the key the caller used (for error messages)
+/// and its value; `None` when neither is set (JSON `null` counts as
+/// unset). Passing both with different values is an error rather than a
+/// silent pick of one.
+pub(crate) fn kind_arg(args: &Value) -> Result<Option<(&'static str, &Value)>, ToolError> {
+    let get = |key: &str| args.get(key).filter(|v| !v.is_null());
+    match (get("kind"), get("type")) {
+        (Some(k), Some(t)) if k != t => Err(ToolError::InvalidArguments(
+            "pass either kind or type, not both with different values \
+             (`type` is an alias of `kind`)"
+                .into(),
+        )),
+        (Some(k), _) => Ok(Some(("kind", k))),
+        (None, Some(t)) => Ok(Some(("type", t))),
+        (None, None) => Ok(None),
+    }
+}
+
+/// [`kind_arg`] parsed into a [`MemoryKind`]. A value that is not one of
+/// the four kinds is an error naming the key the caller used.
+///
+/// [`MemoryKind`]: crate::memory::semantic::MemoryKind
+pub(crate) fn parse_kind_arg(
+    args: &Value,
+) -> Result<Option<crate::memory::semantic::MemoryKind>, ToolError> {
+    let Some((key, value)) = kind_arg(args)? else {
+        return Ok(None);
+    };
+    let s = value
+        .as_str()
+        .ok_or_else(|| ToolError::InvalidArguments(format!("`{key}` must be a string")))?;
+    crate::memory::semantic::MemoryKind::parse(s)
+        .map(Some)
+        .ok_or_else(|| {
+            ToolError::InvalidArguments(format!(
+                "`{key}` must be one of fact|decision|preference|conversation, got `{s}`"
+            ))
+        })
+}
+
+/// Keys of `args` that `allowed` does not list, sorted. Empty for
+/// non-object `args`.
+fn unknown_keys<'a, S: AsRef<str>>(args: &'a Value, allowed: &[S]) -> Vec<&'a str> {
+    let Some(obj) = args.as_object() else {
+        return Vec::new();
+    };
+    let mut unknown: Vec<&str> = obj
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !allowed.iter().any(|a| a.as_ref() == *k))
+        .collect();
+    unknown.sort_unstable();
+    unknown
+}
+
 /// Reject arguments the tool does not declare.
 ///
 /// MCP hosts forward whatever keys the model produced; without this an
@@ -496,18 +608,10 @@ fn reject_unknown_args<S: AsRef<str>>(
     allowed: &[S],
     hint: Option<&str>,
 ) -> Result<(), ToolError> {
-    let Some(obj) = args.as_object() else {
-        return Ok(());
-    };
-    let mut unknown: Vec<&str> = obj
-        .keys()
-        .map(String::as_str)
-        .filter(|k| !allowed.iter().any(|a| a.as_ref() == *k))
-        .collect();
+    let unknown = unknown_keys(args, allowed);
     if unknown.is_empty() {
         return Ok(());
     }
-    unknown.sort_unstable();
     let names = unknown
         .iter()
         .map(|k| format!("`{k}`"))
@@ -676,7 +780,7 @@ mod tests {
             None,
             None,
             None,
-            AutoLogToolCalls::Off,
+            AutoLogToolCalls::Off.into(),
             Id::Number(1),
             Some(json!({"name": name, "arguments": arguments})),
         )
@@ -837,7 +941,7 @@ mod tests {
                 None,
                 None,
                 None,
-                AutoLogToolCalls::Writes,
+                AutoLogToolCalls::Writes.into(),
                 Id::Number(n),
                 Some(json!({"name": "counting", "arguments": {}})),
             )

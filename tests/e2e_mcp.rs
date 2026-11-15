@@ -561,3 +561,327 @@ async fn recall_honours_tags_and_similarity_floor() {
     drop(client.stdin);
     let _ = timeout(Duration::from_secs(5), child.wait()).await.unwrap();
 }
+
+/// Spawn a server and complete the MCP handshake.
+async fn connected() -> (tokio::process::Child, TempDir, Client) {
+    let (mut child, tmp) = spawn_isolated();
+    let mut client = Client {
+        stdin: child.stdin.take().unwrap(),
+        stdout: BufReader::new(child.stdout.take().unwrap()),
+        line_buf: String::new(),
+    };
+    client
+        .send(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "e2e", "version": "0.0.1" }
+            }
+        }))
+        .await;
+    let _ = client.recv().await;
+    client
+        .send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
+        .await;
+    (child, tmp, client)
+}
+
+impl Client {
+    /// One `tools/call` round trip; returns the whole JSON-RPC response.
+    async fn call(&mut self, id: u64, tool: &str, args: Value) -> Value {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": args }
+        }))
+        .await;
+        self.recv().await
+    }
+
+    /// `tools/call` that must succeed; returns the parsed JSON the tool
+    /// put in its text block.
+    async fn call_json(&mut self, id: u64, tool: &str, args: Value) -> Value {
+        let resp = self.call(id, tool, args).await;
+        assert_eq!(resp["result"]["isError"], false, "{tool} failed: {resp}");
+        serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+}
+
+/// Replies name the field `kind`, so agents pass `kind` back. Up to
+/// 1.5.1 the inputs took only `type` and such calls failed with
+/// "unexpected argument(s) `kind`".
+#[tokio::test]
+async fn remember_update_and_recall_accept_kind_with_type_as_alias() {
+    let (mut child, _tmp, mut client) = connected().await;
+
+    // The schemas declare both names.
+    client
+        .send(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
+        .await;
+    let tools = client.recv().await;
+    for name in ["remember", "update", "recall"] {
+        let tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap();
+        for key in ["kind", "type"] {
+            assert!(
+                tool["inputSchema"]["properties"][key].is_object(),
+                "{name} does not declare `{key}`"
+            );
+        }
+    }
+
+    let resp = client
+        .call(
+            10,
+            "remember",
+            json!({ "content": "we cut releases on Tuesdays", "kind": "decision" }),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "remember failed: {resp}");
+    // The old name keeps working.
+    let resp = client
+        .call(
+            11,
+            "remember",
+            json!({ "content": "the user likes short commit subjects", "type": "preference" }),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "remember failed: {resp}");
+
+    let rows = client
+        .call_json(
+            12,
+            "recall",
+            json!({ "query": "releases", "kind": "decision" }),
+        )
+        .await;
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["kind"], "decision");
+    assert_eq!(rows[0]["content"], "we cut releases on Tuesdays");
+    let id = rows[0]["id"].as_str().unwrap().to_owned();
+
+    let resp = client
+        .call(13, "update", json!({ "id": id, "kind": "fact" }))
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "update failed: {resp}");
+    let rows = client
+        .call_json(14, "recall", json!({ "query": "releases", "type": "fact" }))
+        .await;
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+    assert_eq!(rows[0]["id"], id.as_str());
+
+    drop(client.stdin);
+    let _ = timeout(Duration::from_secs(5), child.wait()).await.unwrap();
+}
+
+#[tokio::test]
+async fn kind_and_type_with_different_values_is_invalid_params() {
+    let (mut child, _tmp, mut client) = connected().await;
+
+    let resp = client
+        .call(
+            10,
+            "remember",
+            json!({ "content": "ambiguous", "kind": "decision", "type": "fact" }),
+        )
+        .await;
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pass either kind or type"),
+        "{resp}"
+    );
+    // Nothing was stored.
+    let rows = client
+        .call_json(11, "recall", json!({ "query": "ambiguous" }))
+        .await;
+    assert_eq!(rows, json!([]));
+
+    // Agreeing values are not a conflict.
+    let resp = client
+        .call(
+            12,
+            "remember",
+            json!({ "content": "unambiguous", "kind": "decision", "type": "decision" }),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+
+    // `recall` takes a time window itself since 1.6 (in 1.5.2 `since`
+    // was an unknown argument that pointed at `recall_recent`).
+    let rows = client
+        .call_json(
+            13,
+            "recall",
+            json!({ "query": "unambiguous", "since": "2026-09-01T00:00:00Z" }),
+        )
+        .await;
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+    let rows = client
+        .call_json(
+            14,
+            "recall",
+            json!({ "query": "unambiguous", "until": "2026-09-01T00:00:00Z" }),
+        )
+        .await;
+    assert_eq!(rows, json!([]));
+
+    // An event is found by `recall` only when the episodic layer is
+    // asked for.
+    let resp = client
+        .call(
+            15,
+            "record_event",
+            json!({ "kind": "decision", "payload": { "content": "moved the cutover to zeta-9" } }),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let rows = client
+        .call_json(
+            16,
+            "recall",
+            json!({ "query": "zeta-9", "layers": ["semantic", "episodic"] }),
+        )
+        .await;
+    let episodic: Vec<&Value> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["layer"] == "episodic")
+        .collect();
+    assert_eq!(episodic.len(), 1, "{rows}");
+    assert_eq!(episodic[0]["kind"], "decision");
+    assert_eq!(episodic[0]["content"], "moved the cutover to zeta-9");
+    let rows = client
+        .call_json(17, "recall", json!({ "query": "zeta-9" }))
+        .await;
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["layer"] == "semantic"),
+        "{rows}"
+    );
+
+    drop(client.stdin);
+    let _ = timeout(Duration::from_secs(5), child.wait()).await.unwrap();
+}
+
+/// `forget` used to delete the memory and leave its full text in the
+/// `tool_call` events that `remember` and `update` mirrored to the
+/// timeline.
+#[tokio::test]
+async fn forget_leaves_no_copy_of_the_content_on_the_timeline() {
+    let (mut child, _tmp, mut client) = connected().await;
+    let first = "Mira's locker combination is 31-07-44 at the Riverside gym";
+    let second = "Mira's locker combination changed to 08-19-62, same gym";
+
+    let resp = client
+        .call(10, "remember", json!({ "content": first, "kind": "fact" }))
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let id = resp["result"]["_meta"]["id"]
+        .as_str()
+        .expect("remember reports the id in _meta")
+        .to_owned();
+    let resp = client
+        .call(11, "update", json!({ "id": id, "content": second }))
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+
+    let timeline_args = json!({ "kind": "tool_call", "limit": 50 });
+    let before = client
+        .call(20, "recall_recent", timeline_args.clone())
+        .await;
+    let before = before["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        before.contains("31-07-44") && before.contains("08-19-62"),
+        "{before}"
+    );
+
+    let resp = client.call(12, "forget", json!({ "id": id })).await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    assert_eq!(resp["result"]["_meta"]["redacted_tool_calls"], 2, "{resp}");
+
+    let after = client.call(21, "recall_recent", timeline_args).await;
+    let after = after["result"]["content"][0]["text"].as_str().unwrap();
+    for content in [first, second] {
+        let chars: Vec<char> = content.chars().collect();
+        for window in chars.windows(20) {
+            let needle: String = window.iter().collect();
+            assert!(!after.contains(&needle), "`{needle}` survives in {after}");
+        }
+    }
+    // The rows are still there, as history without the text.
+    assert_eq!(after.matches("forgotten").count(), 2, "{after}");
+    assert!(after.contains(&id), "{after}");
+
+    drop(client.stdin);
+    let _ = timeout(Duration::from_secs(5), child.wait()).await.unwrap();
+}
+
+/// Looking things up is not conversation: `recall`, `recall_recent`,
+/// `stats`, `list_scopes` and `export` must leave the working-turn
+/// count where it was. Up to 1.5.1 every successful call pushed a turn.
+#[tokio::test]
+async fn read_only_tool_calls_leave_the_working_turn_count_unchanged() {
+    let (mut child, _tmp, mut client) = connected().await;
+
+    let resp = client
+        .call(
+            10,
+            "remember",
+            json!({ "content": "postgres runs on port 5432" }),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let stats = client.call_json(11, "stats", json!({})).await;
+    let before = stats["working"]["turns_total"].as_u64().unwrap();
+    assert_eq!(before, 1, "one write so far: {stats}");
+
+    let mut id = 20;
+    for _ in 0..3 {
+        for (tool, args) in [
+            ("recall", json!({ "query": "postgres port" })),
+            ("recall_recent", json!({ "limit": 5 })),
+            ("list_scopes", json!({})),
+            ("export", json!({})),
+            ("stats", json!({})),
+        ] {
+            id += 1;
+            let resp = client.call(id, tool, args).await;
+            assert_eq!(resp["result"]["isError"], false, "{tool}: {resp}");
+        }
+    }
+    let stats = client.call_json(50, "stats", json!({})).await;
+    assert_eq!(
+        stats["working"]["turns_total"].as_u64().unwrap(),
+        before,
+        "15 read-only calls must not add working turns: {stats}"
+    );
+
+    // A write still counts.
+    let resp = client
+        .call(51, "pin", json!({ "content": "always run cargo fmt" }))
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let stats = client.call_json(52, "stats", json!({})).await;
+    assert_eq!(
+        stats["working"]["turns_total"].as_u64().unwrap(),
+        before + 1
+    );
+
+    drop(client.stdin);
+    let _ = timeout(Duration::from_secs(5), child.wait()).await.unwrap();
+}

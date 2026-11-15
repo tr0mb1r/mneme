@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge several extract_baseline runs into one median baseline.
+"""Merge several extract_baseline runs into one baseline (median or min).
 
 A single criterion run on a shared CI runner is not a stable reference.
 Measured here on a Linux VM, `auto_context/no_query` came back at 233,
@@ -11,8 +11,15 @@ So capture N runs and take the per-bench median of each metric. The
 median is robust to the occasional co-tenant stall in a way the mean is
 not, and it needs no outlier-rejection heuristic to argue about.
 
+`--strategy min` takes the per-bench minimum instead. That is the right
+statistic for an A/B comparison on one machine (`ab_gate.sh`): noise on
+a shared runner only ever adds time, so the fastest of several
+interleaved rounds is the closest each side gets to its true cost, and
+both sides are treated alike. For a frozen reference keep the median.
+
 Usage:
-  python3 benches/baselines/merge_baselines.py OUT.json IN1.json IN2.json ...
+  python3 benches/baselines/merge_baselines.py [--strategy median|min] \
+      OUT.json IN1.json IN2.json ...
 
 Benches missing from some inputs are still emitted, with `runs`
 recording how many contributed — a bench measured once is visible as
@@ -46,7 +53,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("output", type=Path)
     ap.add_argument("inputs", type=Path, nargs="+")
+    ap.add_argument("--strategy", choices=("median", "min"), default="median")
     args = ap.parse_args()
+    pick = statistics.median if args.strategy == "median" else min
 
     if len(args.inputs) < 2:
         print(
@@ -73,7 +82,7 @@ def main() -> None:
                 if isinstance(e.get(metric), (int, float))
             ]
             if values:
-                out[metric] = statistics.median(values)
+                out[metric] = pick(values)
         merged[key] = out
 
     first = payloads[0]
@@ -83,7 +92,7 @@ def main() -> None:
         "host": first.get("host"),
         "corpus_filter": first.get("corpus_filter"),
         "merged_from": [str(p) for p in args.inputs],
-        "merge_strategy": "per-metric median across runs",
+        "merge_strategy": f"per-metric {args.strategy} across runs",
         "benches": merged,
     }
     args.output.write_text(json.dumps(payload, indent=2) + "\n")

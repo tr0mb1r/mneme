@@ -1,14 +1,15 @@
 name: perf
 
-# v1.1 release-gate per release-planning v2.1 §6.2: any p95 regression
-# > 10 % vs the frozen `benches/baselines/<release>.json` blocks merge
-# unless explicitly justified. Runs only on Linux for measurement
-# stability — macOS / Windows runners give different numbers and
-# would need their own per-platform baselines (deferred to v1.2 if
-# the cross-platform perf surface ever surfaces an actual issue).
+# Perf regression gate (release-planning v2.1 §6.2, revised after 1.5).
+# Each run benchmarks the base commit and the change on the same runner,
+# in three interleaved rounds, and fails if a hot-path median (the best
+# of the three, per side) slows by more than 15 %. The frozen
+# `benches/baselines/*.json` files are still compared, informationally:
+# absolute numbers do not transfer between GitHub runner hosts, so they
+# cannot gate. Linux only, for measurement stability.
 #
 # Trigger scope: pushes / PRs that touch code or bench infrastructure.
-# Doc-only changes don't pay the ~5 minute bench cost. The
+# Doc-only changes don't pay the bench cost. The
 # `paths-include` list here mirrors the inverse of `ci.yml`'s
 # `paths-ignore`.
 
@@ -39,12 +40,13 @@ env:
 
 jobs:
   perf:
-    name: criterion + p95 regression gate
+    name: criterion + same-runner regression gate
     runs-on: ubuntu-latest
-    # The bench job genuinely takes ~3-5 minutes (model-free, stub
-    # embedder, but four benches × 50 samples × ~1k iters each adds
-    # up). Cap at 20 minutes so a wedged bench doesn't sit forever.
-    timeout-minutes: 20
+    # Two release builds of the bench binaries (the base one reuses the
+    # cached dependencies) plus six `--quick` passes over the four
+    # hot-path benches: 15-25 minutes. Cap at 45 so a wedged bench
+    # doesn't sit forever.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -58,73 +60,99 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: cargo bench (hot path, n=${{ env.MNEME_BENCH_N }})
-        # Run the four hot-path benches plus the encryption-overhead
-        # bench. `criterion` writes per-bench JSON under
-        # target/criterion/<group>/<id>/new/. The next step extracts a
-        # single comparable JSON from those.
-        #
-        # `encryption_overhead` was written for v1.2 but never wired in
-        # here, so the AEAD layer had no CI signal at all. It is gated
-        # by ratio rather than against the frozen baseline — see the
-        # dedicated step below.
+      - name: resolve the commit to compare against
+        # The blocking gate compares this change against its base,
+        # benchmarked on this same runner in this same job. Absolute
+        # numbers swing by 2x between GitHub runner hosts, so comparing
+        # against a frozen file captured elsewhere flagged noise as
+        # regressions (and let real ones through on a fast host).
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "no base commit; the same-runner gate is skipped"
+            exit 0
+          fi
+          if git fetch --no-tags --depth=1 origin "$base"; then
+            echo "sha=$base" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "::warning::could not fetch base $base; the same-runner gate is skipped"
+          fi
+
+      - name: interleaved A/B bench (base vs this change)
+        # Builds the bench binaries once per side, then runs base, head,
+        # base, head, base, head and keeps each side's per-bench minimum
+        # (benches/baselines/ab_gate.sh explains why). The encryption
+        # bench runs once, on this change only: its gate is a ratio
+        # within one run.
+        if: steps.base.outputs.sha != ''
+        env:
+          AB_ROUNDS: '3'
+          AB_HEAD_ONLY: encryption_overhead
+        run: |
+          benches/baselines/ab_gate.sh "${{ steps.base.outputs.sha }}" /tmp/perf
+          cp /tmp/perf/head.json /tmp/perf/this-run.json
+
+      - name: cargo bench (no base to compare against)
+        # First push of a branch, or a base that could not be fetched:
+        # still produce this run's numbers for the informational
+        # compare and the encryption ratio gate.
+        if: steps.base.outputs.sha == ''
         run: |
           cargo bench --bench remember --bench recall \
                       --bench cold_start --bench auto_context \
                       --bench encryption_overhead \
                       -- --quick
-
-      - name: extract baseline JSON for this run
-        run: |
           mkdir -p /tmp/perf
           python3 benches/baselines/extract_baseline.py \
                   /tmp/perf/this-run.json \
                   --corpus ${{ env.MNEME_BENCH_N }}
-          echo "::group::This run's numbers (p95 µs)"
+
+      - name: this run's numbers
+        run: |
           python3 -c "
           import json
           d = json.load(open('/tmp/perf/this-run.json'))['benches']
           for k, v in d.items():
-              print(f'{k:55s}  p95={v[\"p95_ns\"]/1000:>10.2f} µs')
+              print(f'{k:55s}  p50={v[\"p50_ns\"]/1000:>10.2f} µs  p95={v[\"p95_ns\"]/1000:>10.2f} µs')
           "
-          echo "::endgroup::"
 
-      - name: compare against frozen baseline
-        # FAIL on any p95 > 10 % over the frozen v0.2.6 reference.
-        # The `compare.py` script handles the diff + exit code. PRs
-        # that legitimately need to regress perf (rare) should
-        # update the baseline JSON in the same commit and explain
-        # in the description per release-planning §6.2.
-        #
-        # The crypto benches are excluded here and gated by ratio in the
-        # next step: the frozen baseline predates them, and absolute
-        # sub-microsecond numbers do not transfer between the Apple
-        # Silicon capture host and this runner. `compare.py` reports
-        # them under "benches added since baseline" either way.
+      - name: compare against the base commit (same runner)
+        # BLOCKING. p50 rather than p95: with `--quick` sampling the
+        # tail is the noisiest statistic even on one host, and a real
+        # hot-path regression moves the median too. Each side's p50 is
+        # its minimum over the interleaved rounds, so a stall in one
+        # round cannot fail (or pass) the gate. A PR that regresses
+        # on purpose says why in its description and an admin merges it
+        # through the ruleset bypass.
+        if: steps.base.outputs.sha != ''
+        run: |
+          python3 benches/baselines/compare.py \
+                  /tmp/perf/base.json \
+                  /tmp/perf/head.json \
+                  --exclude encrypted_ \
+                  --metric p50_ns \
+                  --tolerance-pct 15
+
+      - name: informational compare against the frozen baselines
+        # NON-BLOCKING. `v0_2_6.json` was captured on Apple Silicon and
+        # predates hybrid recall; `v1_2_2_linux_x86_64.json` is a
+        # median-of-3 on x86_64 Linux but a different machine. Both are
+        # kept for the long-term trend, not for gating.
+        continue-on-error: true
         run: |
           python3 benches/baselines/compare.py \
                   benches/baselines/v0_2_6.json \
                   /tmp/perf/this-run.json \
-                  --exclude encrypted_
-
-      - name: informational compare against the platform-matched baseline
-        # NON-BLOCKING on purpose.
-        #
-        # The blocking gate above uses `v0_2_6.json`, captured on Apple
-        # Silicon, while this job runs on x86_64 Linux. That mismatch is
-        # not cosmetic: `auto_context/no_query` measures ~216 µs on the
-        # capture host and ~235-245 µs here, so it sits permanently near
-        # the 10 % threshold for reasons that have nothing to do with the
-        # diff under test.
-        #
-        # `v1_2_2_linux_x86_64.json` is a median-of-3 capture on x86_64
-        # Linux — same platform as this runner, though not the same
-        # machine. It is reported but not enforced until a maintainer has
-        # watched a few runs and confirmed it is stable on GitHub's
-        # runners; see benches/baselines/README.md for the promotion
-        # procedure.
-        continue-on-error: true
-        run: |
+                  --exclude encrypted_ || true
           python3 benches/baselines/compare.py \
                   benches/baselines/v1_2_2_linux_x86_64.json \
                   /tmp/perf/this-run.json \
@@ -147,5 +175,9 @@ jobs:
           path: |
             target/criterion/**/new/estimates.json
             target/criterion/**/new/sample.json
+            /tmp/perf/criterion/**/new/estimates.json
+            /tmp/perf/criterion/**/new/sample.json
+            /tmp/perf/rounds/*.json
+            /tmp/perf/base.json
             /tmp/perf/this-run.json
           retention-days: 14

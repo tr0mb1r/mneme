@@ -26,15 +26,13 @@ pub const SUBDIRS: &[&str] = &[
 /// privacy-discipline rule, so the data dir and every subdir is
 /// pinned to user-only access. Applied on every `scaffold` call so
 /// the invariant survives manual `chmod`s that loosened permissions.
-#[cfg(unix)]
 const DATA_DIR_MODE: u32 = 0o700;
 
 /// Create the `~/.mneme` directory tree under `root`. Idempotent.
 ///
-/// On Unix, tightens the root and every subdirectory to `0o700`
-/// (SEC-003 from the 2026-05-23 audit) so a misconfigured umask
-/// can't leak the data dir to group/world. On Windows this is a
-/// no-op; ACL-based hardening is out of scope for this fix.
+/// Tightens the root and every subdirectory to `0o700` (SEC-003 from
+/// the 2026-05-23 audit) so a misconfigured umask can't leak the data
+/// dir to group/world.
 pub fn scaffold(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root)?;
     apply_data_dir_mode(root)?;
@@ -46,16 +44,10 @@ pub fn scaffold(root: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn apply_data_dir_mode(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(DATA_DIR_MODE);
     std::fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn apply_data_dir_mode(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -100,7 +92,6 @@ mod tests {
     /// scaffold. Even if the umask is permissive (e.g. 0o022 → dirs
     /// would otherwise inherit 0o755), `apply_data_dir_mode` clamps
     /// them down.
-    #[cfg(unix)]
     #[test]
     fn scaffold_locks_data_dirs_to_0o700() {
         use std::os::unix::fs::PermissionsExt;
@@ -122,7 +113,6 @@ mod tests {
     /// SEC-003: scaffold also tightens an existing, looser data dir
     /// on a re-run — so a one-off `chmod 0o755` on an upgrade path
     /// doesn't strand the invariant.
-    #[cfg(unix)]
     #[test]
     fn scaffold_retightens_existing_loose_dir() {
         use std::os::unix::fs::PermissionsExt;

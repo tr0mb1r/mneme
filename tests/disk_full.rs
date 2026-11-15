@@ -10,11 +10,8 @@
 //! Either is an acceptable "writes return clear errors" outcome — what
 //! matters is that we don't panic and that reads keep working afterwards.
 //!
-//! On non-Unix targets the test is skipped (file-size rlimit isn't a thing
-//! on Windows). This is a single-test file so the rlimit doesn't bleed into
-//! sibling tests.
-
-#![cfg(unix)]
+//! This is a single-test file so the rlimit doesn't bleed into sibling
+//! tests.
 
 use mneme::MnemeError;
 use mneme::storage::{Storage, redb_impl::RedbStorage};

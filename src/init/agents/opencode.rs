@@ -43,7 +43,7 @@
 //! What this installer DOES do:
 //!
 //! - Resolves `~/.config/opencode/opencode.json` (uniform path on
-//!   macOS / Linux / Windows — OpenCode follows XDG conventions).
+//!   macOS and Linux — OpenCode follows XDG conventions).
 //! - Upserts `mcp.mneme = {type: "local", command: ["mneme",
 //!   "client"], enabled: true}` via `json_config::upsert_file`.
 //! - Appends the absolute path of
@@ -520,8 +520,8 @@ mod tests {
 
     #[test]
     fn config_path_is_xdg_uniform() {
-        // OpenCode uses `~/.config/opencode/opencode.json` on macOS,
-        // Linux, and Windows. Pin the literal path so a future
+        // OpenCode uses `~/.config/opencode/opencode.json` on macOS
+        // and Linux. Pin the literal path so a future
         // refactor doesn't introduce a `cfg(target_os)` split.
         let home = Path::new("/some/home");
         assert_eq!(

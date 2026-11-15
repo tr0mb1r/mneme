@@ -167,6 +167,25 @@ impl Resource for Stats {
             None => Value::Null,
         };
 
+        // How the stored memories are known. `unspecified` is every
+        // memory written without a `provenance`, which is all of them
+        // before 1.6.
+        let mut by_provenance = serde_json::Map::new();
+        let mut with_provenance = 0usize;
+        for (provenance, count) in self
+            .semantic
+            .provenance_counts()
+            .await
+            .map_err(|e| ResourceError::Internal(format!("provenance counts: {e}")))?
+        {
+            with_provenance += count;
+            by_provenance.insert(provenance.as_str().into(), json!(count));
+        }
+        by_provenance.insert(
+            "unspecified".into(),
+            json!(semantic_count.saturating_sub(with_provenance)),
+        );
+
         let body = json!({
             "version": env!("CARGO_PKG_VERSION"),
             "schema_version": self.schema_version,
@@ -179,6 +198,7 @@ impl Resource for Stats {
                     "cold_quarters": cold_quarters,
                 },
                 "total_redb": semantic_count + hot_count + warm_count,
+                "by_provenance": by_provenance,
                 "large_memory_count": large_memory_count,
             },
             "semantic_index": {
@@ -392,6 +412,7 @@ mod tests {
             ConsolidationParams {
                 hot_to_warm_days: 28,
                 warm_to_cold_days: 180,
+                cold_exempt_kinds: Vec::new(),
             },
             SchedulerConfig::disabled(),
             vec![],
@@ -443,6 +464,7 @@ mod tests {
             ConsolidationParams {
                 hot_to_warm_days: 28,
                 warm_to_cold_days: 180,
+                cold_exempt_kinds: Vec::new(),
             },
             SchedulerConfig::disabled(),
             vec![],
@@ -483,6 +505,7 @@ mod tests {
             ConsolidationParams {
                 hot_to_warm_days: 28,
                 warm_to_cold_days: 180,
+                cold_exempt_kinds: Vec::new(),
             },
             SchedulerConfig::disabled(),
             vec![],

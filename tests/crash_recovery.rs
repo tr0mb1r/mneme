@@ -172,7 +172,7 @@ impl Driver {
         // Drop stdin first so the child sees EOF or EPIPE on its next write.
         self.stdin.take();
         if let Some(child) = self.child.as_mut() {
-            // std::process::Child::kill sends SIGKILL on Unix, TerminateProcess on Windows.
+            // std::process::Child::kill sends SIGKILL.
             let _ = child.kill();
             let _ = child.wait();
         }

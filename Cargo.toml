@@ -93,10 +93,9 @@ zeroize = { version = "1", features = ["derive"] }
 bip39 = { version = "2", default-features = false, features = ["std"] }
 # OS keyring integration for the KEK happy path (ADR-0013 D6). On
 # macOS the `apple-native` backend talks to Keychain Services; on
-# Linux it talks to Secret Service over D-Bus; on Windows it uses
-# DPAPI. Headless deployments (no D-Bus) fall through to the
+# Linux it talks to Secret Service over D-Bus. Headless deployments (no D-Bus) fall through to the
 # MNEME_RECOVERY_PHRASE env var per the same ADR.
-keyring = { version = "3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
+keyring = { version = "3", default-features = false, features = ["apple-native", "linux-native"] }
 # Base64 for the wrapped-DEK blob in keystore.json. The crate is
 # already in our transitive tree (tokenizers); declaring it directly
 # lets us pin the version we depend on.
@@ -108,9 +107,9 @@ base64 = "0.22"
 # `hf-hub` uses the blocking `ureq` path — model downloads are one-shot
 # operations, no need to drag a second runtime in. `instant-distance` provides
 # the HNSW we serialize via its `with-serde` feature.
-candle-core = { version = "0.10" }
-candle-nn = { version = "0.10" }
-candle-transformers = { version = "0.10" }
+candle-core = { version = "0.11" }
+candle-nn = { version = "0.11" }
+candle-transformers = { version = "0.11" }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
 instant-distance = { version = "0.6", features = ["with-serde"] }
@@ -123,9 +122,8 @@ notify = "6"
 # fine on a single thread.
 zstd = { version = "0.13", default-features = false }
 # Phase 6 §11.2 backup/restore. `tar` + `flate2` is the boring,
-# universally-available combo; on Windows we rely on tar 0.4's
-# fallback path that ignores xattrs. Default features only — we
-# don't pull the extended-format / pax bits.
+# universally-available combo. Default features only — we don't pull
+# the extended-format / pax bits.
 tar = { version = "0.4", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 

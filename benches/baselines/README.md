@@ -1,10 +1,13 @@
 # Performance baselines
 
 Frozen snapshots of mneme's hot-path latency, captured per release
-candidate. Used as the reference point for the v1.1 regression gate
-(release-planning v2.1 §6.2). Future runs compare against the
-matching baseline; >10% slowdown in any p95 tier blocks merge unless
-explicitly justified.
+candidate, and the scripts `perf.yml` uses.
+
+The frozen files do **not** gate merges. Absolute numbers do not carry
+between machines (see [Platform mismatch](#platform-mismatch)), so the
+blocking check is a [same-machine A/B](#the-blocking-gate-same-machine-ab)
+of the base commit against the change. The frozen files are compared in
+an informational step, for the long-term trend.
 
 ## What's captured
 
@@ -12,17 +15,18 @@ explicitly justified.
 2026-05-09 against `develop` HEAD (which is identical to `main`
 HEAD on hot-path code; the two diverging commits — backup `run/`
 exclusion and `remember` description revision — touch neither
-embedding nor storage paths). Captured on **Apple Silicon**. This is
-still the blocking reference in `perf.yml`.
+embedding nor storage paths). Captured on **Apple Silicon**.
 
 `v1_2_2_linux_x86_64.json` — median of 3 `--quick` runs on **x86_64
-Linux**, the platform `perf.yml` actually runs on. Reported but *not*
-enforced; see [Platform mismatch](#platform-mismatch) below.
+Linux**, the platform `perf.yml` runs on, but a different machine.
+
+Both are informational in `perf.yml`.
 
 ## Platform mismatch
 
-`perf.yml` runs on `ubuntu-latest` and gates against a baseline
-captured on Apple Silicon. That is not a cosmetic difference:
+This is why the frozen files stopped being the gate. `perf.yml` runs on
+`ubuntu-latest`, and it used to gate against the Apple Silicon capture.
+That is not a cosmetic difference:
 
 | Bench | Apple Silicon p95 | x86_64 Linux p95 |
 |---|---|---|
@@ -30,9 +34,9 @@ captured on Apple Silicon. That is not a cosmetic difference:
 | `remember/after_prefill_n=1000` | 4108.62 µs | ~856 µs |
 | `recall/k=10_n=1000_pending` | 167.32 µs | ~138 µs |
 
-`auto_context/no_query` therefore sits permanently within a few points
-of the 10 % failure threshold for reasons unrelated to any diff under
-test, while `remember` has ~4.8x of slack and would hide a real
+Against that file, `auto_context/no_query` sat permanently within a few
+points of the failure threshold for reasons unrelated to any diff under
+test, while `remember` had ~4.8x of slack and would have hidden a real
 regression completely.
 
 **Runner noise compounds it.** Three consecutive runs of *identical*
@@ -41,23 +45,13 @@ code on one Linux VM produced 233, 236 and 422 µs for
 single-run capture is an unsuitable reference, which is why
 `merge_baselines.py` exists.
 
-### Promotion procedure
+A same-class frozen reference was considered and dropped: GitHub
+runner hosts differ from each other by as much as 2x, so even a file
+captured on a runner flags noise and misses regressions. Comparing two
+builds on one machine in one job has no such problem.
 
-To make the gate meaningful, the reference must come from the same
-runner class that enforces it:
-
-1. Let `perf.yml` run on `main` a few times and read the
-   "informational compare" step's output. Confirm the deltas against
-   `v1_2_2_linux_x86_64.json` stay inside ±10 % across runs.
-2. If they do, make it the blocking reference: point the "compare
-   against frozen baseline" step at `v1_2_2_linux_x86_64.json` and
-   drop the informational step.
-3. If they don't, re-capture on a GitHub runner (a `workflow_dispatch`
-   job that runs the capture procedure below three times and uploads
-   the merged JSON as an artifact) and commit that instead.
-
-Keep `v0_2_6.json` either way — it is the historical record of the
-v1.0 numbers and the reference for manual release-hardware sweeps.
+Keep `v0_2_6.json` — it is the historical record of the v1.0 numbers and
+the reference for manual release-hardware sweeps.
 
 Per bench, the JSON records:
 
@@ -129,6 +123,33 @@ The extractor records the git branch + sha + describe in the JSON's
 `git` block so the baseline is traceable to a specific commit. Re-run
 after every measurable change to the storage seam, the embedder
 loader, or the orchestrator.
+
+## The blocking gate: same-machine A/B
+
+What `perf.yml` blocks on is not a frozen file. `ab_gate.sh` builds the
+bench binaries for the base commit (in a temporary git worktree) and for
+the change, runs them in interleaved rounds (base, head, base, head, …),
+and writes each side's per-bench minimum (`merge_baselines.py --strategy
+min`). `compare.py` then gates on p50 at 15 %.
+
+```bash
+benches/baselines/ab_gate.sh <base-ref> /tmp/perf     # AB_ROUNDS=3 by default
+python3 benches/baselines/compare.py /tmp/perf/base.json /tmp/perf/head.json \
+        --metric p50_ns --tolerance-pct 15
+```
+
+Interleaving exposes both sides to the same drift, and the minimum
+discards rounds that hit a stall. Both matter for `remember`, which is
+one fdatasync and a handful of thread wake-ups per call: about 21k
+instructions of our code inside 100-250 µs of waiting. One base pass
+followed by one head pass differed by 22 % on identical code.
+
+Each side's criterion output goes to its own directory through
+`CRITERION_HOME`, and `extract_baseline.py --criterion-root` reads it
+from there. The binaries are copied out of the shared target dir before
+anything runs, so a side cannot measure the other's build. Per-round
+JSON is kept under `<out>/rounds/` (and uploaded by CI) for when a
+result needs a second look.
 
 ## Comparison
 

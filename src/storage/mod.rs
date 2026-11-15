@@ -32,6 +32,32 @@ pub(crate) const MEM_KEY_PREFIX: &[u8] = b"mem:";
 /// new field would make every existing record undecodable.
 pub(crate) const SUP_KEY_PREFIX: &[u8] = b"sup:";
 
+/// Last content edit: `MTS_KEY_PREFIX || ulid_bytes` holds an `i64`
+/// big-endian count of milliseconds since the Unix epoch. Written only
+/// when `update` changes a memory's content; an absent row means the
+/// memory was never edited, so its `updated_at` is its `created_at`.
+/// A side table for the same reason as [`SUP_KEY_PREFIX`].
+pub(crate) const MTS_KEY_PREFIX: &[u8] = b"mts:";
+
+/// Lifecycle status: `ST_KEY_PREFIX || ulid_bytes` holds one byte and
+/// exists only for an archived memory. An absent row means active.
+pub(crate) const ST_KEY_PREFIX: &[u8] = b"st:";
+
+/// Typed relations from a memory:
+/// `REL_KEY_PREFIX || from_ulid || type || tag || to_key`. Layout and
+/// value encoding are documented in
+/// [`crate::memory::relations`].
+pub(crate) const REL_KEY_PREFIX: &[u8] = b"rel:";
+
+/// The same relations keyed from the target:
+/// `RREL_KEY_PREFIX || tag || to_key || type || from_ulid`.
+pub(crate) const RREL_KEY_PREFIX: &[u8] = b"rrel:";
+
+/// Provenance: `PROV_KEY_PREFIX || ulid_bytes` holds a version byte and
+/// a postcard [`ProvenanceRecord`](crate::memory::relations::ProvenanceRecord).
+/// Absent for a memory stored without one.
+pub(crate) const PROV_KEY_PREFIX: &[u8] = b"prov:";
+
 #[async_trait]
 pub trait Storage: Send + Sync {
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;

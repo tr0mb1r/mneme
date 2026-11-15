@@ -57,15 +57,16 @@ running.
 **Hot-reload schedule.** A `notify::PollWatcher` polls the file every
 **500 ms** and reloads the in-memory cache when the content hash
 changes. This is faster and more uniform across platforms than
-FSEvents (macOS) or `ReadDirectoryChangesW` (Windows), which
-coalesce events for tens of seconds. External edits are reflected in
+FSEvents (macOS), which coalesces events for tens of seconds. External edits are reflected in
 the running server in **under 1 second**.
 
 **Surfaced via:**
 - Tool: `pin` (write), `unpin` (write).
 - Resource: `mneme://procedural` (read).
-- Auto-context: pinned items get a guaranteed share of the token
-  budget on every `mneme://context` read.
+- Auto-context: every pinned item is in every `mneme://context` read;
+  pins are never trimmed to fit the token budget. A read scoped with
+  `?scope=` returns the pins of those scopes plus the pins of
+  `[auto_context] pin_scopes` (default `global`).
 
 **What runs today:** All of the above. No deferred features.
 
@@ -88,12 +89,25 @@ temp+rename per checkpoint). Single file per session.
 - `session_interval_turns = 5` — and at least every 5 turns.
 - Whichever fires first.
 
+**L1 is session-local.** Every MCP session has its own working
+session and its own checkpoint scheduler: one per `mneme run` process
+(stdio), one per accepted daemon connection, one per HTTP
+`Mcp-Session-Id`. Agents sharing a daemon share L0, L3 and L4, never
+L1. (Up to 1.5.x the daemon and HTTP transports shared one working
+session between all clients.) A per-client session is flushed and its
+scheduler stopped when the connection closes, on `DELETE /mcp`, when an
+idle HTTP session is evicted, and at server shutdown; a session with no
+turns writes no snapshot.
+
 **What runs today:**
 > `cli::run` spawns a `CheckpointScheduler` that writes the active
 > session to `~/.mneme/sessions/<session_id>.snapshot` on the first
 > of two triggers: every `session_interval_secs` (30 s default) when
 > there are pending turns, OR every `session_interval_turns` (5
-> default) tools/call invocations, whichever fires first. A clean
+> default) turns, whichever fires first. A turn is a message recorded
+> with `record_event`, or a successful call to a tool that changes
+> something; read-only tools (`recall`, `recall_recent`, `stats`,
+> `list_scopes`, `export`) do not add turns. A clean
 > shutdown writes a final snapshot with `clean_shutdown = true`.
 > Per-session counters land on `mneme://stats` and the `stats` tool
 > under the `working` key: `session_id`, `started_at`,
@@ -175,7 +189,36 @@ Eligible events that never move mean the idle gate hasn't closed: every
 The pass is idempotent and crash-safe: hot→warm writes the new key
 before deleting the old; warm→cold writes the cold bundle (atomic
 temp+rename) before deleting warm rows. A `kill -9` mid-pass leaves
-duplicates that the next run cleans up.
+duplicates that the next run cleans up. Until it does, readers return
+such a row once (the hot copy) and `forget` removes both copies.
+
+**Reading each tier.**
+
+| Tier | Read by |
+|---|---|
+| hot (`epi:`) | `recall_recent`, `mneme://recent`, `mneme://context`, `summarize_session`, `export` |
+| warm (`wepi:`) | `recall_recent` when `since` is older than `hot_to_warm_days`, when only `until` is set, or with `include_warm: true`; `export` (tool and `mneme export`) by default; `recall` with `layers` containing `episodic`; `forget` by id |
+| cold (`cold/*.zst`) | `recall_recent` and `export` with `include_cold: true`, `mneme export --include-cold`. Not searched by `recall`. `mneme backup` copies the files. |
+
+Rows from `recall_recent` and `export` carry `"tier": "hot"`,
+`"warm"` or `"cold"`.
+
+**Searching L3.** Events are not embedded, but the ones whose kind is in
+`[episodic] index_kinds` are covered by an in-memory keyword index
+(BM25, the same code as L4's lexical half) over the hot and warm tiers.
+`recall(layers=["semantic","episodic"])` merges those matches with L4's
+on one `rank` scale. The index is built from redb on first use and kept
+in step on record, forget and consolidation; nothing extra is written
+to disk. A row's move from hot to warm does not change it. Kinds in
+`[consolidation] cold_exempt_kinds` never go to cold, so a decision
+stays searchable however old it gets; everything else leaves the index
+when it is archived. Hot events that `recall` returns get their
+`last_accessed` refreshed (at most daily, `[episodic] touch_on_recall`),
+which is what keeps a still-used event from being promoted on age. Before 1.5.2 nothing read the warm tier, so an event
+dropped out of every read path at 28 days and `export` was not a
+complete backup. `export` still leaves out the cold tier: for a full
+copy use `mneme backup`, which tars the data dir and so restores every
+row into the tier it was in.
 
 **Designed schedule.** `[consolidation] schedule = "idle"` in the
 default config — meant to run when the server is idle. v1.0 honours
@@ -243,7 +286,7 @@ where `remember`, `recall`, `update`, and `forget` live.
 
 **Embedding.** **Yes.** Every `remember` and every `update` that
 changes `content` calls the embedder. `update`s that change only
-`tags` / `scope` / `type` skip the embedder.
+`tags` / `scope` / `kind` skip the embedder.
 
 The active embedder is set in `[embeddings] model` in `config.toml`:
 - **`bge-m3`** (default) — ~1.5 GB, 1024-dim, multilingual, top-tier
@@ -310,7 +353,7 @@ temp+rename); WAL replay covers the gap. Verified by
   `mneme://context?q=<text>` (see §6).
 
 **Filters and how they're satisfied.** `recall` accepts `scope`,
-`type`, `tags` (all must match), and `min_similarity` (a cosine-
+`kind`, `tags` (all must match), and `min_similarity` (a cosine-
 similarity floor, `1.0` = identical). The HNSW indexes vectors only, so
 these are applied *after* the search — and because a selective filter
 would otherwise leave the result short, `recall` widens its index probe
@@ -335,6 +378,46 @@ Unfiltered recall still issues exactly one probe.
 > vector search fused with BM25 keyword search over an in-memory index,
 > so exact names are found reliably; `mode` selects `hybrid` (default),
 > `semantic`, or `keyword`, and each row reports `match`.
+>
+> **Changed in v1.6.** A memory has an `updated_at`: the last time
+> `update` changed its content (never edited means `created_at`).
+> `update(id, status: "archived")` takes a memory out of `recall` and
+> auto-context while keeping it in the store and in `export`;
+> `status: "active"` brings it back. Both are stored in side tables next
+> to the `mem:` row (`mts:<id>` → big-endian `i64` milliseconds, `st:<id>`
+> → one byte, present only when archived), so the on-disk memory format
+> and `schema_version` are unchanged and `forget` removes them with the
+> memory. `recall` rows gain `rank`, `updated_at` and `status`.
+>
+> **Also in v1.6.** A memory can carry typed relations and a
+> provenance.
+>
+> - **Relations.** `remember` / `update` take
+>   `relations: [{type, id | ref, reason}]` with type `supersedes`,
+>   `refines`, `contradicts` or `evidence_for`. The target is a memory,
+>   an event (`evidence_for` only) or an external reference string
+>   (`evidence_for` only, opaque, at most 128 bytes). `supersedes` hides
+>   the target as before. `refines` and `contradicts` *demote* it while
+>   the refiner is current and newer: it stays in `recall`, flagged
+>   `demoted`, with its keyword evidence dropped and its rank lowered by
+>   `[recall] demote_margin`; auto-context leaves it out unless
+>   `[auto_context] include_demoted`. `recall(ref=…)` returns the
+>   memories citing a reference; `recall(expand=1)` quotes linked
+>   memories.
+> - **Provenance.** `provenance` (`user_stated`, `observed`, `inferred`,
+>   `imported`) and a free-form `source`. Filterable in `recall`,
+>   counted in `stats`, no effect on ranking.
+> - **Storage.** More side tables, so still no change to the memory
+>   format or `schema_version`: `rel:<from><type><tag><target>` and its
+>   mirror `rrel:<tag><target><type><from>` hold a relation's reason and
+>   creation time, `prov:<id>` the provenance; each value is a version
+>   byte followed by postcard. `tag` distinguishes a memory id, an event
+>   id and a reference. `forget` removes a memory's relations in both
+>   directions and its provenance, and a relation whose source memory is
+>   gone is ignored on read.
+> - **From the timeline.** `record_event(promote: {type, tags})` stores
+>   the event's text as a memory with an `evidence_for` link to the
+>   event. Still agent-driven: nothing is promoted unless asked.
 
 ---
 
@@ -342,15 +425,41 @@ Unfiltered recall still issues exactly one probe.
 
 **What it is.** A pre-assembled context blob the agent can read at
 session start. Combines:
-- All pinned items from L0 (every one — they're a small set).
+- All pinned items from L0 (every one — they're a small set, and
+  they are never trimmed).
 - The most recent turns from L1, the active working session.
-- The most recent N events from L3 (recency-ordered).
+- Events from L3: the most recent ones, plus (with a `?q=` seed) the
+  best lexical matches for the query, de-duplicated and clipped.
 - L4 semantic hits, **when the read carries a `?q=` seed** (see
   Parameters below).
 
 Packed to a token budget (`[budgets] auto_context_token_budget =
-4000` by default), with a per-layer floor so no single layer can
-crowd the others out.
+4000` by default) that is divided by layer shares from
+`[auto_context]`:
+
+| Layer | Share |
+|---|---|
+| L0 pins | never trimmed |
+| L1 turns | at most 5% (`working_max_share`) |
+| L3 events | at most 35% (`episodic_max_share`) |
+| L4 memories | at least 30%, or 5 rows if smaller (`semantic_min_share`, `semantic_min_items`); no ceiling |
+
+**Scoring.** Scores order rows inside those shares.
+
+- A memory scores `rank × 0.7 × freshness`. `rank` is similarity plus
+  keyword evidence, as `recall` reports it. `freshness` is
+  `max(0.75, 2^(−age/90d))`, with age counted from the memory's last
+  content edit (`updated_at`), not from when it was created.
+- An event scores `retrieval_weight × 0.8 × recency × (β + (1−β)·lex)`.
+  `recency` has a 14-day half-life on `last_accessed`; `lex` is how much
+  of the query the event contains; β is 0.3. With no query `lex` is 1.
+- A working turn scores `0.9 × recency`.
+
+**Event selection.** Events of kind `archived` and events with
+`retrieval_weight` ≤ 0.3 are left out. Of the rest, exact duplicates and
+near-duplicates (word overlap ≥ 0.6) are dropped, at most 6 of one kind
+are kept, and payloads over 400 characters are clipped and flagged
+`truncated`. All of these are `[auto_context]` keys.
 
 **Parameters.** `resources/read` hands the server a URI and nothing
 else, so parameters ride on the URI's query string:
@@ -358,7 +467,7 @@ else, so parameters ride on the URI's query string:
 | Param | Effect |
 |---|---|
 | `q` (or `query`) | Natural-language seed for L4. Without it the `semantic` array is empty — a vector search needs something to be similar *to*. Percent-encoded. |
-| `scope` | Restricts L0 / L3 / L4 to one scope. L1 turns are session-local and always included. |
+| `scope` | One scope or a comma-separated set (`scope=a,b`). Restricts L3 / L4 to those scopes; L0 returns their pins plus those of `[auto_context] pin_scopes`. L1 turns are session-local and always included. |
 | `limit` | Semantic over-fetch before the budget pass trims. Clamped server-side. |
 | `kinds` | Comma-separated event kinds; the L3 section holds only these. Naming an auto-logged kind opts back in to it. |
 | `exclude_kinds` | Comma-separated event kinds to hide from L3, on top of the default exclusions. |
@@ -373,7 +482,8 @@ and `mneme://recent` still return every kind. Each L3 row also carries its
 ```
 mneme://context                                  → L0 + L1 + L3
 mneme://context?q=how%20do%20we%20deploy          → + L4 hits
-mneme://context?q=deploy&scope=work               → all four layers, work only
+mneme://context?q=deploy&scope=work               → all four layers; work, plus global pins
+mneme://context?q=deploy&scope=work,infra         → two scopes, plus global pins
 ```
 
 Unknown parameters and malformed values are ignored rather than
@@ -387,8 +497,10 @@ string (once) before the HNSW search.
 agent reads `mneme://context`. Latency budget per spec §13:
 **p95 < 200 ms, p99 < 400 ms**.
 
-**Determinism.** Given the same DB state, the assembly is
-deterministic. Verified by `orchestrator::tests::build_context_is_deterministic`.
+**Determinism.** Given the same DB state and the same instant, the
+assembly is deterministic: the assembler takes the clock as a parameter.
+Verified by `orchestrator::tests::build_context_is_deterministic` and
+`build_context_at_is_reproducible_for_a_fixed_now`.
 
 **Surfaced via:** Resource `mneme://context` (fixed form) and
 `mneme://context{?q,scope,limit,kinds,exclude_kinds}` (advertised via
@@ -401,6 +513,13 @@ deterministic. Verified by `orchestrator::tests::build_context_is_deterministic`
 > could ever reach auto-context, and the `working` section was omitted
 > from the response body entirely even though its turns were charged
 > against the token budget. Both are fixed; `?q=` and `?scope=` are new.
+>
+> **Changed in v1.6.** The flat 1/16-per-layer reserve is replaced by the
+> layer shares above. Memories are scored on `updated_at` with a 90-day
+> half-life and a 0.75 floor (it was 14 days from `created_at`). Events
+> are ranked against the query, de-duplicated, capped per kind and
+> clipped. `?scope=` takes a set, and a scoped read also returns the pins
+> of `pin_scopes`: before, `?scope=x` dropped every `global` pin.
 
 ---
 

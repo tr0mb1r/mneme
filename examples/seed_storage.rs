@@ -5,8 +5,20 @@
 //! ```bash
 //! MNEME_DATA_DIR=/tmp/foo cargo run --example seed_storage -- write 10
 //! MNEME_DATA_DIR=/tmp/foo cargo run --example seed_storage -- read
+//! MNEME_DATA_DIR=/tmp/bar cargo run --example seed_storage -- corpus
+//! MNEME_DATA_DIR=/tmp/baz cargo run --example seed_storage -- corpus \\
+//!     --questions tests/fixtures/eval/questions.jsonl /tmp/questions.jsonl
 //! ```
 //!
+//! - `corpus` fills a fresh data directory with the synthetic corpus the
+//!   structural quality tests use (`tests/common/corpus.rs`): 300 facts
+//!   in 6 scopes, 10 stale/current pairs, 20 curated events, 60 warm
+//!   events and 6 pins, all deterministic. Vectors come from the stub
+//!   embedder, so serve the directory with `MNEME_EMBEDDER=stub mneme run`
+//!   to poke at it; a real model re-embeds everything on first boot.
+//!   With `--questions <template> <out>` it also writes the evaluation
+//!   questions for `mneme eval`, with the template's symbolic keys
+//!   replaced by the ids this seeding assigned.
 //! - `write N` populates the dir with N plaintext rows under
 //!   `RedbStorage::open` (legacy plaintext path).
 //! - `read` opens via `crypto::boot::open_episodic_storage`, which
@@ -23,6 +35,9 @@ use mneme::memory::procedural::ProceduralStore;
 use mneme::storage::Storage;
 use mneme::storage::redb_impl::RedbStorage;
 use std::path::PathBuf;
+
+#[path = "../tests/common/corpus.rs"]
+mod corpus;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -94,7 +109,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  {} {} {:?}", p.id, p.content, p.tags);
             }
         }
-        other => return Err(format!("unknown command: {other:?}; use `write N` or `read`").into()),
+        "corpus" => {
+            let c = corpus::seed_data_dir(&root).await?;
+            // `--questions <template> <out>`: resolve the symbolic keys
+            // of a questions template to this store's ids.
+            if args.get(2).map(String::as_str) == Some("--questions") {
+                let (template, out) = match (args.get(3), args.get(4)) {
+                    (Some(t), Some(o)) => (t, o),
+                    _ => {
+                        return Err("usage: corpus --questions <template.jsonl> <out.jsonl>".into());
+                    }
+                };
+                let resolved = c.resolve_questions(&std::fs::read_to_string(template)?)?;
+                std::fs::write(out, resolved)?;
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "data_dir": root.display().to_string(),
+                    "scopes": corpus::SCOPES,
+                    "facts": c.facts.len(),
+                    "id_heavy_facts": c.id_heavy().count(),
+                    "stale_current_pairs": c.pairs.len(),
+                    "semantic_rows": c.semantic_rows(),
+                    "curated_events_hot": c.curated.len(),
+                    "events_warm": c.warm.len(),
+                    "pins": c.pins.len(),
+                    "pins_global": c.pins_in("global").count(),
+                })
+            );
+        }
+        other => {
+            return Err(
+                format!("unknown command: {other:?}; use `write N`, `read` or `corpus`").into(),
+            );
+        }
     }
     Ok(())
 }

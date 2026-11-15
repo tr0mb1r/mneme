@@ -55,8 +55,7 @@ Cursor          ─spawns─▶  mneme client  ─unix sock─▶       │
 
 **Pick this mode when:** you run multiple MCP hosts against the same
 data dir (Claude Code + Claude Desktop + Cursor + …); you want one
-warm process serving them all; you're on macOS/Linux/Windows with
-working Unix-socket / named-pipe support.
+warm process serving them all.
 
 ### Mode B — single-host fallback (`mneme run`)
 
@@ -111,8 +110,7 @@ other MCP client  ─HTTP─┼─▶  mneme serve :7878/mcp  ─▶  /data (or 
 
 **Pick this mode when:** the agent runs in another container or on
 another host and can't spawn `mneme client`; you want mneme as a
-standalone service with its own lifecycle; you're on Windows and want
-several hosts to share one server.
+standalone service with its own lifecycle.
 
 ### Decision matrix
 
@@ -150,7 +148,7 @@ several hosts to share one server.
 | `claude mcp add … mneme run` (manual, fallback) | `["run"]` | Single-host stdio. No daemon, no socket, no token file. |
 | `mneme init hermes --url http://mneme:7878/mcp` | — (`url` + `headers`) | Streamable HTTP to `mneme serve`. The header references `${MNEME_HTTP_TOKEN}`; the value stays out of the config. |
 
-## Subcommands (18)
+## Subcommands (19)
 
 ### Lifecycle
 
@@ -158,11 +156,11 @@ several hosts to share one server.
 |------------|--------------|
 | `mneme init` | Scaffold `~/.mneme/` (config, schema_version, directory layout) and run the schema migration to the binary's `CURRENT_SCHEMA_VERSION`. Idempotent — safe to rerun; only fills in missing pieces. Writes `config.toml` if absent; leaves an existing file alone. |
 | `mneme init <agent> [--upgrade\|--uninstall\|--show]` | v1.1 per-agent installer per ADR-0012 / release-planning §4. `<agent>` ∈ {`claude-code`, `claude-desktop`, `cursor`, `opencode`, `hermes`, `cline`, `codex`, `gemini-cli`}. Today `claude-code`, `claude-desktop`, `cursor`, `opencode`, and `hermes` ship fully wired; the others return `NotYetImplemented` with a tracked task pointer until each integration is validated end-to-end on a real install. Atomic (tmpfile + fsync + rename per file), idempotent (re-run is byte-identical), reversible (`--uninstall` removes mneme-owned files + entries while preserving every other key in the user's config files). `--show` previews the plan without writing. |
-| `mneme daemon [--foreground]` | **v1.1 default MCP server entry point** per ADR-0012. Binds `~/.mneme/run/mneme.sock` (Unix domain socket on macOS / Linux; Windows named pipe lands in M4), accepts multiple MCP clients concurrently, gates each connection on the auth handshake (`MNEME-AUTH: <token>\n` per ADR-0012 D3), serves them via `tokio::spawn` per connection. Acquires `~/.mneme/.lock` for the lifetime of the process. Storage writes serialise through the single-writer seam (D8). Auto-shuts-down after `[daemon].idle_timeout_minutes` (default 30; `0` disables) of no clients. SIGTERM drains in-flight clients up to 30 s before runtime tears them down. Emits `session_start` on boot and `session_end` on graceful exit (ADR-0009). **Self-detaches by default** (D9): the parent spawns a detached child, prints the child PID to stdout, and exits 0 — the shell prompt returns immediately and Ctrl-C in the spawning shell does not kill the daemon. Pass `--foreground` to skip self-detach (right for systemd / launchd unit files and for debugging). Stop a detached daemon with `mneme stop` or `kill <pid>`. |
+| `mneme daemon [--foreground]` | **v1.1 default MCP server entry point** per ADR-0012. Binds `~/.mneme/run/mneme.sock` (a Unix domain socket), accepts multiple MCP clients concurrently, gates each connection on the auth handshake (`MNEME-AUTH: <token>\n` per ADR-0012 D3), serves them via `tokio::spawn` per connection. Acquires `~/.mneme/.lock` for the lifetime of the process. Storage writes serialise through the single-writer seam (D8). Auto-shuts-down after `[daemon].idle_timeout_minutes` (default 30; `0` disables) of no clients. SIGTERM drains in-flight clients up to 30 s before runtime tears them down. Emits `session_start` on boot and `session_end` on graceful exit (ADR-0009). **Self-detaches by default** (D9): the parent spawns a detached child, prints the child PID to stdout, and exits 0 — the shell prompt returns immediately and Ctrl-C in the spawning shell does not kill the daemon. Pass `--foreground` to skip self-detach (right for systemd / launchd unit files and for debugging). Stop a detached daemon with `mneme stop` or `kill <pid>`. |
 | `mneme client` | **Per-agent stdio↔socket bridge** (v1.1). MCP hosts (Claude Code, Claude Desktop, Cursor, …) spawn this as their per-session subprocess. It reads `~/.mneme/run/auth.token`, opens the socket, writes the `MNEME-AUTH:` handshake, then byte-pipes stdin↔socket and socket↔stdout until either side closes. Holds no lockfile, parses no MCP frames, emits no lifecycle events — pure transport adapter. The token value never lands in any agent config file (Invariant 3). |
 | `mneme run` | **Single-host MCP server fallback.** Speaks JSON-RPC over stdio against MCP `2025-06-18`. Acquires `~/.mneme/.lock` for the lifetime of the process; refuses to boot if another instance holds it. Right pick when the host spawns mneme directly with no shared daemon (debugging, restricted environments, CI/test). For multi-session sharing, use `mneme daemon` + `mneme client` instead. SIGTERM / Ctrl-C / SIGINT are treated as a clean exit. Same `session_start`/`session_end` emit semantics as `mneme daemon` — both share the boot path via `execute_with_mode`. |
 | `mneme serve [--bind <host:port>]` | **Network MCP server** (Streamable HTTP, MCP `2025-06-18`). Listens on `--bind`, else `MNEME_HTTP_BIND`, else `[http] bind` (default `127.0.0.1:7878`). `POST /mcp` per JSON-RPC message with `Authorization: Bearer <token>`; `initialize` returns `Mcp-Session-Id`; `DELETE /mcp` ends a session; unauthenticated `GET /healthz` for health checks. Foreground, no idle timeout; acquires `~/.mneme/.lock` like `run` / `daemon`. The container entry point. |
-| `mneme init hermes [--url <url> [--token-env <VAR>]] [--hermes-home <dir>] [--no-hook]` | Hermes Agent installer. Without `--url`: `mcp_servers.mneme` spawns `mneme client`. With `--url`: a Streamable HTTP entry whose `Authorization` header references `${MNEME_HTTP_TOKEN}` (or `--token-env`). Also installs the `mneme` skill, a marker block in `SOUL.md` if it exists, and a `pre_llm_call` context-reload hook (approved in Hermes' shell-hook allowlist) that re-injects pinned rules and recent state at session start and after compression; `--no-hook` skips or removes it. Edits `config.yaml` line by line so comments survive. `--hermes-home` overrides `$HERMES_HOME` / `~/.hermes`. |
+| `mneme init hermes [--url <url> [--token-env <VAR>]] [--hermes-home <dir>] [--no-hook \| --scope-map <file>]` | Hermes Agent installer. Without `--url`: `mcp_servers.mneme` spawns `mneme client`. With `--url`: a Streamable HTTP entry whose `Authorization` header references `${MNEME_HTTP_TOKEN}` (or `--token-env`). Also installs the `mneme` skill, a marker block in `SOUL.md` if it exists, and a `pre_llm_call` context-reload hook (approved in Hermes' shell-hook allowlist) that re-injects pinned rules and recent state at session start and after compression; `--no-hook` skips or removes it. `--scope-map <file>` gives the hook a JSON map from thread ids to scopes, so it loads the conversation's scope plus `global` instead of everything. Edits `config.yaml` line by line so comments survive. `--hermes-home` overrides `$HERMES_HOME` / `~/.hermes`. |
 | `mneme stop` | Find the running server via the lockfile, send SIGTERM, and wait up to 10 s for it to drop the lock. Stale lockfile (PID no longer running) is cleaned up automatically. Exits 0 on either path; non-zero only if the process is alive but won't exit within the timeout. Works for both `mneme daemon` and `mneme run`. |
 | `mneme demo` | Print a 4-pattern walkthrough of the v1.1 memory surface (cross-session recall, `record_event`, `pin`, `mneme://context`). Pure text — pair with a real Claude Code / Claude Desktop session to see the patterns work end-to-end. Complements `mneme init <agent>`'s post-install prompt for users who want to come back to the patterns later. |
 
@@ -173,7 +171,9 @@ several hosts to share one server.
 | `mneme stats` | Print the same JSON `mneme://stats` returns: per-layer counts, schema version, applied LSN, scheduler health (consolidation + working blocks), current scope. Reads `~/.mneme/` directly; refuses while the lockfile is held (live writers would race). |
 | `mneme inspect <ULID>` | Load a single memory by id from redb and pretty-print as JSON. |
 | `mneme inspect --query <text>` | Boot the live embedder, run a `recall` against the on-disk HNSW (snapshot + WAL replay), and print the top-N hits as JSON. Both inspect modes refuse while the lockfile is held — stop the server first. Exactly one of `<ULID>` / `--query` is required. |
-| `mneme export [--scope <s>] [--format json\|ndjson]` | Dump every memory across all three layers. `--format json` (default) is a single pretty-printed object with `procedural` / `episodic` / `semantic` keys. `--format ndjson` emits one row per line, each tagged with a `layer` key. `--scope <s>` filters all three layers by scope. Reads disk directly — no server needed; refuses while the lockfile is held. |
+| `mneme export [--scope <s>] [--format json\|ndjson] [--include-cold]` | Dump every memory across all three layers. `--format json` (default) is a single pretty-printed object with `procedural` / `episodic` / `semantic` keys. `--format ndjson` emits one row per line, each tagged with a `layer` key. `--scope <s>` filters all three layers by scope. Episodic rows come from the hot and warm tiers, newest first, each with a `tier` key (before 1.5.2 warm rows were left out); the cold archive is included only with `--include-cold` (rows tagged `"tier": "cold"`); `mneme backup` is still the complete, restorable copy. There is no import command: `backup` / `restore` is the round trip. Reads disk directly — no server needed; refuses while the lockfile is held. |
+
+| `mneme eval <questions.jsonl> [--tag <t>] [--out-dir <d>] [--data-dir <d>] [--daemon] [--gate-mode <m>] [--min-… / --max-…]` | **Measure recall and auto-context quality** against questions with known answers, without changing the store. Writes `metrics-<tag>.json` and `summary-<tag>.md`. See [Evaluating recall quality](#evaluating-recall-quality). |
 
 ### Archive
 
@@ -200,6 +200,87 @@ All four subcommands below refuse while a `mneme daemon` or
 
 See [Encryption at rest](./encryption.md) for the full setup guide,
 key-custody model, and headless configuration.
+
+## Evaluating recall quality
+
+`mneme eval` answers "did this change make memory better or worse?"
+with numbers. You give it questions whose answers you know; it asks the
+store the way an agent would and scores what comes back.
+
+```bash
+mneme eval questions.jsonl --tag before --out-dir eval/
+# change a setting, a model, a version ...
+mneme eval questions.jsonl --tag after --out-dir eval/
+diff eval/summary-before.md eval/summary-after.md
+```
+
+**Questions file.** JSON Lines; blank lines and lines starting with `#`
+are skipped. Only `id` and `question` are required.
+
+```json
+{"id":"q01","question":"which port does the staging gateway use?","type":"fact","scope":"ops","gold":["01M7…"],"gold_l3":[],"stale":["01M4…"]}
+```
+
+| Field | Meaning |
+|---|---|
+| `gold` | ids of the L4 memories that answer the question (`mneme inspect --query`, or the `id` in a `recall` row) |
+| `gold_l3` | ids of L3 events that answer it, for answers that live on the timeline only |
+| `stale` | ids of superseded memories that must not rank above a current one |
+| `scope` | the scope an agent would be in when asking; used for the scoped half of the grid and the context replay |
+| `type` | free-form label; the report breaks hits down by it |
+
+**What runs.** `recall` for every question in every combination of mode
+(`hybrid`, `semantic`, `keyword`) × scope filter (off, on) × layers
+(semantic; and semantic + episodic when the server's `recall` has a
+`layers` argument, which `--layers auto` detects from the tool schema).
+Then one `mneme://context?q=<question>` read per question.
+
+| Metric | Definition |
+|---|---|
+| hit@1, hit@5, MRR | rank of the first gold id in the returned rows. `L4` is over questions with `gold`; `all` is over every question with any gold, so an L3-only question is a miss when only the semantic layer is searched |
+| stale over current | questions where a `stale` id ranks above every gold id (or is returned when none is) |
+| off-scope@5 | mean share of the top five rows outside the question's scope; must be 0 with the scope filter on |
+| context gold | share of questions whose auto-context contains one of their gold ids |
+| layer shares | each context section's estimated tokens (chars / 4) over the token budget, mean and max |
+| distinct event sets | how many different sets of events the context reads produced; 1 means the events ignore the query |
+| latency | p50 / p95 per `recall` call and per context read, measured at the client |
+
+**How it reaches the store.** It starts a private `mneme run` on the
+data directory (`--data-dir`, else `$MNEME_DATA_DIR`, else `~/.mneme`)
+and speaks MCP to it, so the numbers come from the same code path,
+config and embedder an agent gets. That server takes the lockfile:
+stop a running daemon first, or pass `--daemon` to evaluate through it
+(`mneme client`). Evaluating a restored backup in a scratch directory
+is the way to measure production data without touching it.
+
+**Read-only.** The run calls `recall` and nothing else, and reads
+`mneme://context` and `mneme://stats`. It compares memory counts, the
+index's applied LSN and `turns_total` before and after, and fails
+loudly if any moved. That happens when the server is configured to
+record reads (`[working] record_tool_turns = "all"`, `[episodic]
+auto_log_tool_calls = "all"`) or, with `--daemon`, when another client
+wrote meanwhile. Two caveats: a private server logs its own
+`session_start` / `session_end` events like any server start, and with
+`[episodic] touch_on_recall = true` reads refresh access times; set it
+to `false` for a run that must leave no trace.
+
+**Using it as a gate.** With thresholds the command exits non-zero when
+one is missed (the files are written either way):
+
+```bash
+mneme eval questions.jsonl --min-l4-hit5 0.95 --min-all-hit5 0.90 \
+  --min-context-gold 0.4 --max-stale-over-current 0 \
+  --max-context-stale-over-current 0
+```
+
+Thresholds read the `--gate-mode` row (default `hybrid`), unscoped. A
+metric that could not be measured (no questions of that kind) fails its
+threshold rather than passing it.
+
+The repository's nightly job (`.github/workflows/quality-nightly.yml`)
+runs this on a synthetic corpus with the stub embedder. Stub vectors
+carry no meaning, so it gates on `--gate-mode keyword`; do the same for
+any model-free run.
 
 ## Lockfile contract
 

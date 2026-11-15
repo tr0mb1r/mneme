@@ -7,6 +7,16 @@
 //! writer would race the consolidation scheduler. Stop the server
 //! first (`mneme stop`).
 //!
+//! The episodic layer covers the hot and warm tiers; each row has a
+//! `tier` key. Until 1.5.2 only the hot tier was dumped, so an export
+//! kept as a backup lost every event older than `hot_to_warm_days`.
+//! The cold archive (`<root>/cold/*.zst`) is included only with
+//! `--include-cold`; `mneme backup` always captures it.
+//!
+//! There is no import command. To restore, use `mneme backup` /
+//! `mneme restore`, which copy the data dir byte-for-byte and so keep
+//! every row in the tier it was in.
+//!
 //! Two formats:
 //! * `--format json` (default) — one pretty-printed object with three
 //!   top-level keys (`procedural`, `episodic`, `semantic`).
@@ -19,15 +29,16 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::crypto::{KekStore, OsKeyring};
-use crate::memory::episodic::EpisodicStore;
+use crate::memory::episodic::{EpisodicStore, newest_first, with_cold_rows};
 use crate::memory::procedural::ProceduralStore;
-use crate::memory::semantic::MemoryItem;
+use crate::memory::semantic::{MemoryItem, read_memory_meta};
 use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
+use crate::storage::archive::ColdArchive;
 use crate::storage::layout;
 use crate::{MnemeError, Result};
 
-pub fn execute(scope: Option<String>, format: String) -> Result<()> {
+pub fn execute(scope: Option<String>, format: String, include_cold: bool) -> Result<()> {
     let format = match format.to_ascii_lowercase().as_str() {
         "json" => Format::Json,
         "ndjson" => Format::Ndjson,
@@ -46,7 +57,7 @@ pub fn execute(scope: Option<String>, format: String) -> Result<()> {
         proc_json,
         epi_json,
         sem_json,
-    } = collect_all(&root, scope.as_deref(), &OsKeyring::new())?;
+    } = collect_all_with(&root, scope.as_deref(), &OsKeyring::new(), include_cold)?;
 
     match format {
         Format::Json => {
@@ -91,11 +102,23 @@ pub struct Layers {
 /// and the export dies before emitting a byte (regression fixed
 /// 2026-07-25).
 pub fn collect_all(root: &Path, scope: Option<&str>, keyring: &dyn KekStore) -> Result<Layers> {
+    collect_all_with(root, scope, keyring, false)
+}
+
+/// [`collect_all`], optionally with the cold archive's episodic events
+/// (`--include-cold`).
+pub fn collect_all_with(
+    root: &Path,
+    scope: Option<&str>,
+    keyring: &dyn KekStore,
+    include_cold: bool,
+) -> Result<Layers> {
     refuse_if_locked(root)?;
 
     let (storage, aead) = crate::crypto::boot::open_episodic_storage_and_aead(root, keyring)?;
     let procedural = ProceduralStore::open_with_crypto(root, aead.clone())?;
     let episodic = EpisodicStore::new(Arc::clone(&storage));
+    let cold = include_cold.then(|| ColdArchive::new_with_crypto(root, aead.clone()));
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -104,7 +127,7 @@ pub fn collect_all(root: &Path, scope: Option<&str>, keyring: &dyn KekStore) -> 
 
     Ok(Layers {
         proc_json: collect_procedural(&procedural, scope)?,
-        epi_json: runtime.block_on(collect_episodic(&episodic, scope))?,
+        epi_json: runtime.block_on(collect_episodic(&episodic, scope, cold.as_ref()))?,
         sem_json: runtime.block_on(collect_semantic(&storage, scope))?,
     })
 }
@@ -153,15 +176,30 @@ fn collect_procedural(store: &ProceduralStore, scope: Option<&str>) -> Result<Ve
         .collect())
 }
 
-async fn collect_episodic(store: &EpisodicStore, scope: Option<&str>) -> Result<Vec<Value>> {
-    let mut events = store.list_all().await?;
+/// Hot and warm episodic rows, plus the cold archive's when `cold` is
+/// given, newest first, each tagged with its tier.
+async fn collect_episodic(
+    store: &EpisodicStore,
+    scope: Option<&str>,
+    cold: Option<&ColdArchive>,
+) -> Result<Vec<Value>> {
+    let mut events = store.list_hot_and_warm(true).await?;
     if let Some(s) = scope {
-        events.retain(|e| e.scope == s);
+        events.retain(|t| t.event.scope == s);
+    }
+    if let Some(cold) = cold {
+        let cold_rows = cold.read_window(None, None, usize::MAX, |e| {
+            scope.is_none_or(|s| e.scope == s)
+        })?;
+        events = with_cold_rows(events, cold_rows);
+        events.sort_by(|a, b| newest_first(&a.event, &b.event));
     }
     Ok(events
         .into_iter()
-        .map(|e| {
+        .map(|t| {
+            let e = t.event;
             json!({
+                "tier": t.tier.as_str(),
                 "id": e.id.to_string(),
                 "kind": e.kind,
                 "scope": e.scope,
@@ -189,19 +227,38 @@ async fn collect_semantic(storage: &Arc<dyn Storage>, scope: Option<&str>) -> Re
         items.push(item);
     }
     items.sort_by_key(|m| std::cmp::Reverse(m.created_at));
-    Ok(items
-        .into_iter()
-        .map(|m| {
-            json!({
-                "id": m.id.to_string(),
-                "content": m.content,
-                "kind": m.kind.as_str(),
-                "tags": m.tags,
-                "scope": m.scope,
-                "created_at": m.created_at.to_rfc3339(),
-            })
-        })
-        .collect())
+    // `updated_at`, `status` and the supersession link live in side
+    // tables next to the `mem:` row (see `storage/mod.rs`), so each
+    // costs a point read. Archived and superseded memories are always
+    // exported: this is a dump, not a recall.
+    let mut out = Vec::with_capacity(items.len());
+    for m in items {
+        let meta = read_memory_meta(storage.as_ref(), &m).await?;
+        let mut row = json!({
+            "id": m.id.to_string(),
+            "content": m.content,
+            "kind": m.kind.as_str(),
+            "tags": m.tags,
+            "scope": m.scope,
+            "created_at": m.created_at.to_rfc3339(),
+            "updated_at": meta.updated_at.to_rfc3339(),
+            "status": meta.status.as_str(),
+        });
+        if let Some(newer) = meta.superseded_by {
+            row["superseded_by"] = json!(newer.to_string());
+        }
+        if let Some(record) = &meta.provenance {
+            row["provenance"] = json!(record.provenance.as_str());
+            if let Some(source) = &record.source {
+                row["source"] = json!(source);
+            }
+        }
+        if !meta.relations.is_empty() {
+            row["relations"] = crate::mcp::tools::links::export_json(&meta.relations);
+        }
+        out.push(row);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -269,7 +326,7 @@ mod tests {
         assert_eq!(proc_json.len(), 1);
         assert_eq!(proc_json[0]["content"], "never deploy on Friday");
 
-        let epi_json = collect_episodic(&episodic, None).await.unwrap();
+        let epi_json = collect_episodic(&episodic, None, None).await.unwrap();
         assert_eq!(epi_json.len(), 1);
         assert_eq!(epi_json[0]["kind"], "tool_call");
 
@@ -353,6 +410,113 @@ mod tests {
         assert_eq!(layers.proc_json[0]["content"], "sealed rule");
     }
 
+    /// The 1.5.2 bug: `mneme export` read the hot tier only, so the
+    /// weekly export-as-backup dropped every warm row. Drives the
+    /// real `collect_all` path against an on-disk redb.
+    #[test]
+    fn export_includes_warm_rows() {
+        use crate::crypto::keyring::InMemoryKekStore;
+        use crate::memory::consolidation::_record_backdated_for_tests;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("episodic")).unwrap();
+        std::fs::create_dir_all(root.join("procedural")).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (hot, warm) = {
+            let storage: Arc<dyn Storage> = RedbStorage::open(&root.join("episodic")).unwrap();
+            rt.block_on(async {
+                let episodic = EpisodicStore::new(Arc::clone(&storage));
+                let now = Utc::now();
+                for d in [1, 2] {
+                    _record_backdated_for_tests(
+                        &storage,
+                        &format!("hot-{d}d"),
+                        "work",
+                        "\"h\"",
+                        now - chrono::Duration::days(d),
+                    )
+                    .await
+                    .unwrap();
+                }
+                for (d, scope) in [(40, "work"), (50, "personal"), (60, "work")] {
+                    let id = _record_backdated_for_tests(
+                        &storage,
+                        &format!("warm-{d}d"),
+                        scope,
+                        "\"w\"",
+                        now - chrono::Duration::days(d),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(episodic.promote_to_warm(id).await.unwrap());
+                }
+                storage.flush().await.unwrap();
+                (
+                    episodic.count_hot().await.unwrap(),
+                    episodic.count_warm().await.unwrap(),
+                )
+            })
+        };
+        assert_eq!((hot, warm), (2, 3));
+
+        let layers = collect_all(root, None, &InMemoryKekStore::new()).unwrap();
+        assert_eq!(layers.epi_json.len(), hot + warm);
+        let got: Vec<(&str, &str)> = layers
+            .epi_json
+            .iter()
+            .map(|r| (r["kind"].as_str().unwrap(), r["tier"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("hot-1d", "hot"),
+                ("hot-2d", "hot"),
+                ("warm-40d", "warm"),
+                ("warm-50d", "warm"),
+                ("warm-60d", "warm"),
+            ]
+        );
+
+        // Second run: same rows, same order.
+        let again = collect_all(root, None, &InMemoryKekStore::new()).unwrap();
+        assert_eq!(again.epi_json, layers.epi_json);
+
+        // Scope filter reaches warm rows too.
+        let personal = collect_all(root, Some("personal"), &InMemoryKekStore::new()).unwrap();
+        assert_eq!(personal.epi_json.len(), 1);
+        assert_eq!(personal.epi_json[0]["kind"], "warm-50d");
+
+        // `--include-cold`: the archive's rows are appended, tagged.
+        let at = Utc::now() - chrono::Duration::days(300);
+        ColdArchive::new(root)
+            .append(&[crate::memory::episodic::EpisodicEvent {
+                id: crate::ids::EventId::new(),
+                kind: "cold-300d".into(),
+                scope: "work".into(),
+                payload: "\"c\"".into(),
+                tags: vec![],
+                retrieval_weight: 1.0,
+                last_accessed: at,
+                created_at: at,
+            }])
+            .unwrap();
+        let without = collect_all(root, None, &InMemoryKekStore::new()).unwrap();
+        assert_eq!(without.epi_json, layers.epi_json, "cold stays opt-in");
+        let with = collect_all_with(root, None, &InMemoryKekStore::new(), true).unwrap();
+        assert_eq!(with.epi_json.len(), hot + warm + 1);
+        let last = with.epi_json.last().unwrap();
+        assert_eq!(last["kind"], "cold-300d");
+        assert_eq!(last["tier"], "cold");
+        let scoped =
+            collect_all_with(root, Some("personal"), &InMemoryKekStore::new(), true).unwrap();
+        assert_eq!(scoped.epi_json.len(), 1);
+    }
+
     #[tokio::test]
     async fn collect_paths_apply_scope_filter() {
         let tmp = TempDir::new().unwrap();
@@ -371,8 +535,133 @@ mod tests {
             .await
             .unwrap();
 
-        let work_only = collect_episodic(&episodic, Some("work")).await.unwrap();
+        let work_only = collect_episodic(&episodic, Some("work"), None)
+            .await
+            .unwrap();
         assert_eq!(work_only.len(), 1);
         assert_eq!(work_only[0]["scope"], "work");
+    }
+
+    /// `mneme backup` then `mneme restore` into an empty directory:
+    /// relations and provenance are side rows in the same redb file as
+    /// the memories, so they have to come back with them, and an export
+    /// of the restored directory has to equal one of the original.
+    #[test]
+    fn backup_and_restore_round_trip_relations_and_provenance() {
+        use crate::cli::backup::backup_at;
+        use crate::cli::restore::restore_at;
+        use crate::embed::Embedder;
+        use crate::embed::stub::StubEmbedder;
+        use crate::memory::relations::{
+            Provenance, ProvenanceRecord, RelationTarget, RelationType,
+        };
+        use crate::memory::semantic::{RecallFilters, SemanticStore, SnapshotConfig};
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let open = |root: &Path| -> (Arc<dyn Storage>, Arc<SemanticStore>) {
+            let storage: Arc<dyn Storage> = RedbStorage::open(&root.join("episodic")).unwrap();
+            let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+            let semantic = SemanticStore::open(
+                root,
+                Arc::clone(&storage),
+                embedder,
+                SnapshotConfig::disabled(),
+            )
+            .unwrap();
+            (storage, semantic)
+        };
+
+        let src = TempDir::new().unwrap();
+        std::fs::create_dir_all(src.path().join("episodic")).unwrap();
+        std::fs::create_dir_all(src.path().join("procedural")).unwrap();
+        let (old, new, before) = rt.block_on(async {
+            let (storage, s) = open(src.path());
+            let old = s
+                .remember(
+                    "port for the gateway is 8080",
+                    MemoryKind::Fact,
+                    vec![],
+                    "p".into(),
+                )
+                .await
+                .unwrap();
+            let new = s
+                .remember(
+                    "port for the gateway is 9090",
+                    MemoryKind::Fact,
+                    vec![],
+                    "p".into(),
+                )
+                .await
+                .unwrap();
+            s.relate(
+                new,
+                RelationType::Refines,
+                RelationTarget::Memory(old),
+                "moved in March",
+            )
+            .await
+            .unwrap();
+            s.relate(
+                new,
+                RelationType::EvidenceFor,
+                RelationTarget::Ref("path:/etc/gateway.toml".into()),
+                "",
+            )
+            .await
+            .unwrap();
+            s.set_provenance(
+                new,
+                ProvenanceRecord {
+                    provenance: Provenance::Observed,
+                    source: Some("tool:cat".into()),
+                },
+            )
+            .await
+            .unwrap();
+            let before = collect_semantic(&storage, None).await.unwrap();
+            s.shutdown().await.unwrap();
+            (old, new, before)
+        });
+        // The export itself carries them.
+        let row = before.iter().find(|r| r["id"] == new.to_string()).unwrap();
+        assert_eq!(row["provenance"], "observed");
+        assert_eq!(row["relations"].as_array().unwrap().len(), 2);
+
+        let archive = TempDir::new().unwrap();
+        let tarball = archive.path().join("mneme-backup.tar.gz");
+        backup_at(src.path(), &tarball, false).unwrap();
+        let dst = TempDir::new().unwrap();
+        let dst_root = dst.path().join("restored");
+        restore_at(&tarball, &dst_root, false).unwrap();
+
+        rt.block_on(async {
+            let (storage, s) = open(&dst_root);
+            let after = collect_semantic(&storage, None).await.unwrap();
+            assert_eq!(after, before, "export differs after restore");
+
+            // And they still act: the refined memory is demoted.
+            let hits = s
+                .recall("port for the gateway is 7070", 5, &RecallFilters::default())
+                .await
+                .unwrap();
+            assert_eq!(hits[0].item.id, new);
+            let stale = hits.iter().find(|h| h.item.id == old).unwrap();
+            assert!(stale.demoted);
+            assert_eq!(stale.relations.refined_by[0].reason, "moved in March");
+            assert_eq!(hits[0].provenance, Some(Provenance::Observed));
+            assert_eq!(hits[0].source.as_deref(), Some("tool:cat"));
+            assert_eq!(
+                s.recall_by_ref("path:/etc/gateway.toml", None, 5, &RecallFilters::default())
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            s.shutdown().await.unwrap();
+        });
     }
 }
