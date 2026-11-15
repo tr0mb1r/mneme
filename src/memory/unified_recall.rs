@@ -216,7 +216,13 @@ pub async fn recall(
     // L3 has no vectors: `mode = "semantic"` (meaning only) has nothing
     // to ask it.
     let l3 = match episodic {
-        Some(store) if req.layers.episodic && req.filters.mode != RecallMode::Semantic => {
+        // Nor does a provenance filter: events carry no provenance, and
+        // a row without one never matches.
+        Some(store)
+            if req.layers.episodic
+                && req.filters.mode != RecallMode::Semantic
+                && req.filters.provenance.is_none() =>
+        {
             episodic_hits(store, query, k, req).await?
         }
         _ => Vec::new(),

@@ -442,6 +442,7 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
         .with_active_session(Arc::clone(&active_session))
         .with_auto_context(config.auto_context.clone()),
     );
+    semantic.set_demote_margin(config.recall.demote_margin);
 
     let sessions_dir = root.join("sessions");
     // The daemon and the HTTP listener open one working session per

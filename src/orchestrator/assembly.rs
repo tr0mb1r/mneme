@@ -370,6 +370,10 @@ mod tests {
             rank: similarity,
             updated_at: t0() - Duration::days(updated_days),
             status: MemoryStatus::Active,
+            demoted: false,
+            relations: Default::default(),
+            provenance: None,
+            source: None,
         }
     }
 

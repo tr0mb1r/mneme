@@ -82,8 +82,9 @@
 
 use super::snapshot_scheduler;
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -99,6 +100,9 @@ use crate::index::hnsw::HnswIndex;
 use crate::index::snapshot;
 use crate::memory::activity::ActivityCounter;
 use crate::memory::keyword::{self, KeywordHit, KeywordIndex};
+use crate::memory::relations::{
+    self, Provenance, ProvenanceRecord, Relation, RelationTarget, RelationType,
+};
 use crate::storage::Storage;
 use crate::storage::wal::{self, WalOp, WalWriter};
 use crate::storage::{MEM_KEY_PREFIX, MTS_KEY_PREFIX, ST_KEY_PREFIX, SUP_KEY_PREFIX};
@@ -218,7 +222,92 @@ pub struct RecallHit {
     /// caller asked for archived memories via
     /// [`RecallFilters::include_archived`].
     pub status: MemoryStatus,
+    /// A current, newer memory `refines` or `contradicts` this one, so
+    /// it was pushed down: its keyword evidence is not counted and
+    /// `rank` is lower by the demote margin
+    /// ([`SemanticStore::set_demote_margin`]). Still returned; a
+    /// demoted memory is out of date in part, not gone.
+    pub demoted: bool,
+    /// The relations this memory takes part in. Empty for most.
+    pub relations: HitRelations,
+    /// How the writer came to know this, if it said.
+    pub provenance: Option<Provenance>,
+    /// Where it came from, if the writer said.
+    pub source: Option<String>,
 }
+
+/// One end of a relation between two memories, as shown on a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub id: MemoryId,
+    pub reason: String,
+}
+
+/// Something a memory names as its evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Evidence {
+    pub target: RelationTarget,
+    pub reason: String,
+}
+
+/// The relations of one memory, both directions, with gone memories
+/// already filtered out. `superseded_by` stays on [`RecallHit`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HitRelations {
+    /// Memories that refine this one.
+    pub refined_by: Vec<Link>,
+    /// Memories that contradict this one.
+    pub contradicted_by: Vec<Link>,
+    /// Memories this one refines.
+    pub refines: Vec<Link>,
+    /// Memories this one contradicts.
+    pub contradicts: Vec<Link>,
+    /// Memories this one supersedes.
+    pub supersedes: Vec<Link>,
+    /// What this memory cites: memories, events, external references.
+    pub evidence: Vec<Evidence>,
+}
+
+impl HitRelations {
+    pub fn is_empty(&self) -> bool {
+        self.refined_by.is_empty()
+            && self.contradicted_by.is_empty()
+            && self.refines.is_empty()
+            && self.contradicts.is_empty()
+            && self.supersedes.is_empty()
+            && self.evidence.is_empty()
+    }
+
+    /// Ids of every memory linked in either direction, without
+    /// repeats, in a stable order.
+    pub fn linked_memories(&self) -> Vec<MemoryId> {
+        let mut out: Vec<MemoryId> = Vec::new();
+        let links = self
+            .refined_by
+            .iter()
+            .chain(&self.contradicted_by)
+            .chain(&self.refines)
+            .chain(&self.contradicts)
+            .chain(&self.supersedes)
+            .map(|l| l.id);
+        let cited = self.evidence.iter().filter_map(|e| match &e.target {
+            RelationTarget::Memory(id) => Some(*id),
+            _ => None,
+        });
+        for id in links.chain(cited) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+}
+
+/// Default for [`SemanticStore::set_demote_margin`]; the default of
+/// `[recall] demote_margin`. About the similarity gap between a right
+/// answer and a lookalike, so a refined memory drops just below its
+/// refiner rather than to the bottom of the list.
+pub const DEFAULT_DEMOTE_MARGIN: f32 = 0.10;
 
 /// Lifecycle status of a memory.
 ///
@@ -272,7 +361,7 @@ impl TimeField {
 
 /// The parts of a memory kept beside its `mem:` row rather than in
 /// [`MemoryItem`]: see [`read_memory_meta`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryMeta {
     /// Last content edit, or `created_at` if never edited.
     pub updated_at: DateTime<Utc>,
@@ -281,13 +370,19 @@ pub struct MemoryMeta {
     /// checked for existence (unlike [`SemanticStore::superseded_by`]),
     /// so an export carries exactly what is on disk.
     pub superseded_by: Option<MemoryId>,
+    /// The memory's provenance row, if it has one.
+    pub provenance: Option<ProvenanceRecord>,
+    /// The relations this memory carries, as stored (targets are not
+    /// checked for existence).
+    pub relations: Vec<Relation>,
 }
 
 /// Read a memory's side-table metadata straight from `storage`.
 ///
 /// For paths that scan `mem:` rows without a [`SemanticStore`] (the
-/// `export` tool and CLI). Three point reads; absent rows resolve to
-/// the defaults (never edited, active, not superseded).
+/// `export` tool and CLI). Four point reads and one short range scan;
+/// absent rows resolve to the defaults (never edited, active, not
+/// superseded, no provenance, no relations).
 pub async fn read_memory_meta(storage: &dyn Storage, item: &MemoryItem) -> Result<MemoryMeta> {
     let updated_at = read_updated_at(storage, item.id)
         .await?
@@ -303,6 +398,8 @@ pub async fn read_memory_meta(storage: &dyn Storage, item: &MemoryItem) -> Resul
         updated_at,
         status,
         superseded_by,
+        provenance: relations::get_provenance(storage, item.id).await?,
+        relations: relations::outgoing(storage, item.id).await?,
     })
 }
 
@@ -358,6 +455,9 @@ pub enum MatchSource {
     Semantic,
     Keyword,
     Both,
+    /// Found by its relation to an external reference
+    /// ([`SemanticStore::recall_by_ref`]), not by a search.
+    Reference,
 }
 
 impl MatchSource {
@@ -366,6 +466,7 @@ impl MatchSource {
             Self::Semantic => "semantic",
             Self::Keyword => "keyword",
             Self::Both => "both",
+            Self::Reference => "ref",
         }
     }
 }
@@ -419,6 +520,9 @@ pub struct RecallFilters {
     /// Also return archived memories ([`MemoryStatus::Archived`]). Off
     /// by default: archiving is how an agent says "not current".
     pub include_archived: bool,
+    /// Keep only memories recorded with this provenance. A memory with
+    /// no provenance never matches.
+    pub provenance: Option<Provenance>,
 }
 
 impl RecallFilters {
@@ -683,6 +787,28 @@ pub struct SemanticStore {
     /// between the scan and the swap-in); kept in step by every write
     /// after that. Memory-only by design: see [`super::keyword`].
     keyword: RwLock<Option<KeywordIndex>>,
+
+    /// Which memories have relations or a provenance row. `None` until
+    /// the first recall builds it, like the keyword index. It exists so
+    /// that recall pays nothing for these side tables on the (common)
+    /// memory that has neither: a set lookup instead of a storage read
+    /// per candidate. A superset is fine (a stale entry costs one read
+    /// that finds nothing); a missing entry is not, so every write to
+    /// the side tables goes through this store and updates it.
+    side: RwLock<Option<SideIndex>>,
+
+    /// `[recall] demote_margin`, as `f32` bits.
+    demote_margin: AtomicU32,
+}
+
+/// See [`SemanticStore::side`].
+#[derive(Default)]
+struct SideIndex {
+    /// Memories that carry at least one relation.
+    sources: HashSet<MemoryId>,
+    /// Memories at least one relation points at.
+    targets: HashSet<MemoryId>,
+    provenance: HashMap<MemoryId, Provenance>,
 }
 
 impl SemanticStore {
@@ -834,6 +960,8 @@ impl SemanticStore {
             scheduler_join,
             activity: ActivityCounter::new(),
             keyword: RwLock::new(None),
+            side: RwLock::new(None),
+            demote_margin: AtomicU32::new(DEFAULT_DEMOTE_MARGIN.to_bits()),
         }))
     }
 
@@ -1157,8 +1285,328 @@ impl SemanticStore {
             return Ok(false);
         }
         self.storage.put(&sup_key(&old), &new.0.to_bytes()).await?;
+        // The same fact as a relation, so it shows up beside the other
+        // types. `sup:` stays the authority for hiding `old`. An
+        // existing relation (written with a reason) is left alone.
+        let target = RelationTarget::Memory(old);
+        let already = relations::outgoing(self.storage.as_ref(), new)
+            .await?
+            .iter()
+            .any(|r| r.kind == RelationType::Supersedes && r.target == target);
+        if !already {
+            relations::put(
+                self.storage.as_ref(),
+                &Relation {
+                    from: new,
+                    kind: RelationType::Supersedes,
+                    target,
+                    reason: String::new(),
+                    created_at: Utc::now(),
+                },
+            )
+            .await?;
+        }
+        self.with_side_index(|side| {
+            side.sources.insert(new);
+            side.targets.insert(old);
+        });
         self.note_mutation();
         Ok(true)
+    }
+
+    // ---------- relations ----------
+
+    /// Record that memory `from` stands in relation `kind` to `target`,
+    /// replacing any earlier relation of the same type between the two
+    /// (so the reason can be corrected by writing it again).
+    ///
+    /// Returns `false`, writing nothing, if `from` is not stored, if a
+    /// memory `target` is not stored, or if the two are the same
+    /// memory. An event target is not checked here (this store does
+    /// not hold events) and a reference cannot be: callers validate.
+    /// Limits on `reason` and the reference are enforced
+    /// ([`relations::validate`]).
+    ///
+    /// `supersedes` also writes the `sup:` link, with all that implies
+    /// for recall. `refines` and `contradicts` demote the target while
+    /// `from` is current and the newer of the two; see
+    /// [`RecallHit::demoted`].
+    pub async fn relate(
+        &self,
+        from: MemoryId,
+        kind: RelationType,
+        target: RelationTarget,
+        reason: &str,
+    ) -> Result<bool> {
+        relations::validate(kind, &target, reason)
+            .map_err(|msg| MnemeError::Storage(format!("relation: {msg}")))?;
+        let _g = self.write_lock.lock().await;
+        if self.storage.get(&mem_key(&from)).await?.is_none() {
+            return Ok(false);
+        }
+        if let RelationTarget::Memory(to) = &target
+            && (*to == from || self.storage.get(&mem_key(to)).await?.is_none())
+        {
+            return Ok(false);
+        }
+        relations::put(
+            self.storage.as_ref(),
+            &Relation {
+                from,
+                kind,
+                target: target.clone(),
+                reason: reason.to_owned(),
+                created_at: Utc::now(),
+            },
+        )
+        .await?;
+        if let (RelationType::Supersedes, RelationTarget::Memory(old)) = (kind, &target) {
+            self.storage.put(&sup_key(old), &from.0.to_bytes()).await?;
+        }
+        self.with_side_index(|side| {
+            side.sources.insert(from);
+            if let RelationTarget::Memory(to) = &target {
+                side.targets.insert(*to);
+            }
+        });
+        self.note_mutation();
+        Ok(true)
+    }
+
+    /// The relations `id` carries, as stored.
+    pub async fn outgoing_relations(&self, id: MemoryId) -> Result<Vec<Relation>> {
+        relations::outgoing(self.storage.as_ref(), id).await
+    }
+
+    /// The relations of `id` in both directions, as shown on a recall
+    /// row. Relations whose other end is a memory that no longer exists
+    /// are left out.
+    pub async fn relations_of(&self, id: MemoryId) -> Result<HitRelations> {
+        let storage = self.storage.as_ref();
+        let mut out = HitRelations::default();
+        for r in relations::outgoing(storage, id).await? {
+            match (&r.target, r.kind) {
+                (RelationTarget::Memory(to), kind) => {
+                    if self.storage.get(&mem_key(to)).await?.is_none() {
+                        continue;
+                    }
+                    let link = Link {
+                        id: *to,
+                        reason: r.reason,
+                    };
+                    match kind {
+                        RelationType::Refines => out.refines.push(link),
+                        RelationType::Contradicts => out.contradicts.push(link),
+                        RelationType::Supersedes => out.supersedes.push(link),
+                        RelationType::EvidenceFor => out.evidence.push(Evidence {
+                            target: RelationTarget::Memory(link.id),
+                            reason: link.reason,
+                        }),
+                    }
+                }
+                (target, _) => out.evidence.push(Evidence {
+                    target: target.clone(),
+                    reason: r.reason,
+                }),
+            }
+        }
+        for r in relations::incoming(storage, &RelationTarget::Memory(id)).await? {
+            let link = Link {
+                id: r.from,
+                reason: r.reason,
+            };
+            match r.kind {
+                RelationType::Refines => out.refined_by.push(link),
+                RelationType::Contradicts => out.contradicted_by.push(link),
+                // `superseded_by` is reported from the `sup:` link;
+                // being cited as evidence is not shown on the cited row.
+                RelationType::Supersedes | RelationType::EvidenceFor => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether a current memory, edited more recently than
+    /// `updated_at`, refines or contradicts `id`.
+    ///
+    /// "Current" is not archived and not superseded: a refinement that
+    /// was itself retired no longer speaks for the present. "Newer"
+    /// keeps a memory that was revised *after* being refined from
+    /// staying demoted by a remark about its old text.
+    async fn is_demoted(&self, id: MemoryId, updated_at: DateTime<Utc>) -> Result<bool> {
+        let storage = self.storage.as_ref();
+        for r in relations::incoming(storage, &RelationTarget::Memory(id)).await? {
+            if !r.kind.demotes() {
+                continue;
+            }
+            let Some(source) = self.get(r.from).await? else {
+                continue;
+            };
+            if read_status(storage, r.from).await? == MemoryStatus::Archived
+                || self.superseded_by(r.from).await?.is_some()
+            {
+                continue;
+            }
+            let source_updated = read_updated_at(storage, r.from)
+                .await?
+                .unwrap_or(source.created_at);
+            if source_updated > updated_at {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Fill in the parts of each returned row that live in side tables
+    /// and are not needed for ranking: relations and the provenance
+    /// source. Storage is read only for rows the side index flags.
+    async fn decorate(&self, hits: &mut [RecallHit]) -> Result<()> {
+        for hit in hits.iter_mut() {
+            let id = hit.item.id;
+            let has_relations =
+                self.side_read(|side| side.sources.contains(&id) || side.targets.contains(&id));
+            if has_relations {
+                hit.relations = self.relations_of(id).await?;
+            }
+            if hit.provenance.is_some()
+                && let Some(record) = relations::get_provenance(self.storage.as_ref(), id).await?
+            {
+                hit.provenance = Some(record.provenance);
+                hit.source = record.source;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rank penalty for a demoted memory, on the cosine scale.
+    pub fn demote_margin(&self) -> f32 {
+        f32::from_bits(self.demote_margin.load(Ordering::Relaxed))
+    }
+
+    /// Set `[recall] demote_margin`. Negative or non-finite values are
+    /// treated as zero (no penalty; keyword evidence is still dropped).
+    pub fn set_demote_margin(&self, margin: f32) {
+        let margin = if margin.is_finite() {
+            margin.max(0.0)
+        } else {
+            0.0
+        };
+        self.demote_margin
+            .store(margin.to_bits(), Ordering::Relaxed);
+    }
+
+    // ---------- provenance ----------
+
+    /// Record how `id` came to be known. Returns `false` if no memory
+    /// with this id is stored. Replaces an earlier record.
+    pub async fn set_provenance(&self, id: MemoryId, record: ProvenanceRecord) -> Result<bool> {
+        if record
+            .source
+            .as_deref()
+            .is_some_and(|s| s.chars().count() > relations::MAX_SOURCE_CHARS)
+        {
+            return Err(MnemeError::Storage(format!(
+                "provenance source is longer than {} characters",
+                relations::MAX_SOURCE_CHARS
+            )));
+        }
+        let _g = self.write_lock.lock().await;
+        if self.storage.get(&mem_key(&id)).await?.is_none() {
+            return Ok(false);
+        }
+        relations::put_provenance(self.storage.as_ref(), id, &record).await?;
+        self.with_side_index(|side| {
+            side.provenance.insert(id, record.provenance);
+        });
+        self.note_mutation();
+        Ok(true)
+    }
+
+    /// The provenance recorded for `id`, if any.
+    pub async fn provenance(&self, id: MemoryId) -> Result<Option<ProvenanceRecord>> {
+        relations::get_provenance(self.storage.as_ref(), id).await
+    }
+
+    /// How many stored memories carry each provenance. Memories with
+    /// none are not counted here; subtract from the total for those.
+    pub async fn provenance_counts(&self) -> Result<Vec<(Provenance, usize)>> {
+        let rows = relations::scan_provenance(self.storage.as_ref()).await?;
+        let mut counts: Vec<(Provenance, usize)> =
+            Provenance::ALL.into_iter().map(|p| (p, 0)).collect();
+        for (id, record) in rows {
+            // A row can outlive its memory by a crash inside `forget`.
+            if self.storage.get(&mem_key(&id)).await?.is_none() {
+                continue;
+            }
+            if let Some(slot) = counts.iter_mut().find(|(p, _)| *p == record.provenance) {
+                slot.1 += 1;
+            }
+        }
+        Ok(counts)
+    }
+
+    // ---------- side index ----------
+
+    /// Build the side index from storage if it does not exist yet.
+    /// Same discipline as [`Self::ensure_keyword_index`]: the scan runs
+    /// under `write_lock`, so a write either precedes it or updates the
+    /// finished index.
+    async fn ensure_side_index(&self) -> Result<()> {
+        if self.side_built() {
+            return Ok(());
+        }
+        let _g = self.write_lock.lock().await;
+        if self.side_built() {
+            return Ok(());
+        }
+        let mut side = SideIndex::default();
+        for r in relations::scan_all(self.storage.as_ref()).await? {
+            side.sources.insert(r.from);
+            if let RelationTarget::Memory(to) = r.target {
+                side.targets.insert(to);
+            }
+        }
+        for (id, record) in relations::scan_provenance(self.storage.as_ref()).await? {
+            side.provenance.insert(id, record.provenance);
+        }
+        match self.side.write() {
+            Ok(mut guard) => *guard = Some(side),
+            Err(poisoned) => *poisoned.into_inner() = Some(side),
+        }
+        Ok(())
+    }
+
+    fn side_built(&self) -> bool {
+        self.side.read().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    /// Read from the side index. Before it is built (or if its lock is
+    /// poisoned) `f` sees an empty index; recall builds it first.
+    fn side_read<T>(&self, f: impl FnOnce(&SideIndex) -> T) -> T {
+        match self.side.read() {
+            Ok(guard) => match guard.as_ref() {
+                Some(side) => f(side),
+                None => f(&SideIndex::default()),
+            },
+            Err(_) => f(&SideIndex::default()),
+        }
+    }
+
+    /// Apply `f` to the side index if it has been built. Callers hold
+    /// `write_lock`. A poisoned lock drops the index so the next recall
+    /// rebuilds it from storage.
+    fn with_side_index(&self, f: impl FnOnce(&mut SideIndex)) {
+        match self.side.write() {
+            Ok(mut guard) => {
+                if let Some(side) = guard.as_mut() {
+                    f(side);
+                }
+            }
+            Err(poisoned) => {
+                tracing::warn!("side index lock poisoned; it will be rebuilt");
+                *poisoned.into_inner() = None;
+            }
+        }
     }
 
     /// The memory that superseded `id`, if any.
@@ -1226,15 +1674,25 @@ impl SemanticStore {
         // Embedded in every mode: keyword-only hits still report their
         // vector similarity, so the agent can compare rows.
         let qvec = self.embedder.embed(trimmed).await?;
+        self.ensure_side_index().await?;
 
-        let (semantic, semantic_stale) = match filters.mode {
+        let (mut semantic, semantic_stale) = match filters.mode {
             RecallMode::Keyword => (Vec::new(), Vec::new()),
             _ => self.semantic_candidates(&qvec, k, filters).await?,
         };
         if filters.mode == RecallMode::Semantic {
             // No literal evidence was looked for, so `rank` stays the
-            // similarity `admit` set.
-            return Ok(append_stale(semantic, semantic_stale, k));
+            // similarity `admit` set, less the margin for a demoted
+            // row. The list arrives nearest-first; re-sorting by rank
+            // only moves demoted rows (the sort is stable).
+            semantic.sort_by(|a, b| {
+                b.rank
+                    .partial_cmp(&a.rank)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut hits = append_stale(semantic, semantic_stale, k);
+            self.decorate(&mut hits).await?;
+            return Ok(hits);
         }
         let (lexical, lexical_stale) = self.keyword_candidates(trimmed, &qvec, k, filters).await?;
         let fused = fuse(trimmed, semantic, lexical, k, filters.mode);
@@ -1250,7 +1708,109 @@ impl SemanticStore {
                 .partial_cmp(&b.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        Ok(append_stale(fused, stale, k))
+        let mut hits = append_stale(fused, stale, k);
+        self.decorate(&mut hits).await?;
+        Ok(hits)
+    }
+
+    /// Memories that have a relation to the external reference
+    /// `reference` (`evidence_for` in practice), newest edit first, or
+    /// best match first when `query` is given.
+    ///
+    /// This is a lookup, not a search: the reference is matched byte
+    /// for byte through the reverse relation table. `filters` apply as
+    /// in [`recall`](Self::recall) (scope, kind, tags, time window,
+    /// archived, superseded, provenance), except `mode` and
+    /// `min_similarity`, which have nothing to act on without a query.
+    /// With a `query`, each row carries its real similarity to it and
+    /// `min_similarity` applies; without, `score` is `1.0` and `rank`
+    /// `0.0`, placeholders the `recall` tool reports as null.
+    pub async fn recall_by_ref(
+        &self,
+        reference: &str,
+        query: Option<&str>,
+        k: usize,
+        filters: &RecallFilters,
+    ) -> Result<Vec<RecallHit>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        self.ensure_side_index().await?;
+        let target = RelationTarget::Ref(reference.to_owned());
+        let mut ids: Vec<MemoryId> = Vec::new();
+        for relation in relations::incoming(self.storage.as_ref(), &target).await? {
+            if !ids.contains(&relation.from) {
+                ids.push(relation.from);
+            }
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query = query.map(str::trim).filter(|q| !q.is_empty());
+        let distances: HashMap<MemoryId, f32> = match query {
+            None => HashMap::new(),
+            Some(q) => {
+                let qvec = self.embedder.embed(q).await?;
+                let wanted: HashSet<MemoryId> = ids.iter().copied().collect();
+                let guard = self
+                    .index
+                    .read()
+                    .map_err(|e| MnemeError::Index(format!("hnsw rwlock poisoned: {e}")))?;
+                guard
+                    .vectors_for(&wanted)
+                    .into_iter()
+                    .map(|(id, v)| (id, 1.0 - dot(&v, &qvec)))
+                    .collect()
+            }
+        };
+
+        let mut current = Vec::new();
+        let mut stale = Vec::new();
+        for id in ids {
+            let Some(item) = self.get(id).await? else {
+                continue;
+            };
+            let score = distances.get(&id).copied().unwrap_or(1.0);
+            let passes = if query.is_some() {
+                filters.matches(&item, score)
+            } else {
+                filters.matches_metadata(&item)
+            };
+            if !passes {
+                continue;
+            }
+            match self
+                .admit(item, score, MatchSource::Reference, filters)
+                .await?
+            {
+                Admitted::Current(mut hit) => {
+                    if query.is_none() {
+                        hit.rank = 0.0;
+                    }
+                    current.push(hit);
+                }
+                Admitted::Stale(mut hit) => {
+                    if query.is_none() {
+                        hit.rank = 0.0;
+                    }
+                    stale.push(hit);
+                }
+                Admitted::Rejected => {}
+            }
+        }
+        let order = |a: &RecallHit, b: &RecallHit| {
+            b.rank
+                .partial_cmp(&a.rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+                .then_with(|| b.item.id.cmp(&a.item.id))
+        };
+        current.sort_by(order);
+        stale.sort_by(order);
+        current.truncate(k);
+        let mut hits = append_stale(current, stale, k);
+        self.decorate(&mut hits).await?;
+        Ok(hits)
     }
 
     /// Vector candidates: the `k` nearest current memories passing
@@ -1413,7 +1973,9 @@ impl SemanticStore {
                 Admitted::Stale(mut hit) => {
                     // Stale rows skip `fuse`, so their keyword evidence
                     // is folded in here.
-                    hit.rank += KEYWORD_WEIGHT * kh.coverage * kh.coverage;
+                    if !hit.demoted {
+                        hit.rank += KEYWORD_WEIGHT * kh.coverage * kh.coverage;
+                    }
                     stale.push(hit);
                 }
                 Admitted::Rejected => {}
@@ -1454,14 +2016,34 @@ impl SemanticStore {
         if superseded_by.is_some() && !filters.include_superseded {
             return Ok(Admitted::Rejected);
         }
+        // Both answered from the side index: no storage read unless
+        // this memory really is the target of a relation.
+        let (provenance, is_target) = self.side_read(|side| {
+            (
+                side.provenance.get(&item.id).copied(),
+                side.targets.contains(&item.id),
+            )
+        });
+        if filters.provenance.is_some() && filters.provenance != provenance {
+            return Ok(Admitted::Rejected);
+        }
+        let demoted = is_target && self.is_demoted(item.id, updated_at).await?;
+        let mut rank = similarity_from_distance(score);
+        if demoted {
+            rank -= self.demote_margin();
+        }
         let hit = RecallHit {
             item,
             score,
             superseded_by,
             matched,
-            rank: similarity_from_distance(score),
+            rank,
             updated_at,
             status,
+            demoted,
+            relations: HitRelations::default(),
+            provenance,
+            source: None,
         };
         Ok(if hit.superseded_by.is_some() {
             Admitted::Stale(hit)
@@ -1670,6 +2252,15 @@ impl SemanticStore {
         // And its side rows, so a forgotten id leaves nothing behind.
         self.storage.delete(&mts_key(&id)).await?;
         self.storage.delete(&st_key(&id)).await?;
+        // Relations in both directions and the provenance row. A
+        // relation lapses with either end; see `memory::relations`.
+        relations::delete_all_for(self.storage.as_ref(), id).await?;
+        relations::delete_provenance(self.storage.as_ref(), id).await?;
+        self.with_side_index(|side| {
+            side.sources.remove(&id);
+            side.targets.remove(&id);
+            side.provenance.remove(&id);
+        });
         self.with_keyword_index(|idx| idx.remove(id));
         // Tombstone the vector unconditionally — even if the metadata
         // is gone, leaving an orphan vector wastes RAM and can return
@@ -1902,25 +2493,35 @@ fn fuse(
         if keyword::contains_phrase(&keyword::words(&hit.item.content), &query_words) {
             *ev += PHRASE_WEIGHT;
         }
+        // A memory that a newer one refines or contradicts matches the
+        // query's words as well as ever, usually better than its
+        // refiner: the stale wording is what the question was phrased
+        // after. That literal match is exactly what must not decide.
+        if hit.demoted {
+            *ev = 0.0;
+        }
     }
     // `RecallHit::rank` is similarity + evidence in every mode, so
     // callers that mix layers compare like with like. Only the *sort*
     // differs in keyword mode.
+    // `admit` set `rank` to the similarity, less the demote margin.
+    let base: Vec<f32> = merged.iter().map(|(hit, _)| hit.rank).collect();
     for (hit, ev) in merged.iter_mut() {
-        hit.rank = similarity_from_distance(hit.score) + *ev;
+        hit.rank += *ev;
     }
-    let order = |(hit, ev): &(RecallHit, f32)| -> f32 {
+    let mut keyed: Vec<((RecallHit, f32), f32)> = merged.into_iter().zip(base).collect();
+    let order = |((hit, ev), base): &((RecallHit, f32), f32)| -> f32 {
         match mode {
-            RecallMode::Keyword => ev * 10.0 + similarity_from_distance(hit.score),
+            RecallMode::Keyword => ev * 10.0 + base,
             _ => hit.rank,
         }
     };
-    merged.sort_by(|a, b| {
+    keyed.sort_by(|a, b| {
         order(b)
             .partial_cmp(&order(a))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    merged.into_iter().take(k).map(|(h, _)| h).collect()
+    keyed.into_iter().take(k).map(|((h, _), _)| h).collect()
 }
 
 /// Superseded hits rank after every current one and only fill leftover
@@ -3416,6 +4017,10 @@ mod tests {
             rank: 0.8,
             updated_at: Utc::now(),
             status: MemoryStatus::Active,
+            demoted: false,
+            relations: Default::default(),
+            provenance: None,
+            source: None,
         };
         let weak_keyword = RecallHit {
             item: item("the user called twice"),
@@ -3425,6 +4030,10 @@ mod tests {
             rank: 0.3,
             updated_at: Utc::now(),
             status: MemoryStatus::Active,
+            demoted: false,
+            relations: Default::default(),
+            provenance: None,
+            source: None,
         };
         let kh = KeywordHit {
             id: weak_keyword.item.id,
@@ -4020,6 +4629,658 @@ mod tests {
                 assert_eq!(st, [ST_ARCHIVED]);
             }
             s.shutdown().await.unwrap();
+        }
+    }
+
+    // ---------- relations and provenance (1.7) ----------
+
+    /// Three memories the stub embedder cannot tell apart from the
+    /// query (same first byte, same length), so every difference in
+    /// rank below comes from relations, not from similarity.
+    const OLD: &str = "port for the gateway is 8080";
+    const NEW: &str = "port for the gateway is 9090";
+    const QUERY: &str = "port for the gateway is 7070";
+
+    async fn pair(s: &SemanticStore) -> (MemoryId, MemoryId) {
+        let old = s
+            .remember(OLD, MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let new = s
+            .remember(NEW, MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        (old, new)
+    }
+
+    async fn ranked(s: &SemanticStore, mode: RecallMode) -> Vec<RecallHit> {
+        s.recall(
+            QUERY,
+            10,
+            &RecallFilters {
+                mode,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn of(hits: &[RecallHit], id: MemoryId) -> &RecallHit {
+        hits.iter().find(|h| h.item.id == id).unwrap()
+    }
+
+    const MODES: [RecallMode; 3] = [
+        RecallMode::Hybrid,
+        RecallMode::Semantic,
+        RecallMode::Keyword,
+    ];
+
+    #[tokio::test]
+    async fn a_refined_memory_ranks_below_its_refiner_at_equal_cosine() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+
+        // Before: nothing separates them.
+        for mode in MODES {
+            let hits = ranked(&s, mode).await;
+            assert_eq!(of(&hits, old).score, of(&hits, new).score, "{mode:?}");
+            assert_eq!(of(&hits, old).rank, of(&hits, new).rank, "{mode:?}");
+            assert!(!of(&hits, old).demoted);
+            assert!(of(&hits, old).relations.is_empty());
+        }
+
+        assert!(
+            s.relate(
+                new,
+                RelationType::Refines,
+                RelationTarget::Memory(old),
+                "port moved in March"
+            )
+            .await
+            .unwrap()
+        );
+
+        for mode in MODES {
+            let hits = ranked(&s, mode).await;
+            let ids: Vec<MemoryId> = hits.iter().map(|h| h.item.id).collect();
+            assert_eq!(ids, vec![new, old], "{mode:?}");
+            let (o, n) = (of(&hits, old), of(&hits, new));
+            // Still returned, same similarity, lower rank.
+            assert_eq!(o.score, n.score, "{mode:?}");
+            assert!(o.demoted && !n.demoted, "{mode:?}");
+            assert!(n.rank - o.rank >= DEFAULT_DEMOTE_MARGIN - 1e-6, "{mode:?}");
+            // The demoted row keeps no keyword evidence: its rank is
+            // its similarity less the margin, exactly.
+            assert!(
+                (o.rank - (similarity_from_distance(o.score) - DEFAULT_DEMOTE_MARGIN)).abs() < 1e-6,
+                "{mode:?}: {}",
+                o.rank
+            );
+            // Both rows say how they are related.
+            assert_eq!(
+                o.relations.refined_by,
+                vec![Link {
+                    id: new,
+                    reason: "port moved in March".into()
+                }]
+            );
+            assert_eq!(n.relations.refines[0].id, old);
+        }
+    }
+
+    #[tokio::test]
+    async fn forgetting_the_refiner_restores_the_rank() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let s = store_on(tmp.path(), Arc::clone(&storage));
+        let (old, new) = pair(&s).await;
+        let before = of(&ranked(&s, RecallMode::Hybrid).await, old).rank;
+        s.relate(new, RelationType::Refines, RelationTarget::Memory(old), "")
+            .await
+            .unwrap();
+        assert!(of(&ranked(&s, RecallMode::Hybrid).await, old).demoted);
+
+        assert!(s.forget(new).await.unwrap());
+        for mode in MODES {
+            let hits = ranked(&s, mode).await;
+            assert_eq!(hits.len(), 1, "{mode:?}");
+            assert!(!hits[0].demoted, "{mode:?}");
+            assert!(hits[0].relations.is_empty(), "{mode:?}");
+        }
+        // Its keyword evidence counts again: the rank is back above the
+        // bare similarity, where a demoted row sits a margin below it.
+        let restored = &ranked(&s, RecallMode::Hybrid).await[0];
+        assert!(restored.rank > similarity_from_distance(restored.score));
+        assert!(before > 0.0);
+        // And the rows are gone, not merely ignored.
+        assert!(
+            storage
+                .scan_prefix(crate::storage::REL_KEY_PREFIX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .scan_prefix(crate::storage::RREL_KEY_PREFIX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn contradicts_demotes_like_refines() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        s.relate(
+            new,
+            RelationType::Contradicts,
+            RelationTarget::Memory(old),
+            "measured again",
+        )
+        .await
+        .unwrap();
+        for mode in MODES {
+            let hits = ranked(&s, mode).await;
+            assert_eq!(hits[0].item.id, new, "{mode:?}");
+            let o = of(&hits, old);
+            assert!(o.demoted, "{mode:?}");
+            assert_eq!(o.relations.contradicted_by[0].reason, "measured again");
+            assert_eq!(of(&hits, new).relations.contradicts[0].id, old);
+        }
+        s.forget(new).await.unwrap();
+        assert!(!ranked(&s, RecallMode::Hybrid).await[0].demoted);
+    }
+
+    #[tokio::test]
+    async fn only_a_current_newer_refiner_demotes() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        s.relate(new, RelationType::Refines, RelationTarget::Memory(old), "")
+            .await
+            .unwrap();
+        let demoted = |s: Arc<SemanticStore>| async move {
+            let hits = s
+                .recall(
+                    QUERY,
+                    10,
+                    &RecallFilters {
+                        include_archived: true,
+                        include_superseded: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            of(&hits, old).demoted
+        };
+        assert!(demoted(Arc::clone(&s)).await);
+
+        // An archived refiner no longer speaks for the present.
+        s.set_status(new, MemoryStatus::Archived).await.unwrap();
+        assert!(!demoted(Arc::clone(&s)).await);
+        s.set_status(new, MemoryStatus::Active).await.unwrap();
+        assert!(demoted(Arc::clone(&s)).await);
+
+        // Nor does a superseded one.
+        let newest = s
+            .remember(
+                "port for the gateway is 9191",
+                MemoryKind::Fact,
+                vec![],
+                "p".into(),
+            )
+            .await
+            .unwrap();
+        s.supersede(new, newest).await.unwrap();
+        assert!(!demoted(Arc::clone(&s)).await);
+        s.forget(newest).await.unwrap();
+        assert!(demoted(Arc::clone(&s)).await);
+
+        // And once the old memory is itself revised after the
+        // refinement, the remark about its old text lapses.
+        let later = Utc::now() + chrono::Duration::days(1);
+        s.backdate_updated_at(old, later).await.unwrap();
+        assert!(!demoted(Arc::clone(&s)).await);
+    }
+
+    #[tokio::test]
+    async fn the_demote_margin_is_configurable() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        s.relate(new, RelationType::Refines, RelationTarget::Memory(old), "")
+            .await
+            .unwrap();
+        s.set_demote_margin(0.25);
+        let hits = ranked(&s, RecallMode::Semantic).await;
+        assert!((of(&hits, new).rank - of(&hits, old).rank - 0.25).abs() < 1e-6);
+        // Garbage is "no penalty", never a boost.
+        s.set_demote_margin(-3.0);
+        assert_eq!(s.demote_margin(), 0.0);
+        s.set_demote_margin(f32::NAN);
+        assert_eq!(s.demote_margin(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_supersedes_relation_still_hides_the_old_memory() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        s.relate(
+            new,
+            RelationType::Supersedes,
+            RelationTarget::Memory(old),
+            "replaced outright",
+        )
+        .await
+        .unwrap();
+        for mode in MODES {
+            let ids: Vec<MemoryId> = ranked(&s, mode).await.iter().map(|h| h.item.id).collect();
+            assert_eq!(ids, vec![new], "{mode:?}");
+        }
+        assert_eq!(s.superseded_by(old).await.unwrap(), Some(new));
+        let all = s
+            .recall(
+                QUERY,
+                10,
+                &RecallFilters {
+                    include_superseded: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(of(&all, old).superseded_by, Some(new));
+        assert_eq!(
+            of(&all, new).relations.supersedes[0].reason,
+            "replaced outright"
+        );
+    }
+
+    /// The `supersedes` argument is sugar: it writes the `sup:` link
+    /// and the same fact as a relation, and never erases a reason.
+    #[tokio::test]
+    async fn supersede_also_records_a_relation() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        assert!(s.supersede(old, new).await.unwrap());
+        let out = s.outgoing_relations(new).await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, RelationType::Supersedes);
+        assert_eq!(out[0].target, RelationTarget::Memory(old));
+        assert_eq!(out[0].reason, "");
+
+        s.relate(
+            new,
+            RelationType::Supersedes,
+            RelationTarget::Memory(old),
+            "why",
+        )
+        .await
+        .unwrap();
+        s.supersede(old, new).await.unwrap();
+        assert_eq!(s.outgoing_relations(new).await.unwrap()[0].reason, "why");
+    }
+
+    #[tokio::test]
+    async fn relate_rejects_missing_ends_and_self() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        let ghost = MemoryId::new();
+        let refines = RelationType::Refines;
+        assert!(
+            !s.relate(ghost, refines, RelationTarget::Memory(old), "")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !s.relate(new, refines, RelationTarget::Memory(ghost), "")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !s.relate(new, refines, RelationTarget::Memory(new), "")
+                .await
+                .unwrap()
+        );
+        assert!(s.outgoing_relations(new).await.unwrap().is_empty());
+        // Limits are errors, not silent truncation.
+        assert!(
+            s.relate(new, refines, RelationTarget::Memory(old), &"r".repeat(301))
+                .await
+                .is_err()
+        );
+        assert!(
+            s.relate(new, refines, RelationTarget::Ref("x:y".into()), "")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_for_a_ref_is_found_by_recall_by_ref() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let cited = s
+            .remember(
+                "pricing tiers were cut to three",
+                MemoryKind::Decision,
+                vec![],
+                "work".into(),
+            )
+            .await
+            .unwrap();
+        let also = s
+            .remember(
+                "enterprise tier keeps annual billing",
+                MemoryKind::Fact,
+                vec![],
+                "work".into(),
+            )
+            .await
+            .unwrap();
+        let other = s
+            .remember(
+                "unrelated note about lunch",
+                MemoryKind::Fact,
+                vec![],
+                "work".into(),
+            )
+            .await
+            .unwrap();
+        let reference = "research:pricing-study";
+        for id in [cited, also] {
+            s.relate(
+                id,
+                RelationType::EvidenceFor,
+                RelationTarget::Ref(reference.into()),
+                "section 4",
+            )
+            .await
+            .unwrap();
+        }
+        s.relate(
+            other,
+            RelationType::EvidenceFor,
+            RelationTarget::Ref("research:pricing-study-2".into()),
+            "",
+        )
+        .await
+        .unwrap();
+
+        let hits = s
+            .recall_by_ref(reference, None, 10, &RecallFilters::default())
+            .await
+            .unwrap();
+        let mut ids: Vec<MemoryId> = hits.iter().map(|h| h.item.id).collect();
+        ids.sort();
+        let mut want = vec![cited, also];
+        want.sort();
+        assert_eq!(ids, want);
+        for h in &hits {
+            assert_eq!(h.matched, MatchSource::Reference);
+            assert_eq!(
+                h.relations.evidence,
+                vec![Evidence {
+                    target: RelationTarget::Ref(reference.into()),
+                    reason: "section 4".into()
+                }]
+            );
+        }
+        // Exact match only.
+        assert!(
+            s.recall_by_ref("research:pricing", None, 10, &RecallFilters::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Filters still apply, and so does the limit.
+        let decisions = RecallFilters {
+            kind: Some(MemoryKind::Decision),
+            ..Default::default()
+        };
+        let hits = s
+            .recall_by_ref(reference, None, 10, &decisions)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.item.id).collect::<Vec<_>>(),
+            vec![cited]
+        );
+        assert_eq!(
+            s.recall_by_ref(reference, None, 1, &RecallFilters::default())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // With a query the rows carry a real similarity to it.
+        let hits = s
+            .recall_by_ref(
+                reference,
+                Some("pricing tiers were cut to three"),
+                10,
+                &RecallFilters::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits[0].item.id, cited);
+        assert!(hits[0].score < 0.001);
+        // Archived memories are hidden here as everywhere.
+        s.set_status(cited, MemoryStatus::Archived).await.unwrap();
+        let hits = s
+            .recall_by_ref(reference, None, 10, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.item.id).collect::<Vec<_>>(),
+            vec![also]
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_is_stored_filtered_and_counted() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let stated = s
+            .remember("shared topic one", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let inferred = s
+            .remember("shared topic two", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let plain = s
+            .remember("shared topic six", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        assert!(
+            s.set_provenance(
+                stated,
+                ProvenanceRecord {
+                    provenance: Provenance::UserStated,
+                    source: Some("telegram:chat-12".into())
+                }
+            )
+            .await
+            .unwrap()
+        );
+        s.set_provenance(
+            inferred,
+            ProvenanceRecord {
+                provenance: Provenance::Inferred,
+                source: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !s.set_provenance(
+                MemoryId::new(),
+                ProvenanceRecord {
+                    provenance: Provenance::Observed,
+                    source: None
+                }
+            )
+            .await
+            .unwrap()
+        );
+
+        let all = s
+            .recall("shared topic", 10, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(of(&all, stated).provenance, Some(Provenance::UserStated));
+        assert_eq!(of(&all, stated).source.as_deref(), Some("telegram:chat-12"));
+        assert_eq!(of(&all, inferred).provenance, Some(Provenance::Inferred));
+        assert_eq!(of(&all, inferred).source, None);
+        assert_eq!(of(&all, plain).provenance, None);
+
+        for mode in MODES {
+            let hits = s
+                .recall(
+                    "shared topic",
+                    10,
+                    &RecallFilters {
+                        provenance: Some(Provenance::Inferred),
+                        mode,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                hits.iter().map(|h| h.item.id).collect::<Vec<_>>(),
+                vec![inferred],
+                "{mode:?}"
+            );
+        }
+
+        let counts = s.provenance_counts().await.unwrap();
+        let count = |p| counts.iter().find(|(q, _)| *q == p).unwrap().1;
+        assert_eq!(count(Provenance::UserStated), 1);
+        assert_eq!(count(Provenance::Inferred), 1);
+        assert_eq!(count(Provenance::Observed), 0);
+        assert_eq!(count(Provenance::Imported), 0);
+
+        // `forget` takes the row with the memory.
+        s.forget(stated).await.unwrap();
+        assert_eq!(s.provenance(stated).await.unwrap(), None);
+        let counts = s.provenance_counts().await.unwrap();
+        assert_eq!(counts.iter().map(|(_, n)| n).sum::<usize>(), 1);
+        // Over-long sources are refused.
+        assert!(
+            s.set_provenance(
+                plain,
+                ProvenanceRecord {
+                    provenance: Provenance::Imported,
+                    source: Some("s".repeat(201))
+                }
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    /// Relations and provenance are ordinary KV rows: after a restart
+    /// the side index is rebuilt from them and recall behaves the same,
+    /// on a plain store and on an encrypted one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relations_and_provenance_survive_reopen_plain_and_encrypted() {
+        use crate::crypto::{Aead, Dek};
+        use crate::storage::EncryptedStorage;
+        use crate::storage::redb_impl::RedbStorage;
+
+        for encrypted in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let kv_root = tmp.path().join("episodic");
+            std::fs::create_dir_all(&kv_root).unwrap();
+            let dek = Dek::generate().unwrap();
+            let open = || -> Arc<dyn Storage> {
+                if encrypted {
+                    let raw =
+                        RedbStorage::open_encrypted(&kv_root, Arc::new(Aead::new(&dek))).unwrap();
+                    EncryptedStorage::new(raw, &dek)
+                } else {
+                    RedbStorage::open(&kv_root).unwrap()
+                }
+            };
+            let (old, new) = {
+                let s = store_on(tmp.path(), open());
+                let (old, new) = pair(&s).await;
+                s.relate(
+                    new,
+                    RelationType::Refines,
+                    RelationTarget::Memory(old),
+                    "moved",
+                )
+                .await
+                .unwrap();
+                s.relate(
+                    new,
+                    RelationType::EvidenceFor,
+                    RelationTarget::Ref("path:/etc/gateway.toml".into()),
+                    "",
+                )
+                .await
+                .unwrap();
+                s.set_provenance(
+                    new,
+                    ProvenanceRecord {
+                        provenance: Provenance::Observed,
+                        source: Some("tool:cat".into()),
+                    },
+                )
+                .await
+                .unwrap();
+                s.shutdown().await.unwrap();
+                (old, new)
+            };
+
+            let s = store_on(tmp.path(), open());
+            let label = if encrypted { "encrypted" } else { "plain" };
+            let hits = ranked(&s, RecallMode::Hybrid).await;
+            assert_eq!(hits[0].item.id, new, "{label}");
+            assert!(of(&hits, old).demoted, "{label}");
+            assert_eq!(of(&hits, old).relations.refined_by[0].reason, "moved");
+            assert_eq!(of(&hits, new).provenance, Some(Provenance::Observed));
+            assert_eq!(of(&hits, new).source.as_deref(), Some("tool:cat"));
+            assert_eq!(of(&hits, new).relations.evidence.len(), 1, "{label}");
+            assert_eq!(
+                s.recall_by_ref("path:/etc/gateway.toml", None, 5, &RecallFilters::default())
+                    .await
+                    .unwrap()
+                    .len(),
+                1,
+                "{label}"
+            );
+            s.shutdown().await.unwrap();
+        }
+    }
+
+    /// A store with no relations pays nothing for them: the rows of an
+    /// ordinary recall are exactly what they were before 1.7.
+    #[tokio::test]
+    async fn rows_without_relations_are_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let (old, new) = pair(&s).await;
+        for mode in MODES {
+            for h in ranked(&s, mode).await {
+                assert!(!h.demoted);
+                assert!(h.relations.is_empty());
+                assert_eq!(h.provenance, None);
+                assert_eq!(h.source, None);
+                assert!(h.item.id == old || h.item.id == new);
+            }
         }
     }
 }

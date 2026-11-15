@@ -413,7 +413,14 @@ impl Orchestrator {
             scopes: scopes.to_vec(),
             ..Default::default()
         };
-        self.semantic.recall(q, limit, &filters).await
+        let mut hits = self.semantic.recall(q, limit, &filters).await?;
+        // A memory that a current, newer one refines or contradicts is
+        // out of date in part. `recall` still returns it, lower down;
+        // a context block has no room for "probably stale".
+        if !self.auto_context.include_demoted {
+            hits.retain(|h| !h.demoted);
+        }
+        Ok(hits)
     }
 
     /// Fetch the last `WORKING_FETCH` turns from the active session,
@@ -1073,5 +1080,73 @@ mod tests {
         lists.sort();
         lists.dedup();
         assert_eq!(lists.len(), topics.len(), "each query gets its own list");
+    }
+
+    /// A memory that a current, newer one refines is "probably stale":
+    /// `recall` still returns it, a context block does not, unless
+    /// `[auto_context] include_demoted` says so.
+    #[tokio::test]
+    async fn demoted_memories_are_left_out_of_context_by_default() {
+        use crate::memory::relations::{RelationTarget, RelationType};
+        let (o, _tmp, a) = fresh_orchestrator();
+        let old = a
+            .semantic
+            .remember(
+                "port for the gateway is 8080",
+                MemoryKind::Fact,
+                vec![],
+                "p".into(),
+            )
+            .await
+            .unwrap();
+        let new = a
+            .semantic
+            .remember(
+                "port for the gateway is 9090",
+                MemoryKind::Fact,
+                vec![],
+                "p".into(),
+            )
+            .await
+            .unwrap();
+        a.semantic
+            .relate(
+                new,
+                RelationType::Refines,
+                RelationTarget::Memory(old),
+                "moved",
+            )
+            .await
+            .unwrap();
+        let query = Some("port for the gateway is 7070");
+
+        let ctx = o
+            .build_context(query, None, TokenBudget::default())
+            .await
+            .unwrap();
+        let ids: Vec<_> = ctx.semantic.iter().map(|h| h.item.id).collect();
+        assert_eq!(ids, vec![new]);
+        // The row that is kept says what it refines.
+        assert_eq!(ctx.semantic[0].relations.refines[0].id, old);
+
+        let keep = o.clone().with_auto_context(AutoContextConfig {
+            include_demoted: true,
+            ..Default::default()
+        });
+        let ctx = keep
+            .build_context(query, None, TokenBudget::default())
+            .await
+            .unwrap();
+        let ids: Vec<_> = ctx.semantic.iter().map(|h| h.item.id).collect();
+        assert_eq!(ids, vec![new, old]);
+
+        // Forget the refiner and the old memory is current again.
+        a.semantic.forget(new).await.unwrap();
+        let ctx = o
+            .build_context(query, None, TokenBudget::default())
+            .await
+            .unwrap();
+        assert_eq!(ctx.semantic.len(), 1);
+        assert_eq!(ctx.semantic[0].item.id, old);
     }
 }

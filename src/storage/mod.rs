@@ -43,6 +43,21 @@ pub(crate) const MTS_KEY_PREFIX: &[u8] = b"mts:";
 /// exists only for an archived memory. An absent row means active.
 pub(crate) const ST_KEY_PREFIX: &[u8] = b"st:";
 
+/// Typed relations from a memory:
+/// `REL_KEY_PREFIX || from_ulid || type || tag || to_key`. Layout and
+/// value encoding are documented in
+/// [`crate::memory::relations`].
+pub(crate) const REL_KEY_PREFIX: &[u8] = b"rel:";
+
+/// The same relations keyed from the target:
+/// `RREL_KEY_PREFIX || tag || to_key || type || from_ulid`.
+pub(crate) const RREL_KEY_PREFIX: &[u8] = b"rrel:";
+
+/// Provenance: `PROV_KEY_PREFIX || ulid_bytes` holds a version byte and
+/// a postcard [`ProvenanceRecord`](crate::memory::relations::ProvenanceRecord).
+/// Absent for a memory stored without one.
+pub(crate) const PROV_KEY_PREFIX: &[u8] = b"prov:";
+
 #[async_trait]
 pub trait Storage: Send + Sync {
     async fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;

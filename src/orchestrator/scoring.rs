@@ -228,6 +228,10 @@ mod tests {
             rank: similarity,
             updated_at: now - Duration::days(updated_days),
             status: crate::memory::semantic::MemoryStatus::Active,
+            demoted: false,
+            relations: Default::default(),
+            provenance: None,
+            source: None,
         }
     }
 
