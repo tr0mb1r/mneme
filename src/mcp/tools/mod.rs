@@ -29,6 +29,9 @@ use crate::storage::archive::ColdArchive;
 
 pub mod export;
 pub mod forget;
+pub(crate) mod links;
+#[cfg(test)]
+mod links_surface_tests;
 pub mod list_scopes;
 pub mod pin;
 pub mod recall;
@@ -344,6 +347,7 @@ impl ToolRegistry {
         // L4 — semantic memory.
         r.register(Arc::new(
             remember::Remember::new(Arc::clone(&semantic), Arc::clone(&scope_state))
+                .with_episodic(Arc::clone(&episodic))
                 .with_max_chars(max_remember_chars)
                 .with_secret_guard(secrets),
         ));
@@ -357,6 +361,7 @@ impl ToolRegistry {
         )));
         r.register(Arc::new(
             update::Update::new(Arc::clone(&semantic))
+                .with_episodic(Arc::clone(&episodic))
                 .with_max_chars(max_remember_chars)
                 .with_secret_guard(secrets),
         ));
@@ -379,6 +384,7 @@ impl ToolRegistry {
         // captures conversation content rather than just tool names.
         let mut record_event_tool =
             record_event::RecordEvent::new(Arc::clone(&episodic), Arc::clone(&scope_state))
+                .with_semantic(Arc::clone(&semantic))
                 .with_max_chars(max_remember_chars)
                 .with_secret_guard(secrets);
         if let Some(ref session) = active_session {

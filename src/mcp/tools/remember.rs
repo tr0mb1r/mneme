@@ -8,9 +8,10 @@ use serde_json::{Value, json};
 
 use super::secret_guard::{self, Guard};
 use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
-use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult, links};
 use crate::config::SecretsMode;
 use crate::ids::MemoryId;
+use crate::memory::episodic::EpisodicStore;
 use crate::memory::semantic::{
     MemoryKind, NEAR_DUPLICATE_SIMILARITY, NearDuplicate, RememberOutcome, SemanticStore,
 };
@@ -39,6 +40,15 @@ balance, a changed decision, a corrected detail), pass its id in \
 When a close existing memory is found, the reply says so (and gives its \
 id) so you can decide.\n\
 \n\
+RELATING FACTS: when this memory narrows, corrects part of, or disputes \
+an older one without replacing it, pass `relations: [{type: \"refines\" \
+| \"contradicts\", id, reason}]`. The older memory stays in `recall`, \
+ranked below this one. `{type: \"evidence_for\", id | ref, reason}` \
+records what this memory is based on: a memory, an event, or an external \
+reference such as `research:pricing-study`. `provenance` says how you \
+know it (`user_stated`, `observed`, `inferred`, `imported`) and `source` \
+where from.\n\
+\n\
 RETRIES: storing content identical to an existing current memory in the \
 same scope (ignoring leading/trailing and repeated whitespace) writes \
 nothing; the reply says `already stored as <id>` with `deduplicated: true`, \
@@ -66,6 +76,9 @@ pub struct Remember {
     max_chars: usize,
     /// `[guardrails] secrets`.
     secrets: SecretsMode,
+    /// For checking that an `evidence_for` id names a stored event.
+    /// Without it only memories and references can be cited.
+    episodic: Option<Arc<EpisodicStore>>,
 }
 
 impl Remember {
@@ -75,7 +88,14 @@ impl Remember {
             scope_state,
             max_chars: DEFAULT_MAX_CHARS,
             secrets: SecretsMode::default(),
+            episodic: None,
         }
+    }
+
+    /// Attach the episodic store so `relations` can cite an event.
+    pub fn with_episodic(mut self, episodic: Arc<EpisodicStore>) -> Self {
+        self.episodic = Some(episodic);
+        self
     }
 
     /// Override the over-limit ceiling. The 500/2,000-character
@@ -129,7 +149,10 @@ impl Tool for Remember {
                         ],
                         "description": "Id (or ids) of memories this one replaces. They stay \
             readable by id but drop out of recall and auto-context."
-                    }
+                    },
+                    "relations": links::relations_schema(),
+                    "provenance": links::provenance_schema().0,
+                    "source": links::provenance_schema().1
                 },
                 "required": ["content"]
             }),
@@ -218,6 +241,18 @@ impl Tool for Remember {
             }
         }
 
+        // Relations and provenance are validated up front for the same
+        // reason. Both are absent on an ordinary `remember`, which then
+        // does no extra work here.
+        let relations = links::parse_relations(
+            args.get("relations"),
+            &self.store,
+            self.episodic.as_deref(),
+            None,
+        )
+        .await?;
+        let provenance = links::parse_provenance(&args)?;
+
         // With `supersedes` the new memory is meant to sit next to a close
         // neighbour until the link is written, so dedup is skipped there.
         let (id, duplicate) = if supersedes.is_empty() {
@@ -236,6 +271,9 @@ impl Tool for Remember {
                         memory_id = %id,
                         "remember: identical content already stored, nothing written"
                     );
+                    // A retry carries the same links; writing them
+                    // again is idempotent.
+                    links::apply(&self.store, id, &relations, provenance.as_ref()).await?;
                     let kept = self
                         .differs_from_stored(id, passed_kind, &passed_tags)
                         .await;
@@ -272,10 +310,15 @@ impl Tool for Remember {
                 .map_err(|e| ToolError::Internal(format!("supersede {old} failed: {e}")))?;
         }
 
+        links::apply(&self.store, id, &relations, provenance.as_ref()).await?;
+
         let mut text = format!("stored memory {id}");
         if !supersedes.is_empty() {
             let ids: Vec<String> = supersedes.iter().map(ToString::to_string).collect();
             text.push_str(&format!(" (supersedes {})", ids.join(", ")));
+        }
+        if !relations.is_empty() {
+            text.push_str(&format!(" ({})", links::summary(&relations)));
         }
 
         // Merge the size advisory (if any) and the similarity advisory
@@ -284,9 +327,16 @@ impl Tool for Remember {
         let mut meta = size_tier::success_meta(tier, len, self.max_chars)
             .and_then(|m| m.as_object().cloned())
             .unwrap_or_default();
-        // A neighbour the caller just superseded is the expected
-        // outcome, not something to warn about.
-        if let Some(near) = duplicate.filter(|d| !supersedes.contains(&d.id)) {
+        // A neighbour the caller just superseded, or just related this
+        // memory to, is the expected outcome, not something to warn
+        // about.
+        let already_linked = |near: &NearDuplicate| {
+            supersedes.contains(&near.id)
+                || relations
+                    .iter()
+                    .any(|r| r.target == crate::memory::relations::RelationTarget::Memory(near.id))
+        };
+        if let Some(near) = duplicate.filter(|d| !already_linked(d)) {
             let (key, advisory, note) = similarity_advisory(&near);
             tracing::info!(
                 memory_id = %id,
@@ -311,6 +361,12 @@ impl Tool for Remember {
                         .collect::<Vec<_>>()
                 ),
             );
+        }
+        if !relations.is_empty() {
+            meta.insert("relations".into(), links::parsed_json(&relations));
+        }
+        if let Some(record) = &provenance {
+            meta.insert("provenance".into(), json!(record.provenance.as_str()));
         }
 
         let mut result = ToolResult::text(text);
@@ -375,16 +431,20 @@ fn similarity_advisory(near: &NearDuplicate) -> (&'static str, Value, String) {
         "The new memory is {relation} memory {} (similarity {:.2}). Both are stored. \
          If the new one is an updated version (new value, changed decision), \
          retire the old one: call `update` on the new id with `supersedes: \"{}\"` \
-         (or pass `supersedes` to `remember` up front next time). If it only \
+         (or pass `supersedes` to `remember` up front next time). If it narrows \
+         or corrects part of the old one and both should stay findable, call \
+         `update` on the new id with `relations: [{{\"type\": \"refines\", \"id\": \"{}\"}}]`: \
+         the old one then ranks below it. If it only \
          restates the old one, `forget` the new id. If both are true and \
          distinct, ignore this.",
-        near.id, near.similarity, near.id
+        near.id, near.similarity, near.id, near.id
     );
     let note = format!(
         "note: {relation} memory {} (similarity {:.2}): \"{quoted}\". If this \
          replaces it, call `update` on the new id with `supersedes: \"{}\"`; if it \
+         refines it, with `relations: [{{\"type\": \"refines\", \"id\": \"{}\"}}]`; if it \
          only restates it, `forget` the new id.",
-        near.id, near.similarity, near.id
+        near.id, near.similarity, near.id, near.id
     );
     (
         key,
@@ -394,6 +454,8 @@ fn similarity_advisory(near: &NearDuplicate) -> (&'static str, Value, String) {
             "existing_scope": near.scope,
             "similarity": near.similarity,
             "message": message,
+            // What to pass if the new memory refines the existing one.
+            "suggested_relation": { "type": "refines", "id": near.id.to_string() },
         }),
         note,
     )

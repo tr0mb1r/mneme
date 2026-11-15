@@ -6,15 +6,17 @@
 //! time window; see [`crate::memory::unified_recall`]. The default is
 //! still L4 only.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::recall_recent::parse_time_bound;
-use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult, links};
 use crate::ids::EventId;
-use crate::memory::episodic::{EpisodicStore, RECALL_TOUCH_DEBOUNCE_HOURS, Tier};
+use crate::memory::episodic::{EpisodicStore, RECALL_TOUCH_DEBOUNCE_HOURS, Tier, indexable_text};
+use crate::memory::relations::{Provenance, RelationTarget};
 use crate::memory::semantic::{RecallFilters, RecallMode, SemanticStore};
 use crate::memory::unified_recall::{self, Layers, RecallRequest, TimeField, UnifiedHit};
 
@@ -33,7 +35,15 @@ By default only stored memories are searched. Pass \
 `match: \"keyword\"` and no `similarity`. All rows are ordered by `rank`. \
 `since` / `until` keep only rows inside a `[since, until)` time window \
 (RFC3339 or a ULID; the server does not parse phrases like 'last week'). \
-`scope` takes one scope or several separated by commas.";
+`scope` takes one scope or several separated by commas. \
+\
+A memory that a newer one `refines` or `contradicts` is still returned, \
+lower down, with `demoted: true`; its row's `relations` names the newer \
+memory and the reason. `expand: 1` adds a `linked` list quoting the start \
+of each related memory. `ref: \"research:pricing-study\"` returns the \
+memories that cite that external reference as evidence (`query` is then \
+optional). `provenance` keeps only memories recorded as `user_stated`, \
+`observed`, `inferred` or `imported`.";
 
 /// Cap on the result count. Above ~100 the LLM context burn dwarfs any
 /// retrieval signal. Matches spec §6.1's `recall.limit.maximum`.
@@ -237,23 +247,98 @@ impl Tool for Recall {
                         "description": "Also return memories that a newer memory replaced \
             (`remember` with `supersedes`). They come after every current match and \
             carry `superseded_by`. Defaults to false."
+                    },
+                    "ref": {
+                        "type": "string",
+                        "description": "An external reference, matched exactly. Returns \
+            the memories related to it (`evidence_for` with this `ref`) instead of \
+            searching. `query` is optional with it and, when given, orders the rows \
+            by similarity. Memories only; `layers` and `mode` do not apply."
+                    },
+                    "provenance": {
+                        "type": "string",
+                        "enum": ["user_stated", "observed", "inferred", "imported"],
+                        "description": "Keep only memories recorded with this provenance. \
+            Memories stored without one never match, and neither do events."
+                    },
+                    "expand": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "1 adds `linked` to each row that has relations: \
+            the id and first 120 characters of every related memory or event. \
+            Defaults to 0."
                     }
                 },
-                "required": ["query"]
+                // `query` is required unless `ref` is given; checked in
+                // the handler, since JSON Schema cannot say "either".
+                "required": []
             }),
         }
     }
 
     async fn invoke(&self, args: Value) -> Result<ToolResult, ToolError> {
-        let query = args
-            .get("query")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArguments("`query` is required".into()))?;
-        if query.trim().is_empty() {
+        let reference = match args.get("ref") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => {
+                let s = s.trim();
+                if s.is_empty() {
+                    return Err(ToolError::InvalidArguments(
+                        "`ref` must not be empty".into(),
+                    ));
+                }
+                if s.len() > crate::memory::relations::MAX_REF_BYTES {
+                    return Err(ToolError::InvalidArguments(format!(
+                        "`ref` is longer than {} bytes",
+                        crate::memory::relations::MAX_REF_BYTES
+                    )));
+                }
+                Some(s.to_owned())
+            }
+            Some(_) => {
+                return Err(ToolError::InvalidArguments("`ref` must be a string".into()));
+            }
+        };
+        let query = match args.get("query") {
+            None | Some(Value::Null) if reference.is_some() => "",
+            None | Some(Value::Null) => {
+                return Err(ToolError::InvalidArguments("`query` is required".into()));
+            }
+            Some(Value::String(q)) => q.as_str(),
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`query` must be a string".into(),
+                ));
+            }
+        };
+        if query.trim().is_empty() && reference.is_none() {
             return Err(ToolError::InvalidArguments(
                 "`query` must not be empty".into(),
             ));
         }
+        let provenance = match args.get("provenance") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(Provenance::parse(s).ok_or_else(|| {
+                ToolError::InvalidArguments(format!(
+                    "`provenance` must be one of user_stated|observed|inferred|imported, got `{s}`"
+                ))
+            })?),
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`provenance` must be a string".into(),
+                ));
+            }
+        };
+        let expand = match args.get("expand") {
+            None | Some(Value::Null) => false,
+            Some(Value::Number(n)) if n.as_u64() == Some(0) => false,
+            Some(Value::Number(n)) if n.as_u64() == Some(1) => true,
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`expand` must be 0 or 1".into(),
+                ));
+            }
+        };
 
         let limit = match args.get("limit") {
             None => DEFAULT_LIMIT,
@@ -358,6 +443,7 @@ impl Tool for Recall {
                 min_similarity,
                 include_superseded,
                 mode,
+                provenance,
                 ..Default::default()
             },
             layers,
@@ -367,15 +453,90 @@ impl Tool for Recall {
             time_field,
             include_archived,
         };
-        let hits = unified_recall::recall(
-            &self.store,
-            self.episodic.as_deref(),
-            query,
-            limit as usize,
-            &request,
-        )
-        .await
-        .map_err(|e| ToolError::Internal(format!("recall failed: {e}")))?;
+        // A `ref` lookup with no query has no similarity to report.
+        let unranked = reference.is_some() && query.trim().is_empty();
+        let hits = match &reference {
+            None => unified_recall::recall(
+                &self.store,
+                self.episodic.as_deref(),
+                query,
+                limit as usize,
+                &request,
+            )
+            .await
+            .map_err(|e| ToolError::Internal(format!("recall failed: {e}")))?,
+            Some(reference) => {
+                let filters = RecallFilters {
+                    scope: None,
+                    scopes: request.scopes.clone(),
+                    since: request.since,
+                    until: request.until,
+                    time_field: request.time_field,
+                    include_archived: request.include_archived,
+                    ..request.filters.clone()
+                };
+                self.store
+                    .recall_by_ref(reference, Some(query), limit as usize, &filters)
+                    .await
+                    .map_err(|e| ToolError::Internal(format!("recall failed: {e}")))?
+                    .into_iter()
+                    .map(|hit| {
+                        let rank = hit.rank;
+                        UnifiedHit::Semantic { hit, rank }
+                    })
+                    .collect()
+            }
+        };
+
+        // `expand: 1`: the start of every memory or event a returned
+        // row is related to, looked up once per id.
+        let mut stubs: HashMap<String, Value> = HashMap::new();
+        if expand {
+            for unified in &hits {
+                let UnifiedHit::Semantic { hit, .. } = unified else {
+                    continue;
+                };
+                for id in hit.relations.linked_memories() {
+                    if stubs.contains_key(&id.to_string()) {
+                        continue;
+                    }
+                    if let Some(item) = self
+                        .store
+                        .get(id)
+                        .await
+                        .map_err(|e| ToolError::Internal(format!("recall failed: {e}")))?
+                    {
+                        stubs.insert(
+                            id.to_string(),
+                            json!({ "id": id.to_string(), "layer": "semantic",
+                                    "content": links::stub(&item.content) }),
+                        );
+                    }
+                }
+                let Some(episodic) = self.episodic.as_ref() else {
+                    continue;
+                };
+                for evidence in &hit.relations.evidence {
+                    let RelationTarget::Event(id) = &evidence.target else {
+                        continue;
+                    };
+                    if stubs.contains_key(&id.to_string()) {
+                        continue;
+                    }
+                    if let Some(event) = episodic
+                        .find_warm_or_hot(*id)
+                        .await
+                        .map_err(|e| ToolError::Internal(format!("recall failed: {e}")))?
+                    {
+                        stubs.insert(
+                            id.to_string(),
+                            json!({ "id": id.to_string(), "layer": "episodic",
+                                    "content": links::stub(&indexable_text(&event)) }),
+                        );
+                    }
+                }
+            }
+        }
 
         // Emit one structured JSON document so MCP hosts can either
         // parse it as JSON or hand it to the model verbatim. An empty
@@ -439,6 +600,39 @@ impl Tool for Recall {
                 });
                 if let Some(newer) = h.superseded_by {
                     row["superseded_by"] = json!(newer.to_string());
+                }
+                if unranked {
+                    // Found by reference, with no query to be similar to.
+                    row["score"] = Value::Null;
+                    row["similarity"] = Value::Null;
+                    row["rank"] = Value::Null;
+                }
+                if h.demoted {
+                    row["demoted"] = json!(true);
+                }
+                if let Some(provenance) = h.provenance {
+                    row["provenance"] = json!(provenance.as_str());
+                }
+                if let Some(source) = &h.source {
+                    row["source"] = json!(source);
+                }
+                if let Some(relations) = links::hit_relations_json(&h.relations, h.superseded_by) {
+                    row["relations"] = relations;
+                }
+                if expand {
+                    let mut linked: Vec<Value> = h
+                        .relations
+                        .linked_memories()
+                        .iter()
+                        .filter_map(|id| stubs.get(&id.to_string()).cloned())
+                        .collect();
+                    linked.extend(h.relations.evidence.iter().filter_map(|e| match &e.target {
+                        RelationTarget::Event(id) => stubs.get(&id.to_string()).cloned(),
+                        _ => None,
+                    }));
+                    if !linked.is_empty() {
+                        row["linked"] = Value::Array(linked);
+                    }
                 }
                 row
             })

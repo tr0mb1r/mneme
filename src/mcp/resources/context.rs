@@ -267,7 +267,8 @@ impl Resource for Context {
             // L4 semantic hits. Non-empty only when the read carried a
             // `?q=` seed. Field names match the `recall` tool's rows so
             // an agent can treat both surfaces identically.
-            "semantic": ctx.semantic.iter().map(|h| json!({
+            "semantic": ctx.semantic.iter().map(|h| {
+                let mut row = json!({
                 "id": h.item.id.to_string(),
                 "content": h.item.content,
                 "kind": h.item.kind.as_str(),
@@ -280,7 +281,20 @@ impl Resource for Context {
                 "similarity": similarity_from_distance(h.score),
                 // Similarity plus keyword evidence.
                 "rank": h.rank,
-            })).collect::<Vec<_>>(),
+                });
+                if let Some(provenance) = h.provenance {
+                    row["provenance"] = json!(provenance.as_str());
+                }
+                if let Some(source) = &h.source {
+                    row["source"] = json!(source);
+                }
+                if let Some(relations) =
+                    crate::mcp::tools::links::hit_relations_json(&h.relations, h.superseded_by)
+                {
+                    row["relations"] = relations;
+                }
+                row
+            }).collect::<Vec<_>>(),
             // Echo what the read was interpreted as, so a caller can
             // tell "no semantic hits" from "no query supplied".
             "request": {

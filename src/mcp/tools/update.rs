@@ -14,9 +14,10 @@ use ulid::Ulid;
 
 use super::secret_guard::{self, Guard};
 use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
-use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
+use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult, links};
 use crate::config::SecretsMode;
 use crate::ids::MemoryId;
+use crate::memory::episodic::EpisodicStore;
 use crate::memory::semantic::{MemoryStatus, SemanticStore, UpdatePatch};
 
 const DESCRIPTION: &str = "Edit an existing memory in place. Provide \
@@ -30,7 +31,11 @@ example after `remember` reported a close existing memory): they stay \
 readable by id but drop out of `recall` and auto-context. Pass \
 `status: archived` for a memory that is no longer current but worth \
 keeping: it leaves auto-context and default `recall`, and comes back \
-with `recall(include_archived: true)`, `export`, or `status: active`.";
+with `recall(include_archived: true)`, `export`, or `status: active`. \
+Pass `relations` to say this memory `refines` or `contradicts` an older \
+one (which then ranks below it in `recall`, still findable) or what it is \
+`evidence_for`; relations are added, never removed, by an update. \
+`provenance` and `source` record how the fact is known.";
 
 pub struct Update {
     store: Arc<SemanticStore>,
@@ -41,6 +46,8 @@ pub struct Update {
     max_chars: usize,
     /// `[guardrails] secrets`.
     secrets: SecretsMode,
+    /// For checking that an `evidence_for` id names a stored event.
+    episodic: Option<Arc<EpisodicStore>>,
 }
 
 impl Update {
@@ -49,7 +56,14 @@ impl Update {
             store,
             max_chars: DEFAULT_MAX_CHARS,
             secrets: SecretsMode::default(),
+            episodic: None,
         }
+    }
+
+    /// Attach the episodic store so `relations` can cite an event.
+    pub fn with_episodic(mut self, episodic: Arc<EpisodicStore>) -> Self {
+        self.episodic = Some(episodic);
+        self
     }
 
     /// Override the over-limit ceiling. Mirrors `Remember::with_max_chars`.
@@ -106,7 +120,10 @@ impl Tool for Update {
                             { "type": "array", "items": { "type": "string" } }
                         ],
                         "description": "Id (or ids) of older memories this one replaces."
-                    }
+                    },
+                    "relations": links::relations_schema(),
+                    "provenance": links::provenance_schema().0,
+                    "source": links::provenance_schema().1
                 },
                 "required": ["id"]
             }),
@@ -236,6 +253,15 @@ impl Tool for Update {
             }
         }
 
+        let relations = links::parse_relations(
+            args.get("relations"),
+            &self.store,
+            self.episodic.as_deref(),
+            Some(memory_id),
+        )
+        .await?;
+        let provenance = links::parse_provenance(&args)?;
+
         let patch = UpdatePatch {
             content,
             kind,
@@ -266,6 +292,7 @@ impl Tool for Update {
                     .await
                     .map_err(|e| ToolError::Internal(format!("supersede {old} failed: {e}")))?;
             }
+            links::apply(&self.store, memory_id, &relations, provenance.as_ref()).await?;
         }
 
         let mut text = if existed {
@@ -280,6 +307,9 @@ impl Tool for Update {
         if existed && !supersedes.is_empty() {
             let ids: Vec<String> = supersedes.iter().map(ToString::to_string).collect();
             text.push_str(&format!(" (supersedes {})", ids.join(", ")));
+        }
+        if existed && !relations.is_empty() {
+            text.push_str(&format!(" ({})", links::summary(&relations)));
         }
         let mut result = ToolResult::text(text);
         // Only attach an advisory/warning if the update actually

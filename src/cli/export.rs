@@ -247,6 +247,15 @@ async fn collect_semantic(storage: &Arc<dyn Storage>, scope: Option<&str>) -> Re
         if let Some(newer) = meta.superseded_by {
             row["superseded_by"] = json!(newer.to_string());
         }
+        if let Some(record) = &meta.provenance {
+            row["provenance"] = json!(record.provenance.as_str());
+            if let Some(source) = &record.source {
+                row["source"] = json!(source);
+            }
+        }
+        if !meta.relations.is_empty() {
+            row["relations"] = crate::mcp::tools::links::export_json(&meta.relations);
+        }
         out.push(row);
     }
     Ok(out)
@@ -531,5 +540,128 @@ mod tests {
             .unwrap();
         assert_eq!(work_only.len(), 1);
         assert_eq!(work_only[0]["scope"], "work");
+    }
+
+    /// `mneme backup` then `mneme restore` into an empty directory:
+    /// relations and provenance are side rows in the same redb file as
+    /// the memories, so they have to come back with them, and an export
+    /// of the restored directory has to equal one of the original.
+    #[test]
+    fn backup_and_restore_round_trip_relations_and_provenance() {
+        use crate::cli::backup::backup_at;
+        use crate::cli::restore::restore_at;
+        use crate::embed::Embedder;
+        use crate::embed::stub::StubEmbedder;
+        use crate::memory::relations::{
+            Provenance, ProvenanceRecord, RelationTarget, RelationType,
+        };
+        use crate::memory::semantic::{RecallFilters, SemanticStore, SnapshotConfig};
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let open = |root: &Path| -> (Arc<dyn Storage>, Arc<SemanticStore>) {
+            let storage: Arc<dyn Storage> = RedbStorage::open(&root.join("episodic")).unwrap();
+            let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+            let semantic = SemanticStore::open(
+                root,
+                Arc::clone(&storage),
+                embedder,
+                SnapshotConfig::disabled(),
+            )
+            .unwrap();
+            (storage, semantic)
+        };
+
+        let src = TempDir::new().unwrap();
+        std::fs::create_dir_all(src.path().join("episodic")).unwrap();
+        std::fs::create_dir_all(src.path().join("procedural")).unwrap();
+        let (old, new, before) = rt.block_on(async {
+            let (storage, s) = open(src.path());
+            let old = s
+                .remember(
+                    "port for the gateway is 8080",
+                    MemoryKind::Fact,
+                    vec![],
+                    "p".into(),
+                )
+                .await
+                .unwrap();
+            let new = s
+                .remember(
+                    "port for the gateway is 9090",
+                    MemoryKind::Fact,
+                    vec![],
+                    "p".into(),
+                )
+                .await
+                .unwrap();
+            s.relate(
+                new,
+                RelationType::Refines,
+                RelationTarget::Memory(old),
+                "moved in March",
+            )
+            .await
+            .unwrap();
+            s.relate(
+                new,
+                RelationType::EvidenceFor,
+                RelationTarget::Ref("path:/etc/gateway.toml".into()),
+                "",
+            )
+            .await
+            .unwrap();
+            s.set_provenance(
+                new,
+                ProvenanceRecord {
+                    provenance: Provenance::Observed,
+                    source: Some("tool:cat".into()),
+                },
+            )
+            .await
+            .unwrap();
+            let before = collect_semantic(&storage, None).await.unwrap();
+            s.shutdown().await.unwrap();
+            (old, new, before)
+        });
+        // The export itself carries them.
+        let row = before.iter().find(|r| r["id"] == new.to_string()).unwrap();
+        assert_eq!(row["provenance"], "observed");
+        assert_eq!(row["relations"].as_array().unwrap().len(), 2);
+
+        let archive = TempDir::new().unwrap();
+        let tarball = archive.path().join("mneme-backup.tar.gz");
+        backup_at(src.path(), &tarball, false).unwrap();
+        let dst = TempDir::new().unwrap();
+        let dst_root = dst.path().join("restored");
+        restore_at(&tarball, &dst_root, false).unwrap();
+
+        rt.block_on(async {
+            let (storage, s) = open(&dst_root);
+            let after = collect_semantic(&storage, None).await.unwrap();
+            assert_eq!(after, before, "export differs after restore");
+
+            // And they still act: the refined memory is demoted.
+            let hits = s
+                .recall("port for the gateway is 7070", 5, &RecallFilters::default())
+                .await
+                .unwrap();
+            assert_eq!(hits[0].item.id, new);
+            let stale = hits.iter().find(|h| h.item.id == old).unwrap();
+            assert!(stale.demoted);
+            assert_eq!(stale.relations.refined_by[0].reason, "moved in March");
+            assert_eq!(hits[0].provenance, Some(Provenance::Observed));
+            assert_eq!(hits[0].source.as_deref(), Some("tool:cat"));
+            assert_eq!(
+                s.recall_by_ref("path:/etc/gateway.toml", None, 5, &RecallFilters::default())
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            s.shutdown().await.unwrap();
+        });
     }
 }

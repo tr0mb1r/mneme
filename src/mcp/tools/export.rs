@@ -17,6 +17,9 @@
 //! memory rather than in it: `updated_at`, `status`, and (when set)
 //! `superseded_by`. Archived and superseded memories are always in an
 //! export; until 1.6 the supersession links were silently left out.
+//! Since 1.7 a row also carries `provenance` / `source` and a
+//! `relations` array (the relations the memory carries, each with its
+//! type, target, reason and creation time) when it has them.
 
 use std::sync::Arc;
 
@@ -255,6 +258,15 @@ impl Tool for Export {
             });
             if let Some(newer) = meta.superseded_by {
                 row["superseded_by"] = json!(newer.to_string());
+            }
+            if let Some(record) = &meta.provenance {
+                row["provenance"] = json!(record.provenance.as_str());
+                if let Some(source) = &record.source {
+                    row["source"] = json!(source);
+                }
+            }
+            if !meta.relations.is_empty() {
+                row["relations"] = super::links::export_json(&meta.relations);
             }
             sem_json.push(row);
         }
