@@ -130,6 +130,33 @@ The extractor records the git branch + sha + describe in the JSON's
 after every measurable change to the storage seam, the embedder
 loader, or the orchestrator.
 
+## The blocking gate: same-machine A/B
+
+What `perf.yml` blocks on is not a frozen file. `ab_gate.sh` builds the
+bench binaries for the base commit (in a temporary git worktree) and for
+the change, runs them in interleaved rounds (base, head, base, head, …),
+and writes each side's per-bench minimum (`merge_baselines.py --strategy
+min`). `compare.py` then gates on p50 at 15 %.
+
+```bash
+benches/baselines/ab_gate.sh <base-ref> /tmp/perf     # AB_ROUNDS=3 by default
+python3 benches/baselines/compare.py /tmp/perf/base.json /tmp/perf/head.json \
+        --metric p50_ns --tolerance-pct 15
+```
+
+Interleaving exposes both sides to the same drift, and the minimum
+discards rounds that hit a stall. Both matter for `remember`, which is
+one fdatasync and a handful of thread wake-ups per call: about 21k
+instructions of our code inside 100-250 µs of waiting. One base pass
+followed by one head pass differed by 22 % on identical code.
+
+Each side's criterion output goes to its own directory through
+`CRITERION_HOME`, and `extract_baseline.py --criterion-root` reads it
+from there. The binaries are copied out of the shared target dir before
+anything runs, so a side cannot measure the other's build. Per-round
+JSON is kept under `<out>/rounds/` (and uploaded by CI) for when a
+result needs a second look.
+
 ## Comparison
 
 ```bash
