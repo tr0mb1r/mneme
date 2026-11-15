@@ -438,7 +438,8 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
             Arc::clone(&procedural),
             Arc::clone(&episodic),
         )
-        .with_active_session(Arc::clone(&active_session)),
+        .with_active_session(Arc::clone(&active_session))
+        .with_auto_context(config.auto_context.clone()),
     );
 
     let sessions_dir = root.join("sessions");

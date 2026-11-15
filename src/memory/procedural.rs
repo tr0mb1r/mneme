@@ -167,6 +167,25 @@ impl ProceduralStore {
     /// watcher has flipped the stale flag since the last call, the
     /// cache is rebuilt from disk first.
     pub fn list(&self, scope: Option<&str>) -> Result<Vec<PinnedItem>> {
+        match scope {
+            None => self.list_where(|_| true),
+            Some(s) => self.list_where(|p| p.scope == s),
+        }
+    }
+
+    /// Pinned items whose scope is any of `scopes`, in file order. An
+    /// empty set means no constraint, like `list(None)`.
+    ///
+    /// Auto-context uses this to return the pins of the requested
+    /// scopes together with the always-on `[auto_context] pin_scopes`.
+    pub fn list_in_scopes(&self, scopes: &[String]) -> Result<Vec<PinnedItem>> {
+        if scopes.is_empty() {
+            return self.list_where(|_| true);
+        }
+        self.list_where(|p| scopes.contains(&p.scope))
+    }
+
+    fn list_where(&self, keep: impl Fn(&PinnedItem) -> bool) -> Result<Vec<PinnedItem>> {
         if self.stale.swap(false, Ordering::SeqCst) {
             let fresh = read_file(&self.path, self.aead.as_deref())?;
             *self
@@ -179,10 +198,7 @@ impl ProceduralStore {
             .cache
             .lock()
             .map_err(|e| MnemeError::Storage(format!("procedural cache poisoned: {e}")))?;
-        Ok(match scope {
-            None => g.clone(),
-            Some(s) => g.iter().filter(|p| p.scope == s).cloned().collect(),
-        })
+        Ok(g.iter().filter(|p| keep(p)).cloned().collect())
     }
 
     /// Append a new pinned item. Returns the assigned id.
@@ -596,5 +612,27 @@ mod tests {
         let items = s2.list(None).unwrap();
         let contents: Vec<&str> = items.iter().map(|p| p.content.as_str()).collect();
         assert_eq!(contents, vec!["alpha", "charlie"]);
+    }
+
+    #[tokio::test]
+    async fn list_in_scopes_is_a_set_filter() {
+        let tmp = TempDir::new().unwrap();
+        let s = ProceduralStore::open(tmp.path()).unwrap();
+        for scope in ["global", "a", "b", "c"] {
+            s.pin(format!("rule {scope}"), vec![], scope.into())
+                .await
+                .unwrap();
+        }
+        let scopes = |items: Vec<PinnedItem>| -> Vec<String> {
+            items.into_iter().map(|p| p.scope).collect()
+        };
+        let want = ["a".to_owned(), "global".to_owned()];
+        // File order, not request order.
+        assert_eq!(scopes(s.list_in_scopes(&want).unwrap()), ["global", "a"]);
+        assert!(s.list_in_scopes(&["nope".to_owned()]).unwrap().is_empty());
+        // The empty set is "no constraint", like `list(None)`.
+        assert_eq!(s.list_in_scopes(&[]).unwrap().len(), 4);
+        // The single-scope form still means exactly that scope.
+        assert_eq!(scopes(s.list(Some("a")).unwrap()), ["a"]);
     }
 }

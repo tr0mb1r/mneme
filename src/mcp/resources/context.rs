@@ -15,7 +15,7 @@
 //! | Param   | Meaning |
 //! |---------|---------|
 //! | `q`     | Natural-language seed for the L4 semantic layer. Percent-decoded. |
-//! | `scope` | Restrict L0 / L3 / L4 to one scope. L1 turns are session-local and always included. |
+//! | `scope` | Restrict L3 / L4 to one scope, or to several (`scope=a,b`). L0 returns the pins of those scopes plus `[auto_context] pin_scopes` (default `global`). L1 turns are session-local and always included. |
 //! | `limit` | Semantic over-fetch before the budget pass trims. Clamped by the orchestrator. |
 //! | `kinds` | Comma-separated episodic kinds to include, and only those. Naming an auto-logged kind here (e.g. `tool_call`) opts back in to it. |
 //! | `exclude_kinds` | Comma-separated episodic kinds to hide, on top of the default exclusions. |
@@ -24,6 +24,23 @@
 //! (`tool_call`, `tool_call_failed`, `session_start`, `session_end`):
 //! in one deployment 56 of 61 context events were `tool_call` and ate
 //! most of the token budget. Pass `?kinds=tool_call` to see them.
+//! Events of kind `archived`, and events whose `retrieval_weight` is at
+//! or below `[auto_context] min_event_weight`, are left out too: both
+//! are how an agent marks an event as not worth startup space, and
+//! dropping them server-side keeps them from being charged against the
+//! budget first.
+//!
+//! Event payloads longer than `[auto_context] event_clip_chars` are
+//! clipped and the row carries `"truncated": true`. Read the full
+//! event with `recall_recent`.
+//!
+//! # Scopes and pins
+//!
+//! `scope=a,b` is split on commas *before* any other handling, each
+//! name trimmed. Since 1.6 a scoped read also returns the pins of
+//! `[auto_context] pin_scopes`: before, `?scope=myproject` silently
+//! dropped every `global` rule. Set `pin_scopes = []` for the old
+//! behaviour.
 //!
 //! `query` is accepted as an alias for `q`. Unknown parameters are
 //! ignored rather than rejected — a host that appends a cache-buster
@@ -35,7 +52,10 @@
 //! sections below are all live now.
 //!
 //! The output is JSON with four layer sections + a `total_tokens`
-//! count; the agent's host renders it however it likes.
+//! count; the agent's host renders it however it likes. `request`
+//! echoes how the read was interpreted, including the scope set and
+//! the layer `shares` in force; `layer_tokens` says where the budget
+//! went.
 
 use std::sync::Arc;
 
@@ -44,7 +64,7 @@ use serde_json::json;
 
 use super::{Resource, ResourceContent, ResourceDescriptor, ResourceError};
 use crate::memory::semantic::similarity_from_distance;
-use crate::orchestrator::{ContextRequest, Orchestrator, TokenBudget};
+use crate::orchestrator::{ContextRequest, LayerShares, Orchestrator, TokenBudget};
 
 /// Fixed URI — the no-parameter form, and what `resources/list`
 /// advertises.
@@ -99,7 +119,7 @@ impl Context {
             }
             match key {
                 "q" | "query" => req.query = Some(decoded),
-                "scope" => req.scope = Some(decoded),
+                "scope" => req.scope = split_scopes(&decoded),
                 "limit" => req.semantic_limit = decoded.trim().parse::<usize>().ok(),
                 "kinds" => req.kinds = split_kinds(&decoded),
                 "exclude_kinds" => req.exclude_kinds = split_kinds(&decoded),
@@ -108,6 +128,20 @@ impl Context {
         }
         req
     }
+}
+
+/// Split `scope=a,b` into its scope names: trimmed, blanks dropped,
+/// duplicates removed, order kept. Deliberately nothing more — the
+/// names are compared for equality against stored scopes, and running
+/// them through a sanitiser would turn `a,b` into one scope `a-b`.
+fn split_scopes(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for scope in s.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+        if !out.iter().any(|have| have == scope) {
+            out.push(scope.to_owned());
+        }
+    }
+    out
 }
 
 /// Split a comma-separated kind list, trimming blanks. Kinds are
@@ -172,11 +206,14 @@ impl Resource for Context {
             description: "Auto-assembled context block: pinned procedural rules + \
                           working-session turns + recent episodic events, packed inside \
                           the configured token budget. Append `?q=<text>` to also fold in \
-                          semantically-similar long-term memories, and `?scope=<name>` to \
-                          restrict it to one scope. Auto-logged event kinds (`tool_call`, \
-                          `tool_call_failed`, `session_start`, `session_end`) are hidden by \
-                          default; `?kinds=a,b` includes only those kinds and \
-                          `?exclude_kinds=a,b` hides more.",
+                          semantically-similar long-term memories and rank events by \
+                          relevance to it, and `?scope=<name>` (or `?scope=a,b`) to restrict \
+                          it to those scopes; pins of the always-on scopes (`global` by \
+                          default) are still included. Auto-logged event kinds (`tool_call`, \
+                          `tool_call_failed`, `session_start`, `session_end`) and `archived` \
+                          events are hidden by default; `?kinds=a,b` includes only those \
+                          kinds and `?exclude_kinds=a,b` hides more. Long event payloads are \
+                          clipped and marked `truncated`.",
             mime_type: "application/json",
         }
     }
@@ -189,6 +226,8 @@ impl Resource for Context {
             .await
             .map_err(|e| ResourceError::Internal(format!("build_context: {e}")))?;
 
+        let auto = self.orchestrator.auto_context();
+        let shares = LayerShares::from_config(auto);
         let body = json!({
             "procedural": ctx.procedural.iter().map(|p| json!({
                 "id": p.id.to_string(),
@@ -211,7 +250,11 @@ impl Resource for Context {
                 "id": e.id.to_string(),
                 "kind": e.kind,
                 "scope": e.scope,
+                // Clipped to `[auto_context] event_clip_chars` when
+                // `truncated` is true; the budget was charged for
+                // exactly this text.
                 "payload": e.payload,
+                "truncated": ctx.is_truncated(e.id),
                 "tags": e.tags,
                 // Lets clients (the Hermes hook) honour weighting that
                 // agents apply themselves: an agent may down-weight or
@@ -231,16 +274,41 @@ impl Resource for Context {
                 "tags": h.item.tags,
                 "scope": h.item.scope,
                 "created_at": h.item.created_at.to_rfc3339(),
+                // Last content edit; what L4 freshness is measured on.
+                "updated_at": h.updated_at.to_rfc3339(),
                 "score": h.score,
                 "similarity": similarity_from_distance(h.score),
+                // Similarity plus keyword evidence.
+                "rank": h.rank,
             })).collect::<Vec<_>>(),
             // Echo what the read was interpreted as, so a caller can
             // tell "no semantic hits" from "no query supplied".
             "request": {
                 "query": req.query,
-                "scope": req.scope,
+                // The single requested scope, as before 1.6; `null`
+                // for none or for several (see `scopes`).
+                "scope": match req.scope.as_slice() {
+                    [one] => Some(one.as_str()),
+                    _ => None,
+                },
+                "scopes": req.scope,
+                // Scopes whose pins are included whatever was asked
+                // for. Only consulted when `scopes` is non-empty.
+                "pin_scopes": auto.pin_scopes,
                 "kinds": req.kinds,
                 "exclude_kinds": req.exclude_kinds,
+                "shares": {
+                    "episodic_max": shares.episodic_max,
+                    "semantic_min": shares.semantic_min,
+                    "semantic_min_items": shares.semantic_min_items,
+                    "working_max": shares.working_max,
+                },
+            },
+            "layer_tokens": {
+                "procedural": ctx.layer_tokens.procedural,
+                "working": ctx.layer_tokens.working,
+                "episodic": ctx.layer_tokens.episodic,
+                "semantic": ctx.layer_tokens.semantic,
             },
             "total_tokens": ctx.total_tokens,
             "max_tokens": self.budget.max_tokens,
@@ -336,7 +404,7 @@ mod tests {
     fn parse_request_reads_q_scope_and_limit() {
         let req = Context::parse_request("mneme://context?q=deploy&scope=work&limit=5");
         assert_eq!(req.query.as_deref(), Some("deploy"));
-        assert_eq!(req.scope.as_deref(), Some("work"));
+        assert_eq!(req.scope, vec!["work".to_owned()]);
         assert_eq!(req.semantic_limit, Some(5));
     }
 
@@ -358,7 +426,7 @@ mod tests {
             Context::parse_request("mneme://context?limit=abc&unknown=1&bareflag&=&q=real#frag");
         assert_eq!(req.semantic_limit, None, "unparseable limit is ignored");
         assert_eq!(req.query.as_deref(), Some("real"));
-        assert_eq!(req.scope, None);
+        assert!(req.scope.is_empty());
     }
 
     #[test]
@@ -383,7 +451,7 @@ mod tests {
     fn parse_request_ignores_blank_values() {
         let req = Context::parse_request("mneme://context?q=&scope=%20");
         assert_eq!(req.query, None);
-        assert_eq!(req.scope, None);
+        assert!(req.scope.is_empty());
     }
 
     #[test]
@@ -437,7 +505,7 @@ mod tests {
         let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
         let episodic = Arc::new(EpisodicStore::new(backing));
         episodic
-            .record_weighted("decision", "global", "{\"content\":\"x\"}", 0.25)
+            .record_weighted("decision", "global", "{\"content\":\"x\"}", 0.6)
             .await
             .unwrap();
         let orch = Arc::new(Orchestrator::new(semantic, procedural, episodic));
@@ -448,7 +516,7 @@ mod tests {
         let rows = v["episodic"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         let w = rows[0]["retrieval_weight"].as_f64().unwrap();
-        assert!((w - 0.25).abs() < 1e-6, "weight was {w}");
+        assert!((w - 0.6).abs() < 1e-6, "weight was {w}");
     }
 
     #[tokio::test]
@@ -577,5 +645,198 @@ mod tests {
         let uri = "mneme://context?q=anything&scope=work";
         let c = ctx.read(uri).await.unwrap();
         assert_eq!(c.uri, uri);
+    }
+
+    // ---------- multi-scope, pins, shares (1.6) ----------
+
+    #[test]
+    fn parse_request_splits_scope_on_commas() {
+        let req = Context::parse_request("mneme://context?scope=a,b");
+        assert_eq!(req.scope, vec!["a".to_owned(), "b".to_owned()]);
+        // Percent-encoded comma, padding, blanks and repeats.
+        let req = Context::parse_request("mneme://context?scope=%20a%20%2C,b%2Ca,");
+        assert_eq!(req.scope, vec!["a".to_owned(), "b".to_owned()]);
+        // Names are compared verbatim, never sanitised into one scope.
+        let req = Context::parse_request("mneme://context?scope=My%20Proj,global");
+        assert_eq!(req.scope, vec!["My Proj".to_owned(), "global".to_owned()]);
+    }
+
+    struct ScopedFixture {
+        ctx: Context,
+        _tmp: TempDir,
+    }
+
+    /// Pins in `global`, `a`, `b` and `c`; one memory and one event in
+    /// each of `a`, `b`, `c`. `pin_scopes` is the config under test.
+    async fn scoped_fixture(pin_scopes: Option<Vec<String>>) -> ScopedFixture {
+        use crate::memory::semantic::MemoryKind;
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(backing));
+        for scope in ["global", "a", "b", "c"] {
+            procedural
+                .pin(format!("rule for {scope}"), vec![], scope.into())
+                .await
+                .unwrap();
+        }
+        for scope in ["a", "b", "c"] {
+            semantic
+                .remember(
+                    &format!("shared topic in {scope}"),
+                    MemoryKind::Fact,
+                    vec![],
+                    scope.into(),
+                )
+                .await
+                .unwrap();
+            episodic
+                .record(
+                    "decision",
+                    scope,
+                    &format!("{{\"content\":\"{scope} work log\"}}"),
+                )
+                .await
+                .unwrap();
+        }
+        let mut orch = Orchestrator::new(semantic, procedural, episodic);
+        if let Some(pin_scopes) = pin_scopes {
+            orch = orch.with_auto_context(crate::config::AutoContextConfig {
+                pin_scopes,
+                ..Default::default()
+            });
+        }
+        ScopedFixture {
+            ctx: Context::new(Arc::new(orch), TokenBudget::for_tests(2000)),
+            _tmp: tmp,
+        }
+    }
+
+    fn scopes_of(v: &serde_json::Value, layer: &str) -> Vec<String> {
+        let mut out: Vec<String> = v[layer]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["scope"].as_str().unwrap().to_owned())
+            .collect();
+        out.sort();
+        out
+    }
+
+    async fn read_json(ctx: &Context, uri: &str) -> serde_json::Value {
+        serde_json::from_str(&ctx.read(uri).await.unwrap().text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn two_scopes_return_both_plus_global_pins() {
+        let f = scoped_fixture(None).await;
+        let v = read_json(&f.ctx, "mneme://context?q=shared%20topic&scope=a,b").await;
+        assert_eq!(scopes_of(&v, "procedural"), vec!["a", "b", "global"]);
+        assert_eq!(scopes_of(&v, "episodic"), vec!["a", "b"]);
+        assert_eq!(scopes_of(&v, "semantic"), vec!["a", "b"]);
+        assert_eq!(v["request"]["scopes"], serde_json::json!(["a", "b"]));
+        assert_eq!(v["request"]["scope"], serde_json::Value::Null);
+        assert_eq!(v["request"]["pin_scopes"], serde_json::json!(["global"]));
+    }
+
+    /// The documented 1.6 behaviour change: one scope now also brings
+    /// the global pins.
+    #[tokio::test]
+    async fn a_single_scope_also_returns_global_pins() {
+        let f = scoped_fixture(None).await;
+        let v = read_json(&f.ctx, "mneme://context?scope=a").await;
+        assert_eq!(scopes_of(&v, "procedural"), vec!["a", "global"]);
+        assert_eq!(scopes_of(&v, "episodic"), vec!["a"]);
+        assert_eq!(v["request"]["scope"], "a");
+        assert_eq!(v["request"]["scopes"], serde_json::json!(["a"]));
+    }
+
+    #[tokio::test]
+    async fn empty_pin_scopes_restores_the_old_scoping() {
+        let f = scoped_fixture(Some(vec![])).await;
+        let v = read_json(&f.ctx, "mneme://context?scope=a").await;
+        assert_eq!(scopes_of(&v, "procedural"), vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn no_scope_is_unchanged_and_returns_everything() {
+        let f = scoped_fixture(None).await;
+        let v = read_json(&f.ctx, "mneme://context?q=shared%20topic").await;
+        assert_eq!(scopes_of(&v, "procedural"), vec!["a", "b", "c", "global"]);
+        assert_eq!(scopes_of(&v, "episodic"), vec!["a", "b", "c"]);
+        assert_eq!(scopes_of(&v, "semantic"), vec!["a", "b", "c"]);
+        assert_eq!(v["request"]["scopes"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn request_echo_reports_shares_and_layer_tokens() {
+        let f = scoped_fixture(None).await;
+        let v = read_json(&f.ctx, "mneme://context?q=shared%20topic").await;
+        let shares = &v["request"]["shares"];
+        assert!((shares["episodic_max"].as_f64().unwrap() - 0.35).abs() < 1e-6);
+        assert!((shares["semantic_min"].as_f64().unwrap() - 0.30).abs() < 1e-6);
+        assert!((shares["working_max"].as_f64().unwrap() - 0.05).abs() < 1e-6);
+        assert_eq!(shares["semantic_min_items"], 5);
+        let t = &v["layer_tokens"];
+        let sum: u64 = ["procedural", "working", "episodic", "semantic"]
+            .iter()
+            .map(|k| t[k].as_u64().unwrap())
+            .sum();
+        assert_eq!(sum, v["total_tokens"].as_u64().unwrap());
+        assert!(t["semantic"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn long_events_are_clipped_and_flagged() {
+        let tmp = TempDir::new().unwrap();
+        let backing: Arc<dyn Storage> = MemoryStorage::new();
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        let semantic =
+            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+        let episodic = Arc::new(EpisodicStore::new(backing));
+        let long = serde_json::json!({ "content": "detail ".repeat(200) }).to_string();
+        episodic.record("summary", "p", &long).await.unwrap();
+        episodic
+            .record("decision", "p", "{\"content\":\"short\"}")
+            .await
+            .unwrap();
+        episodic
+            .record("archived", "p", "{\"content\":\"old news\"}")
+            .await
+            .unwrap();
+        episodic
+            .record_weighted("lesson", "p", "{\"content\":\"low signal\"}", 0.2)
+            .await
+            .unwrap();
+        let orch = Arc::new(Orchestrator::new(semantic, procedural, episodic));
+        let ctx = Context::new(orch, TokenBudget::for_tests(2000));
+
+        let v = read_json(&ctx, "mneme://context").await;
+        let rows = v["episodic"].as_array().unwrap();
+        // `archived` and the weight-0.2 event are dropped server-side.
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let payload = row["payload"].as_str().unwrap();
+            if row["kind"] == "summary" {
+                assert_eq!(row["truncated"], true);
+                assert!(payload.chars().count() <= 400);
+                // Still parseable by a client that reads `content`.
+                let inner: serde_json::Value = serde_json::from_str(payload).unwrap();
+                assert!(inner["content"].as_str().unwrap().ends_with('…'));
+            } else {
+                assert_eq!(row["truncated"], false);
+            }
+        }
+        assert!(v["layer_tokens"]["episodic"].as_u64().unwrap() <= 110);
+
+        // Naming the kind opts back in.
+        assert_eq!(
+            episodic_kinds(&ctx, "mneme://context?kinds=archived").await,
+            vec!["archived"]
+        );
     }
 }
