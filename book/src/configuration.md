@@ -433,6 +433,36 @@ payload carries the value-bearing argument of write tools
 (`remember.content`, for instance), so it is also the place a credential
 would be copied to if `[guardrails] secrets` let one through.
 
+### `index_kinds`
+
+| | |
+|---|---|
+| **Type** | array of strings |
+| **Default** | `["decision", "milestone", "lesson", "summary", "resolution", "problem", "pivot", "observation", "archived"]` |
+| **Affects** | which event kinds `recall(layers=[…, "episodic"])` can find |
+
+Events of these kinds are keyword-indexed (in memory, hot and warm
+tiers). The text indexed is `payload.content`, else `payload.text`, plus
+the tags. `tool_call` and the message kinds are left out by default:
+they are many, and they repeat text that is already stored elsewhere.
+Changing the list takes effect on restart, when the index is rebuilt.
+
+### `touch_on_recall`
+
+| | |
+|---|---|
+| **Type** | boolean |
+| **Default** | `true` |
+| **Affects** | whether `recall` refreshes `last_accessed` on the events it returns |
+
+Consolidation moves an event to warm once its `last_accessed` is
+`hot_to_warm_days` old. With this on, a hot event returned by `recall`
+has its `last_accessed` set to now, so events that keep being used stay
+hot. The write happens after the response is sent and at most once per
+24 hours per event; warm events are never rewritten. Set it to `false`
+for runs that must not write on reads (evaluations, CI): `recall` then
+changes nothing.
+
 ---
 
 ## `[consolidation]` — L3 hot/warm/cold tiering
@@ -468,7 +498,24 @@ Warm events older than this get archived to
 `<root>/cold/<YYYY-Qn>.zst` (zstd-compressed JSON bundles) and
 deleted from the warm tier. Cold lookups are still possible via
 `storage::archive::ColdArchive::find_anywhere(id)` but are off the
-hot path — they're for forensics, not auto-context.
+hot path — they're for forensics, not auto-context. `recall_recent` and
+`export` read them with `include_cold: true`; `recall` does not search
+them.
+
+### `cold_exempt_kinds`
+
+| | |
+|---|---|
+| **Type** | array of strings |
+| **Default** | `["archived", "summary", "milestone", "lesson", "decision"]` |
+| **Affects** | which event kinds stay in the warm tier for good |
+
+Events of these kinds are never archived to cold, however old. They stay
+in redb, so `recall` keeps finding them and `forget` can still delete
+them (cold bundles are never rewritten). The cost is that redb keeps
+growing with them; these are the low-volume kinds. `[]` restores the
+pre-1.6 behaviour, where every kind is archived at `warm_to_cold_days`.
+Events already in the cold archive are not brought back.
 
 ### `schedule`
 

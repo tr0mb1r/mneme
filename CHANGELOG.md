@@ -12,6 +12,48 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+### Added
+
+- **`recall` can search recorded events.** `layers: ["semantic",
+  "episodic"]` adds keyword search over the L3 events whose kind is in
+  `[episodic] index_kinds` (decisions, milestones, lessons, summaries
+  and the like; not `tool_call`). Until now an event could be listed by
+  time but not found by what it said, so anything recorded with
+  `record_event` and never copied into a memory was invisible to
+  `recall`. Rows from both layers carry `layer` and `rank` and are
+  ordered by `rank`; an event that contains every query word ranks like
+  a memory at similarity 0.65. Events of kind `archived` or with
+  `retrieval_weight` ≤ 0.3 are demoted, not hidden. The default is still
+  `["semantic"]`, with the same rows in the same order as before.
+- **`recall` takes `since` / `until`** (RFC3339 or ULID, with
+  `time_field`), applied after the search with the search widened until
+  the window is filled. In 1.5.2 these were unknown arguments that
+  pointed at `recall_recent`. `scope` accepts several scopes separated by
+  commas. `include_archived` is accepted.
+- **`include_cold`** on `recall_recent` and `export`, and `mneme export
+  --include-cold`: read the cold archive too. Opt-in because it
+  decompresses quarterly bundles; `recall_recent` opens only the quarters
+  that overlap the window and reads at most 1000 cold rows. Rows are
+  tagged `"tier": "cold"`.
+- **`[consolidation] cold_exempt_kinds`** is honoured: events of those
+  kinds (`archived`, `summary`, `milestone`, `lesson`, `decision` by
+  default) stay in the warm tier instead of being archived, so they stay
+  searchable and forgettable. `[]` restores the old behaviour.
+- **`[episodic] touch_on_recall`** is honoured: hot events returned by
+  `recall` get their `last_accessed` refreshed, after the response and at
+  most once per 24 hours each, so events still in use are not moved to
+  warm on age alone. Nothing called `touch` before, so promotion was pure
+  age.
+
+### Changed
+
+- The consolidation scheduler runs its passes through the server's
+  shared episodic store rather than a private one, so the keyword index
+  sees events leave for cold. Search results are also checked against
+  storage, and an index entry whose row is gone is dropped.
+- `[recall] stemming = "en"` is accepted by the config but not yet
+  implemented; keyword search still matches exact tokens.
+
 ### Fixed
 
 - **Warm-tier events are readable again.** Consolidation moves an

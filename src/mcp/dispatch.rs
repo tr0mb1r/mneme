@@ -954,23 +954,14 @@ mod tests {
         }
     }
 
+    /// `recall` takes `since` / `until` itself since 1.6, so the 1.5.2
+    /// hint that sent callers to `recall_recent` is gone. A stray key
+    /// still gets the plain unknown-argument error.
     #[tokio::test]
-    async fn recall_since_until_points_at_recall_recent() {
+    async fn recall_stray_argument_gets_the_plain_error() {
         let rig = Rig::new(SecretsMode::Reject, AutoLogToolCalls::Writes);
-        let msg = invalid_params(
-            &rig,
-            "recall",
-            json!({"query": "x", "since": "2026-09-01T00:00:00Z", "until": "2026-10-19T00:00:00Z"}),
-        )
-        .await;
-        assert!(
-            msg.contains("unexpected argument(s) `since`, `until`"),
-            "{msg}"
-        );
-        assert_eq!(msg.matches("call `recall_recent`").count(), 1, "{msg}");
-
-        // Any other stray key gets the plain error, without the hint.
         let msg = invalid_params(&rig, "recall", json!({"query": "x", "k": 3})).await;
+        assert!(msg.contains("unexpected argument(s) `k`"), "{msg}");
         assert!(!msg.contains("recall_recent"), "{msg}");
     }
 

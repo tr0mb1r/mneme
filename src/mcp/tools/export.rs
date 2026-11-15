@@ -19,18 +19,20 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
-use crate::memory::episodic::EpisodicStore;
+use crate::memory::episodic::{EpisodicStore, newest_first, with_cold_rows};
 use crate::memory::procedural::ProceduralStore;
 use crate::memory::semantic::MemoryItem;
 use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
+use crate::storage::archive::ColdArchive;
 
 const DESCRIPTION: &str = "Export every memory the agent currently \
 holds as one JSON document, optionally filtered by scope. Use this \
 for human-readable inspection or for piping to `jq` / external \
 scripts. Episodic events come from the hot and warm tiers (each row \
 has a `tier` field); pass `include_warm: false` for hot only. Events \
-in the cold archive are not included. Each layer is capped at \
+in the cold archive are left out unless `include_cold: true`, which \
+decompresses the archive and is slow. Each layer is capped at \
 `limit_per_layer` rows, newest first, so raise it (max 5000) for a \
 complete dump. For at-rest, full-fidelity copies use the \
 `mneme backup` CLI command instead.";
@@ -43,6 +45,9 @@ pub struct Export {
     procedural: Arc<ProceduralStore>,
     episodic: Arc<EpisodicStore>,
     storage: Arc<dyn Storage>,
+    /// Cold archive for `include_cold`. `None` in fixtures built
+    /// without one; `include_cold: true` is then an error.
+    cold: Option<ColdArchive>,
 }
 
 impl Export {
@@ -55,7 +60,14 @@ impl Export {
             procedural,
             episodic,
             storage,
+            cold: None,
         }
+    }
+
+    /// Attach the cold archive so `include_cold` can read it.
+    pub fn with_cold(mut self, cold: ColdArchive) -> Self {
+        self.cold = Some(cold);
+        self
     }
 }
 
@@ -81,6 +93,12 @@ impl Tool for Export {
                         "type": "boolean",
                         "description": "Include warm-tier episodic events (older than the \
             hot-to-warm threshold). Defaults to true."
+                    },
+                    "include_cold": {
+                        "type": "boolean",
+                        "description": "Also include episodic events from the cold archive \
+            (past the warm-to-cold threshold). Defaults to false; slow, and counts \
+            toward `limit_per_layer`."
                     }
                 }
             }),
@@ -116,6 +134,16 @@ impl Tool for Export {
             }
         };
 
+        let include_cold = match args.get("include_cold") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`include_cold` must be a boolean".into(),
+                ));
+            }
+        };
+
         // L0 procedural.
         let proc_items = self
             .procedural
@@ -143,6 +171,25 @@ impl Tool for Export {
             .map_err(|e| ToolError::Internal(format!("episodic list: {e}")))?;
         if let Some(ref s) = scope_filter {
             all_episodic.retain(|t| &t.event.scope == s);
+        }
+        if include_cold {
+            let cold = self.cold.clone().ok_or_else(|| {
+                ToolError::Internal("`include_cold`: no cold archive attached".into())
+            })?;
+            let scope = scope_filter.clone();
+            // Bundle reads are blocking file I/O plus zstd. The newest
+            // `limit` cold rows are enough: older ones cannot make the
+            // cut after the merge.
+            let cold_rows = tokio::task::spawn_blocking(move || {
+                cold.read_window(None, None, limit, |e| {
+                    scope.as_ref().is_none_or(|s| &e.scope == s)
+                })
+            })
+            .await
+            .map_err(|e| ToolError::Internal(format!("cold read task: {e}")))?
+            .map_err(|e| ToolError::Internal(format!("cold read failed: {e}")))?;
+            all_episodic = with_cold_rows(all_episodic, cold_rows);
+            all_episodic.sort_by(|a, b| newest_first(&a.event, &b.event));
         }
         let epi_json: Vec<Value> = all_episodic
             .into_iter()
@@ -379,6 +426,72 @@ mod tests {
         let rows = episodic_rows(&e, json!({ "limit_per_layer": 2 })).await;
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1]["kind"], "warm-40d");
+    }
+
+    /// One event in the cold archive, 300 days old, in `scope`.
+    fn cold_with_one_event(tmp: &TempDir, scope: &str) -> ColdArchive {
+        use crate::memory::episodic::{DEFAULT_RETRIEVAL_WEIGHT, EpisodicEvent};
+        let cold = ColdArchive::new(&tmp.path().join("coldroot"));
+        let at = chrono::Utc::now() - chrono::Duration::days(300);
+        cold.append(&[EpisodicEvent {
+            id: crate::ids::EventId::new(),
+            kind: "cold-300d".into(),
+            scope: scope.into(),
+            payload: "\"c\"".into(),
+            tags: vec![],
+            retrieval_weight: DEFAULT_RETRIEVAL_WEIGHT,
+            last_accessed: at,
+            created_at: at,
+        }])
+        .unwrap();
+        cold
+    }
+
+    #[tokio::test]
+    async fn export_include_cold_is_opt_in() {
+        let (e, _semantic, tmp) = fixture_with_warm().await;
+        let e = e.with_cold(cold_with_one_event(&tmp, "personal"));
+
+        // Default: hot + warm, as in 1.5.2.
+        assert_eq!(episodic_rows(&e, json!({})).await.len(), 4);
+
+        let rows = episodic_rows(&e, json!({ "include_cold": true })).await;
+        let got: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r["kind"].as_str().unwrap(), r["tier"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("k", "hot"),
+                ("warm-40d", "warm"),
+                ("warm-50d", "warm"),
+                ("warm-60d", "warm"),
+                ("cold-300d", "cold"),
+            ]
+        );
+        // Scope filter and the per-layer cap cover cold rows.
+        assert!(
+            episodic_rows(&e, json!({ "include_cold": true, "scope": "work" }))
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            episodic_rows(&e, json!({ "include_cold": true, "limit_per_layer": 4 }))
+                .await
+                .len(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn export_include_cold_is_validated() {
+        let (e, _, _tmp) = fixture().await;
+        let err = e.invoke(json!({ "include_cold": 1 })).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+        // No archive attached.
+        let err = e.invoke(json!({ "include_cold": true })).await.unwrap_err();
+        assert!(matches!(err, ToolError::Internal(_)));
     }
 
     #[tokio::test]

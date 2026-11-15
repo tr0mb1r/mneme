@@ -173,6 +173,9 @@ pub enum Command {
         scope: Option<String>,
         #[arg(long, default_value = "json")]
         format: String,
+        /// Also dump episodic events from the cold archive
+        #[arg(long)]
+        include_cold: bool,
     },
     /// Stop a running mneme instance
     Stop,
@@ -283,7 +286,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Client => client::execute(),
         Command::Stats => stats::execute(),
         Command::Inspect { id, query } => inspect::execute(id, query),
-        Command::Export { scope, format } => export::execute(scope, format),
+        Command::Export {
+            scope,
+            format,
+            include_cold,
+        } => export::execute(scope, format, include_cold),
         Command::Stop => stop::execute(),
         Command::Backup {
             output,
