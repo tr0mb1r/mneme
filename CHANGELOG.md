@@ -37,6 +37,14 @@ the work that landed before automation was wired up.
   archive bundles are not rewritten. See "Forgetting and the timeline" in
   `book/src/mcp-surface.md`.
 
+- Read-only tool calls no longer push an L1 working turn. Every successful
+  `tools/call` used to add a `tool` turn, so `recall`, `recall_recent`,
+  `stats`, `list_scopes` and `export` inflated `turns_total`, filled the
+  working-memory window with tool names and triggered empty checkpoints (a
+  read-only evaluation run added 665 turns). Only tools that are not
+  `readOnlyHint` push a turn now, the rule `auto_log_tool_calls = "writes"`
+  already uses for the timeline. Not configurable yet.
+
 ### Added
 
 - Successful `remember`, `pin` and `update` calls report the id of the

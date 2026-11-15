@@ -192,8 +192,9 @@ impl CheckpointScheduler {
     }
 
     /// Wake the scheduler immediately if it's currently sleeping.
-    /// Used by the MCP server after each successful `tools/call` so
-    /// the turn-count threshold is checked promptly rather than at
+    /// Used by the MCP server after each successful `tools/call` that
+    /// pushed a turn (read-only tools push none) so the turn-count
+    /// threshold is checked promptly rather than at
     /// the next wall-clock tick.
     pub fn poke(&self) {
         self.state.notify.notify_one();

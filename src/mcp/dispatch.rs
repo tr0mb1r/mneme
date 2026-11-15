@@ -273,6 +273,21 @@ async fn emit_tool_call_failed(
     }
 }
 
+/// Whether a successful call to a tool with the given `readOnlyHint`
+/// pushes an L1 working turn (`role = "tool"`, content = the tool name).
+///
+/// Reads do not. A turn per call made looking something up count as
+/// conversation: a read-only evaluation run moved `turns_total` from 361
+/// to 1026, each of those turns took a slot in the working-memory window
+/// that auto-context shows the model, and every fifth one triggered a
+/// session checkpoint with nothing new in it. It is the same rule
+/// `auto_log_tool_calls = "writes"` applies to the L3 mirror.
+///
+/// Fixed at "writes" for now; 1.6 makes it `[working] record_tool_turns`.
+fn records_tool_turn(read_only: bool) -> bool {
+    !read_only
+}
+
 /// Dispatch a `tools/call` request: extract name/args, look up the
 /// tool in the registry, invoke it, and return the appropriate
 /// JSON-RPC response. Also handles L3 event emission for both
@@ -339,18 +354,19 @@ pub async fn handle_tools_call(
             Response::success(id, result.to_json())
         }
         Ok(result) => {
-            if let (Some(session), Some(sched)) = (session, checkpoint_scheduler) {
+            // Both the L1 turn and the L3 mirror are decided by the
+            // tool's own `readOnlyHint` (cached at registration), so a
+            // newly added tool is classified without touching this code.
+            let read_only = tools.is_read_only(&name).unwrap_or(false);
+            if records_tool_turn(read_only)
+                && let (Some(session), Some(sched)) = (session, checkpoint_scheduler)
+            {
                 session.push_turn("tool", &name);
                 sched.poke();
             }
-            // The mirror is decided by the tool's own `readOnlyHint`
-            // (cached at registration), so a newly added tool is
-            // classified without touching this code.
-            if let (true, Some(episodic), Some(scope_state)) = (
-                auto_log.logs_success(tools.is_read_only(&name).unwrap_or(false)),
-                episodic,
-                scope_state,
-            ) {
+            if let (true, Some(episodic), Some(scope_state)) =
+                (auto_log.logs_success(read_only), episodic, scope_state)
+            {
                 let scope = scope_state.current();
                 let mut payload = tool_call_payload(&name, &args);
                 if has_secret_advisory(&result) {
@@ -737,6 +753,85 @@ mod tests {
         let rows = rig.tool_call_rows().await;
         assert_eq!(rows.iter().filter(|r| r.contains("31-07-44")).count(), 1);
         assert!(rows.iter().any(|r| r.contains(BYSTANDER)));
+    }
+
+    /// F10: a read-only evaluation run pushed 665 L1 turns.
+    #[tokio::test]
+    async fn read_only_tools_push_no_working_turn() {
+        use crate::memory::checkpoint_scheduler::CheckpointSchedulerConfig;
+
+        let rig = Rig::new(SecretsMode::Reject, AutoLogToolCalls::All);
+        let sessions = tempfile::TempDir::new().unwrap();
+        let session = ActiveSession::open(sessions.path().to_path_buf()).unwrap();
+        let sched =
+            CheckpointScheduler::start(Arc::clone(&session), CheckpointSchedulerConfig::disabled());
+        let call = |tool: &'static str, args: Value| {
+            let (rig, session, sched) = (&rig, &session, &sched);
+            async move {
+                let resp = handle_tools_call(
+                    &rig.registry,
+                    Some(session),
+                    Some(sched),
+                    Some(&rig.episodic),
+                    Some(&rig.scope_state),
+                    rig.auto_log,
+                    Id::Number(1),
+                    Some(json!({"name": tool, "arguments": args})),
+                )
+                .await;
+                assert!(resp.error.is_none(), "{tool}: {:?}", resp.error);
+                resp.result.unwrap()
+            }
+        };
+
+        // Writes count, one turn each, named after the tool.
+        let stored = call("remember", json!({"content": "we use redb"})).await;
+        let id = stored["_meta"]["id"].as_str().unwrap().to_owned();
+        call("pin", json!({"content": "run cargo fmt"})).await;
+        assert_eq!(session.turns_total(), 2);
+
+        // Every tool that declares `readOnlyHint` leaves the count alone,
+        // even with auto-logging on `all` (the L3 mirror is a separate
+        // setting and still fires).
+        let read_only: Vec<&'static str> = rig
+            .registry
+            .list()
+            .into_iter()
+            .filter(|d| d.annotations.read_only)
+            .map(|d| d.name)
+            .collect();
+        for expected in ["recall", "recall_recent", "stats", "list_scopes", "export"] {
+            assert!(read_only.contains(&expected), "{expected} not read-only");
+        }
+        for tool in &read_only {
+            let args = match *tool {
+                "recall" => json!({"query": "redb"}),
+                _ => json!({}),
+            };
+            call(tool, args).await;
+        }
+        assert_eq!(
+            session.turns_total(),
+            2,
+            "read-only calls ({read_only:?}) must not push turns"
+        );
+        let mirrored = rig.tool_call_payloads().await.len();
+        assert_eq!(mirrored, 2 + read_only.len(), "L3 mirror is unaffected");
+
+        // Writes after the reads still count.
+        call("update", json!({"id": id, "tags": ["db"]})).await;
+        call("switch_scope", json!({"scope": "other"})).await;
+        call("forget", json!({"id": id})).await;
+        assert_eq!(session.turns_total(), 5);
+        let turns = session.turns_snapshot();
+        let names: Vec<&str> = turns.iter().map(|t| t.content.as_str()).collect();
+        assert_eq!(
+            names,
+            ["remember", "pin", "update", "switch_scope", "forget"]
+        );
+        assert!(turns.iter().all(|t| t.role == "tool"));
+
+        sched.shutdown().await.unwrap();
     }
 
     #[test]

@@ -791,3 +791,58 @@ async fn forget_leaves_no_copy_of_the_content_on_the_timeline() {
     drop(client.stdin);
     let _ = timeout(Duration::from_secs(5), child.wait()).await.unwrap();
 }
+
+/// Looking things up is not conversation: `recall`, `recall_recent`,
+/// `stats`, `list_scopes` and `export` must leave the working-turn
+/// count where it was. Up to 1.5.1 every successful call pushed a turn.
+#[tokio::test]
+async fn read_only_tool_calls_leave_the_working_turn_count_unchanged() {
+    let (mut child, _tmp, mut client) = connected().await;
+
+    let resp = client
+        .call(
+            10,
+            "remember",
+            json!({ "content": "postgres runs on port 5432" }),
+        )
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let stats = client.call_json(11, "stats", json!({})).await;
+    let before = stats["working"]["turns_total"].as_u64().unwrap();
+    assert_eq!(before, 1, "one write so far: {stats}");
+
+    let mut id = 20;
+    for _ in 0..3 {
+        for (tool, args) in [
+            ("recall", json!({ "query": "postgres port" })),
+            ("recall_recent", json!({ "limit": 5 })),
+            ("list_scopes", json!({})),
+            ("export", json!({})),
+            ("stats", json!({})),
+        ] {
+            id += 1;
+            let resp = client.call(id, tool, args).await;
+            assert_eq!(resp["result"]["isError"], false, "{tool}: {resp}");
+        }
+    }
+    let stats = client.call_json(50, "stats", json!({})).await;
+    assert_eq!(
+        stats["working"]["turns_total"].as_u64().unwrap(),
+        before,
+        "15 read-only calls must not add working turns: {stats}"
+    );
+
+    // A write still counts.
+    let resp = client
+        .call(51, "pin", json!({ "content": "always run cargo fmt" }))
+        .await;
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let stats = client.call_json(52, "stats", json!({})).await;
+    assert_eq!(
+        stats["working"]["turns_total"].as_u64().unwrap(),
+        before + 1
+    );
+
+    drop(client.stdin);
+    let _ = timeout(Duration::from_secs(5), child.wait()).await.unwrap();
+}

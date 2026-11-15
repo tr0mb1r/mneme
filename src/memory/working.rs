@@ -151,8 +151,9 @@ impl Default for Session {
 /// the checkpoint scheduler needs.
 ///
 /// One `ActiveSession` lives for the duration of a `mneme run` — boot
-/// allocates a fresh [`SessionId`], every successful `tools/call`
-/// pushes a turn, and shutdown flushes a final checkpoint. The
+/// allocates a fresh [`SessionId`], every successful `tools/call` of a
+/// tool that is not read-only pushes a turn, and shutdown flushes a
+/// final checkpoint. The
 /// scheduler holds an `Arc` of this and reads the turn counter to
 /// decide when to fire.
 ///

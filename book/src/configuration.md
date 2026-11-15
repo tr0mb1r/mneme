@@ -354,7 +354,18 @@ the wall-clock trigger.
 
 The same scheduler also fires when `turns_since_last_checkpoint >=
 interval_turns`, evaluated whenever the server pokes after a
-successful `tools/call`. Whichever trigger fires first wins.
+successful `tools/call` that added a turn. Whichever trigger fires
+first wins.
+
+What counts as a turn: a `user_message` / `assistant_message` recorded
+with `record_event`, and each successful call to a tool that changes
+something (`remember`, `update`, `forget`, `pin`, `unpin`,
+`record_event`, `switch_scope`). Read-only tools (`recall`,
+`recall_recent`, `summarize_session`, `stats`, `list_scopes`, `export`)
+add none since 1.5.2; before that every successful call did, so a
+session that only looked things up filled the working window with tool
+names and checkpointed for nothing. The rule is the tool's own
+`readOnlyHint`, the same one `auto_log_tool_calls = "writes"` uses.
 
 The two are designed together: pure wall-clock under-flushes a
 busy session (5 turns of dense back-and-forth in 10 s would sit

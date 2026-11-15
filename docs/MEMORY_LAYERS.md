@@ -93,7 +93,10 @@ temp+rename per checkpoint). Single file per session.
 > session to `~/.mneme/sessions/<session_id>.snapshot` on the first
 > of two triggers: every `session_interval_secs` (30 s default) when
 > there are pending turns, OR every `session_interval_turns` (5
-> default) tools/call invocations, whichever fires first. A clean
+> default) turns, whichever fires first. A turn is a message recorded
+> with `record_event`, or a successful call to a tool that changes
+> something; read-only tools (`recall`, `recall_recent`, `stats`,
+> `list_scopes`, `export`) do not add turns. A clean
 > shutdown writes a final snapshot with `clean_shutdown = true`.
 > Per-session counters land on `mneme://stats` and the `stats` tool
 > under the `working` key: `session_id`, `started_at`,
