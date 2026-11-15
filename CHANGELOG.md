@@ -87,6 +87,13 @@ the work that landed before automation was wired up.
 
 ### Changed
 
+- **`recall` breaks rank ties by the latest edit.** Two memories with
+  the same rank (within 0.0001) are now ordered newest `updated_at`
+  first, in `hybrid`, `semantic` and `keyword` mode. The order of tied
+  rows used to be whatever the search returned, which in keyword mode
+  put the older of two equally matching memories first every time: a
+  fact and its corrected version share nearly all their words. Rows with
+  different ranks are ordered as before.
 - The consolidation scheduler runs its passes through the server's
   shared episodic store rather than a private one, so the keyword index
   sees events leave for cold. Search results are also checked against

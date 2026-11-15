@@ -60,16 +60,14 @@ jobs:
       #   context gold                  41/46 = 0.891   gate >= 0.85
       #                                 (40/46 passes, 39/46 fails)
       #   stale over current, context   0/10            gate <= 0
-      #   stale over current, recall    10/10           NOT gated yet
+      #   stale over current, recall    0/10            gate <= 0
       #
-      # Two known gaps the numbers show, neither gated:
+      # The recall figure was 10/10 until recall broke rank ties by
+      # `updated_at`: the two memories of a latest-state pair score the
+      # same on keywords, and the tie used to go to the older one.
       #
-      # - Recall ranks the stale memory first for all ten latest-state
-      #   questions: the two memories of a pair score the same on
-      #   keywords and the tie goes to the older one. When recall prefers
-      #   the newer of two equal matches (plan W3), add
-      #   `--max-stale-over-current 0` below; until then that flag would
-      #   fail every night and teach people to ignore this job.
+      # One known gap the numbers show, not gated:
+      #
       # - With both layers, none of the ten hot L3-only questions has its
       #   event in the top five: memories that share one token with the
       #   question outrank the event that shares three. That is why
@@ -87,6 +85,7 @@ jobs:
             --min-l4-hit5 0.95 \
             --min-all-hit5 0.75 \
             --min-context-gold 0.85 \
+            --max-stale-over-current 0 \
             --max-context-stale-over-current 0
 
       - name: Summary

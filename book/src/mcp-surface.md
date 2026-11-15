@@ -641,6 +641,16 @@ revising the older one afterwards (its `updated_at` then passes the
 refiner's). `mneme://context` leaves demoted memories out; set
 `[auto_context] include_demoted = true` to keep them.
 
+### Ties
+
+Without any relation, two memories can still rank the same: a fact and
+its corrected version are close in meaning and share most of their
+words. `recall` orders rows of equal `rank` (within 0.0001) by
+`updated_at`, newest first, in every mode, so the version edited last
+leads even when nobody has linked the two. Before 1.7 the order of tied
+rows was whatever the search returned, and in keyword mode that was the
+older memory.
+
 ### Relations on a row
 
 `recall` and `mneme://context` rows carry a `relations` object when the

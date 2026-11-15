@@ -1685,11 +1685,7 @@ impl SemanticStore {
             // similarity `admit` set, less the margin for a demoted
             // row. The list arrives nearest-first; re-sorting by rank
             // only moves demoted rows (the sort is stable).
-            semantic.sort_by(|a, b| {
-                b.rank
-                    .partial_cmp(&a.rank)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            semantic.sort_by(|a, b| by_rank_then_recency(a.rank, a, b.rank, b));
             let mut hits = append_stale(semantic, semantic_stale, k);
             self.decorate(&mut hits).await?;
             return Ok(hits);
@@ -1798,13 +1794,7 @@ impl SemanticStore {
                 Admitted::Rejected => {}
             }
         }
-        let order = |a: &RecallHit, b: &RecallHit| {
-            b.rank
-                .partial_cmp(&a.rank)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.updated_at.cmp(&a.updated_at))
-                .then_with(|| b.item.id.cmp(&a.item.id))
-        };
+        let order = |a: &RecallHit, b: &RecallHit| by_rank_then_recency(a.rank, a, b.rank, b);
         current.sort_by(order);
         stale.sort_by(order);
         current.truncate(k);
@@ -2516,12 +2506,38 @@ fn fuse(
             _ => hit.rank,
         }
     };
-    keyed.sort_by(|a, b| {
-        order(b)
-            .partial_cmp(&order(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    keyed.sort_by(|a, b| by_rank_then_recency(order(a), &a.0.0, order(b), &b.0.0));
     keyed.into_iter().take(k).map(|((h, _), _)| h).collect()
+}
+
+/// Sort keys closer than this are a tie. Two memories with the same
+/// vector and the same keyword evidence differ only by float noise,
+/// and that noise must not be what orders them.
+const RANK_TIE: f32 = 1e-4;
+
+/// Best key first; among equals, the most recently edited first, then
+/// the newest id.
+///
+/// The tie-break matters more than it looks. A fact and its corrected
+/// version are close in meaning and share most of their words, so they
+/// routinely tie, and before 1.7 the tie fell to whichever the search
+/// happened to return first: in keyword mode, the older memory, every
+/// time. Preferring the later edit puts the current version first even
+/// when nobody has linked the two.
+///
+/// Keys are compared in steps of [`RANK_TIE`] rather than with an
+/// "about equal" test, so the ordering stays transitive.
+fn by_rank_then_recency(
+    key_a: f32,
+    a: &RecallHit,
+    key_b: f32,
+    b: &RecallHit,
+) -> std::cmp::Ordering {
+    let step = |key: f32| (key / RANK_TIE).round() as i64;
+    step(key_b)
+        .cmp(&step(key_a))
+        .then_with(|| b.updated_at.cmp(&a.updated_at))
+        .then_with(|| b.item.id.cmp(&a.item.id))
 }
 
 /// Superseded hits rank after every current one and only fill leftover
@@ -5282,5 +5298,111 @@ mod tests {
                 assert!(h.item.id == old || h.item.id == new);
             }
         }
+    }
+
+    /// Two memories the query cannot tell apart, with nothing linking
+    /// them: the one edited last comes first, in every mode. Before
+    /// 1.7 keyword mode put the older one first, every time.
+    #[tokio::test]
+    async fn ties_go_to_the_most_recently_edited_memory() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        // Several rounds, so an order that only happens to hold for one
+        // pair of random ids would show.
+        for round in 0..4 {
+            let old = s
+                .remember(
+                    &format!("port {round} for the gateway is 8080"),
+                    MemoryKind::Fact,
+                    vec![],
+                    "p".into(),
+                )
+                .await
+                .unwrap();
+            let new = s
+                .remember(
+                    &format!("port {round} for the gateway is 9090"),
+                    MemoryKind::Fact,
+                    vec![],
+                    "p".into(),
+                )
+                .await
+                .unwrap();
+            let query = format!("port {round} for the gateway is 7070");
+            let order = |s: Arc<SemanticStore>, mode| {
+                let query = query.clone();
+                async move {
+                    s.recall(
+                        &query,
+                        2,
+                        &RecallFilters {
+                            mode,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|h| h.item.id == old || h.item.id == new)
+                    .map(|h| h.item.id)
+                    .collect::<Vec<_>>()
+                }
+            };
+            for mode in [RecallMode::Hybrid, RecallMode::Keyword] {
+                assert_eq!(
+                    order(Arc::clone(&s), mode).await,
+                    vec![new, old],
+                    "round {round} {mode:?}"
+                );
+            }
+            // Revise the older one (in place, same text length) and it
+            // becomes the current one.
+            s.backdate_updated_at(old, Utc::now() + chrono::Duration::days(1))
+                .await
+                .unwrap();
+            for mode in [RecallMode::Hybrid, RecallMode::Keyword] {
+                assert_eq!(
+                    order(Arc::clone(&s), mode).await,
+                    vec![old, new],
+                    "round {round} {mode:?} after the edit"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rank_ties_are_stepped_not_fuzzy() {
+        let item = |content: &str| MemoryItem {
+            id: MemoryId::new(),
+            content: content.into(),
+            kind: MemoryKind::Fact,
+            tags: vec![],
+            scope: "p".into(),
+            created_at: Utc::now(),
+        };
+        let hit = |age_days: i64| RecallHit {
+            item: item("x"),
+            score: 0.5,
+            superseded_by: None,
+            matched: MatchSource::Semantic,
+            rank: 0.5,
+            updated_at: Utc::now() - chrono::Duration::days(age_days),
+            status: MemoryStatus::Active,
+            demoted: false,
+            relations: Default::default(),
+            provenance: None,
+            source: None,
+        };
+        let (older, newer) = (hit(30), hit(1));
+        use std::cmp::Ordering::{Greater, Less};
+        // Float noise apart: the newer edit wins either way round.
+        assert_eq!(
+            by_rank_then_recency(0.500_001, &older, 0.5, &newer),
+            Greater
+        );
+        assert_eq!(by_rank_then_recency(0.5, &newer, 0.500_001, &older), Less);
+        // A real difference in rank still decides.
+        assert_eq!(by_rank_then_recency(0.51, &older, 0.5, &newer), Less);
+        assert_eq!(by_rank_then_recency(0.5, &newer, 0.51, &older), Greater);
     }
 }

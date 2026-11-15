@@ -168,6 +168,13 @@ async fn eval_measures_the_seeded_corpus_and_writes_nothing() {
     assert_eq!(keyword["by_type"]["exact"]["hit_at_1"], 1.0);
     assert_eq!(keyword["by_type"]["fact"]["hit_at_1"], 1.0);
     assert_eq!(keyword["stale_over_current"]["n"], 10);
+    // The two memories of a latest-state pair tie on keywords; the tie
+    // goes to the one edited last, so the stale one is never first.
+    assert_eq!(
+        keyword["stale_over_current"]["count"], 0,
+        "{}",
+        keyword["stale_over_current"]
+    );
 
     // Context replays ran for every question, within budget.
     let c = &m["context"];
