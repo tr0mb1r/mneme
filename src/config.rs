@@ -36,6 +36,12 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub episodic: EpisodicConfig,
+    #[serde(default)]
+    pub auto_context: AutoContextConfig,
+    #[serde(default)]
+    pub working: WorkingConfig,
+    #[serde(default)]
+    pub recall: RecallConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -71,6 +77,11 @@ pub struct ConsolidationConfig {
     pub warm_to_cold_days: u32,
     #[serde(default = "default_consolidation_schedule")]
     pub schedule: String,
+    /// Episodic kinds that never leave the warm tier for the cold
+    /// archive, so they stay in redb and stay searchable. `[]` restores
+    /// the pre-1.6 behaviour (every kind ages into cold).
+    #[serde(default = "default_cold_exempt_kinds")]
+    pub cold_exempt_kinds: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -144,13 +155,177 @@ impl AutoLogToolCalls {
     }
 }
 
+/// How much of a tool call's arguments a `tool_call` event keeps.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LogToolCallValues {
+    /// The argument values as passed (content included). The default,
+    /// for auditability (ADR-0009); `forget` redacts matching rows.
+    #[default]
+    Full,
+    /// Tool name, ids, scope, and a short hash + length of the content.
+    Ids,
+    /// Tool name only.
+    Off,
+}
+
 /// `[episodic]` -- L3 timeline behaviour.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct EpisodicConfig {
     /// Which tool calls are auto-logged as `tool_call` events. See
     /// [`AutoLogToolCalls`]. Defaults to `writes`.
-    #[serde(default)]
     pub auto_log_tool_calls: AutoLogToolCalls,
+    /// Event kinds whose text is indexed for keyword search
+    /// (`recall(layers=[..,"episodic"])`, query-conditioned auto-context).
+    /// `tool_call` rows are deliberately absent.
+    pub index_kinds: Vec<String>,
+    /// Whether episodic rows returned by `recall` refresh their
+    /// `last_accessed`, so events that keep being used stay hot.
+    pub touch_on_recall: bool,
+    /// How much of the arguments a `tool_call` event keeps.
+    pub log_tool_call_values: LogToolCallValues,
+}
+
+impl Default for EpisodicConfig {
+    fn default() -> Self {
+        Self {
+            auto_log_tool_calls: AutoLogToolCalls::default(),
+            index_kinds: [
+                "decision",
+                "milestone",
+                "lesson",
+                "summary",
+                "resolution",
+                "problem",
+                "pivot",
+                "observation",
+                "archived",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            touch_on_recall: true,
+            log_tool_call_values: LogToolCallValues::default(),
+        }
+    }
+}
+
+/// `[auto_context]` -- how `mneme://context` scores and packs layers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AutoContextConfig {
+    /// Half-life, in days, of L4 freshness measured on `updated_at`.
+    /// `0` turns L4 decay off. Auto-context only; `recall` is undecayed.
+    pub semantic_half_life_days: f32,
+    /// Lower bound of the L4 freshness factor, so age only breaks
+    /// near-ties in relevance.
+    pub semantic_recency_floor: f32,
+    /// Largest share of the token budget episodic events may take.
+    pub episodic_max_share: f32,
+    /// Share of the budget reserved for semantic rows (capped by
+    /// `semantic_min_items` rows, whichever is smaller in tokens).
+    pub semantic_min_share: f32,
+    /// Row count alternative to `semantic_min_share`.
+    pub semantic_min_items: usize,
+    /// Largest share of the budget working-session turns may take.
+    pub working_max_share: f32,
+    /// β: the weight of recency-only versus query match for events.
+    pub episodic_query_mix: f32,
+    /// Events are clipped to this many characters server-side and
+    /// charged at the clipped size.
+    pub event_clip_chars: usize,
+    /// Events whose retrieval weight is at or below this are skipped.
+    pub min_event_weight: f32,
+    /// At most this many events of one kind.
+    pub max_events_per_kind: usize,
+    /// Procedural scopes always included alongside the requested ones.
+    /// `[]` restores the pre-1.6 behaviour (pins of the requested scope only).
+    pub pin_scopes: Vec<String>,
+    /// Include memories demoted by a newer `refines`/`contradicts`.
+    pub include_demoted: bool,
+}
+
+impl Default for AutoContextConfig {
+    fn default() -> Self {
+        Self {
+            semantic_half_life_days: 90.0,
+            semantic_recency_floor: 0.75,
+            episodic_max_share: 0.35,
+            semantic_min_share: 0.30,
+            semantic_min_items: 5,
+            working_max_share: 0.05,
+            episodic_query_mix: 0.3,
+            event_clip_chars: 400,
+            min_event_weight: 0.3,
+            max_events_per_kind: 6,
+            pin_scopes: vec!["global".to_owned()],
+            include_demoted: false,
+        }
+    }
+}
+
+/// Which successful tool calls push an L1 working turn.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordToolTurns {
+    /// Only tools that are not `readOnlyHint`. The default.
+    #[default]
+    Writes,
+    /// Every successful call (pre-1.5.2 behaviour).
+    All,
+    /// None.
+    Off,
+}
+
+impl RecordToolTurns {
+    /// Whether a successful call to a tool with this `readOnlyHint`
+    /// pushes a working turn.
+    pub fn records(self, read_only: bool) -> bool {
+        match self {
+            Self::Writes => !read_only,
+            Self::All => true,
+            Self::Off => false,
+        }
+    }
+}
+
+/// `[working]` -- L1 working-session behaviour.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorkingConfig {
+    pub record_tool_turns: RecordToolTurns,
+}
+
+/// Keyword-index stemming.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Stemming {
+    /// Exact tokens only. The default.
+    #[default]
+    Off,
+    /// English stems, added as extra tokens for purely alphabetic words of
+    /// four or more characters; ids and paths are unchanged.
+    En,
+}
+
+/// `[recall]` -- `recall` ranking knobs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RecallConfig {
+    pub stemming: Stemming,
+    /// Rank penalty (cosine scale) for a memory refined or contradicted
+    /// by a current, newer memory.
+    pub demote_margin: f32,
+}
+
+impl Default for RecallConfig {
+    fn default() -> Self {
+        Self {
+            stemming: Stemming::default(),
+            demote_margin: 0.10,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -333,6 +508,12 @@ fn default_batch_size() -> usize {
 /// episodic store can fall back to it when no config is threaded in.
 pub const DEFAULT_HOT_TO_WARM_DAYS: u32 = 28;
 
+fn default_cold_exempt_kinds() -> Vec<String> {
+    ["archived", "summary", "milestone", "lesson", "decision"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
 fn default_hot_to_warm_days() -> u32 {
     DEFAULT_HOT_TO_WARM_DAYS
 }
@@ -430,6 +611,7 @@ impl Default for ConsolidationConfig {
             hot_to_warm_days: default_hot_to_warm_days(),
             warm_to_cold_days: default_warm_to_cold_days(),
             schedule: default_consolidation_schedule(),
+            cold_exempt_kinds: default_cold_exempt_kinds(),
         }
     }
 }
@@ -1088,5 +1270,40 @@ mod tests {
         // Other fields fall back to defaults.
         assert_eq!(c.embeddings.model, "bge-m3");
         assert_eq!(c.scopes.default, "global");
+    }
+
+    #[test]
+    fn v1_6_sections_default_and_parse() {
+        let c = Config::default();
+        assert_eq!(c.auto_context.semantic_recency_floor, 0.75);
+        assert_eq!(c.auto_context.pin_scopes, vec!["global".to_owned()]);
+        assert_eq!(c.working.record_tool_turns, RecordToolTurns::Writes);
+        assert_eq!(c.episodic.log_tool_call_values, LogToolCallValues::Full);
+        assert!(c.episodic.touch_on_recall);
+        assert!(c.episodic.index_kinds.iter().any(|k| k == "decision"));
+        assert!(!c.episodic.index_kinds.iter().any(|k| k == "tool_call"));
+        assert_eq!(c.recall.stemming, Stemming::Off);
+
+        let parsed: Config = toml::from_str(
+            "[auto_context]\npin_scopes = []\nevent_clip_chars = 200\n\
+             [working]\nrecord_tool_turns = \"all\"\n\
+             [episodic]\nlog_tool_call_values = \"ids\"\n\
+             [recall]\nstemming = \"en\"\n\
+             [consolidation]\ncold_exempt_kinds = []\n",
+        )
+        .expect("parse");
+        assert!(parsed.auto_context.pin_scopes.is_empty());
+        assert_eq!(parsed.auto_context.event_clip_chars, 200);
+        assert_eq!(parsed.auto_context.episodic_max_share, 0.35);
+        assert_eq!(parsed.working.record_tool_turns, RecordToolTurns::All);
+        assert_eq!(parsed.episodic.log_tool_call_values, LogToolCallValues::Ids);
+        assert_eq!(
+            parsed.episodic.auto_log_tool_calls,
+            AutoLogToolCalls::Writes
+        );
+        assert_eq!(parsed.recall.stemming, Stemming::En);
+        assert!(parsed.consolidation.cold_exempt_kinds.is_empty());
+        assert!(RecordToolTurns::Writes.records(false));
+        assert!(!RecordToolTurns::Writes.records(true));
     }
 }
