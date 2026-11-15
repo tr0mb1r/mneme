@@ -9,6 +9,7 @@ pub mod client;
 pub mod daemon;
 pub mod demo;
 pub mod encrypt;
+pub mod eval;
 pub mod export;
 pub mod init;
 pub mod inspect;
@@ -151,6 +152,11 @@ pub enum Command {
         #[arg(long)]
         query: Option<String>,
     },
+    /// Measure recall and auto-context quality against a questions
+    /// file with known answers. Read-only: it calls `recall` and reads
+    /// `mneme://context`, and fails if the store changed during the
+    /// run. Writes `metrics-<tag>.json` and `summary-<tag>.md`.
+    Eval(eval::EvalArgs),
     /// Export memories for backup
     Export {
         #[arg(long)]
@@ -270,6 +276,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Command::Client => client::execute(),
         Command::Stats => stats::execute(),
         Command::Inspect { id, query } => inspect::execute(id, query),
+        Command::Eval(args) => eval::execute(args),
         Command::Export {
             scope,
             format,

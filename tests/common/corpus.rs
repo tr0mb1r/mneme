@@ -122,6 +122,70 @@ impl Corpus {
         self.facts.len() + 2 * self.pairs.len()
     }
 
+    /// The id behind a symbolic key, as used in
+    /// `tests/fixtures/eval/questions.jsonl`:
+    ///
+    /// - `fact:<scope>:<n>`: fact `n` (0..50) of a scope;
+    /// - `pair:<n>:current` / `pair:<n>:stale`;
+    /// - `event:<n>`: curated (hot) event `n`;
+    /// - `warm:<n>`: warm event `n`.
+    pub fn resolve(&self, key: &str) -> Option<String> {
+        let parts: Vec<&str> = key.split(':').collect();
+        match parts.as_slice() {
+            ["fact", scope, n] => {
+                let n: usize = n.parse().ok()?;
+                let s = SCOPES.iter().position(|x| x == scope)?;
+                (n < FACTS_PER_SCOPE).then(|| self.facts[s * FACTS_PER_SCOPE + n].id.to_string())
+            }
+            ["pair", n, which] => {
+                let pair = self.pairs.get(n.parse::<usize>().ok()?)?;
+                match *which {
+                    "current" => Some(pair.current.to_string()),
+                    "stale" => Some(pair.stale.to_string()),
+                    _ => None,
+                }
+            }
+            ["event", n] => Some(self.curated.get(n.parse::<usize>().ok()?)?.id.to_string()),
+            ["warm", n] => Some(self.warm.get(n.parse::<usize>().ok()?)?.id.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Turn the questions template (symbolic keys in `gold`, `gold_l3`
+    /// and `stale`) into a questions file for this seeded store. Ids
+    /// are assigned at seed time, so a questions file with real ids
+    /// cannot be checked in.
+    pub fn resolve_questions(&self, template: &str) -> std::result::Result<String, String> {
+        let mut out = String::new();
+        for (i, line) in template.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut q: serde_json::Value =
+                serde_json::from_str(line).map_err(|e| format!("line {}: {e}", i + 1))?;
+            for field in ["gold", "gold_l3", "stale"] {
+                let Some(keys) = q.get(field).and_then(|v| v.as_array()).cloned() else {
+                    continue;
+                };
+                let mut ids = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let key = key
+                        .as_str()
+                        .ok_or_else(|| format!("line {}: non-string key", i + 1))?;
+                    ids.push(
+                        self.resolve(key)
+                            .ok_or_else(|| format!("line {}: unknown key `{key}`", i + 1))?,
+                    );
+                }
+                q[field] = serde_json::json!(ids);
+            }
+            out.push_str(&q.to_string());
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
     /// Every piece of text the corpus wrote, in write order. Two seeded
     /// stores must agree on this exactly.
     pub fn fingerprint(&self) -> Vec<String> {
@@ -392,4 +456,32 @@ pub async fn seed(
         warm,
         pins,
     })
+}
+
+/// Create a data directory at `root` and seed the corpus into it, with
+/// vectors from the stub embedder. Serve it with `MNEME_EMBEDDER=stub`.
+pub async fn seed_data_dir(root: &std::path::Path) -> Result<Corpus> {
+    use mneme::embed::Embedder;
+    use mneme::embed::stub::StubEmbedder;
+    use mneme::memory::semantic::SnapshotConfig;
+    use std::sync::Arc;
+
+    mneme::cli::init::init_at(root)?;
+    let keyring = mneme::crypto::OsKeyring::new();
+    let (storage, aead) = mneme::crypto::boot::open_episodic_storage_and_aead(root, &keyring)?;
+    let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::new());
+    let semantic = SemanticStore::open_with_crypto(
+        root,
+        Arc::clone(&storage),
+        embedder,
+        SnapshotConfig::disabled(),
+        aead.clone(),
+    )?;
+    let procedural = ProceduralStore::open_with_crypto(root, aead)?;
+    let episodic = EpisodicStore::new(Arc::clone(&storage));
+
+    let corpus = seed(&semantic, &procedural, &episodic).await?;
+    semantic.shutdown().await?;
+    storage.flush().await?;
+    Ok(corpus)
 }

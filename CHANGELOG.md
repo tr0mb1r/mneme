@@ -116,6 +116,15 @@ the work that landed before automation was wired up.
 
 ### Fixed
 
+- **`mneme client` survives a daemon that is killed and restarted.** After
+  losing its daemon the client could connect to the old daemon's listener
+  in the instant before it closed, get a connection reset while replaying
+  `initialize`, and exit, so the MCP host lost its server. A disconnect
+  before the daemon has answered `initialize` is now retried like "nothing
+  listening yet". The client also no longer dies when the agent writes a
+  request before the disconnect was noticed, and it reports an auth
+  rejection on reconnect as such.
+
 - **Warm-tier events are readable again.** Consolidation moves an
   episodic event from `epi:` to `wepi:` after `hot_to_warm_days` (28),
   and no read path looked there, so the event was gone from
@@ -184,6 +193,15 @@ the work that landed before automation was wired up.
   (`mneme run`) is unchanged.
 
 ### Added
+
+- **`mneme eval`**: measure recall and auto-context quality against a
+  questions file with known answers. Runs `recall` over mode × scope ×
+  layers and replays `mneme://context` per question; reports hit@1,
+  hit@5, MRR, stale-over-current, off-scope@5, context gold, layer shares
+  and p50/p95 latency to `metrics-<tag>.json` and `summary-<tag>.md`.
+  Read-only, and fails if the store changed during the run. Optional
+  thresholds make it a gate; a nightly workflow runs it on a synthetic
+  corpus.
 
 - **Auto-context ranks events against the query.** With `?q=`, the
   `episodic` section of `mneme://context` is no longer the same 64 most
