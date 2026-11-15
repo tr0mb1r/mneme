@@ -317,7 +317,7 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     }
     let scope_state = ScopeState::new(&default_scope);
     let derive_scope_from_roots = config.scopes.derive_from_roots;
-    let auto_log_tool_calls = config.episodic.auto_log_tool_calls;
+    let dispatch_policy = crate::mcp::dispatch::DispatchPolicy::from_config(&config);
 
     // `remember` / `update` content ceiling (release-planning v2.1
     // §5.3). Configured via `[budgets] max_remember_chars`; the
@@ -469,7 +469,7 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
                 // `DaemonServeMany` mints.
                 default_scope: default_scope.clone(),
                 derive_scope_from_roots,
-                auto_log_tool_calls,
+                dispatch_policy,
                 sessions_dir,
                 auto_context_budget,
                 schema_version: on_disk_version.max(migrate::CURRENT_SCHEMA_VERSION),
@@ -561,9 +561,10 @@ struct DaemonRuntimeConfig {
     /// replace its default scope with one derived from the client's
     /// `initialize` roots.
     derive_scope_from_roots: bool,
-    /// `[episodic] auto_log_tool_calls` — which tool calls are
-    /// mirrored into the L3 timeline.
-    auto_log_tool_calls: crate::config::AutoLogToolCalls,
+    /// What a successful tool call leaves behind: `[episodic]
+    /// auto_log_tool_calls` / `log_tool_call_values` and `[working]
+    /// record_tool_turns`.
+    dispatch_policy: crate::mcp::dispatch::DispatchPolicy,
     sessions_dir: std::path::PathBuf,
     auto_context_budget: TokenBudget,
     schema_version: u32,
@@ -609,7 +610,7 @@ async fn async_main(
         scope_state,
         default_scope,
         derive_scope_from_roots,
-        auto_log_tool_calls,
+        dispatch_policy,
         sessions_dir,
         auto_context_budget,
         schema_version,
@@ -720,7 +721,7 @@ async fn async_main(
             let mut server = Server::new(transport, tool, resource, storage)
                 .with_session(active_session, checkpoint_scheduler, episodic, scope_state)
                 .with_scope_from_roots(derive_scope_from_roots)
-                .with_auto_log_tool_calls(auto_log_tool_calls);
+                .with_dispatch_policy(dispatch_policy);
             if with_signal {
                 tokio::select! {
                     result = server.run() => result?,
@@ -790,7 +791,7 @@ async fn async_main(
                     scope_c,
                 )
                 .with_scope_from_roots(derive_scope_from_roots)
-                .with_auto_log_tool_calls(auto_log_tool_calls)
+                .with_dispatch_policy(dispatch_policy)
         })
     };
 
@@ -1065,7 +1066,7 @@ async fn async_main(
                                         scope_c,
                                     )
                                     .with_scope_from_roots(derive_scope_from_roots)
-                                    .with_auto_log_tool_calls(auto_log_tool_calls);
+                                    .with_dispatch_policy(dispatch_policy);
                                     // Race the serve loop against the
                                     // daemon-level shutdown broadcast.
                                     // `Server::run` blocks in

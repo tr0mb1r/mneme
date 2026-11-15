@@ -86,6 +86,10 @@ Limits, so you know what is and is not covered:
   `forget` with its id again: the reply is `no such memory …`, and any
   rows carrying that id (its `update` events) are still redacted. The
   redaction runs on every `forget`, which also makes it safe to retry.
+- **`log_tool_call_values`.** With `[episodic] log_tool_call_values =
+  "ids"` the events never held the text, only its length and a short
+  hash; `forget` finds them by id and removes those too. With `"off"`
+  they hold the tool name only and there is nothing to redact.
 - **Other event kinds.** Only `tool_call` rows are touched. An event you
   wrote yourself with `record_event` that quotes the memory is a separate
   item: `forget` it by its own id.

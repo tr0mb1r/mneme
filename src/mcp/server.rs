@@ -35,7 +35,9 @@ use crate::memory::working::ActiveSession;
 use crate::scope::ScopeState;
 use crate::storage::Storage;
 
-pub use super::dispatch::{soft_error_message, tool_call_failed_payload, tool_call_payload};
+pub use super::dispatch::{
+    DispatchPolicy, soft_error_message, tool_call_failed_payload, tool_call_payload,
+};
 
 // Tools consume the SemanticStore directly (Phase 3); the `Storage`
 // handle on `Server` is now mostly informational, kept for future
@@ -95,9 +97,10 @@ pub struct McpSession {
     /// default scope. Mirrors `[scopes] derive_from_roots`; off unless
     /// the user opted in, because it changes where writes land.
     derive_scope_from_roots: bool,
-    /// Which successful `tools/call`s are mirrored as `tool_call`
-    /// events. `[episodic] auto_log_tool_calls`; defaults to `writes`.
-    auto_log: AutoLogToolCalls,
+    /// What a successful `tools/call` leaves behind: the L3 mirror
+    /// (`[episodic] auto_log_tool_calls`, `log_tool_call_values`) and
+    /// the L1 turn (`[working] record_tool_turns`).
+    policy: DispatchPolicy,
     initialized: AtomicBool,
 }
 
@@ -116,7 +119,7 @@ impl McpSession {
             episodic: None,
             scope_state: None,
             derive_scope_from_roots: false,
-            auto_log: AutoLogToolCalls::default(),
+            policy: DispatchPolicy::default(),
             initialized: AtomicBool::new(false),
         }
     }
@@ -133,7 +136,14 @@ impl McpSession {
     /// `tool_call` events. `cli::run` passes
     /// `[episodic] auto_log_tool_calls`.
     pub fn with_auto_log_tool_calls(mut self, mode: AutoLogToolCalls) -> Self {
-        self.auto_log = mode;
+        self.policy.auto_log = mode;
+        self
+    }
+
+    /// All three dispatch settings at once; `cli::run` builds the value
+    /// from the loaded config.
+    pub fn with_dispatch_policy(mut self, policy: DispatchPolicy) -> Self {
+        self.policy = policy;
         self
     }
 
@@ -302,7 +312,7 @@ impl McpSession {
             self.checkpoint_scheduler.as_deref(),
             self.episodic.as_deref(),
             self.scope_state.as_deref(),
-            self.auto_log,
+            self.policy,
             id,
             params,
         )
@@ -392,6 +402,12 @@ where
     /// See [`McpSession::with_auto_log_tool_calls`].
     pub fn with_auto_log_tool_calls(mut self, mode: AutoLogToolCalls) -> Self {
         self.session = self.session.with_auto_log_tool_calls(mode);
+        self
+    }
+
+    /// See [`McpSession::with_dispatch_policy`].
+    pub fn with_dispatch_policy(mut self, policy: DispatchPolicy) -> Self {
+        self.session = self.session.with_dispatch_policy(policy);
         self
     }
 
@@ -999,7 +1015,7 @@ mod tests {
     fn session_defaults_to_writes_mode() {
         let (tools, resources, storage, _tmp) = bare_registries();
         let session = McpSession::new(tools, resources, storage);
-        assert_eq!(session.auto_log, AutoLogToolCalls::Writes);
+        assert_eq!(session.policy.auto_log, AutoLogToolCalls::Writes);
     }
 
     /// Closes the L3 producer gap. Until v0.2.3 the episodic hot

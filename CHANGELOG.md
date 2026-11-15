@@ -76,6 +76,18 @@ the work that landed before automation was wired up.
   memory they stored or changed as `_meta.id`, and their `tool_call` event
   records it as `memory_id`.
 
+- `[working] record_tool_turns` (`"writes"` default, `"all"`, `"off"`):
+  which successful tool calls add an L1 working turn. `"writes"` is the
+  1.5.2 behaviour, now configurable; `"all"` restores a turn per call.
+- `[episodic] log_tool_call_values` (`"full"` default, `"ids"`, `"off"`):
+  how much of a call's arguments a `tool_call` event keeps. `"ids"` keeps
+  the tool name, ids and scope and replaces `content` with its length and
+  an 8-hex-digit SHA-256 prefix; `"off"` keeps the tool name only.
+  `forget` redaction works in every mode.
+- `mneme init` writes the 1.6 sections into the starter `config.toml`,
+  with comments: `[working]`, `[auto_context]`, and the new `[episodic]`
+  and `[consolidation]` keys.
+
 ### Changed
 
 - `forget`'s input schema declares only `id` (now `required`). `query` and
@@ -1013,9 +1025,4 @@ formula, public release pipeline).
 ### Documentation
 
 - Issue and PR templates added under `.github/`.
-- `CONTRIBUTING.md` durability-path policy made concrete:
-  `scripts/manual_test.sh --stub` is the floor for any change
-  touching WAL / redb / HNSW / backup-restore.
-
-[0.2.1]: https://github.com/tr0mb1r/mneme/releases/tag/v0.2.1
-[0.2.0]: https://github.com/tr0mb1r/mneme/releases/tag/v0.2.0
+- `CONTRIBUT
