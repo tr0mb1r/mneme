@@ -1042,6 +1042,63 @@ assert len(text) > 100 and "over --max-chars 100" in err and "still" in err, err
 text, err = stderr_of(hook.render, big, "session start", 100000)
 assert err == ""
 
+# P8: the server picks the events (1.6); the hook only caps how many it
+# shows and marks what the server clipped.
+events = [
+    {"kind": "tool_call", "retrieval_weight": 1.0, "payload": json.dumps({"content": "kept: kind is the server's call"})},
+    {"kind": "archived", "retrieval_weight": 0.1, "payload": json.dumps({"content": "kept: weight is the server's call"})},
+    {"kind": "decision", "payload": json.dumps({"content": "x" * 900})},
+    {"kind": "decision", "truncated": True, "payload": json.dumps({"content": "cut by the server"})},
+    {"kind": "decision", "payload": ""},
+]
+usable = hook.usable_events(events)
+assert [e["kind"] for e, _ in usable] == ["tool_call", "archived", "decision", "decision"], usable
+assert len(hook.usable_events([{"kind": "k", "payload": "\"t\""}] * 40)) == hook.MAX_EVENTS
+text = hook.render(json.dumps({"episodic": events}), "session start", 100000)
+assert "x" * 900 in text, "the hook must not clip what the server sent whole"
+assert "cut by the server …" in text, text
+for gone in ("SKIP_KINDS", "MIN_EVENT_WEIGHT", "EVENT_CLIP"):
+    assert not hasattr(hook, gone), gone
+
+# P9: the context URI. No scope without a map entry; thread scope plus
+# the shared one with it.
+assert hook.context_uri("") == "mneme://context"
+assert hook.context_uri("how do we deploy?") == "mneme://context?q=how%20do%20we%20deploy%3F"
+assert hook.context_uri("deploy", "trading") == "mneme://context?q=deploy&scope=trading,global"
+assert hook.context_uri("", "trading") == "mneme://context?scope=trading,global"
+assert hook.context_uri("", "global") == "mneme://context?scope=global"
+assert hook.context_uri("", "my scope", "") == "mneme://context?scope=my%20scope"
+assert hook.context_uri("q", None) == "mneme://context?q=q"
+
+# P10: thread → scope lookup, in each accepted map shape.
+p = {"session_id": "sess-1", "extra": {"thread_id": 42, "chat_id": "c9"}}
+assert hook.thread_scope(p, {"42": "trading"}) == "trading"
+assert hook.thread_scope(p, {"42": {"scope": "trading", "title": "t"}}) == "trading"
+assert hook.thread_scope(p, {"42": {"mneme_scope": "ops"}}) == "ops"
+assert hook.thread_scope(p, {"threads": {"c9": "ops"}}) == "ops"
+assert hook.thread_scope(p, [{"thread_id": 42, "scope": "trading"}, {"id": "zz", "scope": "other"}]) == "trading"
+assert hook.thread_scope(p, {"sess-1": "by-session"}) == "by-session"
+# The first key that has an entry wins: thread_id before session_id.
+assert hook.thread_scope(p, {"sess-1": "by-session", "42": "by-thread"}) == "by-thread"
+# An explicit key is the only one tried.
+assert hook.thread_scope(p, {"42": "a", "c9": "b"}, "extra.chat_id") == "b"
+assert hook.thread_scope(p, {"42": "a"}, "extra.chat_id") is None
+# Unknown thread, unusable entries, unusable maps: no scope.
+for bad in ({}, {"7": "x"}, {"42": ""}, {"42": "a,b"}, {"42": 5}, {"42": {"title": "t"}}, None, "str", 3, [1, 2]):
+    assert hook.thread_scope(p, bad) is None, bad
+assert hook.thread_scope({}, {"42": "x"}) is None
+assert hook.thread_scope({"extra": {"thread_id": True}}, {"True": "x"}) is None
+with tempfile.TemporaryDirectory() as d:
+    good = d + "/threads.json"
+    with open(good, "w") as f:
+        json.dump({"42": "trading"}, f)
+    assert hook.load_scope_map(good) == {"42": "trading"}
+    with open(d + "/broken.json", "w") as f:
+        f.write("{not json")
+    for path in (d + "/broken.json", d + "/missing.json"):
+        loaded, err = stderr_of(hook.load_scope_map, path)
+        assert loaded is None and "reading unscoped" in err, err
+
 # P7: footer wording matches the skill.
 assert "exact strings" not in hook.FOOTER and "not exact phrases" in hook.FOOTER
 print("ok")
@@ -1226,5 +1283,79 @@ fn hook_speaks_stdio_through_mneme_client() {
             .as_str()
             .unwrap()
             .contains("STDIO-SUMMARY-BODY")
+    );
+}
+
+/// With a scope map the hook reads the conversation's scope plus
+/// `global`: the thread's memories and the global pins come back, another
+/// thread's memories do not. A thread the map does not know reads
+/// unscoped, as before.
+#[test]
+fn hook_scopes_the_read_to_the_thread_and_keeps_global_pins() {
+    let Some(py) = python() else {
+        eprintln!("skipping: python3 not found");
+        return;
+    };
+    let data = TempDir::new().unwrap();
+    let hermes = TempDir::new().unwrap();
+    std::fs::write(
+        hermes.path().join(".env"),
+        format!("MNEME_HTTP_TOKEN={TOKEN}\n"),
+    )
+    .unwrap();
+    let server = start_serve(data.path());
+    for (name, args) in [
+        (
+            "pin",
+            json!({"content": "Always answer with numbers first.", "scope": "global"}),
+        ),
+        (
+            "remember",
+            json!({"content": "The stop-loss for QQQ3 is a 6% trailing stop.", "scope": "trading"}),
+        ),
+        (
+            "remember",
+            json!({"content": "The stop-loss alert for the backup job pages ops.", "scope": "ops"}),
+        ),
+    ] {
+        let r = call_tool(server.addr, name, args);
+        assert_eq!(r["result"]["isError"], false, "{name}: {r}");
+    }
+    let map = hermes.path().join("threads.json");
+    std::fs::write(&map, r#"{"threads": {"sess-1": {"scope": "trading"}}}"#).unwrap();
+    let mut args = http_args(server.addr);
+    args.extend(["--scope-map".to_owned(), map.display().to_string()]);
+
+    let scoped = run_hook(
+        py,
+        &args,
+        hermes.path(),
+        &payload(vec![], true, "what is the stop-loss?"),
+    );
+    let ctx = context_of(&scoped);
+    assert!(ctx.contains("Always answer with numbers first."), "{ctx}");
+    assert!(ctx.contains("6% trailing stop"), "{ctx}");
+    assert!(!ctx.contains("backup job"), "another scope leaked: {ctx}");
+
+    // A session the map does not list: the unscoped read, both scopes.
+    let mut other = payload(vec![], true, "what is the stop-loss?");
+    other["session_id"] = json!("sess-unmapped");
+    let unscoped = run_hook(py, &args, hermes.path(), &other);
+    let ctx = context_of(&unscoped);
+    assert!(
+        ctx.contains("6% trailing stop") && ctx.contains("backup job"),
+        "{ctx}"
+    );
+
+    // A broken map costs the scoping, not the context.
+    std::fs::write(&map, "{not json").unwrap();
+    let mut third = payload(vec![], true, "what is the stop-loss?");
+    third["session_id"] = json!("sess-3");
+    let broken = run_hook(py, &args, hermes.path(), &third);
+    assert!(context_of(&broken).contains("backup job"));
+    assert!(
+        broken.stderr.contains("reading unscoped"),
+        "{}",
+        broken.stderr
     );
 }
