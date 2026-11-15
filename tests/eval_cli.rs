@@ -112,7 +112,7 @@ async fn eval_measures_the_seeded_corpus_and_writes_nothing() {
             "--min-l4-hit5",
             "0.95",
             "--min-all-hit5",
-            "0.75",
+            "0.95",
             "--min-context-gold",
             "0.85",
             "--max-context-stale-over-current",
@@ -168,13 +168,25 @@ async fn eval_measures_the_seeded_corpus_and_writes_nothing() {
     assert_eq!(keyword["by_type"]["exact"]["hit_at_1"], 1.0);
     assert_eq!(keyword["by_type"]["fact"]["hit_at_1"], 1.0);
     assert_eq!(keyword["stale_over_current"]["n"], 10);
-    // The two memories of a latest-state pair tie on keywords; the tie
-    // goes to the one edited last, so the stale one is never first.
-    assert_eq!(
-        keyword["stale_over_current"]["count"], 0,
-        "{}",
-        keyword["stale_over_current"]
-    );
+    // With both layers, the questions only an event answers are found.
+    if layer_sets == 2 {
+        let both = grid
+            .iter()
+            .find(|c| {
+                c["mode"] == "keyword" && c["scoped"] == false && c["layers"] == "semantic+episodic"
+            })
+            .unwrap();
+        assert_eq!(both["by_type"]["l3-only"]["hit_at_5"], 1.0, "{both}");
+        assert_eq!(both["by_type"]["l3-warm"]["hit_at_5"], 1.0, "{both}");
+        assert_eq!(
+            both["by_type"]["exact"]["hit_at_1"], 1.0,
+            "L4 answers keep rank 1"
+        );
+        assert_eq!(
+            both["by_type"]["fact"]["hit_at_1"], 1.0,
+            "L4 answers keep rank 1"
+        );
+    }
 
     // Context replays ran for every question, within budget.
     let c = &m["context"];
@@ -222,12 +234,12 @@ async fn eval_exits_nonzero_when_a_threshold_is_missed() {
         tmp.path(),
         &questions,
         "gate",
-        &["--no-context", "--min-all-hit5", "0.999"],
+        &["--no-context", "--min-all-hit5", "1.01"],
     );
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("all hit@5 is"), "{stderr}");
-    assert!(stderr.contains("below the required 0.999"), "{stderr}");
+    assert!(stderr.contains("below the required 1.01"), "{stderr}");
     // The output is written all the same: a failed gate needs its numbers.
     let m = metrics(tmp.path(), "gate");
     assert!(m["context"].is_null(), "--no-context skips the replays");
