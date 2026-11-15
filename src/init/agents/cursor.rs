@@ -24,8 +24,8 @@
 //!
 //! What this installer DOES do:
 //!
-//! - Resolves `~/.cursor/mcp.json` (uniform path on macOS / Linux /
-//!   Windows — Cursor doesn't use the platform-specific
+//! - Resolves `~/.cursor/mcp.json` (uniform path on macOS and Linux
+//!   — Cursor doesn't use the platform-specific
 //!   `Application Support` convention Claude Desktop does).
 //! - Adds (or updates) `mcpServers.mneme = {"command": "mneme",
 //!   "args": ["client"]}` in that file via the existing
@@ -64,8 +64,8 @@ use crate::init::assets::{self, MNEME_MD_TEMPLATE};
 use crate::init::json_config;
 
 /// Path to Cursor's MCP config JSON. Uniform across all supported
-/// OSes — Cursor uses `~/.cursor/mcp.json` on macOS, Linux, and
-/// Windows alike (no platform-specific dance like Claude Desktop's
+/// OSes — Cursor uses `~/.cursor/mcp.json` on macOS and Linux
+/// alike (no platform-specific dance like Claude Desktop's
 /// `Application Support` directory).
 fn config_path(home: &Path) -> PathBuf {
     home.join(".cursor/mcp.json")
@@ -323,8 +323,8 @@ mod tests {
 
     #[test]
     fn config_path_is_uniform_across_oses() {
-        // Cursor uses `~/.cursor/mcp.json` on macOS, Linux, and
-        // Windows. Pin the literal path so a future refactor
+        // Cursor uses `~/.cursor/mcp.json` on macOS and Linux.
+        // Pin the literal path so a future refactor
         // doesn't accidentally introduce a `cfg(target_os)`
         // platform split that would diverge from Cursor's actual
         // convention.

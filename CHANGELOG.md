@@ -66,7 +66,13 @@ the work that landed before automation was wired up.
 
 - **Windows support.** mneme now supports Linux and macOS only. CI no
   longer builds or tests on Windows, and releases ship no Windows binary.
-  On a Windows machine, run mneme inside WSL2.
+  On a Windows machine, run mneme inside WSL2. The Windows-only code
+  is gone from the tree: the `cfg(windows)` / `cfg(not(unix))` arms
+  (the `mneme client` and daemon-transport stubs, the detached-spawn
+  flags, the `mneme stop` and lockfile fallbacks, the no-op permission
+  helpers), the `keyring` `windows-native` backend, and the Hermes
+  installer's `mneme run` fallback. A build for a non-Unix target now
+  fails with `mneme supports Linux and macOS only`.
 
 ### Fixed
 

@@ -42,7 +42,6 @@ pub const KEYSTORE_FILENAME: &str = "keystore.json";
 pub const KEYSTORE_VERSION: u32 = 1;
 
 /// File permissions for the keystore on unix.
-#[cfg(unix)]
 const KEYSTORE_MODE: u32 = 0o600;
 
 /// The on-disk JSON shape. Field names are stable: this is the
@@ -211,18 +210,9 @@ pub fn keystore_path(data_dir: &Path) -> PathBuf {
     data_dir.join(KEYSTORE_FILENAME)
 }
 
-#[cfg(unix)]
 fn set_keystore_perms(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(KEYSTORE_MODE))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_keystore_perms(_path: &Path) -> Result<()> {
-    // Windows: keystore.json inherits the user-profile ACL of the
-    // data directory (already user-owned + non-world-readable on a
-    // default install). Matches the auth.token handling.
     Ok(())
 }
 
@@ -230,7 +220,6 @@ fn set_keystore_perms(_path: &Path) -> Result<()> {
 /// moment it exists (Unix) — closing the window where the temp
 /// keystore would otherwise sit at the umask default before
 /// [`set_keystore_perms`] tightens it.
-#[cfg(unix)]
 fn write_new_0600(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -241,12 +230,6 @@ fn write_new_0600(path: &Path, bytes: &[u8]) -> Result<()> {
         .mode(KEYSTORE_MODE)
         .open(path)?;
     f.write_all(bytes)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_new_0600(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes)?;
     Ok(())
 }
 
@@ -352,7 +335,6 @@ mod tests {
         assert!(nested.join(KEYSTORE_FILENAME).is_file());
     }
 
-    #[cfg(unix)]
     #[test]
     fn write_sets_0600_permissions() {
         use std::os::unix::fs::PermissionsExt;

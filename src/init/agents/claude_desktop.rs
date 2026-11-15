@@ -18,10 +18,6 @@
 //! - Resolves the platform-specific config path:
 //!   - macOS:   `~/Library/Application Support/Claude/claude_desktop_config.json`
 //!   - Linux:   `~/.config/Claude/claude_desktop_config.json`
-//!   - Windows: `%APPDATA%/Claude/claude_desktop_config.json`
-//!     (Windows path resolution lands when daemon Windows support
-//!     does in M4 — for now Claude Desktop on Windows is `cfg`-gated
-//!     to defer.)
 //! - Adds (or updates) `mcpServers.mneme = {"command": "mneme",
 //!   "args": ["client"]}` in that file via the existing
 //!   `init::json_config::upsert_file` atomic helper. Surrounding
@@ -43,9 +39,9 @@ use super::{AgentError, InstallMode};
 use crate::init::assets::{self, MNEME_MD_TEMPLATE};
 use crate::init::json_config;
 
-/// Platform-specific path to Claude Desktop's config JSON. Returns
-/// `None` on Windows for now — Windows path resolution lands
-/// alongside daemon Windows support in M4.
+/// Platform-specific path to Claude Desktop's config JSON. `None` on
+/// a Unix other than macOS or Linux, where Claude Desktop has no
+/// known config location.
 fn config_path(home: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -74,9 +70,7 @@ fn standalone_mneme_md(home: &Path) -> PathBuf {
 pub fn run(mode: InstallMode, home_dir: &Path) -> Result<(), AgentError> {
     let Some(settings) = config_path(home_dir) else {
         return Err(AgentError::Generic(
-            "Claude Desktop install path resolution for this OS is not yet \
-             implemented; tracked alongside daemon Windows support in M4"
-                .into(),
+            "Claude Desktop's config path is known only on macOS and Linux".into(),
         ));
     };
     let mneme_md = standalone_mneme_md(home_dir);

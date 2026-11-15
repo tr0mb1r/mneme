@@ -19,11 +19,6 @@
 //!    (not auto-flipped to SSE — the auto-flip per ADR-0012 D11 is
 //!    a follow-up A.M2 closing-touch commit; today's behaviour is
 //!    preserve-explicit-stdio + leave-default-stdio).
-//!
-//! Linux + macOS only — the Windows daemon-mode integration tests
-//! land in M4 alongside the named-pipe support.
-
-#![cfg(unix)]
 
 use std::path::Path;
 use std::process::Stdio;

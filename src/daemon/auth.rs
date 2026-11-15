@@ -60,7 +60,6 @@ pub const AUTH_TOKEN_FILENAME: &str = "auth.token";
 
 /// Mode bits applied to the auth token file (Unix only). `0600` so
 /// only the owning user can read it.
-#[cfg(unix)]
 pub const AUTH_TOKEN_MODE: u32 = 0o600;
 
 /// Number of random bytes generated per token. 32 bytes = 256
@@ -368,7 +367,6 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), AuthError> {
 /// exists (Unix), closing the window where the temp token would
 /// otherwise sit at the umask default before [`set_token_perms`]
 /// tightens it.
-#[cfg(unix)]
 fn create_secure(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     std::fs::OpenOptions::new()
@@ -379,12 +377,6 @@ fn create_secure(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
-#[cfg(not(unix))]
-fn create_secure(path: &Path) -> io::Result<std::fs::File> {
-    std::fs::File::create(path)
-}
-
-#[cfg(unix)]
 fn set_token_perms(path: &Path) -> Result<(), AuthError> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(AUTH_TOKEN_MODE)).map_err(
@@ -395,16 +387,6 @@ fn set_token_perms(path: &Path) -> Result<(), AuthError> {
     )
 }
 
-#[cfg(not(unix))]
-fn set_token_perms(_path: &Path) -> Result<(), AuthError> {
-    // Windows ACLs are managed when the daemon's named-pipe
-    // listener is bound (M4 sub-commit). The token file inherits
-    // the user-profile ACL — already user-owned + non-world-
-    // readable on a default install.
-    Ok(())
-}
-
-#[cfg(unix)]
 fn set_run_dir_perms(dir: &Path) -> Result<(), AuthError> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|source| {
@@ -413,11 +395,6 @@ fn set_run_dir_perms(dir: &Path) -> Result<(), AuthError> {
             source,
         }
     })
-}
-
-#[cfg(not(unix))]
-fn set_run_dir_perms(_dir: &Path) -> Result<(), AuthError> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -432,7 +409,6 @@ mod tests {
         assert!(path.exists());
         assert_eq!(path, token_path(tmp.path()));
 
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -445,7 +421,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         ensure_token(tmp.path()).unwrap();
 
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(tmp.path().join("run"))

@@ -172,17 +172,9 @@ fn with_tmp_suffix(path: &Path) -> std::path::PathBuf {
     s.into()
 }
 
-#[cfg(unix)]
 fn set_secret_file_perms(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_secret_file_perms(_path: &Path) -> Result<()> {
-    // Windows: relies on the user-profile ACL of the data dir, same as
-    // the daemon auth.token handling.
     Ok(())
 }
 
@@ -260,7 +252,6 @@ mod tests {
         assert!(open_from_path(&path, AadDomain::Hnsw, b"v2", &a).is_err());
     }
 
-    #[cfg(unix)]
     #[test]
     fn whole_file_has_0600_perms() {
         use std::os::unix::fs::PermissionsExt;

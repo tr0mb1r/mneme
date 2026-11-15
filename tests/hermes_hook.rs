@@ -5,8 +5,6 @@
 //!
 //! Skipped (with a note) when `python3` isn't on the PATH.
 
-#![cfg(unix)]
-
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

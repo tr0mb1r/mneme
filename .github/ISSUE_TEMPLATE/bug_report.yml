@@ -32,7 +32,6 @@ body:
         - macOS (x86_64 / Intel)
         - Linux (x86_64)
         - Linux (aarch64)
-        - Windows
     validations:
       required: true
 

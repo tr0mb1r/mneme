@@ -64,8 +64,7 @@ const PINNED_AAD_POSITION: &[u8] = b"pinned.jsonl/v1";
 /// We deliberately use [`PollWatcher`] over the platform-native
 /// `RecommendedWatcher`: macOS FSEvents coalesces events for
 /// ~30 seconds by default which blows the Phase 4 exit-gate
-/// "reflected within 1 s" budget; Windows ReadDirectoryChangesW has
-/// its own warts around editor save patterns. A 500 ms poll on a
+/// "reflected within 1 s" budget. A 500 ms poll on a
 /// single small file is essentially free CPU and gives us the same
 /// observable latency on every host.
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(500);

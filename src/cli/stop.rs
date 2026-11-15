@@ -80,7 +80,6 @@ fn read_pid(path: &Path) -> Result<u32> {
         .map_err(|e| MnemeError::Lock(format!("malformed PID in {path:?}: {e}")))
 }
 
-#[cfg(unix)]
 fn signal_terminate(pid: u32) -> Result<()> {
     // SIGCONT first: if the target was shell-suspended (SIGTTIN/SIGTSTP'd),
     // queued signals — including the SIGTERM we're about to send — are not
@@ -95,16 +94,4 @@ fn signal_terminate(pid: u32) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn signal_terminate(_pid: u32) -> Result<()> {
-    Err(MnemeError::NotImplemented(
-        "mneme stop on Windows is not yet implemented; use Task Manager or Stop-Process",
-    ))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn signal_terminate(_pid: u32) -> Result<()> {
-    Err(MnemeError::NotImplemented("mneme stop on this platform"))
 }

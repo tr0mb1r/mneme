@@ -231,7 +231,6 @@ async fn call(
     v
 }
 
-#[cfg(unix)]
 async fn sigterm_and_wait(mut child: Child) {
     let pid = child.id().expect("pid") as i32;
     // SAFETY: signalling the child we spawned.
@@ -330,12 +329,7 @@ async fn serve_round_trips_memory_across_sessions() {
     .await;
     assert_eq!(r.status, 204);
 
-    #[cfg(unix)]
     sigterm_and_wait(child).await;
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill().await;
-    }
 }
 
 #[tokio::test]
@@ -356,7 +350,6 @@ async fn serve_defaults_to_the_daemon_token_file() {
 
 /// Bare-metal shape: one daemon serving Claude Code over the Unix
 /// socket and Hermes (or anything else) over HTTP, same store.
-#[cfg(unix)]
 #[tokio::test]
 async fn daemon_with_http_enabled_serves_both_transports() {
     let tmp = TempDir::new().unwrap();
@@ -564,16 +557,9 @@ async fn working_turns_are_isolated_between_http_sessions() {
     assert_eq!(r["result"]["isError"], false, "{r}");
     assert_eq!(stats(addr, &b, 7).await["working"]["turns_total"], 1);
 
-    #[cfg(unix)]
-    {
-        sigterm_and_wait(child).await;
-        assert!(
-            snapshot(&sid_b).exists(),
-            "shutdown must flush open sessions"
-        );
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill().await;
-    }
+    sigterm_and_wait(child).await;
+    assert!(
+        snapshot(&sid_b).exists(),
+        "shutdown must flush open sessions"
+    );
 }

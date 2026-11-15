@@ -635,6 +635,7 @@ them.
 | **Type** | array of strings |
 | **Default** | `["archived", "summary", "milestone", "lesson", "decision"]` |
 | **Affects** | which event kinds stay in the warm tier for good |
+| **Since** | 1.6.0 |
 
 Events of these kinds are never archived to cold, however old. They stay
 in redb, so `recall` keeps finding them and `forget` can still delete
@@ -663,20 +664,6 @@ options:
 Future modes (`"every_<n>m"`, cron expressions, `"on_demand"`)
 are tracked for post-v1.1.x. Anything other than `"idle"` today
 logs a warning and falls back to `"idle"` cadence.
-
-### `cold_exempt_kinds`
-
-| | |
-|---|---|
-| **Type** | array of strings |
-| **Default** | `["archived", "summary", "milestone", "lesson", "decision"]` |
-| **Affects** | which event kinds never move from warm to the cold archive |
-| **Since** | 1.6.0 |
-
-Cold quarter bundles are compact and immutable: events in them are not
-searchable and `forget` cannot reach them. Curated kinds are few and are
-the ones worth finding a year later, so they stay in the warm tier. `[]`
-restores the pre-1.6 behaviour, where every kind ages into cold.
 
 ---
 

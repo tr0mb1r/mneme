@@ -629,7 +629,6 @@ fn write_atomic_simple(path: &Path, bytes: &[u8]) -> Result<()> {
     tmp_buf.push(".tmp");
     let tmp: std::path::PathBuf = tmp_buf.into();
     std::fs::write(&tmp, bytes)?;
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;

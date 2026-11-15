@@ -29,8 +29,7 @@
 //! # Crash safety
 //!
 //! `save` writes to `<path>.tmp`, fsyncs the file, then renames.
-//! Renames are atomic on POSIX; on Windows we fall back to
-//! `replace_file` semantics via `std::fs::rename`. A `kill -9`
+//! Renames are atomic on POSIX. A `kill -9`
 //! mid-save leaves either the previous good file or the new one — never
 //! a half-written `<path>`.
 

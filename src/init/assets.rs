@@ -10,9 +10,7 @@
 //!
 //! 2. **Executable** (lifecycle hook scripts shipped to
 //!    `~/.claude/hooks/mneme/` and equivalents) — same atomicity
-//!    plus owner-executable mode (`0755`) on Unix. Windows hosts
-//!    typically don't use POSIX hooks; those installers fall back
-//!    to whatever per-agent convention applies.
+//!    plus owner-executable mode (`0755`).
 //!
 //! Embedded constants live here so per-agent code in B.M2+ stays
 //! a thin orchestration layer — no `include_str!` calls scattered
@@ -72,12 +70,9 @@ pub fn write_text(path: &Path, contents: &str) -> io::Result<()> {
     write_inner(path, contents.as_bytes(), /* executable */ false)
 }
 
-/// Atomically write `contents` to `path` with owner-executable
-/// permission bit set on Unix (`0755`). Used for lifecycle hook
-/// scripts that the agent's hook runner needs to be able to
-/// execute. On Windows, falls back to plain-text semantics —
-/// Windows POSIX-mode bits don't apply, and the named-pipe-based
-/// hook conventions (TBD per agent) don't need executable bits.
+/// Atomically write `contents` to `path` with the owner-executable
+/// permission bit set (`0755`). Used for lifecycle hook scripts that
+/// the agent's hook runner needs to be able to execute.
 pub fn write_executable(path: &Path, contents: &str) -> io::Result<()> {
     write_inner(path, contents.as_bytes(), /* executable */ true)
 }
@@ -116,20 +111,9 @@ fn write_inner(path: &Path, contents: &[u8], executable: bool) -> io::Result<()>
     Ok(())
 }
 
-#[cfg(unix)]
 fn set_executable(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-}
-
-#[cfg(not(unix))]
-fn set_executable(_path: &Path) -> io::Result<()> {
-    // Windows uses ACLs + the .exe extension as the executability
-    // signal; POSIX mode bits don't apply. The hook scripts are
-    // shipped as `.sh` and aren't directly invoked on Windows
-    // anyway — the per-agent installer there picks a different
-    // hook convention (TBD per agent in B.M2+).
-    Ok(())
 }
 
 #[cfg(test)]
@@ -176,7 +160,6 @@ mod tests {
         assert!(!dest.with_extension("txt.mneme-init-tmp").exists());
     }
 
-    #[cfg(unix)]
     #[test]
     fn write_executable_sets_owner_exec_bit() {
         use std::os::unix::fs::PermissionsExt;
