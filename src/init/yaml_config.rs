@@ -259,8 +259,7 @@ fn sequence_items(doc: &Doc, key_line: usize, end: usize) -> Vec<(usize, usize)>
     }
     let indent = indent_of(&doc.lines[first]);
     let mut items: Vec<(usize, usize)> = Vec::new();
-    for i in first..end {
-        let l = &doc.lines[i];
+    for (i, l) in doc.lines.iter().enumerate().take(end).skip(first) {
         if !is_significant(l) {
             continue;
         }
@@ -425,8 +424,7 @@ impl Doc {
     /// that next key (they introduce it, not us).
     fn block_after(&self, header: usize) -> std::ops::Range<usize> {
         let mut end = self.lines.len();
-        for i in header + 1..self.lines.len() {
-            let l = &self.lines[i];
+        for (i, l) in self.lines.iter().enumerate().skip(header + 1) {
             if is_significant(l) && indent_of(l) == 0 {
                 end = i;
                 break;
@@ -466,8 +464,13 @@ impl Doc {
             return Ok(None);
         };
         let mut end = block.end;
-        for i in start + 1..block.end {
-            let l = &self.lines[i];
+        for (i, l) in self
+            .lines
+            .iter()
+            .enumerate()
+            .take(block.end)
+            .skip(start + 1)
+        {
             // A block sequence may sit at its key's own indentation
             // (`key:\n- item`), so `- ` lines at that depth still
             // belong to the entry.
