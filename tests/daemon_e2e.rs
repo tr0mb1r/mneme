@@ -682,17 +682,13 @@ async fn client_reconnects_after_daemon_restart() {
         .expect("spawn daemon B");
     wait_for_socket(&socket).await;
 
-    // Give the client time to detect the disconnect, reconnect with
-    // backoff, re-auth, and replay the MCP initialize handshake.
-    // Bumped 1500ms → 3000ms after the same panic kept surfacing on
-    // ubuntu CI even after wait_for_socket grew a connect probe — the
-    // tighter budget was leaving no slack for boot variance on the
-    // CI runner. Stays well under the read_line 5s timeout so a hung
-    // client still fails loudly.
-    sleep(Duration::from_millis(3000)).await;
-
-    // Step 3: send another request. If the client reconnected
-    // transparently, this should succeed.
+    // Step 3: send another request straight away. No sleep: the client
+    // owns the reconnect. It queues stdin while it reconnects with
+    // backoff, re-authenticates and replays `initialize`, so the only
+    // thing to wait for is the answer. (This used to sleep 3 s and
+    // still flaked: the client could connect to daemon A's dying
+    // listener and exit before daemon B existed. See
+    // `cli::client::reestablish`.)
     client_stdin
         .write_all(
             br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"stats","arguments":{}}}
@@ -702,11 +698,11 @@ async fn client_reconnects_after_daemon_restart() {
         .unwrap();
     let mut response = String::new();
     timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(20),
         client_stdout.read_line(&mut response),
     )
     .await
-    .expect("post-reconnect stats response within 5s")
+    .expect("post-reconnect stats response within 20s")
     .expect("read post-reconnect stats response");
 
     // Replace `.expect("post-reconnect stats JSON")` with a manual

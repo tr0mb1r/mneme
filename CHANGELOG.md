@@ -28,6 +28,15 @@ the work that landed before automation was wired up.
 
 ### Fixed
 
+- **`mneme client` survives a daemon that is killed and restarted.** After
+  losing its daemon the client could connect to the old daemon's listener
+  in the instant before it closed, get a connection reset while replaying
+  `initialize`, and exit, so the MCP host lost its server. A disconnect
+  before the daemon has answered `initialize` is now retried like "nothing
+  listening yet". The client also no longer dies when the agent writes a
+  request before the disconnect was noticed, and it reports an auth
+  rejection on reconnect as such.
+
 - **Warm-tier events are readable again.** Consolidation moves an
   episodic event from `epi:` to `wepi:` after `hot_to_warm_days` (28),
   and no read path looked there, so the event was gone from
