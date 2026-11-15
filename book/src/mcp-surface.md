@@ -647,7 +647,7 @@ Without any relation, two memories can still rank the same: a fact and
 its corrected version are close in meaning and share most of their
 words. `recall` orders rows of equal `rank` (within 0.0001) by
 `updated_at`, newest first, in every mode, so the version edited last
-leads even when nobody has linked the two. Before 1.7 the order of tied
+leads even when nobody has linked the two. Before 1.6 the order of tied
 rows was whatever the search returned, and in keyword mode that was the
 older memory.
 
@@ -708,7 +708,7 @@ fact, and `source`, where from:
 
 `source` is free-form (`telegram:…`, `research:…`, `tool:…`), at most 200
 characters, and needs `provenance`. Both are optional; a memory stored
-without them has none, which is every memory written before 1.7.
+without them has none, which is every memory written before 1.6.
 
 Rows from `recall`, `mneme://context` and `export` carry `provenance` and
 `source` when set. `recall(provenance: "inferred")` keeps only memories

@@ -205,7 +205,7 @@ impl Tool for Stats {
 
         // How the stored memories are known. `unspecified` is every
         // memory written without a `provenance`, which is all of them
-        // before 1.7.
+        // before 1.6.
         let mut by_provenance = serde_json::Map::new();
         let mut with_provenance = 0usize;
         for (provenance, count) in self

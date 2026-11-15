@@ -1,9 +1,9 @@
 //! Typed relations between a memory and something else, and the
-//! provenance of a memory: the two pieces of L4 metadata added in 1.7.
+//! provenance of a memory: the two pieces of L4 metadata added in 1.6.
 //!
 //! # Why relations
 //!
-//! Until 1.7 the only link a memory could have was `supersedes`, which
+//! Until 1.6 the only link a memory could have was `supersedes`, which
 //! *hides* the old memory. That is right when a fact is replaced
 //! outright and wrong for everything else: a memory that narrows,
 //! corrects one detail of, or disputes another should push the older
@@ -491,7 +491,7 @@ pub async fn put_provenance(
 }
 
 /// The provenance of `id`. `None` when none was recorded (every memory
-/// written before 1.7, and any written without the argument since).
+/// written before 1.6, and any written without the argument since).
 pub async fn get_provenance(
     storage: &dyn Storage,
     id: MemoryId,

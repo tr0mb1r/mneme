@@ -2520,7 +2520,7 @@ const RANK_TIE: f32 = 1e-4;
 ///
 /// The tie-break matters more than it looks. A fact and its corrected
 /// version are close in meaning and share most of their words, so they
-/// routinely tie, and before 1.7 the tie fell to whichever the search
+/// routinely tie, and before 1.6 the tie fell to whichever the search
 /// happened to return first: in keyword mode, the older memory, every
 /// time. Preferring the later edit puts the current version first even
 /// when nobody has linked the two.
@@ -4648,7 +4648,7 @@ mod tests {
         }
     }
 
-    // ---------- relations and provenance (1.7) ----------
+    // ---------- relations and provenance (1.6) ----------
 
     /// Three memories the stub embedder cannot tell apart from the
     /// query (same first byte, same length), so every difference in
@@ -5283,7 +5283,7 @@ mod tests {
     }
 
     /// A store with no relations pays nothing for them: the rows of an
-    /// ordinary recall are exactly what they were before 1.7.
+    /// ordinary recall are exactly what they were before 1.6.
     #[tokio::test]
     async fn rows_without_relations_are_unchanged() {
         let tmp = TempDir::new().unwrap();
@@ -5302,7 +5302,7 @@ mod tests {
 
     /// Two memories the query cannot tell apart, with nothing linking
     /// them: the one edited last comes first, in every mode. Before
-    /// 1.7 keyword mode put the older one first, every time.
+    /// 1.6 keyword mode put the older one first, every time.
     #[tokio::test]
     async fn ties_go_to_the_most_recently_edited_memory() {
         let tmp = TempDir::new().unwrap();

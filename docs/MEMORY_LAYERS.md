@@ -389,7 +389,7 @@ Unfiltered recall still issues exactly one probe.
 > and `schema_version` are unchanged and `forget` removes them with the
 > memory. `recall` rows gain `rank`, `updated_at` and `status`.
 >
-> **Changed in v1.7.** A memory can carry typed relations and a
+> **Also in v1.6.** A memory can carry typed relations and a
 > provenance.
 >
 > - **Relations.** `remember` / `update` take
