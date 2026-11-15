@@ -128,10 +128,9 @@ sweep in the consolidation pass. What doesn't exist:
 - **No automatic compaction or archiving.** Nothing merges, retires or
   archives memories on its own; the advisory reports near-duplicates and
   `supersedes` / `status` are the agent's tools.
-<!-- TODO: verify against merged W3/W6/W7 -->
 - **Relations are stated, never inferred.** `relations` on `remember` /
   `update` (1.6) record that one memory refines, contradicts or
-  supports another. The server does not detect contradictions or
+  supersedes another, or what it cites as evidence. The server does not detect contradictions or
   propose links beyond the similarity advisory.
 - **Only `recall` refreshes an event's `last_accessed`** (1.6, hot
   events, at most daily). Reading an event through `recall_recent` or

@@ -124,11 +124,6 @@ All of it is tunable under [`[auto_context]`](./configuration.md).
 
 ## Relations, provenance and `mneme eval`
 
-<!-- TODO: verify against merged W3/W6/W7 -->
-<!-- Drafted from the plan (§3 W3, W6, W7) before that work merged.
-     Check every argument name, default and number below against the
-     code, then delete these two comments. -->
-
 ### Relations between memories
 
 `supersedes` was the only way to say that one memory replaces another,
@@ -139,36 +134,51 @@ old memory loses the facts that still hold.
 - **`remember` and `update` take `relations`**: a list of
   `{type, id | ref, reason}`. Types are `supersedes`, `refines`,
   `contradicts` and `evidence_for`. `reason` is free text, up to 300
-  characters. The target is another memory or event (`id`), or an
-  external reference string (`ref`, e.g. `research:<slug>`,
-  `path:/…`).
-- **Demote, don't hide.** A memory that a newer, current memory
-  `refines` or `contradicts` stays in `recall` but ranks lower: its
-  keyword evidence is ignored and its rank drops by
-  `[recall] demote_margin` (0.10). Auto-context leaves it out unless
-  `[auto_context] include_demoted = true`. `supersedes` keeps its
-  hide-the-old-one meaning, and `supersedes: "<id>"` still works as
-  shorthand.
+  characters. `id` is another memory; for `evidence_for` it may also
+  be an event. `ref` is an external reference string, `evidence_for`
+  only, up to 128 bytes (e.g. `research:<slug>`, `path:/…`); mneme
+  stores and matches it exactly and never interprets it. Bad input is
+  rejected before anything is written. An update adds relations; the
+  way to remove one is to forget the memory that carries it.
+- **Demote, don't hide.** A memory that another memory `refines` or
+  `contradicts` stays in `recall` but ranks lower, with
+  `demoted: true`: its keyword evidence is ignored and its rank drops
+  by `[recall] demote_margin` (0.10), in every mode. This holds while
+  the newer memory is stored, current (not archived, not superseded)
+  and the more recently edited of the two. Auto-context leaves a
+  demoted memory out unless `[auto_context] include_demoted = true`.
+  `supersedes` keeps its hide-the-old-one meaning, and
+  `supersedes: "<id>"` still works as shorthand.
 - **Rows carry `relations`** (`superseded_by`, `refined_by`,
-  `contradicted_by`, `refines`, `evidence`), omitted when empty.
-  `recall(expand: 1)` adds a stub of each linked memory.
-  `recall(ref: "research:…")` finds memories by the external reference
-  they cite.
+  `contradicted_by`, `refines`, `contradicts`, `supersedes`,
+  `evidence`), omitted when empty. `recall(expand: 1)` adds `linked`:
+  the id and first 120 characters of each linked memory or event.
+  `recall(ref: "research:…")` returns the memories that cite that
+  reference; `query` is optional with it.
 - When `remember` reports a closely related existing memory, the reply
-  now suggests the `relations` entry to add. The server still decides
-  nothing by itself.
-- If the memory a relation comes from is forgotten, the relation lapses
-  and the target's rank returns.
+  now shows the `relations` entry that would mark the new memory as
+  refining it. The server still decides nothing by itself.
+- If the memory a relation comes from is forgotten or archived, the
+  target's rank returns. Forgetting a memory removes its relations.
+- **Ties go to the latest edit.** Two memories of equal rank are
+  ordered newest `updated_at` first in every mode. A fact and its
+  corrected version often tie, and in keyword mode the tie used to go
+  to the older one.
+- **`record_event(promote: {type, tags})`** also stores the event's
+  text as a memory with an `evidence_for` link back to the event, in
+  one call. Nothing is promoted unless asked.
 - Relations are in `export` and survive backup and restore.
 
 ### Provenance
 
 - `remember` and `update` take `provenance` (`user_stated`, `observed`,
   `inferred`, `imported`) and `source` (a free string such as
-  `telegram:…` or `tool:…`). Rows carry both, `recall` can filter on
-  `provenance`, and `stats` counts memories by it.
-- It has no effect on ranking by default. It is there so that a hygiene
-  pass can ask for, say, inferred facts older than 30 days that nobody
+  `telegram:…` or `tool:…`, up to 200 characters; it needs
+  `provenance`). Rows and `export` carry both, `recall` can filter on
+  `provenance` (a memory stored without one never matches), and `stats`
+  counts memories by it under `memories.by_provenance`.
+- It has no effect on ranking. It is there so that a hygiene pass can
+  ask for, say, inferred facts older than 30 days that nobody
   confirmed.
 
 ### `mneme eval`
@@ -178,10 +188,16 @@ old memory loses the facts that still hold.
   scopes and layers, how often a stale fact outranks its correction, and
   how much of the known-good material auto-context includes. Questions
   are JSON lines: `{id, question, type, scope, gold, gold_l3, stale}`.
-  It writes a metrics file and a summary, and it checks that it wrote
-  nothing to the store.
-- A synthetic corpus ships with it (`examples/seed_storage.rs`), so the
-  numbers can be reproduced without anyone's private data.
+  It starts a private server on the data directory (or uses the
+  running daemon with `--daemon`) and speaks MCP to it, so the numbers
+  describe what an agent gets. It writes `metrics-<tag>.json` and
+  `summary-<tag>.md`, and it checks that it wrote nothing to the store.
+  `--min-*` / `--max-*` thresholds turn it into a gate; see
+  [CLI](./cli.md).
+- A synthetic corpus ships with it
+  (`cargo run --example seed_storage -- corpus`), so the numbers can be
+  reproduced without anyone's private data. A nightly CI job seeds it
+  and gates on `mneme eval` in keyword mode.
 - The numbers that motivated this release, on the store it was measured
   against, with the targets it was built to: recall hit@5 over all 51
   questions 0.80 → ≥ 0.90; known-good memories present in auto-context
@@ -219,7 +235,8 @@ old memory loses the facts that still hold.
 | `[episodic]` | `index_kinds`, `touch_on_recall`, `log_tool_call_values` (`full` / `ids` / `off`: how much of a call's arguments a `tool_call` event keeps) |
 | `[consolidation]` | `cold_exempt_kinds` |
 | `[working]` | `record_tool_turns` (`writes` / `all` / `off`) |
-| `[recall]` | `stemming` — accepted, **not implemented yet**; keyword search still matches whole tokens. `demote_margin` <!-- TODO: verify against merged W3/W6/W7 --> |
+| `[auto_context]` (relations) | `include_demoted` (`false`): keep memories that a newer one refines or contradicts in the context block |
+| `[recall]` | `demote_margin` (`0.10`): how much rank a refined or contradicted memory loses. `stemming` — accepted, **not implemented yet**; keyword search still matches whole tokens. |
 
 `mneme init` writes these into a new `config.toml` with comments. An
 existing config needs no change: every key has a default. See
@@ -275,7 +292,10 @@ instead of the content of every write.
 - Binary: `brew upgrade mneme` or `cargo install mneme-mcp`. Restart
   running servers. No migration runs.
 - Take a `mneme backup` first if you want a way back: a 1.5 binary opens
-  a 1.6 store, but it does not know archived memories or `updated_at`.
+  a 1.6 store (`schema_version` is still 1; everything new is in side
+  tables it ignores), but it does not know archived memories,
+  `updated_at`, relations or provenance, so it would show an archived
+  or refined memory as an ordinary one.
 - Hermes installs: re-run `mneme init hermes --upgrade` with the same
   `--hermes-home` / `--url` as the first install (and `--scope-map` if
   you want scoped reads). The hook and skill are copies; upgrading the

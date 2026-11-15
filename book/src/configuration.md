@@ -58,6 +58,10 @@ event_clip_chars        = 400
 min_event_weight        = 0.3
 max_events_per_kind     = 6
 pin_scopes              = ["global"]
+include_demoted         = false
+
+[recall]
+demote_margin = 0.1
 
 [consolidation]
 hot_to_warm_days  = 28

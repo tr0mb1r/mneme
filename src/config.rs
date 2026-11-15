@@ -937,6 +937,19 @@ max_events_per_kind = {max_events_per_kind}
 # Pin scopes always included next to the requested scope, so a scoped
 # read keeps the global rules. [] = only the requested scope's pins.
 pin_scopes = {pin_scopes}
+# A memory that a newer, current memory `refines` or `contradicts` is
+# demoted: `recall` still returns it, lower down. false leaves such
+# memories out of the context block; true keeps them, below the memory
+# that refines them.
+include_demoted = {include_demoted}
+
+[recall]
+# How much rank (cosine-similarity scale) a demoted memory loses in
+# `recall`, on top of its keyword evidence no longer counting. The
+# default is about the gap between a right answer and a lookalike, so
+# the older memory lands just below the one that refines it. 0 = no
+# penalty beyond the keyword evidence.
+demote_margin = {demote_margin}
 
 [consolidation]
 # L3 episodic tier transitions, in days.
@@ -1035,6 +1048,8 @@ max_files = {max_files}
             min_event_weight = toml_float(self.auto_context.min_event_weight),
             max_events_per_kind = self.auto_context.max_events_per_kind,
             pin_scopes = pin_scopes,
+            include_demoted = self.auto_context.include_demoted,
+            demote_margin = toml_float(self.recall.demote_margin),
             cold_exempt_kinds = cold_exempt_kinds,
             hot_to_warm_days = self.consolidation.hot_to_warm_days,
             warm_to_cold_days = self.consolidation.warm_to_cold_days,
@@ -1312,8 +1327,9 @@ mod tests {
             min_event_weight: 0.05,
             max_events_per_kind: 3,
             pin_scopes: vec![],
-            include_demoted: false,
+            include_demoted: true,
         };
+        c.recall.demote_margin = 0.25;
 
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("config.toml");
@@ -1321,8 +1337,8 @@ mod tests {
         assert_eq!(Config::load(&p).unwrap(), c);
     }
 
-    /// The template documents each 1.6 section, and leaves out the keys
-    /// that do nothing until 1.7 (relations) or are still experimental.
+    /// The template documents each 1.6 section, including the two
+    /// relation knobs, and leaves out the key that does nothing yet.
     #[test]
     fn starter_template_lists_the_1_6_sections() {
         let text = Config::default().starter_toml();
@@ -1337,15 +1353,16 @@ mod tests {
             "touch_on_recall = true",
             "index_kinds = [\"decision\"",
             "cold_exempt_kinds = [\"archived\"",
+            "include_demoted = false",
+            "[recall]",
+            "demote_margin = 0.1",
         ] {
             assert!(text.contains(expected), "starter config lacks `{expected}`");
         }
-        for reserved in ["include_demoted", "demote_margin", "[recall]", "stemming"] {
-            assert!(
-                !text.contains(reserved),
-                "starter config lists `{reserved}`, which has no effect yet"
-            );
-        }
+        assert!(
+            !text.contains("stemming"),
+            "starter config lists `stemming`, which has no effect yet"
+        );
     }
 
     #[test]
