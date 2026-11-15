@@ -409,6 +409,38 @@ impl EpisodicStore {
         }
     }
 
+    /// Lexical relevance of `query` to each of `ids`: IDF-weighted query
+    /// coverage in `[0, 1]`. Ids that are not indexed (kind outside
+    /// `[episodic] index_kinds`) or share no token with the query are
+    /// absent from the map; callers treat absent as `0.0`.
+    ///
+    /// Contract between auto-context (W1) and the episodic keyword index
+    /// (W2). Until the index lands this returns an empty map.
+    pub async fn lex_scores(
+        &self,
+        query: &str,
+        ids: &[EventId],
+    ) -> Result<std::collections::HashMap<EventId, f32>> {
+        let _ = (query, ids);
+        Ok(std::collections::HashMap::new())
+    }
+
+    /// Best lexical matches for `query` over hot + warm indexed events,
+    /// with `filters` applied, best first. The `f32` is the same
+    /// coverage score [`lex_scores`](Self::lex_scores) reports.
+    ///
+    /// Contract between auto-context (W1) and the episodic keyword index
+    /// (W2). Until the index lands this returns no rows.
+    pub async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        filters: &RecentFilters,
+    ) -> Result<Vec<(EpisodicEvent, f32)>> {
+        let _ = (query, limit, filters);
+        Ok(Vec::new())
+    }
+
     /// Ranked recent events.
     ///
     /// Sorts by `(last_accessed DESC, retrieval_weight DESC,
