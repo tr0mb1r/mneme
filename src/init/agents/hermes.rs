@@ -98,7 +98,7 @@ events.";
 const SKILL_MD: &str = r#"---
 name: mneme
 description: Persistent long-term memory across sessions via the mneme MCP server. Use at the start of every conversation, whenever the user refers to earlier work, and whenever a decision, preference, or rule is worth keeping.
-version: 1.1.0
+version: 1.2.0
 metadata:
   hermes:
     tags: [memory, mcp]
@@ -143,6 +143,13 @@ tools appear as `mcp_mneme_<tool>`; its resources are read with
    best coverage first), not exact phrases. Filter with `tags` or `scope`
    when you know them. For a broad question use `tags`, not
    `min_similarity`: that floor drops weak matches.
+   - **"What did we conclude about X?"** Pass
+     `layers: ["semantic", "episodic"]`. Decisions, lessons and summaries
+     written with `record_event` are only found this way; the default
+     searches memories alone.
+   - **Time questions** ("what changed last week?"): `since` / `until` on
+     `mcp_mneme_recall` (RFC3339; work the dates out yourself). For a plain
+     timeline with no query, `mcp_mneme_recall_recent`.
 3. **Remember** durable facts with `mcp_mneme_remember`: decisions and their
    reasons, preferences the user states, project conventions, conclusions
    from investigation. One fact per memory, under ~500 characters.
@@ -154,6 +161,9 @@ tools appear as `mcp_mneme_<tool>`; its resources are read with
    existing one, decide: it replaces it → `mcp_mneme_update` the new id with
    `supersedes: "<old id>"`; it only restates it → `mcp_mneme_forget` the new
    id; both are true → ignore the note.
+   **When a fact is no longer current and nothing replaces it**, archive it:
+   `mcp_mneme_update` with `status: "archived"`. It leaves recall and
+   context but stays readable; don't `forget` it and log an event instead.
 4. **Pin** rules that must apply every session ("always answer in British
    English") with `mcp_mneme_pin` instead of `remember`. To replace a rule,
    `mcp_mneme_unpin` the old one and pin the new.
@@ -207,6 +217,8 @@ struct Paths {
     hook: PathBuf,
     hook_state: PathBuf,
     allowlist: PathBuf,
+    /// `--scope-map`, passed through to the hook's command line.
+    scope_map: Option<PathBuf>,
 }
 
 impl Paths {
@@ -219,6 +231,7 @@ impl Paths {
             hook: hermes_home.join("agent-hooks").join(HOOK_FILE),
             hook_state: hermes_home.join("mneme-hook-state"),
             allowlist: hermes_home.join("shell-hooks-allowlist.json"),
+            scope_map: None,
         }
     }
 }
@@ -239,6 +252,9 @@ fn hook_command(paths: &Paths, t: &Transport) -> String {
                 token_env.clone(),
             ]);
         }
+    }
+    if let Some(map) = &paths.scope_map {
+        parts.extend(["--scope-map".into(), map.display().to_string()]);
     }
     parts
         .iter()
@@ -289,7 +305,8 @@ pub fn run(mode: InstallMode, home_dir: &Path, opts: &InstallOptions) -> Result<
 /// [`run`] with Hermes' home already resolved. Tests call this so a
 /// developer's own `$HERMES_HOME` can never be touched.
 fn run_at(mode: InstallMode, hermes_home: &Path, opts: &InstallOptions) -> Result<(), AgentError> {
-    let paths = Paths::new(hermes_home);
+    let mut paths = Paths::new(hermes_home);
+    paths.scope_map = opts.scope_map.clone();
     match mode {
         InstallMode::Install | InstallMode::Upgrade => {
             let t = transport(opts)?;
@@ -793,7 +810,7 @@ mod tests {
     /// the tools: pin the version and the behaviours it teaches.
     #[test]
     fn skill_teaches_the_current_tool_behaviour() {
-        assert!(SKILL_MD.contains("\nversion: 1.1.0\n"));
+        assert!(SKILL_MD.contains("\nversion: 1.2.0\n"));
         for needle in [
             "What goes where",
             "`scope` explicitly on every write",
@@ -803,6 +820,9 @@ mod tests {
             "not exact phrases",
             "`tags`, not\n   `min_similarity`",
             "secret_detected",
+            "`layers: [\"semantic\", \"episodic\"]`",
+            "`since` / `until` on\n     `mcp_mneme_recall`",
+            "`status: \"archived\"`",
         ] {
             assert!(SKILL_MD.contains(needle), "skill lost `{needle}`");
         }
@@ -1068,6 +1088,40 @@ mcp_servers:
             "approval must match the configured command exactly"
         );
         assert!(a["approved_at"].is_string());
+    }
+
+    #[test]
+    fn scope_map_is_passed_to_the_hook_and_approved_with_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut opts = remote("http://mneme:7878/mcp");
+        opts.scope_map = Some(PathBuf::from("/opt/data/autonomy/threads.json"));
+        run_at(InstallMode::Install, tmp.path(), &opts).unwrap();
+        let script = tmp.path().join("agent-hooks").join("mneme-context.py");
+        let command = format!(
+            "{} --url http://mneme:7878/mcp --token-env MNEME_HTTP_TOKEN \
+             --scope-map /opt/data/autonomy/threads.json",
+            shell_quote(&script.display().to_string())
+        );
+        let cfg = read(&tmp.path().join("config.yaml"));
+        assert!(cfg.contains(&yaml_config::quote(&command)), "{cfg}");
+        assert_eq!(allowlist(tmp.path())["approvals"][0]["command"], command);
+
+        // Upgrading without the flag drops it again, approval included.
+        run_at(
+            InstallMode::Upgrade,
+            tmp.path(),
+            &remote("http://mneme:7878/mcp"),
+        )
+        .unwrap();
+        assert!(!read(&tmp.path().join("config.yaml")).contains("--scope-map"));
+        let approvals = allowlist(tmp.path());
+        assert_eq!(approvals["approvals"].as_array().unwrap().len(), 1);
+        assert!(
+            !approvals["approvals"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("--scope-map")
+        );
     }
 
     #[test]
