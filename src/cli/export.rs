@@ -31,7 +31,7 @@ use serde_json::{Value, json};
 use crate::crypto::{KekStore, OsKeyring};
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
-use crate::memory::semantic::MemoryItem;
+use crate::memory::semantic::{MemoryItem, read_memory_meta};
 use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
 use crate::storage::layout;
@@ -203,19 +203,29 @@ async fn collect_semantic(storage: &Arc<dyn Storage>, scope: Option<&str>) -> Re
         items.push(item);
     }
     items.sort_by_key(|m| std::cmp::Reverse(m.created_at));
-    Ok(items
-        .into_iter()
-        .map(|m| {
-            json!({
-                "id": m.id.to_string(),
-                "content": m.content,
-                "kind": m.kind.as_str(),
-                "tags": m.tags,
-                "scope": m.scope,
-                "created_at": m.created_at.to_rfc3339(),
-            })
-        })
-        .collect())
+    // `updated_at`, `status` and the supersession link live in side
+    // tables next to the `mem:` row (see `storage/mod.rs`), so each
+    // costs a point read. Archived and superseded memories are always
+    // exported: this is a dump, not a recall.
+    let mut out = Vec::with_capacity(items.len());
+    for m in items {
+        let meta = read_memory_meta(storage.as_ref(), &m).await?;
+        let mut row = json!({
+            "id": m.id.to_string(),
+            "content": m.content,
+            "kind": m.kind.as_str(),
+            "tags": m.tags,
+            "scope": m.scope,
+            "created_at": m.created_at.to_rfc3339(),
+            "updated_at": meta.updated_at.to_rfc3339(),
+            "status": meta.status.as_str(),
+        });
+        if let Some(newer) = meta.superseded_by {
+            row["superseded_by"] = json!(newer.to_string());
+        }
+        out.push(row);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

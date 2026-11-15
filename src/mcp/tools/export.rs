@@ -12,6 +12,11 @@
 //! `tier` field). Until 1.5.2 it was hot only, so an export taken as
 //! a backup lost every event older than `hot_to_warm_days`. The cold
 //! archive is still not included.
+//!
+//! Each `semantic` row carries the metadata that lives beside the
+//! memory rather than in it: `updated_at`, `status`, and (when set)
+//! `superseded_by`. Archived and superseded memories are always in an
+//! export; until 1.6 the supersession links were silently left out.
 
 use std::sync::Arc;
 
@@ -21,7 +26,7 @@ use serde_json::{Value, json};
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::memory::episodic::EpisodicStore;
 use crate::memory::procedural::ProceduralStore;
-use crate::memory::semantic::MemoryItem;
+use crate::memory::semantic::{MemoryItem, read_memory_meta};
 use crate::storage::MEM_KEY_PREFIX;
 use crate::storage::Storage;
 
@@ -30,7 +35,8 @@ holds as one JSON document, optionally filtered by scope. Use this \
 for human-readable inspection or for piping to `jq` / external \
 scripts. Episodic events come from the hot and warm tiers (each row \
 has a `tier` field); pass `include_warm: false` for hot only. Events \
-in the cold archive are not included. Each layer is capped at \
+in the cold archive are not included. Memories include archived and \
+superseded ones, marked by `status` and `superseded_by`. Each layer is capped at \
 `limit_per_layer` rows, newest first, so raise it (max 5000) for a \
 complete dump. For at-rest, full-fidelity copies use the \
 `mneme backup` CLI command instead.";
@@ -183,20 +189,28 @@ impl Tool for Export {
             sem_items.push(item);
         }
         sem_items.sort_by_key(|m| std::cmp::Reverse(m.created_at));
-        let sem_json: Vec<Value> = sem_items
-            .into_iter()
-            .take(limit)
-            .map(|m| {
-                json!({
-                    "id": m.id.to_string(),
-                    "content": m.content,
-                    "kind": m.kind.as_str(),
-                    "tags": m.tags,
-                    "scope": m.scope,
-                    "created_at": m.created_at.to_rfc3339(),
-                })
-            })
-            .collect();
+        // Side-table metadata is read only for the rows that survive
+        // the limit: three point reads each.
+        let mut sem_json: Vec<Value> = Vec::new();
+        for m in sem_items.into_iter().take(limit) {
+            let meta = read_memory_meta(self.storage.as_ref(), &m)
+                .await
+                .map_err(|e| ToolError::Internal(format!("semantic metadata: {e}")))?;
+            let mut row = json!({
+                "id": m.id.to_string(),
+                "content": m.content,
+                "kind": m.kind.as_str(),
+                "tags": m.tags,
+                "scope": m.scope,
+                "created_at": m.created_at.to_rfc3339(),
+                "updated_at": meta.updated_at.to_rfc3339(),
+                "status": meta.status.as_str(),
+            });
+            if let Some(newer) = meta.superseded_by {
+                row["superseded_by"] = json!(newer.to_string());
+            }
+            sem_json.push(row);
+        }
 
         let body = json!({
             "procedural": proc_json,
@@ -398,5 +412,77 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArguments(_)));
+    }
+
+    /// Side-table metadata reaches the export: an edited memory's
+    /// `updated_at`, an archived one's `status`, and the supersession
+    /// link that exports before 1.6 dropped.
+    #[tokio::test]
+    async fn export_carries_updated_at_status_and_supersession() {
+        use crate::memory::semantic::{MemoryStatus, UpdatePatch};
+        let (e, semantic, _tmp) = fixture().await;
+        let old = semantic
+            .remember("port is 8080", MemoryKind::Fact, vec![], "personal".into())
+            .await
+            .unwrap();
+        let new = semantic
+            .remember("port is 9090", MemoryKind::Fact, vec![], "personal".into())
+            .await
+            .unwrap();
+        assert!(semantic.supersede(old, new).await.unwrap());
+        let archived = semantic
+            .remember("old plan", MemoryKind::Decision, vec![], "personal".into())
+            .await
+            .unwrap();
+        assert!(
+            semantic
+                .set_status(archived, MemoryStatus::Archived)
+                .await
+                .unwrap()
+        );
+        assert!(
+            semantic
+                .update(
+                    new,
+                    UpdatePatch {
+                        content: Some("port is 9191".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+        );
+
+        let res = e.invoke(json!({})).await.unwrap();
+        let text = match &res.content[0] {
+            crate::mcp::tools::ContentBlock::Text(t) => t.clone(),
+        };
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let rows = v["semantic"].as_array().unwrap();
+        // Nothing is hidden from an export.
+        assert_eq!(rows.len(), 4);
+        let row = |id: crate::ids::MemoryId| {
+            rows.iter()
+                .find(|r| r["id"] == id.to_string())
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row(old)["superseded_by"], new.to_string());
+        assert_eq!(row(old)["status"], "active");
+        assert!(row(new).get("superseded_by").is_none());
+        assert_eq!(row(archived)["status"], "archived");
+        // Never edited: updated_at is created_at. Edited: it moved.
+        assert_eq!(row(old)["updated_at"], row(old)["created_at"]);
+        let parse = |v: &Value| chrono::DateTime::parse_from_rfc3339(v.as_str().unwrap()).unwrap();
+        assert!(parse(&row(new)["updated_at"]) >= parse(&row(new)["created_at"]));
+        assert_eq!(
+            semantic
+                .updated_at(new)
+                .await
+                .unwrap()
+                .unwrap()
+                .to_rfc3339(),
+            row(new)["updated_at"].as_str().unwrap()
+        );
     }
 }

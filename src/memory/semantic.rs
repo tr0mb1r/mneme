@@ -101,7 +101,7 @@ use crate::memory::activity::ActivityCounter;
 use crate::memory::keyword::{self, KeywordHit, KeywordIndex};
 use crate::storage::Storage;
 use crate::storage::wal::{self, WalOp, WalWriter};
-use crate::storage::{MEM_KEY_PREFIX, SUP_KEY_PREFIX};
+use crate::storage::{MEM_KEY_PREFIX, MTS_KEY_PREFIX, ST_KEY_PREFIX, SUP_KEY_PREFIX};
 use crate::{MnemeError, Result};
 
 /// How many extra results to over-fetch from HNSW on the *first*
@@ -205,6 +205,128 @@ pub struct RecallHit {
     pub superseded_by: Option<MemoryId>,
     /// Which half of hybrid recall found this memory.
     pub matched: MatchSource,
+    /// Relevance on one scale for every recall mode: cosine similarity
+    /// plus keyword evidence ([`KEYWORD_WEIGHT`] × coverage² and
+    /// [`PHRASE_WEIGHT`]). Equal to the similarity for a hit with no
+    /// literal match. Auto-context and mixed-layer ranking read this
+    /// rather than re-deriving it from `score`.
+    pub rank: f32,
+    /// When the content was last edited by `update`; the creation time
+    /// for a memory never edited.
+    pub updated_at: DateTime<Utc>,
+    /// Lifecycle status. Only ever [`MemoryStatus::Archived`] when the
+    /// caller asked for archived memories via
+    /// [`RecallFilters::include_archived`].
+    pub status: MemoryStatus,
+}
+
+/// Lifecycle status of a memory.
+///
+/// An archived memory is not current: `recall` leaves it out unless
+/// asked, auto-context never carries it, and `export` always does. It
+/// keeps its id, content and vector, so archiving is reversible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MemoryStatus {
+    #[default]
+    Active,
+    Archived,
+}
+
+impl MemoryStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "archived" => Some(Self::Archived),
+            _ => None,
+        }
+    }
+}
+
+/// Which timestamp [`RecallFilters::since`] / [`RecallFilters::until`]
+/// compare against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TimeField {
+    /// When the memory was first stored (the default).
+    #[default]
+    CreatedAt,
+    /// When its content was last edited.
+    UpdatedAt,
+}
+
+impl TimeField {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "created_at" => Some(Self::CreatedAt),
+            "updated_at" => Some(Self::UpdatedAt),
+            _ => None,
+        }
+    }
+}
+
+/// The parts of a memory kept beside its `mem:` row rather than in
+/// [`MemoryItem`]: see [`read_memory_meta`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryMeta {
+    /// Last content edit, or `created_at` if never edited.
+    pub updated_at: DateTime<Utc>,
+    pub status: MemoryStatus,
+    /// The stored supersession link, if any. Raw: the target is not
+    /// checked for existence (unlike [`SemanticStore::superseded_by`]),
+    /// so an export carries exactly what is on disk.
+    pub superseded_by: Option<MemoryId>,
+}
+
+/// Read a memory's side-table metadata straight from `storage`.
+///
+/// For paths that scan `mem:` rows without a [`SemanticStore`] (the
+/// `export` tool and CLI). Three point reads; absent rows resolve to
+/// the defaults (never edited, active, not superseded).
+pub async fn read_memory_meta(storage: &dyn Storage, item: &MemoryItem) -> Result<MemoryMeta> {
+    let updated_at = read_updated_at(storage, item.id)
+        .await?
+        .unwrap_or(item.created_at);
+    let status = read_status(storage, item.id).await?;
+    let superseded_by = match storage.get(&sup_key(&item.id)).await? {
+        None => None,
+        Some(bytes) => <[u8; 16]>::try_from(bytes.as_slice())
+            .ok()
+            .map(|raw| MemoryId(ulid::Ulid::from_bytes(raw))),
+    };
+    Ok(MemoryMeta {
+        updated_at,
+        status,
+        superseded_by,
+    })
+}
+
+/// The `mts:` row for `id`, decoded. `None` when absent or malformed
+/// (a malformed row is logged and treated as never edited).
+async fn read_updated_at(storage: &dyn Storage, id: MemoryId) -> Result<Option<DateTime<Utc>>> {
+    let Some(bytes) = storage.get(&mts_key(&id)).await? else {
+        return Ok(None);
+    };
+    let decoded = <[u8; 8]>::try_from(bytes.as_slice())
+        .ok()
+        .and_then(|raw| DateTime::<Utc>::from_timestamp_millis(i64::from_be_bytes(raw)));
+    if decoded.is_none() {
+        tracing::warn!(memory_id = %id, "ignoring malformed updated_at row");
+    }
+    Ok(decoded)
+}
+
+/// Archived iff an `st:` row exists. The byte's value is reserved.
+async fn read_status(storage: &dyn Storage, id: MemoryId) -> Result<MemoryStatus> {
+    Ok(match storage.get(&st_key(&id)).await? {
+        Some(_) => MemoryStatus::Archived,
+        None => MemoryStatus::Active,
+    })
 }
 
 /// How [`SemanticStore::recall`] finds candidates.
@@ -257,7 +379,12 @@ impl MatchSource {
 /// rather than silently returning a short list.
 #[derive(Debug, Clone, Default)]
 pub struct RecallFilters {
+    /// Single-scope filter. Unioned with [`Self::scopes`]; kept so the
+    /// common one-scope caller stays a one-liner.
     pub scope: Option<String>,
+    /// Scope set: a memory passes if its scope equals any entry (or
+    /// [`Self::scope`]). Both empty means "no scope constraint".
+    pub scopes: Vec<String>,
     pub kind: Option<MemoryKind>,
     /// Every tag listed here must be present on the memory (AND, not
     /// OR). Empty means "no tag constraint". Matching is exact and
@@ -280,6 +407,17 @@ pub struct RecallFilters {
     /// Vector, keyword, or both (default). Every other filter,
     /// `min_similarity` included, applies to hits from either search.
     pub mode: RecallMode,
+    /// Keep only memories whose [`Self::time_field`] timestamp is at or
+    /// after this instant.
+    pub since: Option<DateTime<Utc>>,
+    /// Keep only memories whose [`Self::time_field`] timestamp is at or
+    /// before this instant.
+    pub until: Option<DateTime<Utc>>,
+    /// Which timestamp `since` / `until` compare against.
+    pub time_field: TimeField,
+    /// Also return archived memories ([`MemoryStatus::Archived`]). Off
+    /// by default: archiving is how an agent says "not current".
+    pub include_archived: bool,
 }
 
 impl RecallFilters {
@@ -289,6 +427,30 @@ impl RecallFilters {
             scope: Some(scope.into()),
             ..Default::default()
         }
+    }
+
+    /// Filter by a set of scopes. An empty set is no constraint.
+    pub fn with_scopes(scopes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            scopes: scopes.into_iter().map(Into::into).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Whether `scope` passes the scope constraint.
+    fn scope_matches(&self, scope: &str) -> bool {
+        if self.scope.is_none() && self.scopes.is_empty() {
+            return true;
+        }
+        self.scope.as_deref() == Some(scope) || self.scopes.iter().any(|s| s == scope)
+    }
+
+    fn has_time_window(&self) -> bool {
+        self.since.is_some() || self.until.is_some()
+    }
+
+    fn in_time_window(&self, ts: DateTime<Utc>) -> bool {
+        self.since.is_none_or(|s| ts >= s) && self.until.is_none_or(|u| ts <= u)
     }
 
     /// Apply every populated predicate to one candidate.
@@ -307,9 +469,12 @@ impl RecallFilters {
     /// Scope / kind / tag predicates — everything except the
     /// similarity floor, which keyword matches don't answer to.
     fn matches_metadata(&self, item: &MemoryItem) -> bool {
-        if let Some(want_scope) = &self.scope
-            && &item.scope != want_scope
-        {
+        if !self.scope_matches(&item.scope) {
+            return false;
+        }
+        // The `updated_at` window needs the `mts:` side row, so it is
+        // checked in `SemanticStore::admit` instead.
+        if self.time_field == TimeField::CreatedAt && !self.in_time_window(item.created_at) {
             return false;
         }
         if let Some(want_kind) = self.kind
@@ -412,11 +577,17 @@ pub struct UpdatePatch {
     pub kind: Option<MemoryKind>,
     pub tags: Option<Vec<String>>,
     pub scope: Option<String>,
+    /// Archive or re-activate. Never touches `updated_at`.
+    pub status: Option<MemoryStatus>,
 }
 
 impl UpdatePatch {
     pub fn is_empty(&self) -> bool {
-        self.content.is_none() && self.kind.is_none() && self.tags.is_none() && self.scope.is_none()
+        self.content.is_none()
+            && self.kind.is_none()
+            && self.tags.is_none()
+            && self.scope.is_none()
+            && self.status.is_none()
     }
 }
 
@@ -932,6 +1103,11 @@ impl SemanticStore {
             if self.superseded_by(id).await?.is_some() {
                 continue;
             }
+            // Nor is an archived one: deduplicating a write against it
+            // would swallow a fact the agent can no longer recall.
+            if read_status(self.storage.as_ref(), id).await? == MemoryStatus::Archived {
+                continue;
+            }
             let existing: MemoryItem = postcard::from_bytes(&bytes)
                 .map_err(|e| MnemeError::Storage(format!("decode MemoryItem {id}: {e}")))?;
             out.push(NearDuplicate {
@@ -1055,6 +1231,8 @@ impl SemanticStore {
             _ => self.semantic_candidates(&qvec, k, filters).await?,
         };
         if filters.mode == RecallMode::Semantic {
+            // No literal evidence was looked for, so `rank` stays the
+            // similarity `admit` set.
             return Ok(append_stale(semantic, semantic_stale, k));
         }
         let (lexical, lexical_stale) = self.keyword_candidates(trimmed, &qvec, k, filters).await?;
@@ -1125,20 +1303,13 @@ impl SemanticStore {
                 if !filters.matches(&item, *score) {
                     continue;
                 }
-                match self.superseded_by(item.id).await? {
-                    None => out.push(RecallHit {
-                        item,
-                        score: *score,
-                        superseded_by: None,
-                        matched: MatchSource::Semantic,
-                    }),
-                    Some(newer) if filters.include_superseded => stale.push(RecallHit {
-                        item,
-                        score: *score,
-                        superseded_by: Some(newer),
-                        matched: MatchSource::Semantic,
-                    }),
-                    Some(_) => continue,
+                match self
+                    .admit(item, *score, MatchSource::Semantic, filters)
+                    .await?
+                {
+                    Admitted::Current(hit) => out.push(hit),
+                    Admitted::Stale(hit) => stale.push(hit),
+                    Admitted::Rejected => continue,
                 }
                 if out.len() >= k {
                     break;
@@ -1233,26 +1404,138 @@ impl SemanticStore {
             if !filters.matches(&item, score) {
                 continue;
             }
-            match self.superseded_by(item.id).await? {
-                None => out.push((
-                    RecallHit {
-                        item,
-                        score,
-                        superseded_by: None,
-                        matched: MatchSource::Keyword,
-                    },
-                    kh,
-                )),
-                Some(newer) if filters.include_superseded => stale.push(RecallHit {
-                    item,
-                    score,
-                    superseded_by: Some(newer),
-                    matched: MatchSource::Keyword,
-                }),
-                Some(_) => {}
+            match self
+                .admit(item, score, MatchSource::Keyword, filters)
+                .await?
+            {
+                Admitted::Current(hit) => out.push((hit, kh)),
+                Admitted::Stale(mut hit) => {
+                    // Stale rows skip `fuse`, so their keyword evidence
+                    // is folded in here.
+                    hit.rank += KEYWORD_WEIGHT * kh.coverage * kh.coverage;
+                    stale.push(hit);
+                }
+                Admitted::Rejected => {}
             }
         }
         Ok((out, stale))
+    }
+
+    /// The side-table half of filtering, shared by both candidate
+    /// searches: status, the `updated_at` time window and supersession.
+    /// Runs after [`RecallFilters::matches`] so the extra point reads
+    /// are only paid for candidates that passed the cheap predicates.
+    ///
+    /// The returned hit's `rank` is its similarity; [`fuse`] adds
+    /// keyword evidence.
+    async fn admit(
+        &self,
+        item: MemoryItem,
+        score: f32,
+        matched: MatchSource,
+        filters: &RecallFilters,
+    ) -> Result<Admitted> {
+        let storage = self.storage.as_ref();
+        let status = read_status(storage, item.id).await?;
+        if status == MemoryStatus::Archived && !filters.include_archived {
+            return Ok(Admitted::Rejected);
+        }
+        let updated_at = read_updated_at(storage, item.id)
+            .await?
+            .unwrap_or(item.created_at);
+        if filters.time_field == TimeField::UpdatedAt
+            && filters.has_time_window()
+            && !filters.in_time_window(updated_at)
+        {
+            return Ok(Admitted::Rejected);
+        }
+        let superseded_by = self.superseded_by(item.id).await?;
+        if superseded_by.is_some() && !filters.include_superseded {
+            return Ok(Admitted::Rejected);
+        }
+        let hit = RecallHit {
+            item,
+            score,
+            superseded_by,
+            matched,
+            rank: similarity_from_distance(score),
+            updated_at,
+            status,
+        };
+        Ok(if hit.superseded_by.is_some() {
+            Admitted::Stale(hit)
+        } else {
+            Admitted::Current(hit)
+        })
+    }
+
+    /// When `id`'s content was last edited, or `None` if no memory with
+    /// this id is stored. A memory never edited reports its creation
+    /// time.
+    pub async fn updated_at(&self, id: MemoryId) -> Result<Option<DateTime<Utc>>> {
+        let Some(item) = self.get(id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            read_updated_at(self.storage.as_ref(), id)
+                .await?
+                .unwrap_or(item.created_at),
+        ))
+    }
+
+    /// Lifecycle status of `id`, or `None` if no memory with this id is
+    /// stored.
+    pub async fn status(&self, id: MemoryId) -> Result<Option<MemoryStatus>> {
+        if self.storage.get(&mem_key(&id)).await?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(read_status(self.storage.as_ref(), id).await?))
+    }
+
+    /// Side-table metadata for a stored memory: see [`read_memory_meta`].
+    pub async fn meta(&self, item: &MemoryItem) -> Result<MemoryMeta> {
+        read_memory_meta(self.storage.as_ref(), item).await
+    }
+
+    /// Archive or re-activate a memory. Returns `false` if no memory
+    /// with this id is stored. Idempotent; never changes `updated_at`.
+    pub async fn set_status(&self, id: MemoryId, status: MemoryStatus) -> Result<bool> {
+        let _g = self.write_lock.lock().await;
+        if self.storage.get(&mem_key(&id)).await?.is_none() {
+            return Ok(false);
+        }
+        self.write_status(id, status).await?;
+        self.note_mutation();
+        Ok(true)
+    }
+
+    /// Callers hold `write_lock`.
+    async fn write_status(&self, id: MemoryId, status: MemoryStatus) -> Result<()> {
+        match status {
+            MemoryStatus::Archived => self.storage.put(&st_key(&id), &[ST_ARCHIVED]).await,
+            MemoryStatus::Active => self.storage.delete(&st_key(&id)).await,
+        }
+    }
+
+    /// Record `at` as the last content edit of `id`. Callers hold
+    /// `write_lock`.
+    async fn write_updated_at(&self, id: MemoryId, at: DateTime<Utc>) -> Result<()> {
+        self.storage
+            .put(&mts_key(&id), &at.timestamp_millis().to_be_bytes())
+            .await
+    }
+
+    /// Set a memory's `updated_at` to an arbitrary instant. For tests
+    /// and seed tooling that need an edit history without waiting for
+    /// the clock; `update` is the production path.
+    #[doc(hidden)]
+    pub async fn backdate_updated_at(&self, id: MemoryId, at: DateTime<Utc>) -> Result<bool> {
+        let _g = self.write_lock.lock().await;
+        if self.storage.get(&mem_key(&id)).await?.is_none() {
+            return Ok(false);
+        }
+        self.write_updated_at(id, at).await?;
+        Ok(true)
     }
 
     /// Build the keyword index from storage if it doesn't exist yet.
@@ -1383,6 +1666,9 @@ impl SemanticStore {
         // left in place and resolve as "not superseded" once it's gone
         // (see `superseded_by`).
         self.storage.delete(&sup_key(&id)).await?;
+        // And its side rows, so a forgotten id leaves nothing behind.
+        self.storage.delete(&mts_key(&id)).await?;
+        self.storage.delete(&st_key(&id)).await?;
         self.with_keyword_index(|idx| idx.remove(id));
         // Tombstone the vector unconditionally — even if the metadata
         // is gone, leaving an orphan vector wastes RAM and can return
@@ -1406,6 +1692,10 @@ impl SemanticStore {
     ///
     /// `created_at` is preserved across updates — it identifies when
     /// the memory was first stored, not when it was last touched.
+    /// `updated_at` (the `mts:` side row) moves only when the content
+    /// actually changes: re-tagging, re-scoping, archiving, or writing
+    /// back identical text leave it alone, so it stays a faithful
+    /// "this fact was last revised" signal for auto-context freshness.
     pub async fn update(&self, id: MemoryId, patch: UpdatePatch) -> Result<bool> {
         let key = mem_key(&id);
         let bytes = match self.storage.get(&key).await? {
@@ -1422,6 +1712,7 @@ impl SemanticStore {
         // Re-embed BEFORE acquiring write_lock so we don't block
         // concurrent remember/forget callers on a forward pass — same
         // pattern as `remember`.
+        let mut content_changed = false;
         let new_vector = match &patch.content {
             Some(new_content) => {
                 let trimmed = new_content.trim();
@@ -1436,6 +1727,7 @@ impl SemanticStore {
                         self.embedder.dim()
                     )));
                 }
+                content_changed = item.content != trimmed;
                 item.content = trimmed.to_owned();
                 Some(v)
             }
@@ -1457,9 +1749,21 @@ impl SemanticStore {
 
         let _g = self.write_lock.lock().await;
         self.storage.put(&key, &value).await?;
+        // Side rows are separate puts (the storage seam has no
+        // multi-key transaction). A crash between them leaves the new
+        // content with the old `updated_at`: stale by one edit, never
+        // wrong about the content itself.
+        if content_changed {
+            self.write_updated_at(id, Utc::now()).await?;
+        }
+        if let Some(status) = patch.status {
+            self.write_status(id, status).await?;
+        }
         if let Some(vec) = new_vector {
             self.wal.append(WalOp::VectorReplace { id, vec }).await?;
             self.with_keyword_index(|idx| idx.insert(id, &item.content));
+            self.note_mutation();
+        } else if patch.status.is_some() {
             self.note_mutation();
         }
         Ok(true)
@@ -1598,16 +1902,21 @@ fn fuse(
             *ev += PHRASE_WEIGHT;
         }
     }
-    let rank = |(hit, ev): &(RecallHit, f32)| -> f32 {
-        let similarity = similarity_from_distance(hit.score);
+    // `RecallHit::rank` is similarity + evidence in every mode, so
+    // callers that mix layers compare like with like. Only the *sort*
+    // differs in keyword mode.
+    for (hit, ev) in merged.iter_mut() {
+        hit.rank = similarity_from_distance(hit.score) + *ev;
+    }
+    let order = |(hit, ev): &(RecallHit, f32)| -> f32 {
         match mode {
-            RecallMode::Keyword => ev * 10.0 + similarity,
-            _ => similarity + ev,
+            RecallMode::Keyword => ev * 10.0 + similarity_from_distance(hit.score),
+            _ => hit.rank,
         }
     };
     merged.sort_by(|a, b| {
-        rank(b)
-            .partial_cmp(&rank(a))
+        order(b)
+            .partial_cmp(&order(a))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     merged.into_iter().take(k).map(|(h, _)| h).collect()
@@ -1623,6 +1932,32 @@ fn append_stale(mut hits: Vec<RecallHit>, stale: Vec<RecallHit>, k: usize) -> Ve
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// What [`SemanticStore::admit`] decided about one candidate.
+enum Admitted {
+    Current(RecallHit),
+    /// Superseded, and the caller asked for superseded memories.
+    Stale(RecallHit),
+    Rejected,
+}
+
+/// Value of an `st:` row. Presence is what counts; the byte leaves
+/// room for further statuses.
+const ST_ARCHIVED: u8 = 1;
+
+fn mts_key(id: &MemoryId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(MTS_KEY_PREFIX.len() + 16);
+    k.extend_from_slice(MTS_KEY_PREFIX);
+    k.extend_from_slice(&id.0.to_bytes());
+    k
+}
+
+fn st_key(id: &MemoryId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(ST_KEY_PREFIX.len() + 16);
+    k.extend_from_slice(ST_KEY_PREFIX);
+    k.extend_from_slice(&id.0.to_bytes());
+    k
 }
 
 fn sup_key(id: &MemoryId) -> Vec<u8> {
@@ -3077,12 +3412,18 @@ mod tests {
             score: 0.2,
             superseded_by: None,
             matched: MatchSource::Semantic,
+            rank: 0.8,
+            updated_at: Utc::now(),
+            status: MemoryStatus::Active,
         };
         let weak_keyword = RecallHit {
             item: item("the user called twice"),
             score: 0.7,
             superseded_by: None,
             matched: MatchSource::Keyword,
+            rank: 0.3,
+            updated_at: Utc::now(),
+            status: MemoryStatus::Active,
         };
         let kh = KeywordHit {
             id: weak_keyword.item.id,
@@ -3098,5 +3439,587 @@ mod tests {
             RecallMode::Hybrid,
         );
         assert_eq!(fused[0].item.id, semantic_id);
+    }
+
+    // ---------- side tables: updated_at (mts:) and status (st:) ----------
+
+    async fn raw_side_rows(storage: &dyn Storage, id: MemoryId) -> (bool, bool, bool) {
+        (
+            storage.get(&mts_key(&id)).await.unwrap().is_some(),
+            storage.get(&st_key(&id)).await.unwrap().is_some(),
+            storage.get(&sup_key(&id)).await.unwrap().is_some(),
+        )
+    }
+
+    fn store_on(root: &Path, storage: Arc<dyn Storage>) -> Arc<SemanticStore> {
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+        SemanticStore::open_disabled(root, storage, embedder).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_new_memory_has_no_side_rows_and_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let s = store_on(tmp.path(), Arc::clone(&storage));
+        let id = s
+            .remember("alpha bravo", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            raw_side_rows(storage.as_ref(), id).await,
+            (false, false, false)
+        );
+        let item = s.get(id).await.unwrap().unwrap();
+        assert_eq!(s.updated_at(id).await.unwrap(), Some(item.created_at));
+        assert_eq!(s.status(id).await.unwrap(), Some(MemoryStatus::Active));
+        let hits = s
+            .recall("alpha bravo", 5, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(hits[0].updated_at, item.created_at);
+        assert_eq!(hits[0].status, MemoryStatus::Active);
+        // Unknown ids have no metadata at all.
+        let ghost = MemoryId::new();
+        assert_eq!(s.updated_at(ghost).await.unwrap(), None);
+        assert_eq!(s.status(ghost).await.unwrap(), None);
+        assert!(!s.set_status(ghost, MemoryStatus::Archived).await.unwrap());
+        assert_eq!(
+            raw_side_rows(storage.as_ref(), ghost).await,
+            (false, false, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn content_update_bumps_updated_at_and_keeps_created_at() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let id = s
+            .remember("balance is 5200", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let created = s.get(id).await.unwrap().unwrap().created_at;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let before = Utc::now();
+        s.update(
+            id,
+            UpdatePatch {
+                content: Some("balance is 4800".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let updated = s.updated_at(id).await.unwrap().unwrap();
+        assert_eq!(s.get(id).await.unwrap().unwrap().created_at, created);
+        assert!(updated > created);
+        // Stored at millisecond precision.
+        assert!(updated >= before - chrono::Duration::milliseconds(1));
+        assert!(updated <= Utc::now());
+        let hits = s
+            .recall("balance is 4800", 5, &RecallFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(hits[0].updated_at, updated);
+    }
+
+    #[tokio::test]
+    async fn metadata_only_update_does_not_bump_updated_at() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let s = store_on(tmp.path(), Arc::clone(&storage));
+        let id = s
+            .remember("alpha bravo", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let created = s.get(id).await.unwrap().unwrap().created_at;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        for patch in [
+            UpdatePatch {
+                kind: Some(MemoryKind::Decision),
+                ..Default::default()
+            },
+            UpdatePatch {
+                tags: Some(vec!["t".into()]),
+                ..Default::default()
+            },
+            UpdatePatch {
+                scope: Some("work".into()),
+                ..Default::default()
+            },
+            UpdatePatch {
+                status: Some(MemoryStatus::Archived),
+                ..Default::default()
+            },
+            UpdatePatch {
+                status: Some(MemoryStatus::Active),
+                ..Default::default()
+            },
+            // Writing the same text back is not an edit either.
+            UpdatePatch {
+                content: Some("  alpha bravo ".into()),
+                ..Default::default()
+            },
+            UpdatePatch::default(),
+        ] {
+            assert!(s.update(id, patch).await.unwrap());
+            assert_eq!(s.updated_at(id).await.unwrap(), Some(created));
+        }
+        // Not even a row was written.
+        assert!(!raw_side_rows(storage.as_ref(), id).await.0);
+        // The patches themselves did land.
+        let item = s.get(id).await.unwrap().unwrap();
+        assert_eq!(item.kind, MemoryKind::Decision);
+        assert_eq!(item.scope, "work");
+    }
+
+    #[tokio::test]
+    async fn forget_removes_side_rows() {
+        let tmp = TempDir::new().unwrap();
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let s = store_on(tmp.path(), Arc::clone(&storage));
+        let id = s
+            .remember("alpha bravo", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let newer = s
+            .remember("alpha bravo two", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        s.update(
+            id,
+            UpdatePatch {
+                content: Some("alpha bravo charlie".into()),
+                status: Some(MemoryStatus::Archived),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        s.supersede(id, newer).await.unwrap();
+        assert_eq!(
+            raw_side_rows(storage.as_ref(), id).await,
+            (true, true, true)
+        );
+
+        assert!(s.forget(id).await.unwrap());
+        assert_eq!(
+            raw_side_rows(storage.as_ref(), id).await,
+            (false, false, false)
+        );
+        assert_eq!(s.updated_at(id).await.unwrap(), None);
+        assert_eq!(s.status(id).await.unwrap(), None);
+        // Nothing with this id is left under any memory prefix.
+        for prefix in [
+            MEM_KEY_PREFIX,
+            MTS_KEY_PREFIX,
+            ST_KEY_PREFIX,
+            SUP_KEY_PREFIX,
+        ] {
+            let rows = storage.scan_prefix(prefix).await.unwrap();
+            assert!(
+                rows.iter().all(|(k, _)| !k.ends_with(&id.0.to_bytes())),
+                "row left under {:?}",
+                std::str::from_utf8(prefix)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn archived_memories_are_hidden_unless_asked_for() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let live = s
+            .remember("deploy runbook v2", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let old = s
+            .remember("deploy runbook v1", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        assert!(s.set_status(old, MemoryStatus::Archived).await.unwrap());
+
+        for mode in [
+            RecallMode::Hybrid,
+            RecallMode::Semantic,
+            RecallMode::Keyword,
+        ] {
+            let default = RecallFilters {
+                mode,
+                ..Default::default()
+            };
+            let ids: Vec<MemoryId> = s
+                .recall("deploy runbook", 10, &default)
+                .await
+                .unwrap()
+                .iter()
+                .map(|h| h.item.id)
+                .collect();
+            assert_eq!(ids, vec![live], "{mode:?}");
+
+            let asked = RecallFilters {
+                mode,
+                include_archived: true,
+                ..Default::default()
+            };
+            let hits = s.recall("deploy runbook", 10, &asked).await.unwrap();
+            assert_eq!(hits.len(), 2, "{mode:?}");
+            let archived = hits.iter().find(|h| h.item.id == old).unwrap();
+            assert_eq!(archived.status, MemoryStatus::Archived);
+        }
+
+        // Archiving is reversible and idempotent.
+        assert!(s.set_status(old, MemoryStatus::Archived).await.unwrap());
+        assert!(s.set_status(old, MemoryStatus::Active).await.unwrap());
+        assert_eq!(
+            s.recall("deploy runbook", 10, &RecallFilters::default())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// A retried `remember` must not be deduplicated against a memory
+    /// the agent has archived: it could never recall the "existing" one.
+    #[tokio::test]
+    async fn dedupe_does_not_match_an_archived_twin() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let first = s
+            .remember("the port is 9090", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        s.set_status(first, MemoryStatus::Archived).await.unwrap();
+        let outcome = s
+            .remember_or_dedupe("the port is 9090", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        match outcome {
+            RememberOutcome::Stored { id, near } => {
+                assert_ne!(id, first);
+                assert!(near.is_none());
+            }
+            other => panic!("expected a new memory, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_set_filters_by_membership() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        for scope in ["a", "b", "c"] {
+            s.remember(
+                &format!("shared topic {scope}"),
+                MemoryKind::Fact,
+                vec![],
+                scope.into(),
+            )
+            .await
+            .unwrap();
+        }
+        let scopes_for = |filters: RecallFilters| {
+            let s = Arc::clone(&s);
+            async move {
+                let mut out: Vec<String> = s
+                    .recall("shared topic", 10, &filters)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|h| h.item.scope)
+                    .collect();
+                out.sort();
+                out
+            }
+        };
+        assert_eq!(
+            scopes_for(RecallFilters::with_scopes(["a", "b"])).await,
+            ["a", "b"]
+        );
+        // The single-scope field still works, and unions with the set.
+        assert_eq!(scopes_for(RecallFilters::with_scope("c")).await, ["c"]);
+        assert_eq!(
+            scopes_for(RecallFilters {
+                scope: Some("c".into()),
+                scopes: vec!["a".into()],
+                ..Default::default()
+            })
+            .await,
+            ["a", "c"]
+        );
+        assert_eq!(scopes_for(RecallFilters::default()).await, ["a", "b", "c"]);
+        assert!(
+            scopes_for(RecallFilters::with_scopes(["nope"]))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn since_and_until_filter_on_the_chosen_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        let untouched = s
+            .remember("quarterly plan alpha", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let edited = s
+            .remember("quarterly plan beta", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let created = s.get(edited).await.unwrap().unwrap().created_at;
+        // As if it had been revised a week after it was written.
+        // `updated_at` is stored at millisecond precision.
+        let revised = DateTime::<Utc>::from_timestamp_millis(
+            (created + chrono::Duration::days(7)).timestamp_millis(),
+        )
+        .unwrap();
+        assert!(s.backdate_updated_at(edited, revised).await.unwrap());
+
+        let ids = |filters: RecallFilters| {
+            let s = Arc::clone(&s);
+            async move {
+                let mut out: Vec<MemoryId> = s
+                    .recall("quarterly plan", 10, &filters)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|h| h.item.id)
+                    .collect();
+                out.sort();
+                out
+            }
+        };
+        let mut both = vec![untouched, edited];
+        both.sort();
+        let cutoff = created + chrono::Duration::days(1);
+
+        // By creation time (the default) both are older than the cutoff.
+        assert!(
+            ids(RecallFilters {
+                since: Some(cutoff),
+                ..Default::default()
+            })
+            .await
+            .is_empty()
+        );
+        assert_eq!(
+            ids(RecallFilters {
+                until: Some(cutoff),
+                ..Default::default()
+            })
+            .await,
+            both
+        );
+        // By edit time only the revised one is newer.
+        for mode in [
+            RecallMode::Hybrid,
+            RecallMode::Semantic,
+            RecallMode::Keyword,
+        ] {
+            assert_eq!(
+                ids(RecallFilters {
+                    since: Some(cutoff),
+                    time_field: TimeField::UpdatedAt,
+                    mode,
+                    ..Default::default()
+                })
+                .await,
+                vec![edited],
+                "{mode:?}"
+            );
+            assert_eq!(
+                ids(RecallFilters {
+                    until: Some(cutoff),
+                    time_field: TimeField::UpdatedAt,
+                    mode,
+                    ..Default::default()
+                })
+                .await,
+                vec![untouched],
+                "{mode:?}"
+            );
+        }
+        // Bounds are inclusive.
+        assert_eq!(
+            ids(RecallFilters {
+                since: Some(revised),
+                until: Some(revised),
+                time_field: TimeField::UpdatedAt,
+                ..Default::default()
+            })
+            .await,
+            vec![edited]
+        );
+    }
+
+    /// `rank` is similarity plus keyword evidence on every path.
+    #[tokio::test]
+    async fn rank_is_similarity_plus_evidence_in_every_mode() {
+        let tmp = TempDir::new().unwrap();
+        let s = store_with_stub(tmp.path());
+        s.remember(
+            "the gateway listens on port 4002",
+            MemoryKind::Fact,
+            vec![],
+            "p".into(),
+        )
+        .await
+        .unwrap();
+        s.remember("lunch was a sandwich", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let recall = |mode| {
+            let s = Arc::clone(&s);
+            async move {
+                s.recall(
+                    "gateway port 4002",
+                    5,
+                    &RecallFilters {
+                        mode,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Semantic: no literal evidence is looked for.
+        for h in recall(RecallMode::Semantic).await {
+            assert!((h.rank - similarity_from_distance(h.score)).abs() < 1e-6);
+        }
+        // Hybrid: the literal match gains the full keyword weight; the
+        // other row gains nothing.
+        let hybrid = recall(RecallMode::Hybrid).await;
+        let gateway = hybrid
+            .iter()
+            .find(|h| h.item.content.contains("gateway"))
+            .unwrap();
+        let evidence = gateway.rank - similarity_from_distance(gateway.score);
+        assert!(
+            (evidence - KEYWORD_WEIGHT).abs() < 1e-4,
+            "evidence {evidence}"
+        );
+        for h in hybrid
+            .iter()
+            .filter(|h| !h.item.content.contains("gateway"))
+        {
+            assert!((h.rank - similarity_from_distance(h.score)).abs() < 1e-6);
+        }
+        // Keyword: sorted by evidence first, but `rank` is on the same
+        // scale as the other modes, not the internal sort key.
+        let keyword = recall(RecallMode::Keyword).await;
+        assert_eq!(keyword.len(), 1);
+        assert!((keyword[0].rank - gateway.rank).abs() < 1e-6);
+        assert!(keyword[0].rank < 2.0);
+    }
+
+    /// The side rows are ordinary KV rows: they come back after the
+    /// process restarts, on a plain store and on an encrypted one, and
+    /// on the encrypted one they are ciphertext on disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn side_rows_survive_reopen_plain_and_encrypted() {
+        use crate::crypto::{Aead, Dek};
+        use crate::storage::EncryptedStorage;
+        use crate::storage::redb_impl::RedbStorage;
+
+        for encrypted in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let kv_root = tmp.path().join("episodic");
+            std::fs::create_dir_all(&kv_root).unwrap();
+            let dek = Dek::generate().unwrap();
+            let open = || -> (Arc<dyn Storage>, Arc<RedbStorage>) {
+                if encrypted {
+                    let raw =
+                        RedbStorage::open_encrypted(&kv_root, Arc::new(Aead::new(&dek))).unwrap();
+                    let wrapped: Arc<dyn Storage> = EncryptedStorage::new(Arc::clone(&raw), &dek);
+                    (wrapped, raw)
+                } else {
+                    let raw = RedbStorage::open(&kv_root).unwrap();
+                    (Arc::clone(&raw) as Arc<dyn Storage>, raw)
+                }
+            };
+
+            let revised = DateTime::<Utc>::from_timestamp_millis(1_800_000_123_456).unwrap();
+            let (edited, archived, plain) = {
+                let (storage, _raw) = open();
+                let s = store_on(tmp.path(), storage);
+                let edited = s
+                    .remember("edited memory", MemoryKind::Fact, vec![], "p".into())
+                    .await
+                    .unwrap();
+                let archived = s
+                    .remember("archived memory", MemoryKind::Fact, vec![], "p".into())
+                    .await
+                    .unwrap();
+                let plain = s
+                    .remember("plain memory", MemoryKind::Fact, vec![], "p".into())
+                    .await
+                    .unwrap();
+                s.update(
+                    edited,
+                    UpdatePatch {
+                        content: Some("edited memory, revised".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                // Pin the timestamp so the comparison below is exact.
+                s.backdate_updated_at(edited, revised).await.unwrap();
+                s.set_status(archived, MemoryStatus::Archived)
+                    .await
+                    .unwrap();
+                s.shutdown().await.unwrap();
+                (edited, archived, plain)
+            };
+
+            let (storage, raw) = open();
+            let s = store_on(tmp.path(), Arc::clone(&storage));
+            let label = if encrypted { "encrypted" } else { "plain" };
+            assert_eq!(
+                s.updated_at(edited).await.unwrap(),
+                Some(revised),
+                "{label}"
+            );
+            assert_eq!(
+                s.status(archived).await.unwrap(),
+                Some(MemoryStatus::Archived),
+                "{label}"
+            );
+            let plain_item = s.get(plain).await.unwrap().unwrap();
+            assert_eq!(
+                s.updated_at(plain).await.unwrap(),
+                Some(plain_item.created_at),
+                "{label}"
+            );
+            assert_eq!(
+                s.status(plain).await.unwrap(),
+                Some(MemoryStatus::Active),
+                "{label}"
+            );
+            // And recall honours them after the restart.
+            let hits = s
+                .recall("memory", 10, &RecallFilters::default())
+                .await
+                .unwrap();
+            assert!(hits.iter().all(|h| h.item.id != archived), "{label}");
+            let hit = hits.iter().find(|h| h.item.id == edited).unwrap();
+            assert_eq!(hit.updated_at, revised, "{label}");
+
+            // On disk: the documented encodings when plain, sealed
+            // envelopes when encrypted.
+            let mts = raw.get(&mts_key(&edited)).await.unwrap().unwrap();
+            let st = raw.get(&st_key(&archived)).await.unwrap().unwrap();
+            if encrypted {
+                assert_eq!(&mts[..4], b"MNE1", "mts row is not sealed");
+                assert_eq!(&st[..4], b"MNE1", "st row is not sealed");
+            } else {
+                assert_eq!(mts, revised.timestamp_millis().to_be_bytes());
+                assert_eq!(st, [ST_ARCHIVED]);
+            }
+            s.shutdown().await.unwrap();
+        }
     }
 }

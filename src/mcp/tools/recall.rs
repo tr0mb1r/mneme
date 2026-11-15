@@ -196,6 +196,7 @@ impl Tool for Recall {
             min_similarity,
             include_superseded,
             mode,
+            ..Default::default()
         };
         let hits = self
             .store
@@ -230,6 +231,11 @@ impl Tool for Recall {
                     "similarity": crate::memory::semantic::similarity_from_distance(h.score),
                     // "semantic", "keyword", or "both".
                     "match": h.matched.as_str(),
+                    // Similarity plus keyword evidence: the one value
+                    // rows are comparable on across modes and layers.
+                    "rank": h.rank,
+                    "updated_at": h.updated_at.to_rfc3339(),
+                    "status": h.status.as_str(),
                 });
                 if let Some(newer) = h.superseded_by {
                     row["superseded_by"] = json!(newer.to_string());

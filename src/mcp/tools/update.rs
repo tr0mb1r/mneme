@@ -17,17 +17,20 @@ use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::config::SecretsMode;
 use crate::ids::MemoryId;
-use crate::memory::semantic::{SemanticStore, UpdatePatch};
+use crate::memory::semantic::{MemoryStatus, SemanticStore, UpdatePatch};
 
 const DESCRIPTION: &str = "Edit an existing memory in place. Provide \
-`id` and any subset of `content`, `kind`, `tags`, `scope` — only \
-supplied fields change. Use this when the user revises a fact, narrows \
+`id` and any subset of `content`, `kind`, `tags`, `scope`, `status` — \
+only supplied fields change. Use this when the user revises a fact, narrows \
 a preference, or re-classifies a memory; do NOT use this for \
 unrelated information (call `remember` for new memories instead). \
 Re-embedding happens automatically when `content` changes. Pass \
 `supersedes` to mark older memories as replaced by this one (for \
 example after `remember` reported a close existing memory): they stay \
-readable by id but drop out of `recall` and auto-context.";
+readable by id but drop out of `recall` and auto-context. Pass \
+`status: archived` for a memory that is no longer current but worth \
+keeping: it leaves auto-context and default `recall`, and comes back \
+with `recall(include_archived: true)`, `export`, or `status: active`.";
 
 pub struct Update {
     store: Arc<SemanticStore>,
@@ -92,6 +95,11 @@ impl Tool for Update {
                         "description": "Replacement tag list. Pass [] to clear."
                     },
                     "scope": { "type": "string", "description": "Replacement scope." },
+                    "status": {
+                        "type": "string",
+                        "enum": ["active", "archived"],
+                        "description": "`archived` hides the memory from auto-context and default recall without deleting it; `active` restores it."
+                    },
                     "supersedes": {
                         "oneOf": [
                             { "type": "string" },
@@ -196,6 +204,18 @@ impl Tool for Update {
             }
         };
 
+        let status = match args.get("status") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(MemoryStatus::parse(s).ok_or_else(|| {
+                ToolError::InvalidArguments("`status` must be \"active\" or \"archived\"".into())
+            })?),
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`status` must be a string".into(),
+                ));
+            }
+        };
+
         let supersedes = super::parse_supersedes(args.get("supersedes"))?;
         if supersedes.contains(&memory_id) {
             return Err(ToolError::InvalidArguments(
@@ -221,6 +241,7 @@ impl Tool for Update {
             kind,
             tags,
             scope,
+            status,
         };
 
         let existed = self
@@ -248,7 +269,11 @@ impl Tool for Update {
         }
 
         let mut text = if existed {
-            format!("updated memory {memory_id}")
+            match status {
+                Some(MemoryStatus::Archived) => format!("updated memory {memory_id} (archived)"),
+                Some(MemoryStatus::Active) => format!("updated memory {memory_id} (active)"),
+                None => format!("updated memory {memory_id}"),
+            }
         } else {
             format!("no such memory {memory_id}")
         };
@@ -689,5 +714,69 @@ mod tests {
             .await
             .unwrap();
         assert!(!res.is_error);
+    }
+
+    // ---------- status (1.6) ----------
+
+    async fn recall_ids(s: &SemanticStore, filters: &RecallFilters) -> Vec<MemoryId> {
+        s.recall("fresh kilo lima", 5, filters)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|h| h.item.id)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn status_archived_hides_from_recall_and_active_restores() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let id = s
+            .remember("fresh kilo lima", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let u = Update::new(Arc::clone(&s));
+
+        let res = u
+            .invoke(json!({ "id": id.to_string(), "status": "archived" }))
+            .await
+            .unwrap();
+        let text = match &res.content[0] {
+            crate::mcp::tools::ContentBlock::Text(t) => t.clone(),
+        };
+        assert!(text.contains("archived"), "{text}");
+        assert!(recall_ids(&s, &RecallFilters::default()).await.is_empty());
+        let with_archived = RecallFilters {
+            include_archived: true,
+            ..Default::default()
+        };
+        assert_eq!(recall_ids(&s, &with_archived).await, vec![id]);
+        // Still readable by id, content intact, and not an "edit".
+        assert_eq!(s.get(id).await.unwrap().unwrap().content, "fresh kilo lima");
+        let item = s.get(id).await.unwrap().unwrap();
+        assert_eq!(s.updated_at(id).await.unwrap(), Some(item.created_at));
+
+        u.invoke(json!({ "id": id.to_string(), "status": "active" }))
+            .await
+            .unwrap();
+        assert_eq!(recall_ids(&s, &RecallFilters::default()).await, vec![id]);
+    }
+
+    #[tokio::test]
+    async fn status_must_be_a_known_value() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let id = s
+            .remember("x", MemoryKind::Fact, vec![], "p".into())
+            .await
+            .unwrap();
+        let u = Update::new(s);
+        for bad in [json!("deleted"), json!(1), json!(["archived"])] {
+            let err = u
+                .invoke(json!({ "id": id.to_string(), "status": bad }))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ToolError::InvalidArguments(_)));
+        }
     }
 }
