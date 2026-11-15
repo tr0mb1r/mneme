@@ -10,15 +10,11 @@ they're outstanding, which is more useful than a version number.
 
 ## Platform gaps
 
-**Windows runs `mneme run` and `mneme serve` only.** `mneme daemon` and `mneme client`
-depend on Unix domain sockets; Windows named-pipe support (ADR-0012
-D2/D9) isn't implemented, so the daemon-mode default doesn't apply
-there. `mneme stop` also returns `not yet implemented` on Windows — use
-Task Manager or `Stop-Process`. Every other subcommand works. The
-release pipeline builds a Windows binary, but 1.5.0 shipped without one
-(the Windows build hung); use `cargo install mneme-mcp` there. Configure your MCP host with
-`args: ["run"]` rather than `["client"]`, or run `mneme serve` and
-point HTTP-capable hosts at it to share one server.
+**Linux and macOS only.** Windows support was dropped after 1.5: there
+is no Windows binary, CI no longer builds or tests on Windows, and
+Windows-specific code paths are unmaintained. A Windows host can run
+mneme inside WSL2 (it is Linux there), or reach a `mneme serve` running
+elsewhere over Streamable HTTP.
 
 **Streamable HTTP has no server-to-client stream.** `mneme serve` (and
 the daemon with `[http] enabled`) answer every request with plain JSON

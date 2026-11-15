@@ -12,6 +12,20 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+### Security
+
+- Dependencies refreshed for RustSec advisories reported against the
+  1.5.0 lockfile: `zstd` / `zstd-safe` / `zstd-sys`, `rustls`,
+  `rustls-webpki`, `webpki-roots`, `quinn-proto`, `quinn-udp` (lockfile
+  update), and `zip` via `candle-core` 0.10 → 0.11 (the `zip` fixes are
+  only in 9.x, which candle 0.11 uses). `cargo deny check` is clean.
+
+### Removed
+
+- **Windows support.** mneme now supports Linux and macOS only. CI no
+  longer builds or tests on Windows, and releases ship no Windows binary.
+  On a Windows machine, run mneme inside WSL2.
+
 ### Fixed
 
 - **Warm-tier events are readable again.** Consolidation moves an

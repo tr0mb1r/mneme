@@ -48,10 +48,9 @@ work that the agent would otherwise forget.**
   walkthrough of hot/warm/cold tiers, embedding cadence, and snapshot
   schedules.
 - **What isn't built yet** — see
-  [`book/src/roadmap.md`](book/src/roadmap.md). Notably: **on Windows
-  only `mneme run` and `mneme serve` work** — `mneme daemon`,
-  `mneme client`, and `mneme stop` need Unix domain sockets, so
-  configure your MCP host with `args: ["run"]` there.
+  [`book/src/roadmap.md`](book/src/roadmap.md). Notably: **mneme supports
+  Linux and macOS only.** Windows support was dropped after 1.5; on a
+  Windows machine use WSL2.
 
 ## What works today
 
