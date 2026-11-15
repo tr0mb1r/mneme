@@ -7,10 +7,16 @@
 //!    │  age ≥ hot_to_warm_days
 //!    ▼
 //!  warm (redb, prefix `wepi:`)
-//!    │  age ≥ warm_to_cold_days
+//!    │  age ≥ warm_to_cold_days, kind not in cold_exempt_kinds
 //!    ▼
 //!  cold (zstd quarterly bundles in <root>/cold/)
 //! ```
+//!
+//! Events whose kind is in `[consolidation] cold_exempt_kinds`
+//! (decisions, lessons, summaries, … by default) stop at warm. The cold
+//! archive is outside redb and outside the keyword index, so an event
+//! that goes there can no longer be found by `recall`; the kinds worth
+//! finding years later are kept where search reaches them.
 //!
 //! `run` is the single entry point. It's idempotent: re-running it
 //! against an already-consolidated state is a no-op. Crash-safe at
@@ -47,10 +53,13 @@ use crate::storage::archive::ColdArchive;
 /// Tunables for [`run`]. Constructed from
 /// [`crate::config::ConsolidationConfig`] in production, hand-built
 /// in tests.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsolidationParams {
     pub hot_to_warm_days: u32,
     pub warm_to_cold_days: u32,
+    /// Kinds that are never archived to cold, however old. Empty: every
+    /// kind ages into cold (the pre-1.6 behaviour).
+    pub cold_exempt_kinds: Vec<String>,
 }
 
 impl ConsolidationParams {
@@ -58,6 +67,7 @@ impl ConsolidationParams {
         Self {
             hot_to_warm_days: c.hot_to_warm_days,
             warm_to_cold_days: c.warm_to_cold_days,
+            cold_exempt_kinds: c.cold_exempt_kinds.clone(),
         }
     }
 }
@@ -70,19 +80,32 @@ pub struct ConsolidationReport {
     pub archived_to_cold: usize,
 }
 
-/// Move aged events through the tier pipeline once.
+/// Move aged events through the tier pipeline once, through a private
+/// [`EpisodicStore`] over `storage`.
 ///
-/// Pass the same `Arc<dyn Storage>` the rest of the process uses so
-/// hot/warm reads see the same redb. The `archive` is the cold-tier
-/// destination; one `archive.append(...)` call collapses all
-/// migrated events into the right quarterly bundles.
+/// Prefer [`run_with_store`] wherever the process has a shared store:
+/// rows this variant archives to cold stay in the shared store's
+/// keyword index until a search trips over them and drops them.
 pub async fn run(
     storage: Arc<dyn Storage>,
     archive: &ColdArchive,
     params: ConsolidationParams,
 ) -> Result<ConsolidationReport> {
+    run_with_store(&EpisodicStore::new(storage), archive, &params).await
+}
+
+/// Move aged events through the tier pipeline once.
+///
+/// `store` should be the `EpisodicStore` the rest of the process reads
+/// through, so its keyword index sees the rows that leave for cold. The
+/// `archive` is the cold-tier destination; one `archive.append(...)`
+/// call collapses all migrated events into the right quarterly bundles.
+pub async fn run_with_store(
+    store: &EpisodicStore,
+    archive: &ColdArchive,
+    params: &ConsolidationParams,
+) -> Result<ConsolidationReport> {
     let now = Utc::now();
-    let store = EpisodicStore::new(storage);
 
     // ---- Step 1: hot → warm ----------------------------------------
     let hot_cutoff = now - Duration::days(params.hot_to_warm_days as i64);
@@ -100,6 +123,7 @@ pub async fn run(
     let to_archive: Vec<EpisodicEvent> = warm
         .into_iter()
         .filter(|e| e.last_accessed <= warm_cutoff)
+        .filter(|e| !params.cold_exempt_kinds.contains(&e.kind))
         .collect();
     let archived = to_archive.len();
     if !to_archive.is_empty() {
@@ -162,6 +186,7 @@ mod tests {
         ConsolidationParams {
             hot_to_warm_days: hot,
             warm_to_cold_days: warm,
+            cold_exempt_kinds: Vec::new(),
         }
     }
 
@@ -333,6 +358,129 @@ mod tests {
         assert_eq!(qs.len(), 2);
         assert!(qs.iter().any(|q| q.year == 2025 && q.quarter == 1));
         assert!(qs.iter().any(|q| q.year == 2025 && q.quarter == 3));
+    }
+
+    /// `cold_exempt_kinds`: a decision 365 days old stops at warm, a
+    /// same-age observation goes to cold.
+    #[tokio::test]
+    async fn cold_exempt_kinds_never_leave_warm() {
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let tmp = TempDir::new().unwrap();
+        let archive = ColdArchive::new(tmp.path());
+        let old = Utc::now() - Duration::days(365);
+        let decision = _record_backdated_for_tests(&storage, "decision", "p", "\"keep\"", old)
+            .await
+            .unwrap();
+        let summary = _record_backdated_for_tests(&storage, "summary", "p", "\"keep\"", old)
+            .await
+            .unwrap();
+        let observation = _record_backdated_for_tests(&storage, "observation", "p", "\"go\"", old)
+            .await
+            .unwrap();
+
+        let params = ConsolidationParams {
+            hot_to_warm_days: 28,
+            warm_to_cold_days: 180,
+            cold_exempt_kinds: vec!["decision".into(), "summary".into()],
+        };
+        let store = EpisodicStore::new(Arc::clone(&storage));
+        // Several passes: an exempt row must not go on a later one.
+        for pass in 0..3 {
+            let report = run_with_store(&store, &archive, &params).await.unwrap();
+            if pass == 0 {
+                assert_eq!(report.promoted_to_warm, 3);
+                assert_eq!(report.archived_to_cold, 1);
+            } else {
+                assert_eq!(report, ConsolidationReport::default());
+            }
+        }
+
+        let warm: Vec<EventId> = store
+            .list_warm()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert!(warm.contains(&decision) && warm.contains(&summary));
+        assert_eq!(warm.len(), 2);
+        assert!(archive.find_anywhere(decision).unwrap().is_none());
+        assert!(archive.find_anywhere(summary).unwrap().is_none());
+        assert!(archive.find_anywhere(observation).unwrap().is_some());
+
+        // No exemptions: the pre-1.6 behaviour, everything old goes.
+        let all = ConsolidationParams {
+            cold_exempt_kinds: Vec::new(),
+            ..params
+        };
+        let report = run_with_store(&store, &archive, &all).await.unwrap();
+        assert_eq!(report.archived_to_cold, 2);
+        assert_eq!(store.count_warm().await.unwrap(), 0);
+    }
+
+    #[test]
+    fn params_take_cold_exempt_kinds_from_config() {
+        let config = crate::config::ConsolidationConfig::default();
+        let params = ConsolidationParams::from_config(&config);
+        assert_eq!(params.cold_exempt_kinds, config.cold_exempt_kinds);
+        assert!(params.cold_exempt_kinds.iter().any(|k| k == "decision"));
+    }
+
+    /// A pass run through the shared store keeps its keyword index in
+    /// step: what stays in warm stays searchable, what goes to cold
+    /// stops matching.
+    #[tokio::test]
+    async fn run_with_store_keeps_the_keyword_index_in_step() {
+        use crate::memory::episodic::RecentFilters;
+        let storage: Arc<dyn Storage> = MemoryStorage::new();
+        let tmp = TempDir::new().unwrap();
+        let archive = ColdArchive::new(tmp.path());
+        let old = Utc::now() - Duration::days(365);
+        let kept = _record_backdated_for_tests(
+            &storage,
+            "decision",
+            "p",
+            r#"{"content":"freeze the schema before launch"}"#,
+            old,
+        )
+        .await
+        .unwrap();
+        let archived = _record_backdated_for_tests(
+            &storage,
+            "observation",
+            "p",
+            r#"{"content":"the schema diff was noisy"}"#,
+            old,
+        )
+        .await
+        .unwrap();
+
+        let store = EpisodicStore::new(Arc::clone(&storage));
+        let ids = |hits: Vec<(EpisodicEvent, f32)>| {
+            let mut v: Vec<EventId> = hits.into_iter().map(|(e, _)| e.id).collect();
+            v.sort();
+            v
+        };
+        let mut both = vec![kept, archived];
+        both.sort();
+        let filters = RecentFilters::default();
+        assert_eq!(
+            ids(store.search("schema", 10, &filters).await.unwrap()),
+            both
+        );
+
+        let params = ConsolidationParams {
+            hot_to_warm_days: 28,
+            warm_to_cold_days: 180,
+            cold_exempt_kinds: vec!["decision".into()],
+        };
+        run_with_store(&store, &archive, &params).await.unwrap();
+
+        assert_eq!(store.indexed_len(), Some(1));
+        assert_eq!(
+            ids(store.search("schema", 10, &filters).await.unwrap()),
+            vec![kept]
+        );
     }
 
     #[tokio::test]

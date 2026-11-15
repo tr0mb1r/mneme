@@ -297,7 +297,9 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     let procedural = Arc::new(ProceduralStore::open_with_crypto(&root, data_aead.clone())?);
     let episodic = Arc::new(
         EpisodicStore::new(Arc::clone(&storage_dyn))
-            .with_hot_to_warm_days(config.consolidation.hot_to_warm_days),
+            .with_hot_to_warm_days(config.consolidation.hot_to_warm_days)
+            .with_index_kinds(config.episodic.index_kinds.clone())
+            .with_touch_on_recall(config.episodic.touch_on_recall),
     );
     let auto_context_budget = TokenBudget::from_config(&config.budgets);
     let cold = crate::storage::archive::ColdArchive::new_with_crypto(&root, data_aead.clone());
@@ -409,8 +411,10 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     // entries whose metadata row is gone because a `forget` was
     // interrupted between the two writes.
     let consolidation_scheduler = runtime.block_on(async {
-        ConsolidationScheduler::start_with_orphan_gc(
-            Arc::clone(&storage_dyn),
+        // The shared store, so its keyword index sees rows leave for
+        // cold.
+        ConsolidationScheduler::start_with_shared_store(
+            Arc::clone(&episodic),
             cold.clone(),
             ConsolidationParams::from_config(&config.consolidation),
             SchedulerConfig::from_config(&config.consolidation),

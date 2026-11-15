@@ -1,5 +1,10 @@
-//! In-memory keyword (BM25) index over L4 memory contents — the lexical
-//! half of hybrid `recall`.
+//! In-memory keyword (BM25) index — the lexical half of hybrid `recall`.
+//!
+//! The index is generic over its document key. `KeywordIndex` (the
+//! default, keyed by [`MemoryId`]) covers L4 memory contents;
+//! `KeywordIndex<EventId>` covers the curated L3 events
+//! ([`EpisodicStore`](super::episodic::EpisodicStore)), which have no
+//! vector index at all (ADR-0007) and so are found by their words only.
 //!
 //! Vector search is weakest exactly where an agent often needs strength:
 //! exact names. `live_bt.py`, `D account`, an env var, a ULID, an error
@@ -26,6 +31,7 @@
 //! semantic half.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 
 use crate::ids::MemoryId;
 
@@ -87,10 +93,27 @@ pub fn contains_phrase(haystack: &[String], needle: &[String]) -> bool {
         && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Words that phrase a question rather than name its subject. Only the
+/// [strict](KeywordIndex::strict) index drops them from a query, and
+/// only when the query has other words left.
+const STOPWORDS: &[&str] = &[
+    "a", "about", "all", "am", "an", "and", "any", "are", "as", "at", "be", "been", "but", "by",
+    "can", "could", "did", "do", "does", "for", "from", "had", "has", "have", "how", "i", "if",
+    "in", "into", "is", "it", "its", "me", "my", "no", "not", "of", "on", "or", "our", "should",
+    "so", "than", "that", "the", "their", "then", "there", "these", "this", "those", "to", "us",
+    "was", "we", "were", "what", "when", "where", "which", "who", "why", "will", "with", "would",
+    "you", "your",
+];
+
+/// What a [`KeywordIndex`] can be keyed by: [`MemoryId`],
+/// [`EventId`](crate::ids::EventId).
+pub trait DocKey: Copy + Eq + Hash + Ord {}
+impl<T: Copy + Eq + Hash + Ord> DocKey for T {}
+
 /// One keyword match.
 #[derive(Debug, Clone, PartialEq)]
-pub struct KeywordHit {
-    pub id: MemoryId,
+pub struct KeywordHit<K = MemoryId> {
+    pub id: K,
     /// BM25 score; only meaningful relative to other hits of the same
     /// query.
     pub score: f32,
@@ -101,19 +124,80 @@ pub struct KeywordHit {
     pub coverage: f32,
 }
 
-#[derive(Debug, Default)]
-pub struct KeywordIndex {
+#[derive(Debug)]
+pub struct KeywordIndex<K = MemoryId> {
     /// term → (memory → term frequency).
-    postings: HashMap<String, HashMap<MemoryId, u32>>,
+    postings: HashMap<String, HashMap<K, u32>>,
     /// memory → (distinct terms, token count). The term list lets
     /// `remove` find the postings without the original text.
-    docs: HashMap<MemoryId, (Vec<String>, u32)>,
+    docs: HashMap<K, (Vec<String>, u32)>,
     total_tokens: u64,
+    /// See [`KeywordIndex::strict`].
+    strict: bool,
 }
 
-impl KeywordIndex {
+// Hand-written: `#[derive(Default)]` would demand `K: Default`.
+impl<K> Default for KeywordIndex<K> {
+    fn default() -> Self {
+        Self {
+            postings: HashMap::new(),
+            docs: HashMap::new(),
+            total_tokens: 0,
+            strict: false,
+        }
+    }
+}
+
+/// Per-document tallies for one query: BM25 and the IDF mass of the
+/// query terms the document contains.
+struct Tally<K> {
+    /// Sum of the IDF of every query term that counts (see
+    /// [`KeywordIndex::tally`]).
+    total_idf: f32,
+    /// document → (BM25, matched IDF mass).
+    scores: HashMap<K, (f32, f32)>,
+}
+
+impl<K> Tally<K> {
+    fn coverage(&self, matched_idf: f32) -> f32 {
+        if self.total_idf > 0.0 {
+            (matched_idf / self.total_idf).min(1.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+impl<K: DocKey> KeywordIndex<K> {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An index whose coverage counts every query term, present in the
+    /// index or not.
+    ///
+    /// The default index leaves a query term that no document contains
+    /// out of the coverage denominator, on the theory that it is
+    /// phrasing. That holds when the index is the only place the answer
+    /// could be, and its hits are fused with a vector score that
+    /// disagrees when the match is hollow. It does not hold for an index
+    /// searched *next to* another: a query about ports and accounts
+    /// would "fully cover" an event whose only shared word is `the`,
+    /// because none of the real terms occur in this index at all. Here
+    /// an absent term counts at full rarity, and the phrasing is taken
+    /// out by a fixed English stopword list instead (non-English
+    /// questions get lower coverage; keyword-style queries are
+    /// unaffected).
+    pub fn strict() -> Self {
+        Self {
+            strict: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether `id` is indexed.
+    pub fn contains(&self, id: &K) -> bool {
+        self.docs.contains_key(id)
     }
 
     pub fn len(&self) -> usize {
@@ -125,7 +209,7 @@ impl KeywordIndex {
     }
 
     /// Index `text` under `id`, replacing whatever was indexed for it.
-    pub fn insert(&mut self, id: MemoryId, text: &str) {
+    pub fn insert(&mut self, id: K, text: &str) {
         self.remove(id);
         let tokens = tokenize(text);
         let mut tf: HashMap<String, u32> = HashMap::new();
@@ -142,7 +226,7 @@ impl KeywordIndex {
     }
 
     /// Drop `id`. No-op if it isn't indexed.
-    pub fn remove(&mut self, id: MemoryId) {
+    pub fn remove(&mut self, id: K) {
         let Some((terms, len)) = self.docs.remove(&id) else {
             return;
         };
@@ -157,15 +241,18 @@ impl KeywordIndex {
         }
     }
 
-    /// Up to `limit` memories containing at least one query term, best
-    /// BM25 first. Ties break on id so the order is deterministic.
-    pub fn search(&self, query: &str, limit: usize) -> Vec<KeywordHit> {
-        if limit == 0 || self.docs.is_empty() {
-            return Vec::new();
+    /// Score every document that shares a term with `query`. `None`
+    /// when the index or the query is empty.
+    fn tally(&self, query: &str) -> Option<Tally<K>> {
+        if self.docs.is_empty() {
+            return None;
         }
-        let terms: HashSet<String> = tokenize(query).into_iter().collect();
+        let mut terms: HashSet<String> = tokenize(query).into_iter().collect();
+        if self.strict && terms.iter().any(|t| !STOPWORDS.contains(&t.as_str())) {
+            terms.retain(|t| !STOPWORDS.contains(&t.as_str()));
+        }
         if terms.is_empty() {
-            return Vec::new();
+            return None;
         }
         let n = self.docs.len() as f32;
         let avg_len = (self.total_tokens as f32 / n).max(1.0);
@@ -180,12 +267,12 @@ impl KeywordIndex {
             .iter()
             .filter_map(|t| match self.postings.get(t) {
                 Some(p) => Some(idf(p.len() as f32)),
-                None if is_identifier_like(t) => Some(idf(0.0)),
+                None if self.strict || is_identifier_like(t) => Some(idf(0.0)),
                 None => None,
             })
             .sum();
         // memory → (BM25, matched IDF mass)
-        let mut scores: HashMap<MemoryId, (f32, f32)> = HashMap::new();
+        let mut scores: HashMap<K, (f32, f32)> = HashMap::new();
         for term in &terms {
             let Some(postings) = self.postings.get(term) else {
                 continue;
@@ -200,16 +287,25 @@ impl KeywordIndex {
                 e.1 += term_idf;
             }
         }
-        let mut hits: Vec<KeywordHit> = scores
-            .into_iter()
-            .map(|(id, (score, matched_idf))| KeywordHit {
-                id,
+        Some(Tally { total_idf, scores })
+    }
+
+    /// Up to `limit` memories containing at least one query term, best
+    /// BM25 first. Ties break on id so the order is deterministic.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<KeywordHit<K>> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let Some(tally) = self.tally(query) else {
+            return Vec::new();
+        };
+        let mut hits: Vec<KeywordHit<K>> = tally
+            .scores
+            .iter()
+            .map(|(id, &(score, matched_idf))| KeywordHit {
+                id: *id,
                 score,
-                coverage: if total_idf > 0.0 {
-                    (matched_idf / total_idf).min(1.0)
-                } else {
-                    0.0
-                },
+                coverage: tally.coverage(matched_idf),
             })
             .collect();
         hits.sort_by(|a, b| {
@@ -220,6 +316,24 @@ impl KeywordIndex {
         });
         hits.truncate(limit);
         hits
+    }
+
+    /// [`KeywordHit::coverage`] of `query` for each of `ids`, in
+    /// `(0, 1]`. Ids that are not indexed or share no term with the
+    /// query are absent. The values equal what [`search`](Self::search)
+    /// reports for the same query: coverage is measured against the
+    /// whole index, not against `ids`.
+    pub fn coverage_of(&self, query: &str, ids: &[K]) -> HashMap<K, f32> {
+        let Some(tally) = self.tally(query) else {
+            return HashMap::new();
+        };
+        ids.iter()
+            .filter_map(|id| {
+                let (_, matched_idf) = tally.scores.get(id)?;
+                let c = tally.coverage(*matched_idf);
+                (c > 0.0).then_some((*id, c))
+            })
+            .collect()
     }
 }
 
@@ -334,6 +448,97 @@ mod tests {
         let hits = idx.search("what value should IBKR_GATEWAY_PORT have", 5);
         assert_eq!(hits[0].id, target);
         assert!(hits[0].coverage > 0.9, "coverage {}", hits[0].coverage);
+    }
+
+    #[test]
+    fn index_is_generic_over_the_key() {
+        use crate::ids::EventId;
+        let mut idx: KeywordIndex<EventId> = KeywordIndex::new();
+        let a = EventId::new();
+        let b = EventId::new();
+        idx.insert(a, "switched the backtest to live_bt.py");
+        idx.insert(b, "lunch was fine");
+        let hits = idx.search("live_bt.py", 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, a);
+        assert!(idx.contains(&a) && idx.contains(&b));
+        idx.remove(a);
+        assert!(!idx.contains(&a));
+    }
+
+    #[test]
+    fn coverage_of_matches_search_and_stays_in_range() {
+        let mut idx = KeywordIndex::new();
+        let full = MemoryId::new();
+        let partial = MemoryId::new();
+        let none = MemoryId::new();
+        idx.insert(full, "rotate the gateway token every month");
+        idx.insert(partial, "the gateway is on port 4002");
+        idx.insert(none, "the cat is called Murka");
+        let unindexed = MemoryId::new();
+        let query = "gateway token rotate";
+
+        let cov = idx.coverage_of(query, &[full, partial, none, unindexed]);
+        assert_eq!(cov.len(), 2, "non-matching and unindexed ids are absent");
+        assert_eq!(cov[&full], 1.0);
+        assert!(cov[&partial] > 0.0 && cov[&partial] < 1.0);
+        assert!(cov.values().all(|c| (0.0..=1.0).contains(c)));
+
+        for hit in idx.search(query, 10) {
+            assert_eq!(cov[&hit.id], hit.coverage);
+        }
+        assert!(idx.coverage_of("   ", &[full]).is_empty());
+        assert!(
+            KeywordIndex::<MemoryId>::new()
+                .coverage_of(query, &[full])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn strict_index_counts_absent_terms_and_drops_stopwords() {
+        let lenient = |docs: &[(MemoryId, &str)]| {
+            let mut idx = KeywordIndex::new();
+            for (id, text) in docs {
+                idx.insert(*id, text);
+            }
+            idx
+        };
+        let strict = |docs: &[(MemoryId, &str)]| {
+            let mut idx = KeywordIndex::strict();
+            for (id, text) in docs {
+                idx.insert(*id, text);
+            }
+            idx
+        };
+        let dog = MemoryId::new();
+        let port = MemoryId::new();
+        let docs = [
+            (dog, "walked the dog"),
+            (port, "paper gateway port is 4002"),
+        ];
+        let query = "which port belongs to the paper account";
+
+        // Lenient: `the` is the only query word the dog note has, the
+        // rest of what it lacks is not in the index either, so it
+        // "covers" a large share of the query.
+        let hits = lenient(&docs).search(query, 5);
+        let dog_cov = hits.iter().find(|h| h.id == dog).map(|h| h.coverage);
+        assert!(dog_cov.is_some_and(|c| c > 0.2), "{dog_cov:?}");
+
+        // Strict: stopwords are not query terms, so the dog note does
+        // not match at all, and the absent `belongs` / `account` hold
+        // the real match below full coverage.
+        let hits = strict(&docs).search(query, 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, port);
+        assert!(hits[0].coverage > 0.1 && hits[0].coverage < 0.8, "{hits:?}");
+
+        // A query of nothing but stopwords keeps them.
+        assert_eq!(strict(&docs).search("the", 5)[0].id, dog);
+        // Exact names still cover fully.
+        let hits = strict(&[(port, "run live_bt.py nightly")]).search("live_bt.py", 5);
+        assert_eq!(hits[0].coverage, 1.0);
     }
 
     #[test]
