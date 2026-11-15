@@ -50,6 +50,9 @@
 //! `#[cfg(test)]` modules exercise the JSON shape; if you change a
 //! field name you'll see a red bar there.
 
+#[cfg(not(unix))]
+compile_error!("mneme supports Linux and macOS only");
+
 pub mod cli;
 pub mod config;
 pub mod crypto;

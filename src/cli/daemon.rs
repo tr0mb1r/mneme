@@ -24,9 +24,6 @@
 //!
 //! Still outstanding, tracked in `book/src/roadmap.md`:
 //!
-//! - Windows named-pipe support (D2/D9). Until it lands, `mneme daemon`
-//!   and `mneme client` are Unix-only and Windows users run
-//!   `mneme run`.
 //! - SSE keepalive frames (D7) — periodic comments + dead-peer
 //!   detection. Deferred at the close of A.M3 per ADR-0012 A1.
 //!

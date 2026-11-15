@@ -2,7 +2,7 @@
 //!
 //! The daemon's happy-path key custody: read the wrapping key from
 //! the user's OS keyring (Keychain on macOS, Secret Service on
-//! Linux, DPAPI on Windows). On headless boxes where no keyring
+//! Linux). On headless boxes where no keyring
 //! backend is reachable, the caller falls through to the recovery
 //! mnemonic in `MNEME_RECOVERY_PHRASE`.
 //!

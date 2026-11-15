@@ -57,8 +57,7 @@ running.
 **Hot-reload schedule.** A `notify::PollWatcher` polls the file every
 **500 ms** and reloads the in-memory cache when the content hash
 changes. This is faster and more uniform across platforms than
-FSEvents (macOS) or `ReadDirectoryChangesW` (Windows), which
-coalesce events for tens of seconds. External edits are reflected in
+FSEvents (macOS), which coalesces events for tens of seconds. External edits are reflected in
 the running server in **under 1 second**.
 
 **Surfaced via:**

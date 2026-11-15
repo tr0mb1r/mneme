@@ -3,13 +3,7 @@
 //! actual daemon loop in a new session/process-group with no
 //! controlling terminal.
 //!
-//! Unix-only for now: the detach idiom uses `setsid(2)` via
-//! `Command::pre_exec`. The Windows path uses
-//! `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` and would need a
-//! parallel test exercising the equivalent process-handle checks;
-//! deferred to whenever Windows CI lands per ADR-0012 D2/D9.
-
-#![cfg(unix)]
+//! The detach idiom uses `setsid(2)` via `Command::pre_exec`.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};

@@ -3,8 +3,7 @@
 //!
 //! The file body holds the PID of the holder, so a second instance can
 //! produce a clear error message (`"lock held by PID N"`). Stale locks
-//! (PID file present but the process is dead) are reclaimed automatically
-//! on Unix; on Windows we surface a clear error and leave the file alone.
+//! (PID file present but the process is dead) are reclaimed automatically.
 
 use crate::{MnemeError, Result};
 use fs2::FileExt;
@@ -117,7 +116,6 @@ fn read_pid(file: &mut File) -> Option<u32> {
 
 /// True iff `pid` names a running process (or one we don't have permission
 /// to signal — conservatively treated as alive).
-#[cfg(unix)]
 pub fn pid_is_alive(pid: u32) -> bool {
     // kill(pid, 0) returns 0 if the process exists (and we have permission
     // to signal it), or -1 with errno=ESRCH if it doesn't.
@@ -127,18 +125,6 @@ pub fn pid_is_alive(pid: u32) -> bool {
     }
     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
     errno != libc::ESRCH
-}
-
-#[cfg(windows)]
-pub fn pid_is_alive(_pid: u32) -> bool {
-    // Conservative: assume any holder is alive on Windows. Stale lockfiles
-    // require manual cleanup on this platform.
-    true
-}
-
-#[cfg(not(any(unix, windows)))]
-pub fn pid_is_alive(_pid: u32) -> bool {
-    true
 }
 
 // ---------- Tests ----------
@@ -155,19 +141,11 @@ mod tests {
         let guard = LockGuard::acquire(&path).unwrap();
         assert!(path.exists());
 
-        // On Unix, file locks are advisory — the PID written by
-        // `acquire` is readable through the path while the lock is
-        // still held. On Windows, fs2's exclusive lock prevents
-        // even the holding process from opening the file by path
-        // (the kernel returns ERROR_LOCK_VIOLATION). The PID is
-        // still written; we just can't read it back without
-        // releasing the lock first.
-        #[cfg(unix)]
-        {
-            let contents = std::fs::read_to_string(&path).unwrap();
-            let pid: u32 = contents.trim().parse().unwrap();
-            assert_eq!(pid, std::process::id());
-        }
+        // File locks are advisory: the PID written by `acquire` is
+        // readable through the path while the lock is still held.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let pid: u32 = contents.trim().parse().unwrap();
+        assert_eq!(pid, std::process::id());
 
         drop(guard);
         // After drop, file is removed.
