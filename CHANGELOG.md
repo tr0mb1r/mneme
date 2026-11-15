@@ -12,6 +12,28 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+### Fixed
+
+- `remember`, `update` and `recall` accept `kind` as the name of the
+  memory-kind argument, with `type` kept as an alias. Replies have always
+  called the field `kind`, so agents passed it back and the call failed
+  with "unexpected argument(s) `kind`". Passing both with different values
+  is `INVALID_PARAMS` ("pass either kind or type"). The mirrored
+  `tool_call` event records the value as `kind` whichever name was used.
+- `recall` with `since` / `until` now says to use `recall_recent` for a
+  time window, instead of only listing the accepted arguments.
+- `remember` with `pinned: true` is rejected with a pointer to `pin`. The
+  flag was never wired to the procedural layer: it was logged and dropped,
+  so the caller believed a rule had been pinned. `pinned: false` is still
+  accepted.
+
+### Changed
+
+- `forget`'s input schema declares only `id` (now `required`). `query` and
+  `scope` were advertised as reserved while every call that used them
+  failed; passing one is still `INVALID_PARAMS`, now with a hint to find
+  the ids and forget them one at a time.
+
 ## [1.5.0](https://github.com/tr0mb1r/mneme/compare/v1.4.1...v1.5.0) - 2026-10-12
 
 > Hardening from running mneme as the long-term memory of Hermes Agent

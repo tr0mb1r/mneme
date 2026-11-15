@@ -1436,15 +1436,19 @@ mod tests {
         // someone adds a tool and forgets to add an entry to the
         // match in `tool_call_payload`.
 
-        // remember: content + type + scope (tags excluded)
+        // remember: content + kind + scope (tags excluded). The `type`
+        // alias is recorded as `kind` too.
         let p = tool_call_payload(
             "remember",
             &json!({"content": "x", "type": "fact", "scope": "work", "tags": ["a"]}),
         );
         assert_eq!(p["tool"], "remember");
         assert_eq!(p["content"], "x");
-        assert_eq!(p["type"], "fact");
+        assert_eq!(p["kind"], "fact");
+        assert!(p.get("type").is_none());
         assert_eq!(p["scope"], "work");
+        let p = tool_call_payload("update", &json!({"id": "x", "kind": "decision"}));
+        assert_eq!(p["kind"], "decision");
         assert!(p.get("tags").is_none());
 
         // recall: query + limit (`k` is not a recall argument)

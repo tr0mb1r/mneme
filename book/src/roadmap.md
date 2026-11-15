@@ -60,14 +60,18 @@ writes them into new configs.
 
 ## Tool surface
 
-**`forget` can't do bulk deletes.** The JSON Schema advertises `query`
-and `scope` parameters; the runtime rejects both with "not yet
-supported". Pass `id`. Cold-archive entries are out of reach by design —
-`forget` covers L4, L0, and L3 hot+warm only.
+**`forget` can't do bulk deletes.** It takes `id` only. (Up to 1.5.1 the
+schema also advertised `query` and `scope`, which the runtime always
+rejected; they are gone from the schema, and passing one returns
+`INVALID_PARAMS` with a pointer to "find the ids, forget each one".)
+Cold-archive entries are out of reach by design — `forget` covers L4,
+L0, and L3 hot+warm only.
 
-**`remember`'s `pinned` flag is ignored.** Recognised by the schema,
-logged when set, not wired to the procedural layer. Call `pin`
-separately if you want a rule in L0.
+**`remember` does not pin.** `pinned: true` is rejected with
+`INVALID_PARAMS` and a pointer to `pin` (up to 1.5.1 it was logged and
+ignored, so the caller believed a rule had been pinned). The argument is
+still declared, marked deprecated, so `pinned: false` from an older
+client keeps working. Call `pin` if you want a rule in L0.
 
 **No structured tool output.** MCP 2025-06-18 supports `outputSchema` +
 `structuredContent`; mneme returns JSON inside a text block, so agents

@@ -243,7 +243,7 @@ where `remember`, `recall`, `update`, and `forget` live.
 
 **Embedding.** **Yes.** Every `remember` and every `update` that
 changes `content` calls the embedder. `update`s that change only
-`tags` / `scope` / `type` skip the embedder.
+`tags` / `scope` / `kind` skip the embedder.
 
 The active embedder is set in `[embeddings] model` in `config.toml`:
 - **`bge-m3`** (default) — ~1.5 GB, 1024-dim, multilingual, top-tier
@@ -310,7 +310,7 @@ temp+rename); WAL replay covers the gap. Verified by
   `mneme://context?q=<text>` (see §6).
 
 **Filters and how they're satisfied.** `recall` accepts `scope`,
-`type`, `tags` (all must match), and `min_similarity` (a cosine-
+`kind`, `tags` (all must match), and `min_similarity` (a cosine-
 similarity floor, `1.0` = identical). The HNSW indexes vectors only, so
 these are applied *after* the search — and because a selective filter
 would otherwise leave the result short, `recall` widens its index probe

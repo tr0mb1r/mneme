@@ -1,11 +1,11 @@
 //! `forget` — agent-driven point delete by ULID across all live
 //! memory layers.
 //!
-//! The schema admits `id`, `query`, and `scope` to keep the v1 surface
-//! stable for the agent — but `query`/`scope` (bulk delete by search
-//! or by scope) need an orchestrator that lands later, so this
-//! implementation rejects them with a clear "not yet supported"
-//! message rather than pretending to act.
+//! The schema declares only `id`. `query` and `scope` (bulk delete by
+//! search or by scope) were advertised as "reserved" up to 1.5.1 while
+//! every call that used them failed; they are no longer in the schema,
+//! and a caller that still passes one gets the unknown-argument error
+//! plus a hint to look the ids up and forget them one at a time.
 //!
 //! `forget(id=…)` resolves the ULID against L4 semantic, then L0
 //! procedural, then L3 episodic (hot+warm tiers) — first hit wins.
@@ -30,10 +30,14 @@ use crate::memory::semantic::SemanticStore;
 
 const DESCRIPTION: &str = "Delete a memory by ULID. Resolves across L4 \
 semantic, L0 procedural, and L3 episodic (hot + warm tiers); first \
-hit wins. Cold-archive entries are not reachable. `query` and `scope` \
-arguments are reserved for a future bulk-delete tool and currently \
-return an error. Deletion is permanent — confirm with the user before \
+hit wins. Cold-archive entries are not reachable. There is no bulk \
+delete: find the ids with `recall` or `recall_recent` and forget them \
+one at a time. Deletion is permanent — confirm with the user before \
 invoking.";
+
+/// What to do instead of the bulk delete `forget` never had.
+const BULK_HINT: &str = "bulk forget by `query`/`scope` is not supported; find the ids \
+with `recall` or `recall_recent` and call `forget` once per `id`";
 
 pub(crate) struct Forget {
     semantic: Arc<SemanticStore>,
@@ -57,6 +61,13 @@ impl Forget {
 
 #[async_trait]
 impl Tool for Forget {
+    fn unknown_arg_hint(&self, arg: &str) -> Option<&'static str> {
+        match arg {
+            "query" | "scope" => Some(BULK_HINT),
+            _ => None,
+        }
+    }
+
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "forget",
@@ -66,33 +77,24 @@ impl Tool for Forget {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": "Memory ULID." },
-                    "query": { "type": "string", "description": "Reserved — bulk delete by search is not yet supported." },
-                    "scope": { "type": "string", "description": "Reserved — bulk delete by scope is not yet supported." }
-                }
+                    "id": { "type": "string", "description": "Memory ULID." }
+                },
+                "required": ["id"]
             }),
         }
     }
 
     async fn invoke(&self, args: Value) -> Result<ToolResult, ToolError> {
-        let id = args.get("id").and_then(Value::as_str);
-        let query = args.get("query").and_then(Value::as_str);
-        let scope = args.get("scope").and_then(Value::as_str);
-
-        let count = [id, query, scope].iter().filter(|x| x.is_some()).count();
-        if count != 1 {
-            return Err(ToolError::InvalidArguments(
-                "exactly one of `id`, `query`, `scope` is required".into(),
-            ));
+        // The dispatcher rejects `query`/`scope` as undeclared before
+        // this runs; the check stays for callers that invoke the tool
+        // directly.
+        if args.get("query").is_some() || args.get("scope").is_some() {
+            return Err(ToolError::InvalidArguments(BULK_HINT.into()));
         }
-
-        if query.is_some() || scope.is_some() {
-            return Err(ToolError::InvalidArguments(
-                "bulk forget by `query`/`scope` is not yet supported; pass `id` instead".into(),
-            ));
-        }
-
-        let id_str = id.unwrap();
+        let id_str = args
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidArguments("`id` is required".into()))?;
         let ulid = Ulid::from_string(id_str)
             .map_err(|e| ToolError::InvalidArguments(format!("`id` is not a valid ULID: {e}")))?;
 

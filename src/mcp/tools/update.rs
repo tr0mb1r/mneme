@@ -17,10 +17,10 @@ use super::size_tier::{self, DEFAULT_MAX_CHARS, Tier};
 use super::{Tool, ToolAnnotations, ToolDescriptor, ToolError, ToolResult};
 use crate::config::SecretsMode;
 use crate::ids::MemoryId;
-use crate::memory::semantic::{MemoryKind, SemanticStore, UpdatePatch};
+use crate::memory::semantic::{SemanticStore, UpdatePatch};
 
 const DESCRIPTION: &str = "Edit an existing memory in place. Provide \
-`id` and any subset of `content`, `type`, `tags`, `scope` — only \
+`id` and any subset of `content`, `kind`, `tags`, `scope` — only \
 supplied fields change. Use this when the user revises a fact, narrows \
 a preference, or re-classifies a memory; do NOT use this for \
 unrelated information (call `remember` for new memories instead). \
@@ -76,10 +76,15 @@ impl Tool for Update {
                 "properties": {
                     "id": { "type": "string", "description": "Memory ULID." },
                     "content": { "type": "string", "description": "Replacement text. Triggers re-embedding." },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["fact", "decision", "preference", "conversation"],
+                        "description": "Replacement memory kind."
+                    },
                     "type": {
                         "type": "string",
                         "enum": ["fact", "decision", "preference", "conversation"],
-                        "description": "Replacement memory type."
+                        "description": "Alias of `kind` (the older name). Pass one or the other."
                     },
                     "tags": {
                         "type": "array",
@@ -160,19 +165,8 @@ impl Tool for Update {
             None => None,
         };
 
-        let kind = match args.get("type") {
-            None => None,
-            Some(Value::String(s)) => Some(MemoryKind::parse(s).ok_or_else(|| {
-                ToolError::InvalidArguments(format!(
-                    "`type` must be one of fact|decision|preference|conversation, got `{s}`"
-                ))
-            })?),
-            Some(_) => {
-                return Err(ToolError::InvalidArguments(
-                    "`type` must be a string".into(),
-                ));
-            }
-        };
+        // `kind`, or its alias `type`; both set and different is an error.
+        let kind = super::parse_kind_arg(&args)?;
 
         let tags = match args.get("tags") {
             None => None,

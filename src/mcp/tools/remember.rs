@@ -105,10 +105,15 @@ impl Tool for Remember {
                 "type": "object",
                 "properties": {
                     "content": { "type": "string", "description": "The information to remember." },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["fact", "decision", "preference", "conversation"],
+                        "description": "Memory kind. Defaults to fact."
+                    },
                     "type": {
                         "type": "string",
                         "enum": ["fact", "decision", "preference", "conversation"],
-                        "description": "Memory type. Defaults to fact."
+                        "description": "Alias of `kind` (the older name). Pass one or the other."
                     },
                     "tags": {
                         "type": "array",
@@ -116,7 +121,7 @@ impl Tool for Remember {
                         "description": "Optional tags for retrieval."
                     },
                     "scope": { "type": "string", "description": "Optional scope override. Defaults to the session's current scope (set by `switch_scope`)." },
-                    "pinned": { "type": "boolean", "description": "Promote to procedural memory." },
+                    "pinned": { "type": "boolean", "description": "Deprecated and not supported: `true` is rejected. Call `pin` to add an always-on rule." },
                     "supersedes": {
                         "oneOf": [
                             { "type": "string" },
@@ -163,14 +168,9 @@ impl Tool for Remember {
             g => g.into_advisory(),
         };
 
-        let kind = match args.get("type").and_then(Value::as_str) {
-            None => MemoryKind::Fact,
-            Some(s) => MemoryKind::parse(s).ok_or_else(|| {
-                ToolError::InvalidArguments(format!(
-                    "`type` must be one of fact|decision|preference|conversation, got `{s}`"
-                ))
-            })?,
-        };
+        // `kind`, or its alias `type`; both set and different is an error.
+        let passed_kind = super::parse_kind_arg(&args)?;
+        let kind = passed_kind.unwrap_or(MemoryKind::Fact);
 
         let tags = super::parse_tags_arg(args.get("tags"))?;
 
@@ -180,14 +180,24 @@ impl Tool for Remember {
             .map(|s| s.to_owned())
             .unwrap_or_else(|| self.scope_state.current());
 
-        // `pinned` is recognised by the schema but not wired to the
-        // procedural layer. Warn loudly rather than silently dropping it,
-        // so a caller who set it learns the flag does nothing. Tracked in
-        // book/src/roadmap.md; call `pin` for an L0 rule.
-        if args.get("pinned").and_then(Value::as_bool) == Some(true) {
-            tracing::warn!(
-                "remember: `pinned=true` ignored — call the `pin` tool to add an L0 rule"
-            );
+        // `pinned` was never wired to the procedural layer: `true` used
+        // to be logged and dropped, so the caller believed a rule was
+        // pinned when it was not. Refuse it and say what to call.
+        // `false` (and `null`) ask for nothing and stay accepted.
+        match args.get("pinned") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+            Some(Value::Bool(true)) => {
+                return Err(ToolError::InvalidArguments(
+                    "`pinned` is not supported on `remember`; call `pin` to add an \
+                     always-on rule (L0), or drop `pinned` to store a normal memory"
+                        .into(),
+                ));
+            }
+            Some(_) => {
+                return Err(ToolError::InvalidArguments(
+                    "`pinned` must be a boolean".into(),
+                ));
+            }
         }
 
         // Validate `supersedes` before writing anything, so a typo'd id
@@ -214,7 +224,6 @@ impl Tool for Remember {
             // Only needed to tell the caller their `type`/`tags` were not
             // applied; cloned up front because the store takes ownership.
             let passed_tags = tags.clone();
-            let passed_kind = args.get("type").is_some().then_some(kind);
             match self
                 .store
                 .remember_or_dedupe(content, kind, tags, scope)
@@ -1138,5 +1147,104 @@ mod tests {
             .unwrap_or(false);
         assert!(!has_adv, "off mode must not scan: {:?}", res.meta);
         assert_eq!(s.len(), 1);
+    }
+
+    fn fresh_with_store() -> (Remember, Arc<SemanticStore>, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let store = store(&tmp);
+        (Remember::new(Arc::clone(&store), make_scope()), store, tmp)
+    }
+
+    #[tokio::test]
+    async fn kind_is_accepted_and_type_stays_an_alias() {
+        let (r, store, _tmp) = fresh_with_store();
+        for (key, content) in [
+            ("kind", "we ship on Fridays"),
+            ("type", "we rest on Sundays"),
+        ] {
+            let res = r
+                .invoke(json!({ "content": content, key: "decision" }))
+                .await
+                .unwrap();
+            assert!(!res.is_error);
+        }
+        // The same value under both names is not a conflict.
+        r.invoke(json!({ "content": "both names", "kind": "decision", "type": "decision" }))
+            .await
+            .unwrap();
+        let hits = store
+            .recall(
+                "ship",
+                10,
+                &crate::memory::semantic::RecallFilters::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(hits.iter().all(|h| h.item.kind == MemoryKind::Decision));
+    }
+
+    #[tokio::test]
+    async fn kind_and_type_with_different_values_is_rejected() {
+        let (r, store, _tmp) = fresh_with_store();
+        let err = r
+            .invoke(json!({ "content": "x", "kind": "decision", "type": "fact" }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::InvalidArguments(m) => {
+                assert!(m.contains("pass either kind or type"), "{m}")
+            }
+            other => panic!("expected InvalidArguments, got {other:?}"),
+        }
+        let hits = store
+            .recall("x", 10, &crate::memory::semantic::RecallFilters::default())
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "a rejected call must store nothing");
+    }
+
+    #[tokio::test]
+    async fn bad_kind_value_names_the_key_the_caller_used() {
+        let (r, _store, _tmp) = fresh_with_store();
+        for key in ["kind", "type"] {
+            let err = r
+                .invoke(json!({ "content": "x", key: "weird" }))
+                .await
+                .unwrap_err();
+            let ToolError::InvalidArguments(m) = err else {
+                panic!("expected InvalidArguments");
+            };
+            assert!(m.starts_with(&format!("`{key}` must be one of")), "{m}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_true_is_rejected_with_a_pointer_to_pin() {
+        let (r, store, _tmp) = fresh_with_store();
+        let err = r
+            .invoke(json!({ "content": "always run fmt", "pinned": true }))
+            .await
+            .unwrap_err();
+        let ToolError::InvalidArguments(m) = err else {
+            panic!("expected InvalidArguments");
+        };
+        assert!(m.contains("call `pin`"), "{m}");
+        let hits = store
+            .recall(
+                "fmt",
+                10,
+                &crate::memory::semantic::RecallFilters::default(),
+            )
+            .await
+            .unwrap();
+        assert!(hits.is_empty(), "a rejected call must store nothing");
+
+        // `false` asks for nothing and keeps working.
+        let res = r
+            .invoke(json!({ "content": "always run fmt", "pinned": false }))
+            .await
+            .unwrap();
+        assert!(!res.is_error);
     }
 }

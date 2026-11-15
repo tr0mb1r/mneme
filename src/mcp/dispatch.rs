@@ -31,13 +31,25 @@ pub fn tool_call_payload(name: &str, args: &Value) -> Value {
         }
     };
 
+    // `remember`/`update` take the memory kind as `kind` or its alias
+    // `type`; the event records it as `kind` either way, the name every
+    // reply uses. (A call that passed both with different values was
+    // rejected and never gets here.)
+    let pull_kind = |obj: &mut serde_json::Map<String, Value>, args: &Value| {
+        if let Some(v) = ["kind", "type"]
+            .iter()
+            .filter_map(|k| args.get(*k))
+            .find(|v| !v.is_null())
+        {
+            obj.insert("kind".to_owned(), v.clone());
+        }
+    };
+
     match name {
         // L4 writers — content carries the user's actual data.
         "remember" => {
             pull(obj, args, "content");
-            // The schema argument is `type`; `kind` was never a remember
-            // argument, so the old pull silently captured nothing.
-            pull(obj, args, "type");
+            pull_kind(obj, args);
             pull(obj, args, "scope");
         }
         // L0 writer — same shape as remember, no embedder involvement.
@@ -49,7 +61,7 @@ pub fn tool_call_payload(name: &str, args: &Value) -> Value {
         "update" => {
             pull(obj, args, "id");
             pull(obj, args, "content");
-            pull(obj, args, "type");
+            pull_kind(obj, args);
         }
         "forget" => {
             pull(obj, args, "id");
@@ -330,51 +342,212 @@ mod tests {
         format!("AKIA{}", "IOSFODNN7EXAMPLE")
     }
 
+    /// A full default registry over in-memory storage, plus the
+    /// per-session handles `handle_tools_call` takes.
+    struct Rig {
+        _tmp: tempfile::TempDir,
+        registry: ToolRegistry,
+        episodic: Arc<EpisodicStore>,
+        scope_state: Arc<ScopeState>,
+        auto_log: AutoLogToolCalls,
+    }
+
+    impl Rig {
+        fn new(secrets: SecretsMode, auto_log: AutoLogToolCalls) -> Self {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let backing: Arc<dyn Storage> = MemoryStorage::new();
+            let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
+            let semantic =
+                SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
+            let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
+            let episodic = Arc::new(EpisodicStore::new(Arc::clone(&backing)));
+            let scope_state = ScopeState::new("work");
+            let registry = ToolRegistry::defaults_with_schedulers(
+                semantic,
+                procedural,
+                Arc::clone(&episodic),
+                Arc::clone(&backing),
+                ColdArchive::new(tmp.path()),
+                1,
+                None,
+                None,
+                Arc::clone(&scope_state),
+                None,
+                crate::mcp::tools::size_tier::DEFAULT_MAX_CHARS,
+                secrets,
+            );
+            Self {
+                _tmp: tmp,
+                registry,
+                episodic,
+                scope_state,
+                auto_log,
+            }
+        }
+
+        async fn call(&self, tool: &str, args: Value) -> Response {
+            handle_tools_call(
+                &self.registry,
+                None,
+                None,
+                Some(&self.episodic),
+                Some(&self.scope_state),
+                self.auto_log,
+                Id::Number(1),
+                Some(json!({"name": tool, "arguments": args})),
+            )
+            .await
+        }
+
+        /// Recorded `tool_call` payloads, newest first.
+        async fn tool_call_payloads(&self) -> Vec<Value> {
+            self.episodic
+                .recall_recent(&RecentFilters::default(), 50)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == "tool_call")
+                .map(|e| e.payload_json().unwrap())
+                .collect()
+        }
+    }
+
     /// Call `tool` under `secrets` with auto-logging on `all`, and
     /// return the recorded `tool_call` payloads.
     async fn tool_call_payloads(secrets: SecretsMode, tool: &str, args: Value) -> Vec<Value> {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let backing: Arc<dyn Storage> = MemoryStorage::new();
-        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::with_dim(4));
-        let semantic =
-            SemanticStore::open_disabled(tmp.path(), Arc::clone(&backing), embedder).unwrap();
-        let procedural = Arc::new(ProceduralStore::open(tmp.path()).unwrap());
-        let episodic = Arc::new(EpisodicStore::new(Arc::clone(&backing)));
-        let scope_state = ScopeState::new("work");
-        let registry = ToolRegistry::defaults_with_schedulers(
-            semantic,
-            procedural,
-            Arc::clone(&episodic),
-            Arc::clone(&backing),
-            ColdArchive::new(tmp.path()),
-            1,
-            None,
-            None,
-            Arc::clone(&scope_state),
-            None,
-            crate::mcp::tools::size_tier::DEFAULT_MAX_CHARS,
-            secrets,
-        );
-        let resp = handle_tools_call(
-            &registry,
-            None,
-            None,
-            Some(&episodic),
-            Some(&scope_state),
-            AutoLogToolCalls::All,
-            Id::Number(1),
-            Some(json!({"name": tool, "arguments": args})),
+        let rig = Rig::new(secrets, AutoLogToolCalls::All);
+        let resp = rig.call(tool, args).await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        rig.tool_call_payloads().await
+    }
+
+    /// The JSON-RPC error of a call that must fail with `INVALID_PARAMS`.
+    async fn invalid_params(rig: &Rig, tool: &str, args: Value) -> String {
+        let err = rig.call(tool, args).await.error.expect("expected an error");
+        assert_eq!(err.code, error_codes::INVALID_PARAMS, "{}", err.message);
+        err.message
+    }
+
+    #[tokio::test]
+    async fn remember_update_and_recall_accept_kind() {
+        let rig = Rig::new(SecretsMode::Reject, AutoLogToolCalls::Writes);
+        let resp = rig
+            .call(
+                "remember",
+                json!({"content": "we deploy on Tuesdays", "kind": "decision"}),
+            )
+            .await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let id = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .and_then(|t| t.strip_prefix("stored memory "))
+            .unwrap()
+            .to_owned();
+
+        let resp = rig
+            .call("update", json!({"id": id, "kind": "preference"}))
+            .await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+
+        for (key, value, expect) in [
+            ("kind", "preference", 1),
+            ("type", "preference", 1),
+            ("kind", "decision", 0),
+        ] {
+            let resp = rig
+                .call("recall", json!({"query": "deploy Tuesdays", key: value}))
+                .await;
+            assert!(resp.error.is_none(), "{:?}", resp.error);
+            let text = resp.result.unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let rows: Vec<Value> = serde_json::from_str(&text).unwrap();
+            assert_eq!(rows.len(), expect, "{key}={value}: {text}");
+        }
+
+        // The mirrored events name the field `kind`, whichever was passed.
+        let events = rig.tool_call_payloads().await;
+        assert!(events.iter().all(|e| e.get("type").is_none()), "{events:?}");
+        assert_eq!(events[0]["kind"], "preference");
+        assert_eq!(events[1]["kind"], "decision");
+    }
+
+    #[tokio::test]
+    async fn kind_and_type_conflict_is_invalid_params_on_all_three_tools() {
+        let rig = Rig::new(SecretsMode::Reject, AutoLogToolCalls::Writes);
+        for (tool, args) in [
+            (
+                "remember",
+                json!({"content": "x", "kind": "decision", "type": "fact"}),
+            ),
+            (
+                "update",
+                json!({"id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "kind": "decision", "type": "fact"}),
+            ),
+            (
+                "recall",
+                json!({"query": "x", "kind": "decision", "type": "fact"}),
+            ),
+        ] {
+            let msg = invalid_params(&rig, tool, args).await;
+            assert!(msg.contains("pass either kind or type"), "{tool}: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_since_until_points_at_recall_recent() {
+        let rig = Rig::new(SecretsMode::Reject, AutoLogToolCalls::Writes);
+        let msg = invalid_params(
+            &rig,
+            "recall",
+            json!({"query": "x", "since": "2026-09-01T00:00:00Z", "until": "2026-10-19T00:00:00Z"}),
         )
         .await;
-        assert!(resp.error.is_none(), "{:?}", resp.error);
-        episodic
-            .recall_recent(&RecentFilters::default(), 10)
-            .await
-            .unwrap()
+        assert!(
+            msg.contains("unexpected argument(s) `since`, `until`"),
+            "{msg}"
+        );
+        assert_eq!(msg.matches("call `recall_recent`").count(), 1, "{msg}");
+
+        // Any other stray key gets the plain error, without the hint.
+        let msg = invalid_params(&rig, "recall", json!({"query": "x", "k": 3})).await;
+        assert!(!msg.contains("recall_recent"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn forget_no_longer_declares_query_or_scope() {
+        let rig = Rig::new(SecretsMode::Reject, AutoLogToolCalls::Writes);
+        let forget = rig
+            .registry
+            .list()
             .into_iter()
-            .filter(|e| e.kind == "tool_call")
-            .map(|e| e.payload_json().unwrap())
-            .collect()
+            .find(|d| d.name == "forget")
+            .unwrap();
+        let props = forget.input_schema["properties"].as_object().unwrap();
+        assert_eq!(props.keys().collect::<Vec<_>>(), ["id"]);
+        assert_eq!(forget.input_schema["required"], json!(["id"]));
+
+        for key in ["query", "scope"] {
+            let msg = invalid_params(&rig, "forget", json!({key: "x"})).await;
+            assert!(
+                msg.contains(&format!("unexpected argument(s) `{key}`")),
+                "{msg}"
+            );
+            assert!(msg.contains("call `forget` once per `id`"), "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_pinned_true_is_invalid_params_naming_pin() {
+        let rig = Rig::new(SecretsMode::Reject, AutoLogToolCalls::Writes);
+        let msg = invalid_params(
+            &rig,
+            "remember",
+            json!({"content": "always run fmt", "pinned": true}),
+        )
+        .await;
+        assert!(msg.contains("call `pin`"), "{msg}");
     }
 
     #[tokio::test]
