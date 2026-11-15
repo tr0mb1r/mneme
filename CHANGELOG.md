@@ -12,6 +12,49 @@ the work that landed before automation was wired up.
 
 ## [Unreleased]
 
+## [1.6.0](https://github.com/tr0mb1r/mneme/compare/v1.5.0...v1.6.0) - 2026-11-15
+
+### Added
+
+- *(hermes)* scope the context hook per thread, leave event selection to the server; 1.6 notes
+- *(tools)* relations, provenance, recall by ref and expand, promote on record_event
+- *(semantic)* typed relations and provenance in side tables; demote, don't hide
+- *(cli)* mneme eval, a read-only quality measurement, and a nightly gate
+- *(recall)* search events with layers, time window and multi-scope; opt-in cold reads
+- *(episodic)* keyword index over curated events, cold-exempt kinds, cold window reads
+- *(context)* layer shares, edit-time freshness, query-ranked events, scope sets
+- *(semantic)* updated_at and archived status in side tables, scope sets, rank
+- *(config)* wire [working] record_tool_turns and [episodic] log_tool_call_values
+- *(config)* declare the 1.6 [auto_context], [working] and [recall] keys
+
+### Changed
+
+- remove the Windows-only code; non-Unix builds fail with a clear error
+- *(episodic)* stub lex_scores and search, the auto-context/index contract
+
+### Documentation
+
+- relations and provenance ship in 1.6, say so consistently
+- *(release)* check the 1.6 notes against what merged; list the relation knobs in the starter config
+- relations, demotion, provenance, recall by ref, promote
+- *(config)* one [auto_context] section after the W1 merge
+- *(config)* keep one cold_exempt_kinds entry after the W2 merge
+- auto-context shares and scoring, updated_at, archiving, [auto_context]
+- *(contributing)* point at the structural quality checks and the corpus
+- *(book)* v1.4 and v1.5 release notes, current status, Hermes page
+
+### Fixed
+
+- *(recall)* merge layers on shared keyword evidence in keyword mode
+- *(recall)* break rank ties by the latest edit, and gate stale-over-current nightly
+- *(client)* do not give up when the reconnect lands on a dying daemon
+- *(working)* give every daemon connection and HTTP session its own L1
+- *(ci)* clear RustSec advisories, satisfy clippy 1.100, drop Windows
+- *(working)* read-only tool calls no longer push an L1 turn
+- *(forget)* redact the tool_call events that mirrored a forgotten memory
+- *(episodic)* read the warm tier in recall_recent and export
+- *(mcp)* accept `kind` on remember/update/recall, and say where guessed arguments belong
+
 ### Added
 
 - **Typed relations between memories.** `remember` and `update` take
