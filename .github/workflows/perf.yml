@@ -1,14 +1,15 @@
 name: perf
 
 # Perf regression gate (release-planning v2.1 §6.2, revised after 1.5).
-# Each run benchmarks the base commit and the change on the same runner
-# and fails if a hot-path median slows by more than 15 %. The frozen
+# Each run benchmarks the base commit and the change on the same runner,
+# in three interleaved rounds, and fails if a hot-path median (the best
+# of the three, per side) slows by more than 15 %. The frozen
 # `benches/baselines/*.json` files are still compared, informationally:
 # absolute numbers do not transfer between GitHub runner hosts, so they
 # cannot gate. Linux only, for measurement stability.
 #
 # Trigger scope: pushes / PRs that touch code or bench infrastructure.
-# Doc-only changes don't pay the ~5 minute bench cost. The
+# Doc-only changes don't pay the bench cost. The
 # `paths-include` list here mirrors the inverse of `ci.yml`'s
 # `paths-ignore`.
 
@@ -41,11 +42,11 @@ jobs:
   perf:
     name: criterion + same-runner regression gate
     runs-on: ubuntu-latest
-    # The bench job genuinely takes ~3-5 minutes (model-free, stub
-    # embedder, but four benches × 50 samples × ~1k iters each adds
-    # up), and the gate runs them twice (base, then head). Cap at 40
-    # minutes so a wedged bench doesn't sit forever.
-    timeout-minutes: 40
+    # Two release builds of the bench binaries (the base one reuses the
+    # cached dependencies) plus six `--quick` passes over the four
+    # hot-path benches: 15-25 minutes. Cap at 45 so a wedged bench
+    # doesn't sit forever.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -86,62 +87,57 @@ jobs:
             echo "::warning::could not fetch base $base; the same-runner gate is skipped"
           fi
 
-      - name: cargo bench at the base commit
+      - name: interleaved A/B bench (base vs this change)
+        # Builds the bench binaries once per side, then runs base, head,
+        # base, head, base, head and keeps each side's per-bench minimum
+        # (benches/baselines/ab_gate.sh explains why). The encryption
+        # bench runs once, on this change only: its gate is a ratio
+        # within one run.
         if: steps.base.outputs.sha != ''
-        shell: bash
+        env:
+          AB_ROUNDS: '3'
+          AB_HEAD_ONLY: encryption_overhead
         run: |
-          set -euo pipefail
-          head="$(git rev-parse HEAD)"
-          echo "head=$head" >> "$GITHUB_ENV"
-          git checkout --quiet --detach "${{ steps.base.outputs.sha }}"
-          cargo bench --bench remember --bench recall \
-                      --bench cold_start --bench auto_context \
-                      -- --quick
-          mkdir -p /tmp/perf
-          python3 benches/baselines/extract_baseline.py \
-                  /tmp/perf/base.json \
-                  --corpus ${{ env.MNEME_BENCH_N }}
-          rm -rf target/criterion
-          git checkout --quiet --detach "$head"
+          benches/baselines/ab_gate.sh "${{ steps.base.outputs.sha }}" /tmp/perf
+          cp /tmp/perf/head.json /tmp/perf/this-run.json
 
-      - name: cargo bench (hot path, n=${{ env.MNEME_BENCH_N }})
-        # Run the four hot-path benches plus the encryption-overhead
-        # bench. `criterion` writes per-bench JSON under
-        # target/criterion/<group>/<id>/new/. The next step extracts a
-        # single comparable JSON from those.
+      - name: cargo bench (no base to compare against)
+        # First push of a branch, or a base that could not be fetched:
+        # still produce this run's numbers for the informational
+        # compare and the encryption ratio gate.
+        if: steps.base.outputs.sha == ''
         run: |
           cargo bench --bench remember --bench recall \
                       --bench cold_start --bench auto_context \
                       --bench encryption_overhead \
                       -- --quick
-
-      - name: extract baseline JSON for this run
-        run: |
           mkdir -p /tmp/perf
           python3 benches/baselines/extract_baseline.py \
                   /tmp/perf/this-run.json \
                   --corpus ${{ env.MNEME_BENCH_N }}
-          echo "::group::This run's numbers (p95 µs)"
+
+      - name: this run's numbers
+        run: |
           python3 -c "
           import json
           d = json.load(open('/tmp/perf/this-run.json'))['benches']
           for k, v in d.items():
-              print(f'{k:55s}  p95={v[\"p95_ns\"]/1000:>10.2f} µs')
+              print(f'{k:55s}  p50={v[\"p50_ns\"]/1000:>10.2f} µs  p95={v[\"p95_ns\"]/1000:>10.2f} µs')
           "
-          echo "::endgroup::"
 
       - name: compare against the base commit (same runner)
         # BLOCKING. p50 rather than p95: with `--quick` sampling the
         # tail is the noisiest statistic even on one host, and a real
-        # hot-path regression moves the median too. 15 % leaves room for
-        # run-to-run jitter between the two passes. A PR that regresses
+        # hot-path regression moves the median too. Each side's p50 is
+        # its minimum over the interleaved rounds, so a stall in one
+        # round cannot fail (or pass) the gate. A PR that regresses
         # on purpose says why in its description and an admin merges it
         # through the ruleset bypass.
         if: steps.base.outputs.sha != ''
         run: |
           python3 benches/baselines/compare.py \
                   /tmp/perf/base.json \
-                  /tmp/perf/this-run.json \
+                  /tmp/perf/head.json \
                   --exclude encrypted_ \
                   --metric p50_ns \
                   --tolerance-pct 15
@@ -179,5 +175,9 @@ jobs:
           path: |
             target/criterion/**/new/estimates.json
             target/criterion/**/new/sample.json
+            /tmp/perf/criterion/**/new/estimates.json
+            /tmp/perf/criterion/**/new/sample.json
+            /tmp/perf/rounds/*.json
+            /tmp/perf/base.json
             /tmp/perf/this-run.json
           retention-days: 14

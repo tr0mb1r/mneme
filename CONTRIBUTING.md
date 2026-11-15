@@ -51,22 +51,22 @@ Thanks for your interest. This document is short on purpose.
 - Changes that touch hot-path code (`src/memory/`, `src/index/`,
   `src/storage/`, `src/orchestrator/`, `src/mcp/`) trip the
   `.github/workflows/perf.yml` regression gate. It benchmarks the base
-  commit and your change on the same runner and blocks merge if a
-  hot-path median (p50) slows by more than 15 %. Run the same comparison
-  locally:
+  commit and your change on the same runner, in three interleaved
+  rounds (base, head, base, head, …), takes each side's best median
+  (p50) per bench, and blocks merge if one slows by more than 15 %. Run
+  the same comparison locally (it builds the base in a temporary git
+  worktree, so your working tree is left alone, uncommitted changes
+  included):
 
   ```sh
-  git stash; git checkout main
-  cargo bench --bench remember --bench recall \
-              --bench cold_start --bench auto_context -- --quick
-  python3 benches/baselines/extract_baseline.py /tmp/base.json --corpus 1000
-  rm -rf target/criterion; git checkout -; git stash pop
-  cargo bench --bench remember --bench recall \
-              --bench cold_start --bench auto_context -- --quick
-  python3 benches/baselines/extract_baseline.py /tmp/this.json --corpus 1000
-  python3 benches/baselines/compare.py /tmp/base.json /tmp/this.json \
+  benches/baselines/ab_gate.sh main /tmp/perf
+  python3 benches/baselines/compare.py /tmp/perf/base.json /tmp/perf/head.json \
           --metric p50_ns --tolerance-pct 15
   ```
+
+  A single base run followed by a single head run is not a usable
+  comparison: `remember` does one fdatasync per call, and two passes of
+  identical code a few minutes apart have differed by over 20 %.
 
   If the regression is justified (e.g. v1.1 daemon-mode network hop),
   explain the trade in the PR description; an admin merges it through
