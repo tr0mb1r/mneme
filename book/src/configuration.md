@@ -49,6 +49,19 @@ default_recall_limit       = 10
 auto_context_token_budget  = 4000
 max_remember_chars         = 10000
 
+[auto_context]
+semantic_half_life_days = 90     # 0 = no decay for memories
+semantic_recency_floor  = 0.75
+episodic_max_share      = 0.35
+semantic_min_share      = 0.30
+semantic_min_items      = 5
+working_max_share       = 0.05
+episodic_query_mix      = 0.3
+event_clip_chars        = 400    # 0 = do not clip
+min_event_weight        = 0.3
+max_events_per_kind     = 6      # 0 = no cap
+pin_scopes              = ["global"]
+
 [guardrails]
 secrets = "reject"              # or "warn" / "off"
 
@@ -516,9 +529,12 @@ one. `recall` callers can override per-call up to a hard cap of
 | **Affects** | `mneme://context` total payload size |
 
 Total token budget for the auto-context resource. The orchestrator
-greedy-packs the four memory layers (procedural / working / episodic
-/ semantic) up to this ceiling, with per-layer minimums protecting
-each layer from being starved.
+packs the four memory layers (procedural / working / episodic /
+semantic) up to this ceiling. How the budget is divided between them is
+set in [`[auto_context]`](#auto_context--how-mnemecontext-is-scored-and-packed).
+
+Pinned items are never trimmed. If they alone are larger than this
+budget, the context exceeds it and holds nothing else.
 
 The default 4000 is calibrated for a ~32K-token model context window
 where you want to spend ~12% on agent memory. Bump for larger
@@ -557,6 +573,76 @@ Raise this only when you have a specific need (research notes, long
 runbooks). The advisory + warning meta will still surface above
 500/2,000 chars; tightening the ceiling moves only the rejection
 threshold.
+
+---
+
+## `[auto_context]` — how `mneme://context` is scored and packed
+
+All keys are optional; a config file without the section gets the
+defaults below. Scoring and packing are described in
+[MCP surface §Scoring](./mcp-surface.md#scoring-auto-context).
+
+### Layer shares
+
+Fractions of `[budgets] auto_context_token_budget`. Values outside
+`0.0`–`1.0` are clamped.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `episodic_max_share` | `0.35` | Most of the budget episodic events may take. |
+| `working_max_share` | `0.05` | Most of the budget working-session turns may take. |
+| `semantic_min_share` | `0.30` | Reserved for semantic rows before the other layers are packed. |
+| `semantic_min_items` | `5` | The reserve is this many rows instead, when they are fewer tokens than `semantic_min_share`. |
+
+Pinned items have no share: they are always kept. Semantic rows have no
+ceiling: they take whatever events and turns leave. The shares need not
+add up to 1.
+
+To give events more room, raise `episodic_max_share`; at `1.0` they are
+limited only by the semantic reserve and the pins, which is close to how
+the budget was split before 1.6.
+
+### Freshness of memories
+
+| Key | Default | Meaning |
+|---|---|---|
+| `semantic_half_life_days` | `90` | Half-life of a memory's freshness, measured from its last content edit (`updated_at`). `0` turns decay off. |
+| `semantic_recency_floor` | `0.75` | Lowest value the freshness factor can take. |
+
+A memory's auto-context score is `rank × 0.7 × max(floor, 2^(−age/half_life))`.
+With the defaults a memory never loses more than a quarter of its score to
+age. These keys affect `mneme://context` only; `recall` does not decay.
+
+### Event selection
+
+| Key | Default | Meaning |
+|---|---|---|
+| `episodic_query_mix` | `0.3` | β. With a `?q=` seed an event scores `recency × (β + (1−β)·lex)`, where `lex` is how much of the query it contains. `1.0` ignores the query; `0.0` removes events that share nothing with it from contention. |
+| `event_clip_chars` | `400` | Payloads longer than this are clipped and the row is marked `truncated`. `0` turns clipping off. |
+| `min_event_weight` | `0.3` | Events with `retrieval_weight` at or below this are left out. |
+| `max_events_per_kind` | `6` | At most this many events of one kind. `0` means no cap. |
+
+Events of kind `archived` are always left out unless the read names them
+with `?kinds=archived`.
+
+### `pin_scopes`
+
+| | |
+|---|---|
+| **Type** | array of strings |
+| **Default** | `["global"]` |
+| **Affects** | Which pins a scoped `mneme://context` read returns |
+
+A read of `mneme://context?scope=a,b` returns the pins stored under `a`
+and `b`, plus the pins stored under every scope listed here. A read with
+no `scope` returns every pin and ignores this key.
+
+Before 1.6 a scoped read returned only the pins of that scope, so naming
+a scope dropped the global rules. Set `pin_scopes = []` to restore that.
+
+### `include_demoted`
+
+Reserved for 1.7. Has no effect.
 
 ---
 

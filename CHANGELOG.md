@@ -86,12 +86,76 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **Auto-context ranks events against the query.** With `?q=`, the
+  `episodic` section of `mneme://context` is no longer the same 64 most
+  recent events for every prompt. Candidates are the recent window plus
+  the episodic index's matches for the query, scored
+  `weight × 0.8 × recency × (β + (1−β)·lexical coverage)` with
+  `[auto_context] episodic_query_mix` (β, default 0.3). Without `?q=`
+  the ranking is recency, as before.
+- **Auto-context event selection.** Exact duplicates (same kind and
+  payload, ignoring case and whitespace) and near-duplicates (token
+  Jaccard ≥ 0.6) are dropped, at most `max_events_per_kind` (6) events of
+  one kind are kept, and payloads are clipped to `event_clip_chars` (400)
+  with `"truncated": true` on the row. A clipped event is charged at its
+  clipped size. Events of kind `archived` and events with
+  `retrieval_weight` at or below `min_event_weight` (0.3) are left out;
+  `?kinds=archived` opts back in.
+- **`mneme://context?scope=a,b`.** `scope` takes a comma-separated set.
+  L3 and L4 are filtered to the set; L0 returns the pins of those scopes
+  plus `[auto_context] pin_scopes`.
+- `mneme://context` reports `layer_tokens` (tokens spent per layer), and
+  its `request` echo gains `scopes`, `pin_scopes` and `shares`. Semantic
+  rows gain `updated_at` and `rank`; episodic rows gain `truncated`.
+- **`updated_at` on memories.** `update` records when a memory's content
+  last changed. Changing only `kind`, `tags`, `scope` or `status`, or
+  writing the same text back, does not move it. A memory never edited
+  reports its `created_at`. `recall` rows and `export` carry it.
+- **Archiving a memory: `update(id, status: "archived")`.** An archived
+  memory keeps its id, content and vector but is left out of `recall`
+  and never appears in auto-context. `status: "active"` restores it.
+  `recall` rows and `export` carry `status`; `export` always includes
+  archived memories.
+- `recall` rows carry `rank`: similarity plus keyword evidence, on the
+  same scale in `hybrid`, `semantic` and `keyword` mode.
+- `export` (the MCP tool and `mneme export`) emits `superseded_by` on a
+  memory that has a supersession link. The links were never exported, so
+  a dump could not tell a current fact from a replaced one.
 - Successful `remember`, `pin` and `update` calls report the id of the
   memory they stored or changed as `_meta.id`, and their `tool_call` event
   records it as `memory_id`.
 
 ### Changed
 
+- **A scoped `mneme://context` read now also returns global pins.**
+  `?scope=myproject` used to return only the pins stored under
+  `myproject`, so naming a scope silently dropped every rule pinned under
+  `global`. A scoped read now returns the pins of the requested scopes
+  plus those of `[auto_context] pin_scopes` (default `["global"]`). Set
+  `pin_scopes = []` for the old behaviour. A read with no `scope` is
+  unchanged and returns every pin.
+- **Auto-context budget is split by layer shares, not a flat reserve.**
+  Each layer used to be guaranteed 1/16 of the budget and the rest went
+  by score, which events always won: in one store they took 77% of the
+  context and left room for two memories. Now, from `[auto_context]`:
+  pinned items are never trimmed; events take at most
+  `episodic_max_share` (0.35); working turns at most `working_max_share`
+  (0.05); and semantic rows have `semantic_min_share` (0.30) of the
+  budget, or `semantic_min_items` (5) rows if that is fewer tokens,
+  reserved before the other layers are packed, with no ceiling. A context
+  read with no `?q=` uses less of the budget than before, because events
+  stop at their share.
+- **Pinned items can exceed the auto-context budget.** They are never
+  trimmed. If the pins alone are larger than
+  `auto_context_token_budget`, `total_tokens` exceeds `max_tokens` and
+  the other layers are empty. The server logs a warning when pins use
+  more than 30% of the budget.
+- **Auto-context freshness for memories is measured from the last
+  edit**, with a 90-day half-life and a floor of 0.75
+  (`semantic_half_life_days`, `semantic_recency_floor`; `0` days turns
+  decay off). It was a 14-day half-life from `created_at`, under which a
+  six-week-old memory kept 13% of its score. `recall` ranking is not
+  decayed and is unchanged.
 - `forget`'s input schema declares only `id` (now `required`). `query` and
   `scope` were advertised as reserved while every call that used them
   failed; passing one is still `INVALID_PARAMS`, now with a hint to find
