@@ -566,31 +566,6 @@ per daemon connection, one per HTTP `Mcp-Session-Id`. See
 
 ---
 
-## `[auto_context]` — how `mneme://context` is packed
-
-Since 1.6.0. Shares are fractions of
-`[budgets] auto_context_token_budget`. The behaviour these keys tune is
-described in [MCP surface](./mcp-surface.md); the table is the reference.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `semantic_half_life_days` | `90.0` | Half-life of a long-term memory's freshness, measured from its last update. `0` turns the decay off. Auto-context only; `recall` ranking is not decayed. |
-| `semantic_recency_floor` | `0.75` | The freshness factor never goes below this, so age only breaks near-ties in relevance. |
-| `episodic_max_share` | `0.35` | Largest share of the budget events (L3) may take. |
-| `semantic_min_share` | `0.3` | Share reserved for long-term memories (L4)… |
-| `semantic_min_items` | `5` | …or this many rows, whichever is smaller in tokens. |
-| `working_max_share` | `0.05` | Largest share working-session turns (L1) may take. |
-| `episodic_query_mix` | `0.3` | With a query: the weight of plain recency against query match when ranking events (`0.0` = match only, `1.0` = recency only). |
-| `event_clip_chars` | `400` | Events are clipped to this many characters and charged at the clipped size. |
-| `min_event_weight` | `0.3` | Events at or below this retrieval weight are left out. |
-| `max_events_per_kind` | `6` | At most this many events of one kind. |
-| `pin_scopes` | `["global"]` | Pin scopes always included next to the requested scope, so a scoped read keeps the global rules. `[]` restores the pre-1.6 behaviour (only the requested scope's pins). |
-
-`include_demoted` also loads but has no effect until memory relations
-arrive in 1.7; `mneme init` does not write it.
-
----
-
 ## `[consolidation]` — L3 hot/warm/cold tiering
 
 ### `hot_to_warm_days`
