@@ -695,11 +695,13 @@ mod tests {
     /// semantic gets its floor whenever it has rows to fill it.
     #[test]
     fn share_caps_hold_under_adversarial_sizes() {
-        let sizes = [1usize, 3, 40, 399, 400, 401, 1600, 5000, 20_000];
-        for &max_tokens in &[64usize, 500, 1000, 4000, 16_000] {
+        // Edges around the 400-char clip and the extremes; the full cross
+        // product of a denser grid took over a minute in debug builds.
+        let sizes = [1usize, 399, 400, 401, 20_000];
+        for &max_tokens in &[64usize, 1000, 16_000] {
             for &event_chars in &sizes {
                 for &memory_chars in &sizes {
-                    for &turn_chars in &[8usize, 400, 4000] {
+                    for &turn_chars in &[8usize, 4000] {
                         let c = AutoContextConfig {
                             // Unclipped, uncapped: the worst case.
                             event_clip_chars: 0,

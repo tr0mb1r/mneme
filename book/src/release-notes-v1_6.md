@@ -202,8 +202,15 @@ old memory loses the facts that still hold.
   against, with the targets it was built to: recall hit@5 over all 51
   questions 0.80 → ≥ 0.90; known-good memories present in auto-context
   2/17 → ≥ 7/17; stale-over-current 2/7 → 0/7; global pins kept on a
-  scoped read 0–1/6 → 6/6. Measured results:
-  _to be filled in from the release run._
+  scoped read 0–1/6 → 6/6. Those targets are for the private 51-question
+  set and a real embedding model; they have not been re-measured for this
+  release. On the shipped synthetic corpus (46 questions, stub embedder,
+  keyword mode, both layers) the release measures: all hit@5 46/46, L4
+  hit@5 34/34, context gold 41/46, stale-over-current 0/10 in recall and
+  in context, and global pins kept on every scoped read. Ranking events
+  against memories in hybrid mode with a real model is not yet tuned;
+  run `mneme eval` on your own questions before relying on
+  `layers: ["semantic","episodic"]` in hybrid mode.
 
 ## Fixes
 
