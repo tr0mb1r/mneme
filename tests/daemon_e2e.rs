@@ -1481,3 +1481,175 @@ async fn daemon_drains_idle_clients_promptly_on_sigterm() {
     drop(write);
     drop(reader);
 }
+
+/// One authenticated, initialized daemon connection.
+struct Conn {
+    write: tokio::net::unix::OwnedWriteHalf,
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    next_id: u64,
+}
+
+impl Conn {
+    async fn open(socket: &Path, auth: &str) -> Self {
+        let stream = UnixStream::connect(socket).await.expect("connect");
+        let (read, mut write) = stream.into_split();
+        write.write_all(auth.as_bytes()).await.unwrap();
+        let mut conn = Conn {
+            write,
+            reader: BufReader::new(read),
+            next_id: 1,
+        };
+        let init = conn
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "l1-e2e", "version": "1" },
+                }),
+            )
+            .await;
+        assert_eq!(init["result"]["serverInfo"]["name"], "mneme", "{init}");
+        let note = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        conn.write
+            .write_all(format!("{note}\n").as_bytes())
+            .await
+            .unwrap();
+        conn
+    }
+
+    async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let frame =
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        self.write
+            .write_all(format!("{frame}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        timeout(Duration::from_secs(5), self.reader.read_line(&mut line))
+            .await
+            .unwrap_or_else(|_| panic!("{method}: timeout"))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).expect("response JSON");
+        assert_eq!(v["id"], id, "{v}");
+        v
+    }
+
+    async fn tool(&mut self, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+        let v = self
+            .request(
+                "tools/call",
+                serde_json::json!({"name": name, "arguments": arguments}),
+            )
+            .await;
+        assert_eq!(v["result"]["isError"], false, "{name}: {v}");
+        v
+    }
+
+    async fn stats(&mut self) -> serde_json::Value {
+        let v = self.tool("stats", serde_json::json!({})).await;
+        serde_json::from_str(v["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    async fn context(&mut self) -> serde_json::Value {
+        let v = self
+            .request(
+                "resources/read",
+                serde_json::json!({"uri": "mneme://context"}),
+            )
+            .await;
+        serde_json::from_str(v["result"]["contents"][0]["text"].as_str().unwrap()).unwrap()
+    }
+}
+
+/// L1 belongs to one connection. Up to 1.5.x every daemon client shared
+/// the process's single working session, so one agent's turns were
+/// served to every other agent in `mneme://context`.
+#[tokio::test]
+async fn working_turns_are_isolated_between_daemon_connections() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path();
+    let socket = data_dir.join("run").join("mneme.sock");
+    let mut daemon = Command::new(BINARY)
+        .arg("daemon")
+        .arg("--foreground")
+        .env("MNEME_LOG", "off")
+        .env("MNEME_DATA_DIR", data_dir)
+        .env("MNEME_EMBEDDER", "stub")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mneme daemon");
+    wait_for_socket(&socket).await;
+    let auth = auth_line(data_dir);
+
+    let mut a = Conn::open(&socket, &auth).await;
+    let mut b = Conn::open(&socket, &auth).await;
+
+    let said = "which tulip varieties did we order for the north bed";
+    a.tool(
+        "record_event",
+        serde_json::json!({"kind": "user_message", "payload": {"content": said}}),
+    )
+    .await;
+    a.tool(
+        "remember",
+        serde_json::json!({"content": "the north bed gets Queen of Night"}),
+    )
+    .await;
+
+    let (stats_a, stats_b) = (a.stats().await, b.stats().await);
+    let sid_a = stats_a["working"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let sid_b = stats_b["working"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(sid_a, sid_b, "each connection has its own working session");
+    assert!(
+        stats_a["working"]["turns_total"].as_u64().unwrap() >= 2,
+        "{stats_a}"
+    );
+    assert_eq!(
+        stats_b["working"]["turns_total"], 0,
+        "A's turns leaked into B: {stats_b}"
+    );
+
+    let (ctx_a, ctx_b) = (a.context().await, b.context().await);
+    assert!(ctx_a["working"].to_string().contains(said), "{ctx_a}");
+    assert_eq!(
+        ctx_b["working"],
+        serde_json::json!([]),
+        "A's turns leaked into B's context"
+    );
+
+    // A disconnects: its turns are flushed. B, which has none, leaves no
+    // snapshot when it goes.
+    let snapshot = |sid: &str| data_dir.join("sessions").join(format!("{sid}.snapshot"));
+    drop(a);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !snapshot(&sid_a).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "closing the connection must flush its working session"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+    drop(b);
+
+    sigterm(&daemon);
+    let exit = timeout(Duration::from_secs(10), daemon.wait())
+        .await
+        .expect("daemon exits within 10 s")
+        .expect("wait ok");
+    assert!(exit.success(), "{exit:?}");
+    assert!(
+        !snapshot(&sid_b).exists(),
+        "a connection without turns writes no snapshot"
+    );
+}

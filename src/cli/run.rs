@@ -25,7 +25,9 @@ use crate::mcp::resources::ResourceRegistry;
 use crate::mcp::server::{McpSession, Server};
 use crate::mcp::tools::ToolRegistry;
 use crate::mcp::transport::stdio::StdioTransport;
-use crate::memory::checkpoint_scheduler::{CheckpointScheduler, CheckpointSchedulerConfig};
+use crate::memory::checkpoint_scheduler::{
+    CheckpointScheduler, CheckpointSchedulerConfig, WorkingSessionFactory,
+};
 use crate::memory::consolidation::ConsolidationParams;
 use crate::memory::consolidation_scheduler::{ConsolidationScheduler, SchedulerConfig};
 use crate::memory::episodic::EpisodicStore;
@@ -317,7 +319,7 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     }
     let scope_state = ScopeState::new(&default_scope);
     let derive_scope_from_roots = config.scopes.derive_from_roots;
-    let auto_log_tool_calls = config.episodic.auto_log_tool_calls;
+    let dispatch_policy = crate::mcp::dispatch::DispatchPolicy::from_config(&config);
 
     // `remember` / `update` content ceiling (release-planning v2.1
     // §5.3). Configured via `[budgets] max_remember_chars`; the
@@ -442,6 +444,13 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
     );
 
     let sessions_dir = root.join("sessions");
+    // The daemon and the HTTP listener open one working session per
+    // client from this; stdio keeps the boot session above.
+    let working_sessions = WorkingSessionFactory::new(
+        sessions_dir.clone(),
+        data_aead.clone(),
+        CheckpointSchedulerConfig::from_config(&config.checkpoints),
+    );
     let result = runtime
         .block_on(async_main(
             BootedStorage {
@@ -469,7 +478,8 @@ pub fn execute_with_mode(mode: TransportMode) -> Result<()> {
                 // `DaemonServeMany` mints.
                 default_scope: default_scope.clone(),
                 derive_scope_from_roots,
-                auto_log_tool_calls,
+                dispatch_policy,
+                working_sessions,
                 sessions_dir,
                 auto_context_budget,
                 schema_version: on_disk_version.max(migrate::CURRENT_SCHEMA_VERSION),
@@ -544,6 +554,11 @@ struct BootedSchedulers {
     active_session: Arc<ActiveSession>,
 }
 
+/// Opens the L1 working session for one client: the session, its
+/// scheduler, and whether the client owns them (and so must close them).
+type OpenWorking =
+    Arc<dyn Fn() -> (Arc<ActiveSession>, Arc<CheckpointScheduler>, bool) + Send + Sync>;
+
 /// Runtime configuration knobs that don't belong to a single lifecycle
 /// layer: transport mode, paths, scope state, token budget, etc.
 struct DaemonRuntimeConfig {
@@ -561,9 +576,13 @@ struct DaemonRuntimeConfig {
     /// replace its default scope with one derived from the client's
     /// `initialize` roots.
     derive_scope_from_roots: bool,
-    /// `[episodic] auto_log_tool_calls` — which tool calls are
-    /// mirrored into the L3 timeline.
-    auto_log_tool_calls: crate::config::AutoLogToolCalls,
+    /// What a successful tool call leaves behind: `[episodic]
+    /// auto_log_tool_calls` / `log_tool_call_values` and `[working]
+    /// record_tool_turns`.
+    dispatch_policy: crate::mcp::dispatch::DispatchPolicy,
+    /// Opens the per-client L1 working session for daemon connections
+    /// and HTTP sessions.
+    working_sessions: WorkingSessionFactory,
     sessions_dir: std::path::PathBuf,
     auto_context_budget: TokenBudget,
     schema_version: u32,
@@ -609,7 +628,8 @@ async fn async_main(
         scope_state,
         default_scope,
         derive_scope_from_roots,
-        auto_log_tool_calls,
+        dispatch_policy,
+        working_sessions,
         sessions_dir,
         auto_context_budget,
         schema_version,
@@ -720,7 +740,7 @@ async fn async_main(
             let mut server = Server::new(transport, tool, resource, storage)
                 .with_session(active_session, checkpoint_scheduler, episodic, scope_state)
                 .with_scope_from_roots(derive_scope_from_roots)
-                .with_auto_log_tool_calls(auto_log_tool_calls);
+                .with_dispatch_policy(dispatch_policy);
             if with_signal {
                 tokio::select! {
                     result = server.run() => result?,
@@ -735,6 +755,32 @@ async fn async_main(
         }
     };
 
+    // L1 is per client. Each HTTP session and each daemon connection
+    // gets its own working session and checkpoint scheduler, so one
+    // agent's turns never appear in another's `mneme://context` and
+    // `turns_total` counts one conversation. If the session directory
+    // cannot be opened the client still gets served, on the shared boot
+    // session (the pre-1.6 behaviour), which it does not own and must
+    // not shut down.
+    let open_working: OpenWorking = {
+        let shared_session = Arc::clone(&active_session);
+        let shared_scheduler = Arc::clone(&checkpoint_scheduler);
+        Arc::new(move || match working_sessions.open() {
+            Ok((session, scheduler)) => (session, scheduler, true),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not open a working session for this client; using the shared one"
+                );
+                (
+                    Arc::clone(&shared_session),
+                    Arc::clone(&shared_scheduler),
+                    false,
+                )
+            }
+        })
+    };
+
     // Builds one fully wired `McpSession` per HTTP `initialize`. Same
     // SEC-001 rule as the daemon's accept loop: a fresh `ScopeState`
     // per session so one agent's `switch_scope` can't leak into
@@ -746,13 +792,20 @@ async fn async_main(
         let storage = Arc::clone(&storage);
         let cold = cold.clone();
         let consolidation = Arc::clone(&consolidation);
-        let checkpoint_scheduler = Arc::clone(&checkpoint_scheduler);
-        let active_session = Arc::clone(&active_session);
+        let open_working = Arc::clone(&open_working);
         let orchestrator = Arc::clone(&orchestrator);
         let sessions_dir = sessions_dir.clone();
         let default_scope = default_scope.clone();
         Arc::new(move || {
             let scope_c = ScopeState::new(&default_scope);
+            let (session_c, sched_c, owned) = open_working();
+            // The orchestrator is a bundle of Arcs; a clone pointed at
+            // this session's turns makes `mneme://context` read them.
+            let orchestrator_c = Arc::new(
+                (*orchestrator)
+                    .clone()
+                    .with_active_session(Arc::clone(&session_c)),
+            );
             let tool = Arc::new(ToolRegistry::defaults_with_schedulers(
                 Arc::clone(&semantic),
                 Arc::clone(&procedural),
@@ -761,9 +814,9 @@ async fn async_main(
                 cold.clone(),
                 schema_version,
                 Some(Arc::clone(&consolidation)),
-                Some(Arc::clone(&checkpoint_scheduler)),
+                Some(Arc::clone(&sched_c)),
                 Arc::clone(&scope_c),
-                Some(Arc::clone(&active_session)),
+                Some(Arc::clone(&session_c)),
                 max_remember_chars,
                 secrets_mode,
             ));
@@ -771,26 +824,27 @@ async fn async_main(
                 Arc::clone(&semantic),
                 Arc::clone(&procedural),
                 Arc::clone(&episodic),
-                Arc::clone(&orchestrator),
+                Arc::clone(&orchestrator_c),
                 cold.clone(),
                 schema_version,
                 auto_context_budget,
                 Some(Arc::clone(&consolidation)),
-                Some(Arc::clone(&checkpoint_scheduler)),
-                Some(Arc::clone(&active_session)),
+                Some(Arc::clone(&sched_c)),
+                Some(Arc::clone(&session_c)),
                 Some(sessions_dir.clone()),
                 Some(Arc::clone(&scope_c)),
                 Some((Arc::clone(&storage), max_remember_chars)),
             ));
             McpSession::new(tool, resource, Arc::clone(&storage))
                 .with_session(
-                    Arc::clone(&active_session),
-                    Arc::clone(&checkpoint_scheduler),
+                    Arc::clone(&session_c),
+                    Arc::clone(&sched_c),
                     Arc::clone(&episodic),
                     scope_c,
                 )
                 .with_scope_from_roots(derive_scope_from_roots)
-                .with_auto_log_tool_calls(auto_log_tool_calls)
+                .with_dispatch_policy(dispatch_policy)
+                .with_owned_working_session(owned)
         })
     };
 
@@ -947,6 +1001,15 @@ async fn async_main(
                                 // single-client transports above) is
                                 // intentionally NOT cloned in here.
                                 let scope_c = ScopeState::new(&default_scope);
+                                // L1 is per connection too: its own
+                                // working session and scheduler,
+                                // closed when the connection ends.
+                                let (session_c, sched_c, owned) = open_working();
+                                let orchestrator_c = Arc::new(
+                                    (*orchestrator)
+                                        .clone()
+                                        .with_active_session(Arc::clone(&session_c)),
+                                );
                                 // Per-connection registries bind the
                                 // fresh scope cell into every tool that
                                 // reads it (`remember`, `pin`,
@@ -966,9 +1029,9 @@ async fn async_main(
                                         cold.clone(),
                                         schema_version,
                                         Some(Arc::clone(&consolidation)),
-                                        Some(Arc::clone(&checkpoint_scheduler)),
+                                        Some(Arc::clone(&sched_c)),
                                         Arc::clone(&scope_c),
-                                        Some(Arc::clone(&active_session)),
+                                        Some(Arc::clone(&session_c)),
                                         max_remember_chars,
                                         secrets_mode,
                                     ));
@@ -977,20 +1040,20 @@ async fn async_main(
                                         Arc::clone(&semantic),
                                         Arc::clone(&procedural),
                                         Arc::clone(&episodic),
-                                        Arc::clone(&orchestrator),
+                                        Arc::clone(&orchestrator_c),
                                         cold.clone(),
                                         schema_version,
                                         auto_context_budget,
                                         Some(Arc::clone(&consolidation)),
-                                        Some(Arc::clone(&checkpoint_scheduler)),
-                                        Some(Arc::clone(&active_session)),
+                                        Some(Arc::clone(&sched_c)),
+                                        Some(Arc::clone(&session_c)),
                                         Some(sessions_dir.clone()),
                                         Some(Arc::clone(&scope_c)),
                                         Some((Arc::clone(&storage), max_remember_chars)),
                                     ));
                                 let storage_c = Arc::clone(&storage);
-                                let active_session_c = Arc::clone(&active_session);
-                                let checkpoint_c = Arc::clone(&checkpoint_scheduler);
+                                let active_session_c = session_c;
+                                let checkpoint_c = Arc::clone(&sched_c);
                                 let episodic_c = Arc::clone(&episodic);
                                 let counter = Arc::clone(&active_clients);
                                 let root_for_auth = Arc::clone(&daemon_root);
@@ -1006,6 +1069,19 @@ async fn async_main(
                                     // both `wait_for_drain` and the
                                     // idle-timeout watcher (D6).
                                     let _guard = ConnectionGuard::new(&counter);
+                                    // Ends the working session on
+                                    // every way out of this task,
+                                    // early returns included.
+                                    let close_working = || async {
+                                        if owned
+                                            && let Err(e) = sched_c.shutdown_if_used().await
+                                        {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "closing working session: final checkpoint failed"
+                                            );
+                                        }
+                                    };
                                     // ADR-0012 D3: read the token
                                     // from disk PER CONNECTION (not
                                     // a cached snapshot) so
@@ -1022,6 +1098,7 @@ async fn async_main(
                                                 error = %e,
                                                 "transport=daemon-serve-many: failed to read auth token; dropping connection"
                                             );
+                                            close_working().await;
                                             return;
                                         }
                                     };
@@ -1047,6 +1124,7 @@ async fn async_main(
                                                 error = %e,
                                                 "transport=daemon-serve-many: auth handshake rejected; dropping connection"
                                             );
+                                            close_working().await;
                                             return;
                                         }
                                     };
@@ -1065,7 +1143,7 @@ async fn async_main(
                                         scope_c,
                                     )
                                     .with_scope_from_roots(derive_scope_from_roots)
-                                    .with_auto_log_tool_calls(auto_log_tool_calls);
+                                    .with_dispatch_policy(dispatch_policy);
                                     // Race the serve loop against the
                                     // daemon-level shutdown broadcast.
                                     // `Server::run` blocks in
@@ -1094,6 +1172,11 @@ async fn async_main(
                                             }
                                         }
                                     }
+                                    // The connection is over: flush
+                                    // this client's turns (if it had
+                                    // any) and stop its scheduler.
+                                    drop(server);
+                                    close_working().await;
                                     // guard drops here → counter -= 1
                                 });
                             }

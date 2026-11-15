@@ -37,12 +37,33 @@ hnsw_snapshot_inserts   = 1000
 hnsw_snapshot_minutes   = 60
 
 [episodic]
-auto_log_tool_calls = "writes"   # or "all" / "off"
+auto_log_tool_calls  = "writes"  # or "all" / "off"
+log_tool_call_values = "full"    # or "ids" / "off"
+index_kinds          = ["decision", "milestone", "lesson", "summary", "resolution",
+                        "problem", "pivot", "observation", "archived"]
+touch_on_recall      = true
+
+[working]
+record_tool_turns = "writes"     # or "all" / "off"
+
+[auto_context]
+semantic_half_life_days = 90.0
+semantic_recency_floor  = 0.75
+episodic_max_share      = 0.35
+semantic_min_share      = 0.3
+semantic_min_items      = 5
+working_max_share       = 0.05
+episodic_query_mix      = 0.3
+event_clip_chars        = 400
+min_event_weight        = 0.3
+max_events_per_kind     = 6
+pin_scopes              = ["global"]
 
 [consolidation]
 hot_to_warm_days  = 28
 warm_to_cold_days = 180
 schedule          = "idle"
+cold_exempt_kinds = ["archived", "summary", "milestone", "lesson", "decision"]
 
 [budgets]
 default_recall_limit       = 10
@@ -433,6 +454,122 @@ payload carries the value-bearing argument of write tools
 (`remember.content`, for instance), so it is also the place a credential
 would be copied to if `[guardrails] secrets` let one through.
 
+### `log_tool_call_values`
+
+| | |
+|---|---|
+| **Type** | string |
+| **Default** | `"full"` |
+| **Valid** | `"full"`, `"ids"`, `"off"` |
+| **Affects** | how much of a call's arguments a `tool_call` event keeps |
+| **Since** | 1.6.0 |
+
+`auto_log_tool_calls` decides *which* calls are mirrored; this decides
+*what* a mirrored event holds.
+
+- `"full"`: the value-bearing arguments as passed: `content` for
+  `remember` / `pin` / `update`, the query for `recall`, and so on. The
+  timeline can answer "what exactly was written, and when". `forget`
+  redacts the events that mirrored a forgotten memory (see
+  [Forgetting and the timeline](./mcp-surface.md#forgetting-and-the-timeline)).
+- `"ids"`: the tool name, the ids (`id`, `memory_id`) and the scope
+  (`scope`, `new_scope`). A write's `content` is replaced by
+  `content_len` (characters) and `content_sha256` (the first 8 hex digits
+  of its SHA-256), enough to see that the same text was written twice
+  without storing it. Queries, kinds and limits are dropped. A write the
+  secret guard flagged gets neither field.
+- `"off"`: `{"tool": "<name>"}` and nothing else.
+
+```json
+{"tool": "remember", "scope": "work", "memory_id": "01M7…", "content_sha256": "9f2c41aa", "content_len": 58}
+```
+
+Pick `"ids"` when the timeline should show activity but must never be a
+second copy of the memories. `forget` works the same in every mode: in
+`"ids"` the rows are found by id and lose the hash and length too; in
+`"off"` they hold nothing to redact. The setting applies to events
+written from then on; it does not rewrite existing rows.
+
+### `index_kinds`
+
+| | |
+|---|---|
+| **Type** | array of strings |
+| **Default** | `["decision", "milestone", "lesson", "summary", "resolution", "problem", "pivot", "observation", "archived"]` |
+| **Affects** | which event kinds are keyword-indexed |
+| **Since** | 1.6.0 |
+
+Events of these kinds can be found by their words: by `recall` when it is
+asked for the episodic layer, and by auto-context when a query is given.
+`tool_call` and message kinds are left out on purpose; add a kind of your
+own here if you record curated events under another name.
+
+### `touch_on_recall`
+
+| | |
+|---|---|
+| **Type** | boolean |
+| **Default** | `true` |
+| **Affects** | whether events returned by `recall` refresh their `last_accessed` |
+| **Since** | 1.6.0 |
+
+Events that keep being used stay in the hot tier. Set it to `false` for
+runs that must not write anything (evaluations, CI).
+
+---
+
+## `[working]` — the L1 working session
+
+### `record_tool_turns`
+
+| | |
+|---|---|
+| **Type** | string |
+| **Default** | `"writes"` |
+| **Valid** | `"writes"`, `"all"`, `"off"` |
+| **Affects** | which successful tool calls add a turn to the working session |
+| **Since** | 1.6.0 (the `"writes"` behaviour since 1.5.2) |
+
+A tool turn is `role = "tool"` with the tool's name as content. It shows
+up in the `working` section of `mneme://context`, counts towards
+`turns_total`, and counts towards `[checkpoints] session_interval_turns`.
+
+- `"writes"`: only tools that are not `readOnlyHint` (`remember`,
+  `update`, `forget`, `pin`, `unpin`, `record_event`, `switch_scope`).
+  Looking something up is not conversation.
+- `"all"`: every successful call, as up to 1.5.1.
+- `"off"`: none. The only turns are the messages an agent records with
+  `record_event` (`user_message` / `assistant_message`).
+
+Each MCP session has its own working session: one per stdio process, one
+per daemon connection, one per HTTP `Mcp-Session-Id`. See
+[L1 is session-local](./mcp-surface.md#l1-is-session-local).
+
+---
+
+## `[auto_context]` — how `mneme://context` is packed
+
+Since 1.6.0. Shares are fractions of
+`[budgets] auto_context_token_budget`. The behaviour these keys tune is
+described in [MCP surface](./mcp-surface.md); the table is the reference.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `semantic_half_life_days` | `90.0` | Half-life of a long-term memory's freshness, measured from its last update. `0` turns the decay off. Auto-context only; `recall` ranking is not decayed. |
+| `semantic_recency_floor` | `0.75` | The freshness factor never goes below this, so age only breaks near-ties in relevance. |
+| `episodic_max_share` | `0.35` | Largest share of the budget events (L3) may take. |
+| `semantic_min_share` | `0.3` | Share reserved for long-term memories (L4)… |
+| `semantic_min_items` | `5` | …or this many rows, whichever is smaller in tokens. |
+| `working_max_share` | `0.05` | Largest share working-session turns (L1) may take. |
+| `episodic_query_mix` | `0.3` | With a query: the weight of plain recency against query match when ranking events (`0.0` = match only, `1.0` = recency only). |
+| `event_clip_chars` | `400` | Events are clipped to this many characters and charged at the clipped size. |
+| `min_event_weight` | `0.3` | Events at or below this retrieval weight are left out. |
+| `max_events_per_kind` | `6` | At most this many events of one kind. |
+| `pin_scopes` | `["global"]` | Pin scopes always included next to the requested scope, so a scoped read keeps the global rules. `[]` restores the pre-1.6 behaviour (only the requested scope's pins). |
+
+`include_demoted` also loads but has no effect until memory relations
+arrive in 1.7; `mneme init` does not write it.
+
 ---
 
 ## `[consolidation]` — L3 hot/warm/cold tiering
@@ -490,6 +627,20 @@ options:
 Future modes (`"every_<n>m"`, cron expressions, `"on_demand"`)
 are tracked for post-v1.1.x. Anything other than `"idle"` today
 logs a warning and falls back to `"idle"` cadence.
+
+### `cold_exempt_kinds`
+
+| | |
+|---|---|
+| **Type** | array of strings |
+| **Default** | `["archived", "summary", "milestone", "lesson", "decision"]` |
+| **Affects** | which event kinds never move from warm to the cold archive |
+| **Since** | 1.6.0 |
+
+Cold quarter bundles are compact and immutable: events in them are not
+searchable and `forget` cannot reach them. Curated kinds are few and are
+the ones worth finding a year later, so they stay in the warm tier. `[]`
+restores the pre-1.6 behaviour, where every kind ages into cold.
 
 ---
 

@@ -88,6 +88,16 @@ temp+rename per checkpoint). Single file per session.
 - `session_interval_turns = 5` — and at least every 5 turns.
 - Whichever fires first.
 
+**L1 is session-local.** Every MCP session has its own working
+session and its own checkpoint scheduler: one per `mneme run` process
+(stdio), one per accepted daemon connection, one per HTTP
+`Mcp-Session-Id`. Agents sharing a daemon share L0, L3 and L4, never
+L1. (Up to 1.5.x the daemon and HTTP transports shared one working
+session between all clients.) A per-client session is flushed and its
+scheduler stopped when the connection closes, on `DELETE /mcp`, when an
+idle HTTP session is evicted, and at server shutdown; a session with no
+turns writes no snapshot.
+
 **What runs today:**
 > `cli::run` spawns a `CheckpointScheduler` that writes the active
 > session to `~/.mneme/sessions/<session_id>.snapshot` on the first

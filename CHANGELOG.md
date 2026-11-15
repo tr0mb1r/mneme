@@ -84,11 +84,34 @@ the work that landed before automation was wired up.
   `readOnlyHint` push a turn now, the rule `auto_log_tool_calls = "writes"`
   already uses for the timeline. Not configurable yet.
 
+- **L1 working memory is per session on the daemon and over HTTP.** Every
+  daemon connection and every HTTP `Mcp-Session-Id` now has its own
+  working session and checkpoint scheduler. They used to share the
+  process's single session, so one agent's turns appeared in every other
+  agent's `mneme://context` and `turns_total` mixed all clients, although
+  the docs said "L1 working turns are session-local". A client's session
+  is flushed and its scheduler stopped when the connection closes, on
+  `DELETE /mcp` (before the 204), when an idle HTTP session is evicted and
+  at shutdown. A session that recorded no turn writes no snapshot. stdio
+  (`mneme run`) is unchanged.
+
 ### Added
 
 - Successful `remember`, `pin` and `update` calls report the id of the
   memory they stored or changed as `_meta.id`, and their `tool_call` event
   records it as `memory_id`.
+
+- `[working] record_tool_turns` (`"writes"` default, `"all"`, `"off"`):
+  which successful tool calls add an L1 working turn. `"writes"` is the
+  1.5.2 behaviour, now configurable; `"all"` restores a turn per call.
+- `[episodic] log_tool_call_values` (`"full"` default, `"ids"`, `"off"`):
+  how much of a call's arguments a `tool_call` event keeps. `"ids"` keeps
+  the tool name, ids and scope and replaces `content` with its length and
+  an 8-hex-digit SHA-256 prefix; `"off"` keeps the tool name only.
+  `forget` redaction works in every mode.
+- `mneme init` writes the 1.6 sections into the starter `config.toml`,
+  with comments: `[working]`, `[auto_context]`, and the new `[episodic]`
+  and `[consolidation]` keys.
 
 ### Changed
 
@@ -1027,9 +1050,4 @@ formula, public release pipeline).
 ### Documentation
 
 - Issue and PR templates added under `.github/`.
-- `CONTRIBUTING.md` durability-path policy made concrete:
-  `scripts/manual_test.sh --stub` is the floor for any change
-  touching WAL / redb / HNSW / backup-restore.
-
-[0.2.1]: https://github.com/tr0mb1r/mneme/releases/tag/v0.2.1
-[0.2.0]: https://github.com/tr0mb1r/mneme/releases/tag/v0.2.0
+- `CONTRIBUT

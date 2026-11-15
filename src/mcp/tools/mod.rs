@@ -770,7 +770,7 @@ mod tests {
             None,
             None,
             None,
-            AutoLogToolCalls::Off,
+            AutoLogToolCalls::Off.into(),
             Id::Number(1),
             Some(json!({"name": name, "arguments": arguments})),
         )
@@ -931,7 +931,7 @@ mod tests {
                 None,
                 None,
                 None,
-                AutoLogToolCalls::Writes,
+                AutoLogToolCalls::Writes.into(),
                 Id::Number(n),
                 Some(json!({"name": "counting", "arguments": {}})),
             )
