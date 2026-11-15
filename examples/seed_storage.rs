@@ -6,6 +6,8 @@
 //! MNEME_DATA_DIR=/tmp/foo cargo run --example seed_storage -- write 10
 //! MNEME_DATA_DIR=/tmp/foo cargo run --example seed_storage -- read
 //! MNEME_DATA_DIR=/tmp/bar cargo run --example seed_storage -- corpus
+//! MNEME_DATA_DIR=/tmp/baz cargo run --example seed_storage -- corpus \\
+//!     --questions tests/fixtures/eval/questions.jsonl /tmp/questions.jsonl
 //! ```
 //!
 //! - `corpus` fills a fresh data directory with the synthetic corpus the
@@ -14,6 +16,9 @@
 //!   events and 6 pins, all deterministic. Vectors come from the stub
 //!   embedder, so serve the directory with `MNEME_EMBEDDER=stub mneme run`
 //!   to poke at it; a real model re-embeds everything on first boot.
+//!   With `--questions <template> <out>` it also writes the evaluation
+//!   questions for `mneme eval`, with the template's symbolic keys
+//!   replaced by the ids this seeding assigned.
 //! - `write N` populates the dir with N plaintext rows under
 //!   `RedbStorage::open` (legacy plaintext path).
 //! - `read` opens via `crypto::boot::open_episodic_storage`, which
@@ -105,30 +110,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "corpus" => {
-            use mneme::embed::Embedder;
-            use mneme::embed::stub::StubEmbedder;
-            use mneme::memory::episodic::EpisodicStore;
-            use mneme::memory::semantic::{SemanticStore, SnapshotConfig};
-            use std::sync::Arc;
-
-            mneme::cli::init::init_at(&root)?;
-            let keyring = OsKeyring::new();
-            let (storage, aead) =
-                mneme::crypto::boot::open_episodic_storage_and_aead(&root, &keyring)?;
-            let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::new());
-            let semantic = SemanticStore::open_with_crypto(
-                &root,
-                Arc::clone(&storage),
-                embedder,
-                SnapshotConfig::disabled(),
-                aead.clone(),
-            )?;
-            let procedural = ProceduralStore::open_with_crypto(&root, aead)?;
-            let episodic = EpisodicStore::new(Arc::clone(&storage));
-
-            let c = corpus::seed(&semantic, &procedural, &episodic).await?;
-            semantic.shutdown().await?;
-            storage.flush().await?;
+            let c = corpus::seed_data_dir(&root).await?;
+            // `--questions <template> <out>`: resolve the symbolic keys
+            // of a questions template to this store's ids.
+            if args.get(2).map(String::as_str) == Some("--questions") {
+                let (template, out) = match (args.get(3), args.get(4)) {
+                    (Some(t), Some(o)) => (t, o),
+                    _ => {
+                        return Err("usage: corpus --questions <template.jsonl> <out.jsonl>".into());
+                    }
+                };
+                let resolved = c.resolve_questions(&std::fs::read_to_string(template)?)?;
+                std::fs::write(out, resolved)?;
+            }
             println!(
                 "{}",
                 serde_json::json!({

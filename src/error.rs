@@ -42,6 +42,12 @@ pub enum MnemeError {
 
     #[error("crypto error: {0}")]
     Crypto(String),
+
+    /// A check the command exists to make did not pass (`mneme eval`
+    /// below a threshold, or a store that changed under a read-only
+    /// run). The message is the whole story; no category prefix.
+    #[error("{0}")]
+    CheckFailed(String),
 }
 
 impl From<redb::Error> for MnemeError {

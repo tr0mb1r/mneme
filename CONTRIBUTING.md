@@ -37,6 +37,24 @@ Thanks for your interest. This document is short on purpose.
   progress; un-ignore it when that work lands. To look at the corpus:
   `MNEME_DATA_DIR=/tmp/c cargo run --example seed_storage -- corpus`,
   then `MNEME_EMBEDDER=stub MNEME_DATA_DIR=/tmp/c mneme run`.
+- **Ranking quality is measured nightly with `mneme eval`.**
+  `.github/workflows/quality-nightly.yml` seeds the same corpus and
+  scores the questions in `tests/fixtures/eval/questions.jsonl`
+  (symbolic keys; the seeder resolves them to ids). To run it locally:
+
+  ```bash
+  export MNEME_DATA_DIR=/tmp/c MNEME_EMBEDDER=stub
+  cargo run --example seed_storage -- corpus \
+    --questions tests/fixtures/eval/questions.jsonl /tmp/questions.jsonl
+  cargo run -- eval /tmp/questions.jsonl --gate-mode keyword --tag local
+  ```
+
+  The thresholds live in the workflow, next to the values they were
+  calibrated from. If your change moves a number, say so in the PR; if
+  it moves one past a threshold, change the threshold in the same PR
+  and explain why. New kinds of question go in the fixture, with a new
+  `type`. For numbers with a real model, run `mneme eval` against your
+  own store and questions (the CLI reference in the book has the details).
 
 ## Style
 

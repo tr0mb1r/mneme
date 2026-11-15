@@ -106,6 +106,15 @@ the work that landed before automation was wired up.
 
 ### Added
 
+- **`mneme eval`**: measure recall and auto-context quality against a
+  questions file with known answers. Runs `recall` over mode × scope ×
+  layers and replays `mneme://context` per question; reports hit@1,
+  hit@5, MRR, stale-over-current, off-scope@5, context gold, layer shares
+  and p50/p95 latency to `metrics-<tag>.json` and `summary-<tag>.md`.
+  Read-only, and fails if the store changed during the run. Optional
+  thresholds make it a gate; a nightly workflow runs it on a synthetic
+  corpus.
+
 - Successful `remember`, `pin` and `update` calls report the id of the
   memory they stored or changed as `_meta.id`, and their `tool_call` event
   records it as `memory_id`.
